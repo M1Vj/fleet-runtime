@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync } fr
 import path from "node:path";
 import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
-import { scrub, gh, ghInput, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
+import { scrub, gh, ghInput, gitRevParse, configureIdentity, safeCommitState } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
 import { verifyPullAuthor } from "./lib/verify.mjs";
@@ -195,10 +195,7 @@ async function main() {
       }
     }
     audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Merge gate scan", "ok");
-    gitAdd(REPO_ROOT, ["state"]);
-    if (gitCommit(REPO_ROOT, `[fleet] merge-gate scan ${runId}`, identity) === "committed") {
-      gitPush(REPO_ROOT, "main", process.env);
-    }
+    safeCommitState(REPO_ROOT, ["state", "audit"], `[fleet] merge-gate scan ${runId}`, identity, process.env);
     console.log("MERGE_TERMINAL_STATE=SCAN-DONE");
     return;
   }
@@ -333,10 +330,7 @@ async function main() {
   function finish(a, rid, stateName) {
     a.writeMarkdown(path.join(REPO_ROOT, "audit"), rid, `Merge gate ${TARGET_REPO}#${PR_NUMBER}`, stateName);
     try {
-      gitAdd(REPO_ROOT, ["state"]);
-      if (gitCommit(REPO_ROOT, `[fleet] merge-gate ${rid} ${stateName}`, identity) === "committed") {
-        gitPush(REPO_ROOT, "main", process.env);
-      }
+      safeCommitState(REPO_ROOT, ["state", "audit"], `[fleet] merge-gate ${rid} ${stateName}`, identity, process.env);
     } catch {}
     return 0;
   }

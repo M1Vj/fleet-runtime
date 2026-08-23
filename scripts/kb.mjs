@@ -192,16 +192,17 @@ async function modeSynthesize(audit) {
   audit.note("synthesize", `complete=${result.complete}`);
   if (!result.complete || !result.reply) throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });
 
-  const fileRe = /^FILE path=(.+)$/gm;
-  const matches = [...result.reply.matchAll(fileRe)];
-  const files = [];
-  for (let i = 0; i < matches.length; i++) {
-    const p = matches[i][1].trim().replace(/^["']|["']$/g, "");
-    const after = result.reply.slice(matches[i].index + matches[i][0].length);
+  let files = [];
+  const headered = [];
+  const matches = [...result.reply.matchAll(/^FILE path=(.+)$/gm)];
+  for (const m of matches) {
+    const p = m[1].trim().replace(/^["']|["']$/g, "");
+    const after = result.reply.slice(m.index + m[0].length);
     const fence = after.match(/```[a-zA-Z0-9]*\n([\s\S]*?)\n```/);
-    if (!fence) continue;
-    files.push({ path: p, content: fence[1] });
+    if (fence) headered.push({ path: p, content: fence[1] });
   }
+  if (headered.length > 0) files = headered;
+  else files = harvestFencedFiles(result.reply);
   const errors = [];
   if (files.length === 0 || files.length > 6) errors.push("file count invalid");
   for (const f of files) {

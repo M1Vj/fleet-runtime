@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -198,4 +198,17 @@ export function findExistingOpenPr(repoFullName, branch, env = process.env) {
     if (Array.isArray(res) && res.length > 0) return res[0];
   } catch {}
   return null;
+}
+
+export function safeCommitState(repoDir, subpaths, message, identity, pushEnv = process.env) {
+  const existing = subpaths.filter((p2) => existsSync(path.join(repoDir, p2)));
+  const changed = existing.filter((p2) => {
+    const res = spawnSync("git", ["status", "--porcelain", "--", p2], { cwd: repoDir, encoding: "utf8" });
+    return Boolean((res.stdout || "").trim());
+  });
+  if (changed.length === 0) return "no-changes";
+  gitAdd(repoDir, changed);
+  const outcome = gitCommit(repoDir, message, identity);
+  if (outcome === "committed") gitPush(repoDir, "main", pushEnv);
+  return outcome;
 }

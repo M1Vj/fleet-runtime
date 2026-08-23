@@ -31,3 +31,10 @@ test("sanitize: control chars inside strings only", () => {
   const fixed = sanitizeControlChars('{"a":"x\ny"}');
   assert.equal(JSON.parse(fixed).a, "x\ny");
 });
+
+test("kb harvester fallback parses prose-wrapped packages", () => {
+  const t = "Sure!\n\nv2/identity/core-beliefs.md\n```md\n---\ntype: Identity\n---\n# Core beliefs\n```\nDone.";
+  const files = harvestFencedFiles(t);
+  assert.equal(files.length, 1);
+  assert.equal(files[0].path, "v2/identity/core-beliefs.md");
+});

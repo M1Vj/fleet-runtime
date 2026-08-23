@@ -46,7 +46,7 @@ async function modePick(audit) {
   return 0;
 }
 
-function buildResearchPrompt(repo) {
+function buildResearchPrompt(repo, workdir) {
   const meta = gh(["api", `/repos/${repo}`], process.env);
   const commits = gh(["api", `/repos/${repo}/commits?per_page=15`], process.env) || [];
   const pulls = gh(["api", `/repos/${repo}/pulls?state=open&per_page=10`], process.env) || [];
@@ -59,7 +59,7 @@ function buildResearchPrompt(repo) {
     `Open issues: ${issuesRaw.filter((i) => !i.pull_request).map((i) => `#${i.number} ${i.title}`).join("; ") || "none"}`,
   ];
   return [
-    `You are the research sub-agent for repo ${repo}. Study the context below. Decide what would MOST improve this project right now (correctness, security, DX, performance, docs, CI). You may use webfetch to consult authoritative sources.`,
+    `You are the research sub-agent for repo ${repo}. A full shallow clone is mounted at your working directory ('.')${workdir ? "" : " (digest-only mode)"} — use read/grep/glob on real code before concluding. Decide what would MOST improve this project right now (correctness, security, DX, performance, docs, CI). You may use webfetch to consult authoritative sources.`,
     "Return ONLY strict JSON: {\"ideas\":[{\"title\":\"...\",\"rationale\":\"...\",\"evidence\":\"what you saw\",\"impact\":\"high|medium|low\"}]} max 5 ideas.",
     "Context:",
     lines.join("\n").slice(0, 14000),

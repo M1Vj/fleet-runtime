@@ -86,12 +86,14 @@ function parseFindings(reply) {
   };
 }
 
-export async function analyzeOne(repo, kind, audit) {
+export async function analyzeOne(repo, kind, workdir, audit) {
   const result = await askModel({
     prompt: buildPromptFor({ repo, kind }, workdir),
+    workspace: workdir,
     timeoutMs: 540000,
     env: process.env,
     preferVariantMax: true,
+    maxRounds: 4,
   });
   audit.note("model", `repo=${repo} kind=${kind} complete=${result.complete} attempts=${JSON.stringify(result.attempts)}`);
   if (!result.complete || !result.reply) throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });
@@ -121,7 +123,9 @@ async function mainWorker() {
   const repo = process.env.FLEET_REPO;
   const kind = process.env.FLEET_KIND;
   audit.note("task", `${repo} ${kind}`);
-  const analysis = await analyzeOne(repo, kind, audit);
+  const cloneDir = `/tmp/deep-${String(repo).replace("/", "__")}`;
+  gh(["repo", "clone", repo, cloneDir, "--", "--depth", "1"], process.env);
+  const analysis = await analyzeOne(repo, kind, cloneDir, audit);
   const outPath = path.join(process.env.FLEET_ARTIFACT_DIR || ".", `report-${repo.replace("/", "__")}.json`);
   writeFileSync(outPath, JSON.stringify({ repo, kind, ...analysis, finishedUtc: new Date().toISOString() }, null, 2));
   console.log(`DEEP_RESULT_FILE=${outPath}`);

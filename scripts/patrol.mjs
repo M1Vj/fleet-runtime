@@ -359,6 +359,7 @@ export async function main() {
       try {
         const { gatewayDown } = await import("./lib/gateway-health.mjs");
         if (gatewayDown(gwRoot)) {
+          audit.note("outage-skip", "circuit open; recording STALLED");
           terminal("STALLED", { runId, why: "gateway-circuit-open", trigger });
           console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "skipped-gateway-down" })}`);
           return 0;

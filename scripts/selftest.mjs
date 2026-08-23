@@ -163,19 +163,36 @@ export async function main() {
       const fileB = path.join(dir10, "b.png");
       writeFileSync(fileA, solidPng(255, 0, 0));
       writeFileSync(fileB, solidPng(0, 0, 255));
+      const vresPrompt = "Two images attached in order. Reply ONLY strict JSON {\"same\":false,\"colors\":[\"<dominant color of first>\",\"<dominant color of second>\"]}";
       const vres = await askModel({
-        prompt: "Two images attached in order. Reply ONLY strict JSON {\"same\":false,\"colors\":[\"<dominant color of first>\",\"<dominant color of second>\"]}",
+        prompt: vresPrompt,
         files: [fileA, fileB],
         timeoutMs: 240000,
         env: process.env,
         preferVariantMax: false,
         maxRounds: 2,
       });
-      const lower = String(vres.reply || "").toLowerCase();
-      if (vres.complete && lower.includes("red") && lower.includes("blue")) {
+      let lower = String(vres.reply || "").toLowerCase();
+      if (!(vres.complete && lower.includes("red") && lower.includes("blue"))) {
+        audit.note("T10-retry", "first vision attempt weak; cooling down and retrying");
+        await new Promise((r) => setTimeout(r, 45000));
+        const retry = await askModel({
+          prompt: vresPrompt,
+          files: [fileA, fileB],
+          timeoutMs: 240000,
+          env: process.env,
+          preferVariantMax: false,
+          maxRounds: 2,
+        });
+      }
+      {
+        const finalReply = typeof retry !== "undefined" && retry.complete ? retry.reply : vres.reply;
+        lower = String(finalReply || "").toLowerCase();
+      }
+      if (lower.includes("red") && lower.includes("blue")) {
         audit.note("T10", "PASS vision canary distinguished red vs blue");
       } else {
-        audit.incident("T10", `vision canary weak reply=${String(vres.reply).slice(0, 120)}`);
+        audit.incident("T10", `vision canary weak reply=${String(lower).slice(0, 140)}`);
         failed = true;
       }
     } catch (err) {

@@ -3,6 +3,7 @@ import process from "node:process";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import { runGate } from "./lib/gate.mjs";
+import { ghInput, putFileContent } from "./lib/util.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, gitAdd, gitCommit, gitPush, configureIdentity } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";

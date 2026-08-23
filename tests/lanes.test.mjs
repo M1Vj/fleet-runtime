@@ -161,3 +161,11 @@ test("classify tiers: migrations stay HARD even small", async () => {
   const r = classify([{ filename: "migrations/001.sql", additions: 3, deletions: 0 }]);
   assert.equal(r.risk, "HIGH");
 });
+
+test("resolveModelChain: default single, env chain parsed in order", async () => {
+  const { resolveModelChain } = await import("../scripts/lib/model.mjs");
+  assert.deepEqual(resolveModelChain({}), ["opencode/x-preview-f-free"]);
+  const chain = resolveModelChain({ FLEET_MODEL_CHAIN: "opencode/x-preview-f-free, opencode/gemini-3-flash ,opencode/minimax-m3-free" });
+  assert.equal(chain.length, 3);
+  assert.equal(chain[chain.length - 1], "opencode/minimax-m3-free");
+});

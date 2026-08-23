@@ -60,6 +60,17 @@ session manually on any machine with opencode installed:
     OPENCODE_AUTH_CONTENT="$(cat ~/.local/share/opencode/auth.json)" \
       opencode run -s <sessionId> "follow-up prompt"
 
+## Model fallback chain (research: LiteLLM/OpenRouter patterns)
+
+Set `FLEET_MODEL_CHAIN` repo variable to a comma-separated priority list, e.g.:
+
+    opencode/x-preview-f-free, opencode/gemini-3-flash, opencode/minimax-m3-free
+
+askModel walks the chain per call (each entry gets its own variant/auth/rounds ladder);
+first success wins; breaker opens only after the WHOLE chain fails. Order with your
+most trusted model first and a reliable floor last (OpenRouter guidance). Default is
+Ox/Alpha-only per fleet mandate. Judges honor FLEET_JUDGE_MODEL independently.
+
 ## Known upstream behavior (opencode CLI, researched 2026-08-22)
 
 The Ox/Alpha gateway model is free and popular; the CLI has documented failure modes

@@ -30,6 +30,14 @@ function collectText(obj, out = []) {
   return out;
 }
 
+export function resolveModelChain(env = process.env) {
+  const primary = "opencode/x-preview-f-free";
+  const raw = String(env.FLEET_MODEL_CHAIN || "").trim();
+  if (!raw) return [primary];
+  const chain = raw.split(",").map((m) => m.trim()).filter(Boolean);
+  return chain.length > 0 ? chain : [primary];
+}
+
 export function runOnce({ prompt, sessionId, variant, timeoutMs, env, files = [], modelOverride, workspace }) {
   return new Promise((resolve) => {
     const missing = !env.FLEET_OPENCODE_AUTH;
@@ -118,8 +126,28 @@ export async function askModel({ prompt, sessionId, timeoutMs = 480000, env = pr
   if (!skipCircuitCheck && !sessionId && gatewayCircuitOpen(stateRoot)) {
     return { reply: "", sessionId: "", modelMode: "circuit-open", attempts: [{ round: 0, skipped: "circuit-open" }], complete: false, circuitOpen: true };
   }
+  const chain = modelOverride ? [modelOverride] : resolveModelChain(env);
+  const allAttempts = [];
+  let lastSid = sessionId || "";
+  let lastMode = "";
+  for (let ci = 0; ci < chain.length; ci++) {
+    const r = await askOnModel({ model: chain[ci], isPrimary: ci === 0, prompt, sessionId: lastSid || undefined, timeoutMs, env, preferVariantMax, maxRounds, files, workspace });
+    allAttempts.push(...(r.attempts || []));
+    if (r.sessionId) lastSid = r.sessionId;
+    lastMode = r.modelMode || lastMode;
+    if (r.complete) {
+      try { markGatewayUp(stateRoot); } catch {}
+      return { reply: r.reply, sessionId: lastSid, modelMode: lastMode, attempts: allAttempts, complete: true };
+    }
+  }
+  try { markGatewayDown(stateRoot, allAttempts.map((x) => x.errTail || "").join(" ").slice(-200)); } catch {}
+  return { reply: "", sessionId: lastSid, modelMode: lastMode, attempts: allAttempts, complete: false };
+}
+
+async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env, preferVariantMax, maxRounds, files, workspace }) {
+  const stateRoot = env.FLEET_STATE_ROOT || process.cwd();
   let sid = sessionId || "";
-  let mode = preferVariantMax ? "max" : "plain";
+  let mode = preferVariantMax && isPrimary ? "max" : "plain";
   let useAuth = true;
   let promptNow = prompt;
   const attempts = [];
@@ -129,9 +157,10 @@ export async function askModel({ prompt, sessionId, timeoutMs = 480000, env = pr
       await sleep(backoff);
     }
     const roundEnv = useAuth ? env : stripAuth(env);
-    const r = await runOnce({ prompt: promptNow, sessionId: sid || undefined, variant: mode === "max" ? "max" : undefined, timeoutMs, env: roundEnv, files });
+    const r = await runOnce({ prompt: promptNow, sessionId: sid || undefined, variant: mode === "max" ? "max" : undefined, timeoutMs, env: roundEnv, files, workspace });
     attempts.push({
       round,
+      model,
       mode,
       auth: useAuth ? "yes" : "anon",
       exit: r.exitCode,
@@ -143,10 +172,8 @@ export async function askModel({ prompt, sessionId, timeoutMs = 480000, env = pr
     });
     if (r.sessionId) sid = r.sessionId;
     if (!r.interrupted && r.exitCode === 0 && r.reply) {
-      return { reply: r.reply, sessionId: sid, modelMode: mode === "max" && !useAuth ? "plain-anon" : mode === "max" ? "max" : useAuth ? "plain" : "plain-anon", attempts, complete: true };
-    }
-    if (r.spawnFailed) {
-      return { reply: "", sessionId: sid, modelMode: mode, attempts, complete: false, fatal: true };
+      try { markGatewayUp(stateRoot); } catch {}
+      return { reply: r.reply, sessionId: sid, modelMode: `${model}${mode === "max" ? "@max" : ""}`, attempts, complete: true };
     }
     if (mode === "max") {
       mode = "plain";
@@ -161,15 +188,7 @@ export async function askModel({ prompt, sessionId, timeoutMs = 480000, env = pr
     promptNow = "You were interrupted mid-task. Continue from where you stopped and finish the job. Output ONLY the requested final answer now.";
     sid = "";
   }
-  try { markGatewayDown(stateRoot, attempts.map((a) => a.errTail || "").join(" ").slice(-200)); } catch {}
   return { reply: "", sessionId: sid, modelMode: mode, attempts, complete: false };
-}
-
-function stripAuth(env) {
-  const clone = { ...env };
-  delete clone.FLEET_OPENCODE_AUTH;
-  delete clone.OPENCODE_AUTH_CONTENT;
-  return clone;
 }
 
 export async function askModelResilient(opts) {

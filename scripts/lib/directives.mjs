@@ -220,3 +220,44 @@ export function validateDirectives(rawString) {
   if (errors.length > 0) return { ok: false, directives: [], errors };
   return { ok: true, directives, errors };
 }
+
+const PATHLIKE_RE = /[\w.\/-]+\.(?:md|markdown|tex|txt|bib|yml|yaml)\b/gi;
+
+export function harvestFencedFiles(text, { forcePrefix = "", allowedExt } = {}) {
+  const files = [];
+  const seen = new Set();
+  const lines = String(text).split("\n");
+  let match;
+  const fenceStarts = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^```/.test(lines[i].trim())) {
+      if (fenceStarts.length > 0 && fenceStarts[fenceStarts.length - 1].close === -1) {
+        const open = fenceStarts[fenceStarts.length - 1];
+        open.close = i;
+        const content = lines.slice(open.line + 1, i).join("\n");
+        let foundPath = null;
+        for (let back = i - 1; back >= Math.max(0, open.line - 4) && !foundPath; back--) {
+          const pm = lines[back].match(/(?:path=|`|\*\*)?([\w.\/-]+\.(?:md|markdown|tex|txt|bib|yml|yaml))\b/i);
+          if (pm) foundPath = pm[1];
+        }
+        if (!foundPath) {
+          const allInText = content.match(PATHLIKE_RE);
+          void allInText;
+        }
+        if (foundPath) {
+          let p = foundPath.replace(/^["']|["']$/g, "").replace(/^\.\//, "");
+          if (forcePrefix && !p.startsWith(forcePrefix)) p = forcePrefix + p.replace(/^\//, "");
+          const key = p + "|" + content.slice(0, 80);
+          if (!seen.has(key) && content.trim().length > 0) {
+            seen.add(key);
+            files.push({ path: p, content });
+          }
+        }
+      } else {
+        fenceStarts.push({ line: i, close: -1 });
+      }
+    }
+  }
+  const final = allowedExt ? files.filter((f) => allowedExt.test(f.path)) : files;
+  return final;
+}

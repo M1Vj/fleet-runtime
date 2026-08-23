@@ -7,7 +7,7 @@ import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, ghInput, putFileContent, ensureBranch, findExistingOpenPr, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, sha256, configureIdentity } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor } from "./lib/verify.mjs";
-import { sanitizeControlChars } from "./lib/directives.mjs";
+import { sanitizeControlChars, harvestFencedFiles } from "./lib/directives.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
@@ -70,18 +70,26 @@ async function modeSurvey(audit) {
 }
 
 function extractFileBlocks(text) {
-  const files = [];
-  const fileRe = /^(?:FILE|V2FILE) path=(.+)$/gm;
-  const matches = [...String(text).matchAll(fileRe)];
-  for (let i = 0; i < matches.length; i++) {
-    const rawPath = matches[i][1].trim().replace(/^["']|["']$/g, "");
+  const headered = [];
+  const matches = [...String(text).matchAll(/^(?:FILE|V2FILE) path=(.+)$/gm)];
+  for (const m of matches) {
+    const rawPath = m[1].trim().replace(/^["']|["']$/g, "");
     let p = rawPath.startsWith(V2_PREFIX) ? rawPath : V2_PREFIX + rawPath.replace(/^\//, "");
-    const after = String(text).slice(matches[i].index + matches[i][0].length);
+    const after = String(text).slice(m.index + m[0].length);
     const fence = after.match(/```[a-zA-Z0-9]*\n([\s\S]*?)\n```/);
-    if (!fence) continue;
-    files.push({ path: p, content: fence[1] });
+    if (fence) headered.push({ path: p, content: fence[1] });
   }
-  return files;
+  if (headered.length > 0) return headered;
+  const harvested = harvestFencedFiles(String(text), { forcePrefix: V2_PREFIX });
+  const dedup = [];
+  const seen = new Set(headered.map((h) => h.path));
+  for (const f of harvested) {
+    if (!seen.has(f.path)) {
+      seen.add(f.path);
+      dedup.push(f);
+    }
+  }
+  return dedup;
 }
 
 function validateV2(files) {
@@ -141,6 +149,21 @@ async function modeDraft(audit) {
       maxRounds: 3,
     });
     if (repair.reply) files = extractFileBlocks(repair.reply);
+  }
+  if (files.length === 0 && result.sessionId) {
+    audit.note("fallback", "asking for single consolidated file");
+    const single = await askModel({
+      prompt: "Produce EXACTLY one improvement document. First line 'TITLE: <t>'. Then one fenced code block whose first line is the path comment '// v2/THESIS-IMPROVEMENTS.md' followed by complete markdown content of your full plan and material.",
+      sessionId: result.sessionId,
+      timeoutMs: 480000,
+      env: process.env,
+      preferVariantMax: false,
+      maxRounds: 3,
+    });
+    if (single.reply) files = extractFileBlocks(single.reply);
+    if (files.length === 0) {
+      files = [{ path: "v2/THESIS-IMPROVEMENTS.md", content: "# Thesis improvements\n\n" + String(result.reply).slice(0, 40000) }];
+    }
   }
   const errors = validateV2(files);
   if (errors.length > 0) {

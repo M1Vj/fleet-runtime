@@ -31,7 +31,7 @@ export async function main() {
     audit.note("kill-switch", `committed sha=${sha.slice(0, 10)}`);
 
     for (const repoFullName of ["M1Vj/fleet-runtime", "M1Vj/fleet-control"]) {
-      for (const wf of ["patrol.yml", "watchdog.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml"]) {
+      for (const wf of ["patrol.yml", "watchdog.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml"]) {
         gh(["api", "-X", "PUT", `/repos/${repoFullName}/actions/workflows/${wf}/disable`], process.env);
       }
       audit.note("disable", wf);

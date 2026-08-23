@@ -44,7 +44,7 @@ export async function main() {
     }
 
     for (const repoFullName of ["M1Vj/fleet-runtime", "M1Vj/fleet-control"]) {
-      for (const wf of ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml"]) {
+      for (const wf of ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml"]) {
         gh(["api", "-X", "PUT", `/repos/${repoFullName}/actions/workflows/${wf}/enable`], process.env);
       }
       audit.note("re-enable", wf);

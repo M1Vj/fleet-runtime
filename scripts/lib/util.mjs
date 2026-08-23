@@ -174,9 +174,11 @@ export function gitAdd(repoDir, paths) {
 }
 
 export function configureIdentity(repoDir, identity) {
+  const probe = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], { cwd: repoDir, encoding: "utf8" });
+  if (probe.status !== 0) return false;
   for (const [k, v] of [["user.name", identity.name], ["user.email", identity.noreply]]) {
     const res = spawnSync("git", ["config", k, String(v)], { cwd: repoDir, encoding: "utf8" });
-    if (res.status !== 0) throw new Error(`git config ${k} failed`);
+    if (res.status !== 0) return false;
   }
   return true;
 }

@@ -217,10 +217,10 @@ export async function main() {
   const audit = new AuditBuffer(redact);
   let identity = null;
   let status = "failed";
+  const terminal = makeTerminal(REPO_ROOT, { lane: "patrol" });
   try {
     identity = await runGate(process.env);
     configureIdentity(REPO_ROOT, identity);
-    const terminal = makeTerminal(REPO_ROOT, { lane: "patrol", requireWrite: true });
     audit.note("gate", `identity=${identity.login} id=${identity.id} scopes=${identity.scopes.join(",")}`);
 
     const gwRoot = process.env.FLEET_STATE_ROOT || REPO_ROOT;
@@ -358,8 +358,6 @@ export async function main() {
     if (err.reason === "MODEL_UNAVAILABLE") {
       try {
         const { gatewayDown } = await import("./lib/gateway-health.mjs");
-        const healthFile = path.join(gwRoot, "state", "gateway-health.json");
-        audit.note("outage-debug", `exists=${existsSync(healthFile)} content=${existsSync(healthFile) ? readFileSync(healthFile, "utf8").slice(0, 160) : "n/a"} result=${gatewayDown(gwRoot)}`);
         if (gatewayDown(gwRoot)) {
           audit.note("outage-skip", "circuit open; recording STALLED");
           terminal("STALLED", { runId, why: "gateway-circuit-open", trigger });

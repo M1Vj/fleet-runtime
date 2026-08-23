@@ -1,0 +1,67 @@
+name: fleet-merge-gate
+run-name: "merge gate ${{ github.event.inputs.repo || 'scan' }}#${{ github.event.inputs.pr || '' }}"
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "target repo (owner/name); empty = scan all open fleet PRs"
+        type: string
+        default: ""
+      pr:
+        description: "PR number (requires repo)"
+        type: string
+        default: ""
+      routes:
+        description: "UI routes to verify, comma separated"
+        type: string
+        default: "/"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-merge-gate
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+      FLEET_UI_ROUTES: ${{ github.event.inputs.routes || '/' }}
+    steps:
+      - name: checkout runtime
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install pinned opencode cli
+        run: npm install -g opencode-ai@1.18.21
+      - name: install visual toolchain
+        run: |
+          npm install -g playwright@1.54.0 pngjs pixelmatch
+          npx --yes playwright@1.54.0 install chromium --with-deps || npx --yes playwright@1.54.0 install chromium
+      - name: merge gate
+        env:
+          FLEET_TARGET_REPO: ${{ github.event.inputs.repo }}
+          FLEET_PR_NUMBER: ${{ github.event.inputs.pr }}
+        run: node scripts/merge.mjs

@@ -232,6 +232,35 @@ async function modeSynthesize(audit) {
         errors.splice(0, errors.length);
       }
     }
+    if ((errors.length > 0 || files.length === 0)) {
+      audit.note("kb-fresh", "repair failed; fresh-session attempt");
+      const fresh = await askModel({
+        prompt,
+        timeoutMs: 480000,
+        env: process.env,
+        preferVariantMax: false,
+        maxRounds: 3,
+      });
+      if (fresh.complete && fresh.reply) {
+        const fm = [...fresh.reply.matchAll(fileRe)];
+        const ffiles = [];
+        for (let i = 0; i < fm.length; i++) {
+          const p = fm[i][1].trim();
+          const after = fresh.reply.slice(fm[i].index + fm[i][0].length);
+          const fence = after.match(/```[a-zA-Z0-9]*\n([\s\S]*?)\n```/);
+          if (fence) ffiles.push({ path: p, content: fence[1] });
+        }
+        const ferrs = [];
+        for (const f of ffiles) {
+          if (!kbPathAllowed(f.path)) ferrs.push(f.path);
+          if (!hasValidFrontmatter(f.content)) ferrs.push(f.path + ":fm");
+        }
+        if (ffiles.length > 0 && ferrs.length === 0) {
+          files.splice(0, files.length, ...ffiles);
+          errors.splice(0, errors.length);
+        }
+      }
+    }
   }
   if (errors.length > 0 || files.length === 0) {
     audit.incident("validate", errors.slice(0, 6).join("; ") || "no files");
@@ -287,8 +316,9 @@ async function modeShip(audit) {
     process.env,
   );
   await verifyPullAuthor(KB_REPO, pr.number, identity, process.env.FLEET_GH_TOKEN);
-  const head = gh(["api", `/repos/${KB_REPO}/commits/${branch}`], process.env);
-  await verifyCommit(KB_REPO, head.sha, identity, process.env.FLEET_GH_TOKEN);
+  const headSha = pr.head && pr.head.sha ? pr.head.sha : null;
+  if (!headSha) throw new Error("PR head sha unavailable");
+  await verifyCommit(KB_REPO, headSha, identity, process.env.FLEET_GH_TOKEN);
   audit.note("ship", `pr=#${pr.number} files=${files.length}`);
 
   const labDir = path.join(REPO_ROOT, "docs", "kb-lab");

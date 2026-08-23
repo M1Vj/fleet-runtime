@@ -214,8 +214,9 @@ async function modeShip(audit) {
     process.env,
   );
   await verifyPullAuthor(THESIS_REPO, pr.number, identity, process.env.FLEET_GH_TOKEN);
-  const head = gh(["api", `/repos/${THESIS_REPO}/commits/${branch}`], process.env);
-  await verifyCommit(THESIS_REPO, head.sha, identity, process.env.FLEET_GH_TOKEN);
+  const headSha = pr.head && pr.head.sha ? pr.head.sha : null;
+  if (!headSha) throw new Error("PR head sha unavailable");
+  await verifyCommit(THESIS_REPO, headSha, identity, process.env.FLEET_GH_TOKEN);
   audit.note("ship", `pr=#${pr.number} branch=${branch} files=${files.length}`);
 
   const labDir = path.join(REPO_ROOT, "docs", "thesis-lab");

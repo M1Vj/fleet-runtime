@@ -42,35 +42,42 @@ async function main() {
   const blockersSection = lastJudge.body.split("**Blockers:**")[1] || "";
   const blockerLines = blockersSection.split("\n").filter((l) => l.trim().startsWith("- ")).slice(0, 8);
 
-  const workdir = `/tmp/revise-${repo.replace("/", "__")}-${prNumber}`;
-  gh(["repo", "clone", repo, workdir, "--", "--branch", pr.head.ref], process.env);
+  const filesApi = gh(["api", `/repos/${repo}/pulls/${prNumber}/files?per_page=100`], process.env) || [];
+  const changedPaths = filesApi.map((f) => f.filename);
+  const diffText = filesApi
+    .map((f) => `--- ${f.filename}\n${String(f.patch || "").slice(0, 4000)}`)
+    .join("\n\n")
+    .slice(0, 30000);
 
-  const modelEnv = {
-    ...process.env,
-    FLEET_WORKSPACE_ROOT: workdir,
-    OPENCODE_CONFIG_CONTENT: JSON.stringify({
-      "$schema": "https://opencode.ai/config.json",
-      permission: { edit: "allow", bash: { "*": "deny", "git add *": "allow", "git commit *": "allow" }, question: "deny", external_directory: "deny", read: "allow", grep: "allow", glob: "allow" },
-    }),
-  };
+  const promptV3 = [
+    `You are the REVISION agent for your own change to ${repo} (PR #${prNumber}). Independent judges REJECTED it.`,
+    "Fix every blocker below by returning corrected/new FULL files.",
+    "Respond in EXACTLY this plain-text format:",
+    "REVISED",
+    "SUMMARY: <one line>",
+    "Then per file:",
+    "FILE path=<repo-relative/path>",
+    "```",
+    "<complete corrected file content>",
+    "```",
+    "Rules: only files already present in the diff, plus at most 2 new supporting files; never delete documentation/security sections; make the required CI check hermetic or explicitly gated behind a repository variable with a clear skip reason; keep fail-fast guards.",
+    "",
+    "JUDGE BLOCKERS:",
+    blockerLines.join("\n"),
+    "",
+    "CURRENT DIFF:",
+    diffText,
+    "",
+    "FULL JUDGE COMMENT:",
+    lastJudge.body.slice(0, 5000),
+  ].join("\n");
 
-  const result = await askModel({
-    prompt: [
-      `You are the REVISION agent. Your earlier change to ${repo} (PR #${prNumber}, branch ${pr.head.ref}) was reviewed and REJECTED.`,
-      "The working directory contains the PR branch checked out — edit the files IN PLACE to address every blocker below.",
-      "You may run read-only inspection plus targeted edits. Do NOT touch files unrelated to the blockers. Do NOT delete documentation or security content.",
-      "BLOCKERS:",
-      ...blockerLines,
-      "",
-      "When done editing, reply ONLY strict JSON: {\"summary\":\"what you changed\"}",
-      "Full judge comment for context:",
-      lastJudge.body.slice(0, 6000),
-    ].join("\n"),
+  let result = await askModel({
+    prompt: promptV3,
     timeoutMs: 600000,
-    env: modelEnv,
+    env: process.env,
     preferVariantMax: true,
     maxRounds: 4,
-    workspace: workdir,
   });
   audit.note("revise", `complete=${result.complete}`);
   if (!result.complete || !result.reply) {
@@ -78,55 +85,52 @@ async function main() {
     console.log("REVISE_STATE=MODEL_UNAVAILABLE");
     return 6;
   }
-  let summary = String(result.reply).slice(0, 500);
-  try {
-    summary = JSON.parse(result.reply.match(/{[\s\S]*}/)[0]).summary || summary;
-  } catch {}
-
-  const status = gh(["api", `/repos/${repo}/pulls/${prNumber}`], process.env);
-  void status;
-  let changed = spawnGit(workdir, ["status", "--porcelain"]);
-  if (!changed.stdout.trim()) {
-    audit.note("no-changes", "first pass edited nothing; firm retry");
+  const { harvestFencedFiles } = await import("./lib/directives.mjs");
+  let files = harvestFencedFiles(result.reply);
+  if (files.length === 0 && result.sessionId) {
     const firm = await askModel({
-      prompt: [
-        "You did NOT make any edits. You MUST now actually modify files to fix these blockers:",
-        ...blockerLines,
-        "Use your edit tools on the files in the working directory NOW, then reply ONLY {\"summary\":\"...\"}.",
-      ].join("\n"),
+      prompt: "You returned no parseable FILE blocks. Re-output using EXACTLY: 'REVISED', 'SUMMARY: <line>', then per file 'FILE path=<path>' + fenced complete content.",
       sessionId: result.sessionId,
-      timeoutMs: 600000,
-      env: modelEnv,
-      preferVariantMax: true,
-      maxRounds: 3,
-      workspace: workdir,
+      timeoutMs: 480000,
+      env: process.env,
+      preferVariantMax: false,
+      maxRounds: 2,
     });
-    void firm;
-    changed = spawnGit(workdir, ["status", "--porcelain"]);
+    if (firm.reply) files = harvestFencedFiles(firm.reply);
   }
-  if (!changed.stdout.trim()) {
-    process.stdout.write(`REVISE_REPLY=${String(result.reply).slice(0, 300)}\n`);
-    appendLine({ t: new Date().toISOString(), repo, pr: prNumber, state: "no-changes" });
+  if (files.length === 0) {
+    process.stdout.write(`REVISE_REPLY=${String(result.reply).slice(0, 240)}\n`);
+    appendLine({ t: new Date().toISOString(), repo, pr: prNumber, state: "no-parseable-files" });
     console.log("REVISE_STATE=NO_CHANGES");
     return 0;
   }
-  spawnGit(workdir, ["add", "-A"]);
-  const commit = spawnGit(workdir, ["commit", "-m", `[fleet-revise] address review blockers (${summary.slice(0, 80)})`]);
-  if (commit.status !== 0) throw new Error(`revision commit failed: ${String(commit.stderr).slice(-200)}`);
-  const push = spawnGit(workdir, ["push", "origin", pr.head.ref]);
-  if (push.status !== 0) throw new Error(`push failed: ${String(push.stderr).slice(-200)}`);
 
-  appendLine({ t: new Date().toISOString(), repo, pr: prNumber, state: "revised", round: used + 1 });
-  gh(["api", "-X", "POST", `/repos/${repo}/issues/${prNumber}/comments`, "-F", `body=🔧 **fleet revision agent**: pushed fixes for the review blockers (round ${used + 1}/${max}). Summary: ${summary}\n\nMerge gate will re-evaluate automatically.`], process.env);
-  audit.note("done", `round=${used + 1}`);
-  writeAudit(audit, `revise-${Date.now()}`);
-  console.log("REVISE_STATE=REVISED");
-  return 0;
+  const branch = pr.head.ref;
+  for (const f of files) {
+    let sha;
+    try {
+      const ex = gh(["api", `/repos/${repo}/contents/${f.path}?ref=${branch}`], process.env);
+      sha = ex && ex.sha;
+    } catch {
+      sha = undefined;
+    }
+    ghInput(
+      ["api", "-X", "PUT", `/repos/${repo}/contents/${f.path}`],
+      {
+        message: `[fleet-revise] update ${f.path} (round ${used + 1})`,
+        content: Buffer.from(f.content, "utf8").toString("base64"),
+        branch,
+        ...(sha ? { sha } : {}),
+      },
+      process.env,
+    );
+  }
+  summary = String(result.reply).split("\n").find((l) => l.startsWith("SUMMARY:"))?.replace(/^SUMMARY:\s*/, "") || String(summary).slice(0, 200);
+  gh(["api", "-X", "POST", `/repos/${repo}/issues/${prNumber}/comments`, "-F", `body=🔧 **fleet revision agent** (round ${used + 1}/${max}): pushed corrected files (${files.map((f) => f.path).join(", ")}). ${summary}\n\nMerge gate re-evaluates automatically.`], process.env);
 
   function appendLine(obj) {
     try {
-      const { appendFileSync, mkdirSync: mkd } = requireFsMod();
-      mkd(path.dirname(REVISIONS_PATH), { recursive: true });
+      mkdirSync(path.dirname(REVISIONS_PATH), { recursive: true });
       appendFileSync(REVISIONS_PATH, JSON.stringify(obj) + "\n");
     } catch {}
   }
@@ -135,18 +139,8 @@ async function main() {
       a.writeMarkdown(path.join(REPO_ROOT, "audit"), rid, `Revise ${repo}#${prNumber}`, "ok");
     } catch {}
   }
-  function spawnGit(dir, args) {
-    const cp = req("node:child_process").spawnSync("git", args, { cwd: dir, encoding: "utf8", env: { ...process.env } });
-    return { status: cp.status, stdout: cp.stdout || "", stderr: cp.stderr || "" };
-  }
-  function req(mod) {
-    // eslint-disable-next-line
-    return globalRequire(mod);
-  }
 }
-let globalRequire = null;
-import { createRequire as _cr } from "node:module";
-globalRequire = _cr(import.meta.url);
+
 
 main()
   .then(() => process.exit(0))

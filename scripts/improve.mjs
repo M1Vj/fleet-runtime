@@ -100,7 +100,15 @@ async function modeResearch(audit) {
       fsRemove(workdir);
     } catch {}
   }
-  if (!result.complete || !result.reply) throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });
+  if (!result.complete || !result.reply) {
+    const { gatewayDown } = await import("./lib/gateway-health.mjs");
+    if (gatewayDown(process.env.FLEET_STATE_ROOT || process.cwd())) {
+      audit.note("research", "probe confirmed outage; skipping gracefully");
+      console.log("IMPROVE_SKIPPED=circuit-still-open");
+      return 0;
+    }
+    throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });
+  }
   const outDir = process.env.FLEET_ARTIFACT_DIR || ".";
   mkdirSync(outDir, { recursive: true });
   writeFileSync(path.join(outDir, `ideas-${repo.replace("/", "__")}.json`), JSON.stringify({ repo, reply: result.reply }, null, 2));

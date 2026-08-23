@@ -132,7 +132,21 @@ async function mainWorker() {
   }
   const cloneDir = `/tmp/deep-${String(repo).replace("/", "__")}`;
   gh(["repo", "clone", repo, cloneDir, "--", "--depth", "1"], process.env);
-  const analysis = await analyzeOne(repo, kind, cloneDir, audit);
+  let analysis;
+  try {
+    analysis = await analyzeOne(repo, kind, cloneDir, audit);
+  } catch (err) {
+    if (err.code === 6 || /MODEL_UNAVAILABLE/.test(err.message)) {
+      const { gatewayDown } = await import("./lib/gateway-health.mjs");
+      if (gatewayDown(process.env.FLEET_STATE_ROOT || process.cwd())) {
+        audit.note("analyze", "probe confirmed outage; skipping gracefully");
+        writeFileSync(path.join(process.env.FLEET_ARTIFACT_DIR || ".", `report-${repo.replace("/", "__")}.json`), JSON.stringify({ repo, kind, findings: [{ severity: "low", title: "skipped", detail: "gateway outage" }], verdict: "Skipped during confirmed gateway outage." }, null, 2));
+        console.log(`DEEP_RESULT_FILE=${path.join(process.env.FLEET_ARTIFACT_DIR || ".", `report-${repo.replace("/", "__")}.json`)}`);
+        return 0;
+      }
+    }
+    throw err;
+  }
   const outPath = path.join(process.env.FLEET_ARTIFACT_DIR || ".", `report-${repo.replace("/", "__")}.json`);
   writeFileSync(outPath, JSON.stringify({ repo, kind, ...analysis, finishedUtc: new Date().toISOString() }, null, 2));
   console.log(`DEEP_RESULT_FILE=${outPath}`);

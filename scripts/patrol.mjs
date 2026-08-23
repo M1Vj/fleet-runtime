@@ -355,6 +355,16 @@ export async function main() {
     else audit.incident("fatal", err.message);
     audit.writeMarkdown(AUDIT_DIR, runId, "Patrol run", `failed(${err.reason || code})`);
     console.error(`PATROL_FAILED code=${code} reason=${err.reason || err.message}`);
+    if (err.reason === "MODEL_UNAVAILABLE") {
+      try {
+        const { gatewayDown } = await import("./lib/gateway-health.mjs");
+        if (gatewayDown(gwRoot)) {
+          terminal("STALLED", { runId, why: "gateway-circuit-open", trigger });
+          console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "skipped-gateway-down" })}`);
+          return 0;
+        }
+      } catch {}
+    }
     terminal(err.reason === "MODEL_UNAVAILABLE" ? "EXHAUSTED" : "BLOCKED", { runId, code, trigger });
     if (identity && gitHasChanges(REPO_ROOT, ["audit"])) {
       try {

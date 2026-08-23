@@ -58,6 +58,13 @@ async function main() {
     mkdirSync(dir, { recursive: true });
     sh("git", ["init", "-q"], { cwd: dir });
     sh("git", ["remote", "add", "origin", `https://github.com/${REPO}.git`], { cwd: dir });
+    {
+      const helperDir = path.join(dir, "..", "cred");
+      mkdirSync(helperDir, { recursive: true });
+      const hp = path.join(helperDir, "helper.sh");
+      writeFileSync(hp, "#!/bin/sh\nprintf 'username=%s\\n' \"$FLEET_GH_USER\"\nprintf 'password=%s\\n' \"$FLEET_GH_TOKEN\"\n", { mode: 0o700 });
+      sh("git", ["config", "credential.helper", hp], { cwd: dir });
+    }
     const fr = sh("git", ["fetch", "-q", "--depth", "1", "origin", sha], { cwd: dir, timeout: 240000 });
     if (fr.code !== 0) throw new Error(`fetch ${label} failed: ${fr.stderr.slice(-200)}`);
     sh("git", ["checkout", "-q", "FETCH_HEAD"], { cwd: dir });

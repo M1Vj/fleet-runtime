@@ -212,3 +212,15 @@ export function safeCommitState(repoDir, subpaths, message, identity, pushEnv = 
   if (outcome === "committed") gitPush(repoDir, "main", pushEnv);
   return outcome;
 }
+
+export function installCredentialHelper(repoDir, env = process.env) {
+  const helperPath = path.join(mkdtempSync(path.join(tmpdir(), "fleetcred2-")), "helper.sh");
+  writeFileSync(
+    helperPath,
+    "#!/bin/sh\nprintf 'username=%s\\n' \"$FLEET_GH_USER\"\nprintf 'password=%s\\n' \"$FLEET_GH_TOKEN\"\n",
+    { mode: 0o700 },
+  );
+  const res = spawnSync("git", ["config", "credential.helper", helperPath], { cwd: repoDir, encoding: "utf8", env: childEnv(env) });
+  void res;
+  return helperPath;
+}

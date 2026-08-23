@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync } fr
 import path from "node:path";
 import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
-import { scrub, gh, ghInput, gitRevParse, configureIdentity, safeCommitState } from "./lib/util.mjs";
+import { scrub, gh, ghInput, gitRevParse, configureIdentity, safeCommitState, installCredentialHelper } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
 import { verifyPullAuthor } from "./lib/verify.mjs";
@@ -77,6 +77,7 @@ async function runDeterministicChecks(repo, headSha, audit) {
   const evidenceLines = [];
   const workdir = "/tmp/pr-checkout";
   gh(["repo", "clone", repo, workdir, "--", "--depth", "1"], process.env);
+  installCredentialHelper(workdir, process.env);
   const { spawnSync } = await import("node:child_process");
   let fr = spawnSync("git", ["fetch", "-q", "--depth", "1", "origin", headSha], { cwd: workdir, encoding: "utf8" });
   if (fr.status !== 0) {
@@ -169,7 +170,10 @@ async function main() {
   const audit = new AuditBuffer(scrub(process.env));
   const identity = await runGate(process.env);
   configureIdentity(REPO_ROOT, identity);
-  if (process.env.FLEET_GH_TOKEN && !process.env.GH_TOKEN) process.env.GH_TOKEN = process.env.FLEET_GH_TOKEN;
+  if (process.env.FLEET_GH_TOKEN) {
+    if (!process.env.GH_TOKEN) process.env.GH_TOKEN = process.env.FLEET_GH_TOKEN;
+    if (!process.env.FLEET_GH_USER) process.env.FLEET_GH_USER = identity.login;
+  }
   audit.note("gate", `identity=${identity.login} target=${TARGET_REPO} pr=${PR_NUMBER}`);
 
   if (!TARGET_REPO || !PR_NUMBER) {

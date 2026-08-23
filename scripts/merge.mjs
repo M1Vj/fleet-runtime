@@ -33,7 +33,7 @@ const SECRET_PATTERNS = [
   /sk-[A-Za-z0-9]{20,}/,
 ];
 
-function classify(files) {
+export function classify(files) {
   const reasons = [];
   let additions = 0;
   let deletions = 0;
@@ -55,7 +55,7 @@ function classify(files) {
   return { risk: reasons.length > 0 ? "HIGH" : "LOW", reasons, uiTouched, size };
 }
 
-function secretsInDiff(files) {
+export function secretsInDiff(files) {
   const hits = [];
   for (const f of files) {
     const patch = f.patch || "";
@@ -370,9 +370,11 @@ async function judge({ repo, prNumber, title, body, files, extraEvidence, lens, 
   }
 }
 
-main()
-  .then(() => process.exit(0))
-  .catch((err) => {
-    console.error(`MERGE_GATE_FAILED reason=${err.message}`);
-    process.exit(err.code && Number.isInteger(err.code) ? err.code : 1);
-  });
+if (process.argv[1] && import.meta.url.endsWith(path.basename(process.argv[1]))) {
+  main()
+    .then(() => process.exit(0))
+    .catch((err) => {
+      console.error(`MERGE_GATE_FAILED reason=${err.message}`);
+      process.exit(err.code && Number.isInteger(err.code) ? err.code : 1);
+    });
+}

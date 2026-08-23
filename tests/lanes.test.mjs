@@ -38,3 +38,41 @@ test("kb harvester fallback parses prose-wrapped packages", () => {
   assert.equal(files.length, 1);
   assert.equal(files[0].path, "v2/identity/core-beliefs.md");
 });
+
+test("merge classify: empty file list is HIGH (nothing additive)", async () => {
+  const { classify } = await import("../scripts/merge.mjs");
+  const r = classify([]);
+  assert.equal(r.risk, "HIGH");
+});
+
+test("merge classify: docs-only small diff is LOW", async () => {
+  const { classify } = await import("../scripts/merge.mjs");
+  const r = classify([{ filename: "docs/guide.md", additions: 20, deletions: 2 }]);
+  assert.equal(r.risk, "LOW");
+  assert.equal(r.uiTouched, false);
+});
+
+test("merge classify: mdx counts as UI", async () => {
+  const { classify } = await import("../scripts/merge.mjs");
+  const r = classify([{ filename: "src/intro.mdx", additions: 10, deletions: 0 }]);
+  assert.equal(r.uiTouched, true);
+});
+
+test("merge classify: workflow edits are HIGH", async () => {
+  const { classify } = await import("../scripts/merge.mjs");
+  const r = classify([{ filename: ".github/workflows/ci.yml", additions: 5, deletions: 1 }]);
+  assert.equal(r.risk, "HIGH");
+});
+
+test("merge classify: >400 line diff is HIGH", async () => {
+  const { classify } = await import("../scripts/merge.mjs");
+  const r = classify([{ filename: "src/big.ts", additions: 300, deletions: 150 }]);
+  assert.equal(r.risk, "HIGH");
+  assert.equal(r.size, 450);
+});
+
+test("secretsInDiff flags leaked token patterns", async () => {
+  const { secretsInDiff } = await import("../scripts/merge.mjs");
+  const hits = secretsInDiff([{ filename: "cfg.ts", patch: "+const t = 'ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';" }]);
+  assert.equal(hits.length, 1);
+});

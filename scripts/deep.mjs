@@ -8,6 +8,7 @@ import { scrub, gh, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, conf
 import { askModel } from "./lib/model.mjs";
 import { verifyCommit } from "./lib/verify.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
+import { makeTerminal } from "./lib/terminal.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
@@ -165,6 +166,7 @@ async function mainCommit() {
     audit.note("push-verify", `attribution verified sha=${sha.slice(0, 10)}`);
   }
   audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Deep commit", "ok");
+  makeTerminal(REPO_ROOT)("SUCCESS", { runId, reportsCommitted: processed });
   console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "ok", reportsCommitted: processed })}`);
   return 0;
 }

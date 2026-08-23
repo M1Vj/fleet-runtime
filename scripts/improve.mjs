@@ -7,6 +7,7 @@ import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, ghInput, putFileContent, ensureBranch, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, sha256, configureIdentity } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor, verifyCommentAuthor } from "./lib/verify.mjs";
+import { makeTerminal } from "./lib/terminal.mjs";
 import { isSafeRepoPath, sanitizeControlChars, extractJsonObject } from "./lib/directives.mjs";
 
 const CODE_ROOT = process.cwd();
@@ -378,6 +379,7 @@ if (process.argv[1] && import.meta.url.endsWith(path.basename(process.argv[1])))
   };
   try {
     const code = await MODES[mode](audit);
+    makeTerminal(REPO_ROOT)(code === 0 ? "SUCCESS" : "BLOCKED", { mode });
     audit.writeMarkdown(path.join(REPO_ROOT, "audit"), `improve-${mode}-${Date.now()}`, `Improve ${mode}`, code === 0 ? "ok" : "failed");
     if (code !== 0) dumpAudit();
     process.exit(code);

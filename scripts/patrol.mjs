@@ -9,6 +9,7 @@ import { loadLedger, eventKey, has, append } from "./lib/ledger.mjs";
 import { validateDirectives } from "./lib/directives.mjs";
 import { askModel } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor, verifyCommentAuthor, verifyIssueAuthor } from "./lib/verify.mjs";
+import { makeTerminal } from "./lib/terminal.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
@@ -304,6 +305,8 @@ export async function main() {
       status = "ok-no-changes";
     }
 
+    const state = status === "ok" ? "SUCCESS" : "NO-OP";
+    makeTerminal(REPO_ROOT)(state, { runId, modelMode, mutations });
     console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status, modelMode, directives: directives.length, mutations, auditFile: auditFileRel })}`);
     return 0;
   } catch (err) {
@@ -312,6 +315,7 @@ export async function main() {
     else audit.incident("fatal", err.message);
     audit.writeMarkdown(AUDIT_DIR, runId, "Patrol run", `failed(${err.reason || code})`);
     console.error(`PATROL_FAILED code=${code} reason=${err.reason || err.message}`);
+    makeTerminal(REPO_ROOT)(err.reason === "MODEL_UNAVAILABLE" ? "EXHAUSTED" : "BLOCKED", { runId, code });
     if (identity && gitHasChanges(REPO_ROOT, ["audit"])) {
       try {
         gitAdd(REPO_ROOT, ["audit"]);

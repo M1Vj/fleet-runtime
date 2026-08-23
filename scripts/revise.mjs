@@ -85,8 +85,27 @@ async function main() {
 
   const status = gh(["api", `/repos/${repo}/pulls/${prNumber}`], process.env);
   void status;
-  const changed = spawnGit(workdir, ["status", "--porcelain"]);
+  let changed = spawnGit(workdir, ["status", "--porcelain"]);
   if (!changed.stdout.trim()) {
+    audit.note("no-changes", "first pass edited nothing; firm retry");
+    const firm = await askModel({
+      prompt: [
+        "You did NOT make any edits. You MUST now actually modify files to fix these blockers:",
+        ...blockerLines,
+        "Use your edit tools on the files in the working directory NOW, then reply ONLY {\"summary\":\"...\"}.",
+      ].join("\n"),
+      sessionId: result.sessionId,
+      timeoutMs: 600000,
+      env: modelEnv,
+      preferVariantMax: true,
+      maxRounds: 3,
+      workspace: workdir,
+    });
+    void firm;
+    changed = spawnGit(workdir, ["status", "--porcelain"]);
+  }
+  if (!changed.stdout.trim()) {
+    process.stdout.write(`REVISE_REPLY=${String(result.reply).slice(0, 300)}\n`);
     appendLine({ t: new Date().toISOString(), repo, pr: prNumber, state: "no-changes" });
     console.log("REVISE_STATE=NO_CHANGES");
     return 0;

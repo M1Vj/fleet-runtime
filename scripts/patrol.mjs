@@ -116,6 +116,8 @@ function enqueueDeepTasks(signals) {
   const existing = existsSync(queuePath)
     ? readFileSync(queuePath, "utf8").split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean)
     : [];
+  const openCount = existing.filter((t) => t.status === "pending" || t.status === "in_progress").length;
+  if (openCount >= 12) return 0;
   const pendingKeys = new Set(existing.filter((t) => t.status === "pending" || t.status === "in_progress").map((t) => `${t.repo}|${t.kind}`));
   const doneToday = new Set(
     existing

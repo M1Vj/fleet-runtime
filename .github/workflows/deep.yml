@@ -49,8 +49,9 @@ jobs:
           TASKS=$(node -e '
             const fs=require("fs");
             const max=parseInt(process.argv[1])||3;
-            const rows=fs.readFileSync("state/queue.jsonl","utf8").split("\n").filter(Boolean)
-              .map(l=>{try{return JSON.parse(l)}catch{return null}}).filter(Boolean);
+            const qp=(process.env.FLEET_STATE_ROOT||".")+"/state/queue.jsonl";
+            const rows=fs.existsSync(qp)?fs.readFileSync(qp,"utf8").split("\n").filter(Boolean)
+              .map(l=>{try{return JSON.parse(l)}catch{return null}}).filter(Boolean):[];
             const now=Date.now();
             const claimable=rows.filter(t=>t.status==="pending"||(t.status==="in_progress"&&t.updatedUtc&&now-new Date(t.updatedUtc).getTime()>40*60*1000&&(t.attempts||0)<3));
             const picked=claimable.slice(0,max).map(t=>({repo:t.repo,kind:t.kind}));
@@ -147,5 +148,8 @@ jobs:
           pattern: reports-*
           merge-multiple: true
           path: artifacts
+        continue-on-error: true
+      - name: ensure artifacts dir
+        run: mkdir -p artifacts
       - name: commit reports as M1Vj
         run: FLEET_ARTIFACT_DIR=artifacts FLEET_DEEP_MODE=commit node scripts/deep.mjs

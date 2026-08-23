@@ -29,6 +29,8 @@ jobs:
       - name: checkout
         uses: actions/checkout@v4
         with:
+          persist-credentials: false
+          fetch-depth: 1
       - name: checkout private state repo
         uses: actions/checkout@v4
         with:
@@ -67,6 +69,8 @@ jobs:
       - name: checkout fleet repo
         uses: actions/checkout@v4
         with:
+          persist-credentials: false
+          fetch-depth: 1
       - name: checkout private state repo
         uses: actions/checkout@v4
         with:
@@ -110,6 +114,8 @@ jobs:
       - name: checkout fleet repo
         uses: actions/checkout@v4
         with:
+          persist-credentials: false
+          fetch-depth: 1
       - name: checkout private state repo
         uses: actions/checkout@v4
         with:
@@ -166,6 +172,8 @@ jobs:
       - name: checkout fleet repo
         uses: actions/checkout@v4
         with:
+          persist-credentials: false
+          fetch-depth: 1
       - name: checkout private state repo
         uses: actions/checkout@v4
         with:
@@ -221,6 +229,8 @@ jobs:
       - name: checkout fleet repo
         uses: actions/checkout@v4
         with:
+          persist-credentials: false
+          fetch-depth: 1
       - name: checkout private state repo
         uses: actions/checkout@v4
         with:
@@ -265,6 +275,8 @@ jobs:
       - name: checkout fleet repo
         uses: actions/checkout@v4
         with:
+          persist-credentials: false
+          fetch-depth: 1
       - name: checkout private state repo
         uses: actions/checkout@v4
         with:

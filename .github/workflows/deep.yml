@@ -3,7 +3,7 @@ run-name: "fleet deep ${{ github.run_id }}"
 
 on:
   schedule:
-    - cron: "11,31,51 * * *"
+    - cron: "11,31,51 * * * *"
   workflow_dispatch:
     inputs:
       workers:
@@ -28,6 +28,8 @@ jobs:
       - name: checkout
         uses: actions/checkout@v4
         with:
+          persist-credentials: false
+          fetch-depth: 1
       - name: checkout private state repo
         uses: actions/checkout@v4
         with:
@@ -79,6 +81,8 @@ jobs:
         if: ${{ env.FLEET_REPO != '' }}
         uses: actions/checkout@v4
         with:
+          persist-credentials: false
+          fetch-depth: 1
       - name: checkout private state repo
         uses: actions/checkout@v4
         with:
@@ -123,6 +127,8 @@ jobs:
       - name: checkout
         uses: actions/checkout@v4
         with:
+          persist-credentials: false
+          fetch-depth: 1
       - name: checkout private state repo
         uses: actions/checkout@v4
         with:

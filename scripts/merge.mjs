@@ -406,7 +406,7 @@ async function main() {
     const fleetAuthored = String(pr.head && pr.head.ref || "").startsWith("fleet/");
     if (fleetAuthored && process.env.GITHUB_OUTPUT) {
       try {
-        require("node:fs").appendFileSync(process.env.GITHUB_OUTPUT, "revision_needed=true\n");
+        appendFileSync(process.env.GITHUB_OUTPUT, "revision_needed=true\n");
       } catch {}
       await recordTerminalState("STALLED", { repo: TARGET_REPO, pr: PR_NUMBER, why: "judges rejected; revision queued" });
       console.log("MERGE_TERMINAL_STATE=REVISION_QUEUED");

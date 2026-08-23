@@ -4,12 +4,13 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
-import { scrub, gh, ghInput, putFileContent, ensureBranch, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, sha256, configureIdentity } from "./lib/util.mjs";
+import { scrub, gh, ghInput, putFileContent, ensureBranch, findExistingOpenPr, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, sha256, configureIdentity } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor } from "./lib/verify.mjs";
 import { sanitizeControlChars } from "./lib/directives.mjs";
 
-const REPO_ROOT = process.cwd();
+const CODE_ROOT = process.cwd();
+const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
 export const THESIS_REPO = "M1Vj/THESIS";
 const V2_PREFIX = "v2/";
 const ALLOWED_EXT = /\.(md|markdown|tex|txt|bib|yml|yaml)$/i;
@@ -208,11 +209,19 @@ async function modeShip(audit) {
     "",
     "_Generated autonomously by the M1Vj fleet THESIS agent. Review before merging._",
   ].join("\n");
-  const pr = ghInput(
-    ["api", "-X", "POST", `/repos/${THESIS_REPO}/pulls`],
-    { title: `[fleet-thesis] v2 package: ${files[0].path}`, body, head: branch, base: treeInfo.defaultBranch, draft: true },
-    process.env,
-  );
+  let pr = findExistingOpenPr(THESIS_REPO, branch, process.env);
+  if (!pr) {
+    try {
+      pr = ghInput(
+        ["api", "-X", "POST", `/repos/${THESIS_REPO}/pulls`],
+        { title: `[fleet-thesis] v2 package: ${files[0].path}`, body, head: branch, base: treeInfo.defaultBranch, draft: true },
+        process.env,
+      );
+    } catch (err) {
+      pr = findExistingOpenPr(THESIS_REPO, branch, process.env);
+      if (!pr) throw err;
+    }
+  }
   await verifyPullAuthor(THESIS_REPO, pr.number, identity, process.env.FLEET_GH_TOKEN);
   const headSha = pr.head && pr.head.sha ? pr.head.sha : null;
   if (!headSha) throw new Error("PR head sha unavailable");

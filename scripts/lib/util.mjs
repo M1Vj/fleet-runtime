@@ -191,3 +191,11 @@ export function gitRevParse(repoDir, ref = "HEAD") {
   if (res.status !== 0) throw new Error(`rev-parse failed: ${res.stderr}`);
   return (res.stdout || "").trim();
 }
+
+export function findExistingOpenPr(repoFullName, branch, env = process.env) {
+  try {
+    const res = gh(["api", `/repos/${repoFullName}/pulls?head=${encodeURIComponent("M1Vj:" + branch)}&state=open`], env);
+    if (Array.isArray(res) && res.length > 0) return res[0];
+  } catch {}
+  return null;
+}

@@ -71,6 +71,7 @@ function buildPrompt(task) {
     focus,
     "Return ONLY strict JSON: {\"findings\":[{\"severity\":\"critical|high|medium|low\",\"title\":\"...\",\"detail\":\"...\",\"recommendation\":\"...\"}],\"verdict\":\"one-paragraph summary\"}",
     "Max 12 findings; be specific and evidence-based; do not invent files you have not seen.",
+    "A full clone of the repository is mounted at '.' (your working directory). Use read/grep/glob freely to inspect real code before concluding.",
     "Repository context follows:",
     buildContext(task.repo),
   ].join("\n");
@@ -107,8 +108,8 @@ export async function analyzeOne(repo, kind, audit) {
   }
 }
 
-function buildPromptFor(task) {
-  return buildPrompt(task);
+function buildPromptFor(task, workdir) {
+  return buildPrompt(task, workdir);
 }
 
 async function mainWorker() {
@@ -176,7 +177,7 @@ async function mainCommit() {
     await verifyCommit("M1Vj/fleet-control", sha, identity, process.env.FLEET_GH_TOKEN);
     audit.note("push-verify", `attribution verified sha=${sha.slice(0, 10)}`);
   }
-  audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Deep commit", "ok", { lane });
+  audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Deep commit", "ok", { lane: "deep-commit" });
   console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "ok", reportsCommitted: processed })}`);
   return 0;
 }

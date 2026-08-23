@@ -44,7 +44,7 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs, env, files = []
     delete childEnv.FLEET_GH_TOKEN;
     childEnv.OPENCODE_AUTH_CONTENT = env.FLEET_OPENCODE_AUTH || "";
     childEnv.OPENCODE_DISABLE_AUTOUPDATE = "1";
-    const child = spawn("opencode", args, { env: childEnv, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn("opencode", args, { env: childEnv, stdio: ["ignore", "pipe", "pipe"], cwd: workspace || undefined });
     const timer = setTimeout(() => {
       timedOut = true;
       try { child.kill("SIGTERM"); } catch {}

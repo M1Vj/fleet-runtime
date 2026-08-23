@@ -212,6 +212,22 @@ export async function main() {
       failed = true;
     }
 
+    {
+      const { spawnSync } = await import("node:child_process");
+      const r = spawnSync("node", [path.join(REPO_ROOT, "scripts", "watchdog.mjs")], {
+        encoding: "utf8",
+        timeout: 180000,
+        env: { ...process.env, FLEET_WATCHDOG_DRY_RUN: "1" },
+      });
+      void REPO_ROOT;
+      if (r.status === 0 && String(r.stdout).includes("WATCHDOG_DRY_RUN_OK")) {
+        audit.note("T11", "PASS watchdog integration canary (dry-run through real gate)");
+      } else {
+        audit.incident("T11", `watchdog canary failed exit=${r.status} out=${String(r.stdout).slice(-150)}`);
+        failed = true;
+      }
+    }
+
     let t7Note = "";
     try {
       appendFileSync(path.join(REPO_ROOT, "audit", "selftest-log.md"), `- ${runId} T7 attribution check at ${new Date().toISOString()}\n`);

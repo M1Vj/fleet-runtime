@@ -25,6 +25,17 @@ export async function main() {
     configureIdentity(REPO_ROOT, identity);
     audit.note("gate", `identity=${identity.login}`);
 
+    if (process.env.FLEET_WATCHDOG_DRY_RUN === "1") {
+      const synthetic = { lastRunUtc: new Date(Date.now() - 4 * 3600 * 1000).toISOString() };
+      const plan = planWatchdogActions(synthetic, Date.now());
+      const enables = plan.actions.filter((a) => a.kind === "enable-workflow").length;
+      audit.note("dry-run", `stale=${plan.stale} enables=${enables} alert=${plan.alertIssue}`);
+      for (const a of plan.actions) console.log(`WOULD ${a.kind} ${a.workflow || ""}`.trim());
+      audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Watchdog dry-run", "ok");
+      console.log(`WATCHDOG_DRY_RUN_OK stale=${plan.stale} enables=${enables}`);
+      return 0;
+    }
+
     let heartbeat = null;
     if (existsSync(heartbeatPath())) {
       try {

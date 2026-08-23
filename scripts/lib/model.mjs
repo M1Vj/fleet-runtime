@@ -57,6 +57,9 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs, env, files = []
     let timedOut = false;
     const childEnv = { ...env };
     delete childEnv.FLEET_GH_TOKEN;
+    delete childEnv.GH_TOKEN;
+    delete childEnv.GDRIVE_REFRESH_TOKEN;
+    delete childEnv.GDRIVE_CLIENT_SECRET;
     childEnv.OPENCODE_AUTH_CONTENT = env.FLEET_OPENCODE_AUTH || "";
     childEnv.OPENCODE_DISABLE_AUTOUPDATE = "1";
     const child = spawn("opencode", args, { env: childEnv, stdio: ["ignore", "pipe", "pipe"], cwd: workspace || undefined });

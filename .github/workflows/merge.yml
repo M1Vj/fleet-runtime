@@ -61,7 +61,18 @@ jobs:
           npm install -g playwright@1.54.0 pngjs pixelmatch
           npx --yes playwright@1.54.0 install chromium --with-deps || npx --yes playwright@1.54.0 install chromium
       - name: merge gate
+        id: gate
         env:
           FLEET_TARGET_REPO: ${{ github.event.inputs.repo }}
           FLEET_PR_NUMBER: ${{ github.event.inputs.pr }}
         run: node scripts/merge.mjs
+      - name: autonomous revision
+        if: ${{ steps.gate.outputs.revision_needed == 'true' }}
+        env:
+          FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+          FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+          FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+          OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+          FLEET_REPO: ${{ github.event.inputs.repo }}
+          FLEET_PR_NUMBER: ${{ github.event.inputs.pr }}
+        run: node scripts/revise.mjs

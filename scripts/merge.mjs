@@ -7,6 +7,7 @@ import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, ghInput, gitRevParse, configureIdentity, safeCommitState, installCredentialHelper } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
+import { verifyCommit } from "./lib/verify.mjs";
 import { verifyPullAuthor } from "./lib/verify.mjs";
 
 const REPO_ROOT = process.cwd();

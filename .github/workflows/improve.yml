@@ -57,7 +57,6 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix: ${{ fromJSON(needs.pick.outputs.matrix) }}
     env:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
@@ -216,7 +215,6 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         lens: [correctness, redteam, standards]
     env:

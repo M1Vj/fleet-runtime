@@ -80,6 +80,29 @@ async function modeResearch(audit) {
   return 0;
 }
 
+export function firstBalancedObject(text) {
+  let start = -1;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === "{") { if (depth === 0) start = i; depth++; }
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0 && start !== -1) return text.slice(start, i + 1);
+    }
+  }
+  throw new Error("no balanced object found");
+}
+
 export function extractJson(replyText) {
   const fenced = String(replyText).match(/```(?:json)?\s*([\s\S]*?)```/);
   const candidate = fenced ? fenced[1].trim() : String(replyText).trim();
@@ -90,7 +113,11 @@ export function extractJson(replyText) {
   try {
     return JSON.parse(slice);
   } catch {
-    return JSON.parse(sanitizeControlChars(slice));
+    try {
+      return JSON.parse(sanitizeControlChars(slice));
+    } catch {
+      return JSON.parse(firstBalancedObject(candidate));
+    }
   }
 }
 

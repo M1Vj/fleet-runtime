@@ -62,10 +62,10 @@ jobs:
   analyze:
     needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 65
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 3
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control

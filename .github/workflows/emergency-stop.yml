@@ -1,0 +1,40 @@
+name: fleet-emergency-stop
+run-name: "fleet emergency stop ${{ github.run_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'type STOP to confirm full halt'
+        type: string
+        required: true
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  stop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      FLEET_CONFIRM: ${{ github.event.inputs.confirm }}
+    steps:
+      - name: confirm guard
+        run: |
+          if [ "$FLEET_CONFIRM" != "STOP" ]; then
+            echo "refusing to run without confirm=STOP"
+            exit 1
+          fi
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: emergency stop
+        run: node scripts/emergency-stop.mjs

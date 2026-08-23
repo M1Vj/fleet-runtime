@@ -1,0 +1,291 @@
+name: fleet-improve
+run-name: "fleet improve ${{ github.run_id }}"
+
+on:
+  schedule:
+    - cron: "25 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      top_k:
+        description: "how many top repos to improve"
+        type: string
+        default: "2"
+
+permissions:
+  contents: read
+
+jobs:
+  pick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+      FLEET_TOP_K: ${{ github.event.inputs.top_k || '2' }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: pick targets
+        id: pick
+        run: |
+          OUT=$(FLEET_IMPROVE_MODE=pick node scripts/improve.mjs)
+          echo "$OUT"
+          MATRIX=$(echo "$OUT" | grep '^IMPROVE_MATRIX=' | sed 's/^IMPROVE_MATRIX=//')
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+  research:
+    needs: pick
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.pick.outputs.matrix) }}
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+      FLEET_REPO: ${{ matrix.repo }}
+    steps:
+      - name: checkout fleet repo
+        uses: actions/checkout@v4
+        with:
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install pinned opencode cli
+        run: npm install -g opencode-ai@1.18.21
+      - name: research sub-agent
+        run: |
+          mkdir -p artifacts
+          FLEET_IMPROVE_MODE=research FLEET_ARTIFACT_DIR=artifacts node scripts/improve.mjs
+      - name: dump opencode logs on failure
+        if: failure()
+        run: tail -n 60 $HOME/.local/share/opencode/log/*.log 2>/dev/null || true
+      - name: upload ideas
+        if: hashFiles('artifacts/ideas-*.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ideas-${{ strategy.job-index }}
+          path: artifacts/
+
+  plan:
+    needs: research
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs:
+      implmatrix: ${{ steps.plan.outputs.implmatrix }}
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+    steps:
+      - name: checkout fleet repo
+        uses: actions/checkout@v4
+        with:
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install pinned opencode cli
+        run: npm install -g opencode-ai@1.18.21
+      - name: download ideas
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ideas-*
+          merge-multiple: true
+          path: artifacts
+      - name: plan sub-agent
+        id: plan
+        run: |
+          echo 'implmatrix={"repo":[]}' >> "$GITHUB_OUTPUT"
+          set +e
+          FLEET_IMPROVE_MODE=plan FLEET_ARTIFACT_DIR=artifacts node scripts/improve.mjs 2>&1 | tee plan-run.log
+          CODE=${PIPESTATUS[0]}
+          set -e
+          cat plan-run.log
+          REPOS=$(node -e '
+            const fs=require("fs");
+            const files=fs.existsSync("artifacts")?fs.readdirSync("artifacts").filter(f=>f.startsWith("plan-")&&f.endsWith(".json")):[];
+            const repos=files.map(f=>JSON.parse(fs.readFileSync("artifacts/"+f,"utf8")).repo);
+            console.log(JSON.stringify({repo:repos}));
+          ')
+          echo "implmatrix=$REPOS" >> "$GITHUB_OUTPUT"
+          exit $CODE
+      - name: upload plans
+        if: hashFiles('artifacts/plan-*.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: plans
+          path: artifacts/plan-*.json
+
+  implement:
+    needs: [plan]
+    if: needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+    steps:
+      - name: checkout fleet repo
+        uses: actions/checkout@v4
+        with:
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: download plans
+        uses: actions/download-artifact@v4
+        with:
+          name: plans
+          path: artifacts
+      - name: implement draft PRs as M1Vj
+        run: |
+          set +e
+          RC=0
+          for f in artifacts/plan-*.json; do
+            [ -e "$f" ] || continue
+            REPO=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).repo' "$f")
+            echo "== implementing $REPO"
+            FLEET_IMPROVE_MODE=implement FLEET_ARTIFACT_DIR=artifacts FLEET_REPO="$REPO" node scripts/improve.mjs || { echo "implement failed for $REPO"; RC=1; }
+          done
+          exit $RC
+      - name: upload pr metas
+        if: hashFiles('artifacts/prmeta-*.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: prmeta-all
+          path: artifacts/prmeta-*.json
+
+  review:
+    needs: [plan, implement]
+    if: ${{ always() && needs.implement.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        lens: [correctness, redteam, standards]
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+      FLEET_LENS: ${{ matrix.lens }}
+    steps:
+      - name: checkout fleet repo
+        uses: actions/checkout@v4
+        with:
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install pinned opencode cli
+        run: npm install -g opencode-ai@1.18.21
+      - name: download plans and pr metas
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "{plans,prmeta-all}"
+          merge-multiple: true
+          path: artifacts
+      - name: review sub-agents
+        run: |
+          mkdir -p reviews
+          FLEET_IMPROVE_MODE=review FLEET_ARTIFACT_DIR=artifacts node scripts/improve.mjs
+      - name: upload reviews
+        if: hashFiles('reviews/*.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: reviews-${{ matrix.lens }}
+          path: reviews/
+
+  finalize:
+    needs: [plan, review]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+    steps:
+      - name: checkout fleet repo
+        uses: actions/checkout@v4
+        with:
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "{prmeta-*,reviews-*}"
+          merge-multiple: true
+          path: alldownloaded
+      - name: post reviews as M1Vj and record state
+        run: |
+          mkdir -p split/prmeta split/reviews
+          cp alldownloaded/prmeta-*.json split/prmeta/ 2>/dev/null || true
+          cp alldownloaded/review-*.json split/reviews/ 2>/dev/null || true
+          FLEET_IMPROVE_MODE=finalize FLEET_ARTIFACT_DIR=split/prmeta FLEET_REVIEW_DIR=split/reviews node scripts/improve.mjs

@@ -1,0 +1,41 @@
+name: fleet-watchdog
+run-name: "fleet watchdog ${{ github.run_id }}"
+
+on:
+  schedule:
+    - cron: "9,24,39,54 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-watchdog
+  cancel-in-progress: false
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: watchdog
+        run: node scripts/watchdog.mjs

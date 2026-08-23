@@ -1,0 +1,145 @@
+name: fleet-deep
+run-name: "fleet deep ${{ github.run_id }}"
+
+on:
+  schedule:
+    - cron: "11,31,51 * * *"
+  workflow_dispatch:
+    inputs:
+      workers:
+        description: "max parallel sub-agents"
+        type: string
+        default: "3"
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: plan tasks
+        id: plan
+        run: |
+          MAXW=$(echo "${{ github.event.inputs.workers }}" | grep -E '^[0-9]+$' || echo 3)
+          TASKS=$(node -e '
+            const fs=require("fs");
+            const max=parseInt(process.argv[1])||3;
+            const rows=fs.readFileSync("state/queue.jsonl","utf8").split("\n").filter(Boolean)
+              .map(l=>{try{return JSON.parse(l)}catch{return null}}).filter(Boolean);
+            const now=Date.now();
+            const claimable=rows.filter(t=>t.status==="pending"||(t.status==="in_progress"&&t.updatedUtc&&now-new Date(t.updatedUtc).getTime()>40*60*1000&&(t.attempts||0)<3));
+            const picked=claimable.slice(0,max).map(t=>({repo:t.repo,kind:t.kind}));
+            console.log(JSON.stringify({worker:picked.length?picked:[{repo:"",kind:"none"}]}));
+          ' "$MAXW")
+          echo "matrix=$TASKS" >> "$GITHUB_OUTPUT"
+
+  analyze:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+      FLEET_REPO: ${{ matrix.worker.repo || matrix.repo }}
+      FLEET_KIND: ${{ matrix.worker.kind || matrix.kind }}
+    steps:
+      - name: skip-empty
+        if: ${{ env.FLEET_REPO == '' }}
+        run: echo "no claimable tasks" && exit 0
+      - name: checkout
+        if: ${{ env.FLEET_REPO != '' }}
+        uses: actions/checkout@v4
+        with:
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        if: ${{ env.FLEET_REPO != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install pinned opencode cli
+        if: ${{ env.FLEET_REPO != '' }}
+        run: npm install -g opencode-ai@1.18.21
+      - name: analyze as sub-agent
+        if: ${{ env.FLEET_REPO != '' }}
+        run: |
+          mkdir -p artifacts
+          FLEET_ARTIFACT_DIR=artifacts node scripts/deep.mjs
+      - name: dump opencode logs on failure
+        if: failure()
+        run: tail -n 60 $HOME/.local/share/opencode/log/*.log 2>/dev/null || true
+      - name: upload findings
+        if: ${{ env.FLEET_REPO != '' && hashFiles('artifacts/report-*.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-${{ strategy.job-index }}
+          path: artifacts/
+
+  commit:
+    needs: [plan, analyze]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: download all findings
+        uses: actions/download-artifact@v4
+        with:
+          pattern: reports-*
+          merge-multiple: true
+          path: artifacts
+      - name: commit reports as M1Vj
+        run: FLEET_ARTIFACT_DIR=artifacts FLEET_DEEP_MODE=commit node scripts/deep.mjs

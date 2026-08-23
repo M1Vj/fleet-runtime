@@ -1,0 +1,64 @@
+name: ci-diag
+run-name: "opencode CI diagnostic ${{ github.run_id }}"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install opencode
+        run: npm install -g opencode-ai@1.18.21
+      - name: environment facts
+        run: |
+          uname -a
+          node -v
+          which opencode
+          file "$(readlink -f "$(which opencode)")" || true
+      - name: v1 anonymous plain
+        continue-on-error: true
+        run: |
+          timeout 90 opencode run --format json -m opencode/x-preview-f-free "Reply DIAG1" > o1.txt 2> e1.txt; echo "exit=$?"
+          echo "--stdout--"; head -c 300 o1.txt
+          echo "--stderr--"; tail -c 400 e1.txt
+          echo "--logfile--"; tail -n 6 $HOME/.local/share/opencode/log/*.log 2>/dev/null | cut -c1-220
+      - name: v2 with registry override
+        continue-on-error: true
+        run: |
+          export OPENCODE_MODELS_URL="file://$GITHUB_WORKSPACE/config/models.json"
+          echo "URL=$OPENCODE_MODELS_URL"; ls -la config/models.json
+          timeout 90 env OPENCODE_MODELS_URL="$OPENCODE_MODELS_URL" opencode run --format json -m opencode/x-preview-f-free "Reply DIAG2" > o2.txt 2> e2.txt; echo "exit=$?"
+          echo "--stdout--"; head -c 300 o2.txt
+          echo "--stderr--"; tail -c 400 e2.txt
+          echo "--logfile--"; tail -n 6 $HOME/.local/share/opencode/log/*.log 2>/dev/null | cut -c1-220
+      - name: v3 with auth content
+        continue-on-error: true
+        env:
+          OPENCODE_AUTH_CONTENT: ${{ secrets.FLEET_OPENCODE_AUTH }}
+          OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+        run: |
+          timeout 90 opencode run --format json -m opencode/x-preview-f-free "Reply DIAG3" > o3.txt 2> e3.txt; echo "exit=$?"
+          echo "--stdout--"; head -c 300 o3.txt
+          echo "--stderr--"; tail -c 400 e3.txt
+          echo "--logfile--"; tail -n 6 $HOME/.local/share/opencode/log/*.log 2>/dev/null | cut -c1-220
+      - name: v4 curl gateway directly
+        continue-on-error: true
+        run: |
+          curl -sS -m 15 -o /tmp/gw.json -w "gateway HTTP %{http_code} bytes=%{size_download} time=%{time_total}\n" https://opencode.ai/zen/v1/models || true
+          head -c 200 /tmp/gw.json || true
+          echo
+          curl -sS -m 15 -o /dev/null -w "models.dev HTTP %{http_code} time=%{time_total}\n" https://models.dev/api.json || true

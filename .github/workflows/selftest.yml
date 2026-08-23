@@ -1,0 +1,46 @@
+name: fleet-selftest
+run-name: "fleet selftest ${{ github.run_id }}"
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+      FLEET_OPENCODE_DEBUG: "1"
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install pinned opencode cli
+        run: npm install -g opencode-ai@1.18.21
+      - name: selftest
+        run: node scripts/selftest.mjs
+      - name: dump opencode logs on failure
+        if: failure()
+        run: tail -n 60 $HOME/.local/share/opencode/log/*.log 2>/dev/null || true

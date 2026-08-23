@@ -5,7 +5,7 @@ import path from "node:path";
 import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, ghInput, putFileContent, ensureBranch, findExistingOpenPr, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, sha256, configureIdentity } from "./lib/util.mjs";
-import { askModel } from "./lib/model.mjs";
+import { askModel, askModelResilient } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor } from "./lib/verify.mjs";
 import { sanitizeControlChars, harvestFencedFiles } from "./lib/directives.mjs";
 
@@ -55,12 +55,8 @@ async function modeSurvey(audit) {
     "Snapshot:",
     digest,
   ].join("\n");
-  let result = await askModel({ prompt, timeoutMs: 600000, env: process.env, preferVariantMax: true, maxRounds: 4 });
-  if (!result.complete) {
-    await new Promise((r) => setTimeout(r, 90000));
-    result = await askModel({ prompt, timeoutMs: 600000, env: process.env, preferVariantMax: true, maxRounds: 3 });
-  }
-  audit.note("survey", `complete=${result.complete}`);
+  const result = await askModelResilient({ prompt, timeoutMs: 600000, env: process.env, preferVariantMax: true, maxRounds: 4 });
+  audit.note("survey", `complete=${result.complete} ladders=${result.ladders}`);
   if (!result.complete || !result.reply) throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });
   const dir = process.env.FLEET_ARTIFACT_DIR || ".";
   mkdirSync(dir, { recursive: true });
@@ -128,13 +124,8 @@ async function modeDraft(audit) {
     "EXISTING FILE LIST (do not modify; context only):",
     treeInfo.files.join("\n").slice(0, 8000),
   ].join("\n");
-  let result = await askModel({ prompt, timeoutMs: 600000, env: process.env, preferVariantMax: true, maxRounds: 5 });
-  if (!result.complete) {
-    audit.note("draft-retry", "model unavailable; second ladder after cooldown");
-    await new Promise((r) => setTimeout(r, 120000));
-    result = await askModel({ prompt, timeoutMs: 600000, env: process.env, preferVariantMax: true, maxRounds: 4 });
-  }
-  audit.note("draft", `complete=${result.complete} attempts=${JSON.stringify(result.attempts)}`);
+  const result = await askModelResilient({ prompt, timeoutMs: 600000, env: process.env, preferVariantMax: true, maxRounds: 5, cooldownMs: 120000 });
+  audit.note("draft", `complete=${result.complete} ladders=${result.ladders} attempts=${JSON.stringify(result.attempts)}`);
   if (!result.complete || !result.reply) throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });
 
   let files = extractFileBlocks(result.reply);

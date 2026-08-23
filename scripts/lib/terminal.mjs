@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import path from "node:path";
 
 export function makeTerminal(root, { lane = "unknown", requireWrite = false } = {}) {
@@ -9,6 +9,10 @@ export function makeTerminal(root, { lane = "unknown", requireWrite = false } = 
     try {
       mkdirSync(path.dirname(eventsPath), { recursive: true });
       appendFileSync(eventsPath, record + "\n");
+      if (existsSync(eventsPath)) {
+        const lines = readFileSync(eventsPath, "utf8").split("\n").filter(Boolean);
+        if (lines.length > 1000) writeFileSync(eventsPath, lines.slice(-500).join("\n") + "\n");
+      }
     } catch (err) {
       if (requireWrite) throw Object.assign(new Error(`telemetry write failed: ${err.message}`), { code: 1 });
     }

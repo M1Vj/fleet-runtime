@@ -5,7 +5,7 @@ import path from "node:path";
 import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, ghInput, putFileContent, ensureBranch, findExistingOpenPr, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, sha256, configureIdentity } from "./lib/util.mjs";
-import { askModel } from "./lib/model.mjs";
+import { askModel, askModelResilient } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor } from "./lib/verify.mjs";
 
 const CODE_ROOT = process.cwd();
@@ -183,13 +183,8 @@ async function modeSynthesize(audit) {
     treeInfo.files.join("\n").slice(0, 10000),
   ].join("\n");
 
-  let result = await askModel({ prompt, timeoutMs: 600000, env: process.env, preferVariantMax: true, maxRounds: 5 });
-  if (!result.complete) {
-    audit.note("synthesize-retry", "model unavailable; second ladder after cooldown");
-    await new Promise((r) => setTimeout(r, 90000));
-    result = await askModel({ prompt, timeoutMs: 600000, env: process.env, preferVariantMax: true, maxRounds: 4 });
-  }
-  audit.note("synthesize", `complete=${result.complete}`);
+  const result = await askModelResilient({ prompt, timeoutMs: 600000, env: process.env, preferVariantMax: true, maxRounds: 5 });
+  audit.note("synthesize", `complete=${result.complete} ladders=${result.ladders}`);
   if (!result.complete || !result.reply) throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });
 
   let files = [];

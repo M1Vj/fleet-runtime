@@ -148,3 +148,12 @@ function stripAuth(env) {
   delete clone.OPENCODE_AUTH_CONTENT;
   return clone;
 }
+
+export async function askModelResilient(opts) {
+  const first = await askModel(opts);
+  if (first.complete) return { ...first, ladders: 1 };
+  const cooldownMs = opts.cooldownMs ?? 90000;
+  await new Promise((r) => setTimeout(r, cooldownMs));
+  const second = await askModel({ ...opts, maxRounds: Math.max(2, (opts.maxRounds || 4) - 1) });
+  return { ...second, ladders: 2 };
+}

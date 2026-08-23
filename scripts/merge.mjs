@@ -355,7 +355,15 @@ async function judge({ repo, prNumber, title, body, files, extraEvidence, lens, 
     "DIFF:",
     diff,
   ].join("\n");
-  const result = await askModel({ prompt, timeoutMs: 480000, env: process.env, preferVariantMax: true, maxRounds: 3 });
+  const judgeModel = process.env.FLEET_JUDGE_MODEL;
+  const result = await askModel({
+    prompt,
+    timeoutMs: 480000,
+    env: process.env,
+    preferVariantMax: true,
+    maxRounds: 3,
+    ...(judgeModel ? { modelOverride: judgeModel } : {}),
+  });
   audit.note("judge", `${lens} complete=${result.complete}`);
   if (!result.complete || !result.reply) {
     return { verdict: "reject", score: 0, reasons: ["judge unavailable"], blockers: ["judge unavailable"] };

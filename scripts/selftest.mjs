@@ -10,6 +10,7 @@ import { askModel } from "./lib/model.mjs";
 import { validateDirectives } from "./lib/directives.mjs";
 import { eventKey, loadLedger, has, append } from "./lib/ledger.mjs";
 import { expectUser, verifyCommit } from "./lib/verify.mjs";
+import { decideStale } from "./lib/watchdog-decide.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
@@ -99,6 +100,17 @@ export async function main() {
     audit.note("T6", "PASS attribution preflight identity confirmed");
 
     mkdirSync(path.join(REPO_ROOT, "audit"), { recursive: true });
+    const now = Date.now();
+    const fresh = decideStale(new Date(now - 10 * 60000).toISOString(), now);
+    const stale = decideStale(new Date(now - 3 * 3600 * 1000).toISOString(), now);
+    const missing = decideStale(null, now);
+    if (!fresh.stale && stale.stale && missing.stale && missing.reason === "no-heartbeat") {
+      audit.note("T8", "PASS watchdog staleness decisions correct (fresh/stale/missing)");
+    } else {
+      audit.incident("T8", `watchdog decisions wrong: ${JSON.stringify({ fresh, stale, missing })}`);
+      failed = true;
+    }
+
     let t7Note = "";
     try {
       appendFileSync(path.join(REPO_ROOT, "audit", "selftest-log.md"), `- ${runId} T7 attribution check at ${new Date().toISOString()}\n`);

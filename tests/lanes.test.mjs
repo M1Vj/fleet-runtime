@@ -76,3 +76,15 @@ test("secretsInDiff flags leaked token patterns", async () => {
   const hits = secretsInDiff([{ filename: "cfg.ts", patch: "+const t = 'ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';" }]);
   assert.equal(hits.length, 1);
 });
+
+test("decideStale: fresh/stale/missing/bad-heartbeat matrix", async () => {
+  const { decideStale } = await import("../scripts/lib/watchdog-decide.mjs");
+  const now = Date.now();
+  assert.equal(decideStale(new Date(now - 5 * 60000).toISOString(), now).stale, false);
+  assert.equal(decideStale(new Date(now - 2 * 3600 * 1000).toISOString(), now).stale, true);
+  const missing = decideStale(null, now);
+  assert.equal(missing.stale, true);
+  assert.equal(missing.reason, "no-heartbeat");
+  const bad = decideStale("not-a-date", now);
+  assert.equal(bad.reason, "bad-heartbeat");
+});

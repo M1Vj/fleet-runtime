@@ -19,12 +19,19 @@ export class AuditBuffer {
     this.entries.push(entry);
   }
 
-  writeMarkdown(auditDir, runId, title, status) {
+  writeMarkdown(auditDir, runId, title, status, meta = {}) {
     const finishedAt = new Date().toISOString();
+    const wallMs = Math.round((Date.parse(finishedAt) - Date.parse(this.startedAt)) || 0);
     const day = this.startedAt.slice(0, 10);
     const dir = path.join(auditDir, day);
     mkdirSync(dir, { recursive: true });
     const lines = [];
+    lines.push("---");
+    lines.push(`lane: ${meta.lane || title.toLowerCase().replace(/[^a-z]+/g, "-").replace(/^-|-$/g, "")}`);
+    lines.push(`outcome: ${String(status).toLowerCase().startsWith("ok") || status === "PASSED" ? "success" : String(status).toLowerCase().includes("block") ? "blocked" : "failure"}`);
+    lines.push(`retries: ${meta.retries ?? 0}`);
+    lines.push(`wall_ms: ${wallMs}`);
+    lines.push("---");
     lines.push(`# ${title}`);
     lines.push("");
     lines.push(`- runId: ${runId}`);

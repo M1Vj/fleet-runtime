@@ -175,7 +175,7 @@ async function mainCommit() {
     await verifyCommit("M1Vj/fleet-control", sha, identity, process.env.FLEET_GH_TOKEN);
     audit.note("push-verify", `attribution verified sha=${sha.slice(0, 10)}`);
   }
-  audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Deep commit", "ok");
+  audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Deep commit", "ok", { lane });
   makeTerminal(REPO_ROOT)("SUCCESS", { runId, reportsCommitted: processed });
   console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "ok", reportsCommitted: processed })}`);
   return 0;

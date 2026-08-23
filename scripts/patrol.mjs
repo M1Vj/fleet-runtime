@@ -217,7 +217,20 @@ export async function main() {
   try {
     identity = await runGate(process.env);
     configureIdentity(REPO_ROOT, identity);
+    const terminal = makeTerminal(REPO_ROOT, { lane: "patrol", requireWrite: true });
     audit.note("gate", `identity=${identity.login} id=${identity.id} scopes=${identity.scopes.join(",")}`);
+
+    const trigger = process.env.FLEET_TRIGGER || "manual";
+    const heartbeatPre = readJson(heartbeatPath(), {});
+    const lastMs = heartbeatPre.lastRunUtc ? Date.parse(heartbeatPre.lastRunUtc) : 0;
+    const gapMinutes = lastMs ? Math.round(((Date.now() - lastMs) / 60000) * 10) / 10 : null;
+    audit.note("cadence", `trigger=${trigger} gapMinutes=${gapMinutes}`);
+    if (gapMinutes !== null && gapMinutes > 30) audit.note("cadence-drift", `gap ${gapMinutes}min exceeds 30min bound`);
+    if (trigger === "schedule" && lastMs && gapMinutes !== null && gapMinutes < 10) {
+      terminal("NO-OP", { runId, coalesced: true, gapMinutes });
+      console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "coalesced", gapMinutes })}`);
+      return 0;
+    }
 
     const targets = readJson(targetsPath(), { tier1: [], excluded: [], observeAll: true });
     const seen = loadLedger(ledgerPath());
@@ -305,8 +318,25 @@ export async function main() {
       status = "ok-no-changes";
     }
 
+    let patrolsSince = Number(heartbeatPre.patrolsSinceSelftest || 0);
+    if (status === "ok") {
+      patrolsSince += 1;
+      if (patrolsSince >= 5) {
+        try {
+          gh(["workflow", "run", "selftest.yml", "-R", "M1Vj/fleet-runtime"], process.env);
+          patrolsSince = 0;
+          audit.note("selftest-dispatch", "every-5-patrols cadence");
+        } catch (err) {
+          audit.note("selftest-dispatch", `failed: ${err.message.slice(0, 100)}`);
+        }
+      }
+      writeFileSync(
+        heartbeatPath(),
+        JSON.stringify({ ...(readJson(heartbeatPath(), {})), patrolsSinceSelftest: patrolsSince }, null, 2),
+      );
+    }
     const state = status === "ok" ? "SUCCESS" : "NO-OP";
-    makeTerminal(REPO_ROOT)(state, { runId, modelMode, mutations });
+    terminal(state, { runId, modelMode, mutations, trigger });
     console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status, modelMode, directives: directives.length, mutations, auditFile: auditFileRel })}`);
     return 0;
   } catch (err) {
@@ -315,7 +345,7 @@ export async function main() {
     else audit.incident("fatal", err.message);
     audit.writeMarkdown(AUDIT_DIR, runId, "Patrol run", `failed(${err.reason || code})`);
     console.error(`PATROL_FAILED code=${code} reason=${err.reason || err.message}`);
-    makeTerminal(REPO_ROOT)(err.reason === "MODEL_UNAVAILABLE" ? "EXHAUSTED" : "BLOCKED", { runId, code });
+    terminal(err.reason === "MODEL_UNAVAILABLE" ? "EXHAUSTED" : "BLOCKED", { runId, code, trigger });
     if (identity && gitHasChanges(REPO_ROOT, ["audit"])) {
       try {
         gitAdd(REPO_ROOT, ["audit"]);

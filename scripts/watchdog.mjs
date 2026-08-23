@@ -6,6 +6,7 @@ import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
 import { verifyCommit, verifyIssueAuthor } from "./lib/verify.mjs";
+import { decideStale } from "./lib/watchdog-decide.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
@@ -32,12 +33,11 @@ export async function main() {
         heartbeat = null;
       }
     }
-    const lastRunUtc = heartbeat && heartbeat.lastRunUtc ? new Date(heartbeat.lastRunUtc).getTime() : 0;
-    const ageMs = Date.now() - lastRunUtc;
-    const staleThresholdMs = 90 * 60 * 1000;
-    audit.note("heartbeat", `ageHours=${(ageMs / 3600000).toFixed(2)}`);
+    const decision = decideStale(heartbeat && heartbeat.lastRunUtc);
+    const ageMs = decision.ageMinutes !== null ? decision.ageMinutes * 60000 : Infinity;
+    audit.note("heartbeat", `decision=${decision.reason} ageMinutes=${decision.ageMinutes}`);
 
-    if (lastRunUtc > 0 && ageMs < staleThresholdMs) {
+    if (!decision.stale) {
       audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Watchdog", "ok-fresh");
       console.log("FLEET_RUN_RESULT=" + JSON.stringify({ runId, status: "fresh", action: "none" }));
       return 0;

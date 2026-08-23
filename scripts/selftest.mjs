@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import process from "node:process";
-import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { runGate, GateError } from "./lib/gate.mjs";
@@ -214,16 +214,24 @@ export async function main() {
 
     {
       const { spawnSync } = await import("node:child_process");
-      const r = spawnSync("node", [path.join(REPO_ROOT, "scripts", "watchdog.mjs")], {
+      const runtimeRoot = process.cwd();
+      const scriptPath = path.join(runtimeRoot, "scripts", "watchdog.mjs");
+      const childEnv = {
+        ...process.env,
+        FLEET_WATCHDOG_DRY_RUN: "1",
+        FLEET_STATE_ROOT: process.env.FLEET_STATE_ROOT || path.join(runtimeRoot, "state-control"),
+      };
+      const r = spawnSync(process.execPath, [scriptPath], {
         encoding: "utf8",
         timeout: 180000,
-        env: { ...process.env, FLEET_WATCHDOG_DRY_RUN: "1" },
+        env: childEnv,
+        cwd: runtimeRoot,
       });
-      void REPO_ROOT;
+      const existsOk = existsSync(scriptPath);
       if (r.status === 0 && String(r.stdout).includes("WATCHDOG_DRY_RUN_OK")) {
         audit.note("T11", "PASS watchdog integration canary (dry-run through real gate)");
       } else {
-        audit.incident("T11", `watchdog canary failed exit=${r.status} out=${String(r.stdout).slice(-200)} err=${String(r.stderr).slice(-300)}`);
+        audit.incident("T11", `canary failed scriptExists=${existsOk} exit=${r.status} out=${String(r.stdout).slice(-160)} err=${String(r.stderr).slice(-320)} stateRootSet=${Boolean(childEnv.FLEET_STATE_ROOT)}`);
         failed = true;
       }
     }

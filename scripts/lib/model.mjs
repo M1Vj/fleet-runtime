@@ -29,7 +29,7 @@ function collectText(obj, out = []) {
   return out;
 }
 
-export function runOnce({ prompt, sessionId, variant, timeoutMs, env, files = [] }) {
+export function runOnce({ prompt, sessionId, variant, timeoutMs, env, files = [], modelOverride, workspace }) {
   return new Promise((resolve) => {
     const missing = !env.FLEET_OPENCODE_AUTH;
     const args = ["run", "--format", "json", "-m", "opencode/x-preview-f-free"];
@@ -37,6 +37,20 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs, env, files = []
     if (!missing && variant) args.push("--variant", variant);
     if (!missing && sessionId) args.push("-s", sessionId);
     args.push(prompt);
+    const workspaceRoot = env.FLEET_WORKSPACE_ROOT || process.cwd();
+    for (const f of files || []) {
+      let attachPath = f;
+      try {
+        const rel = path.relative(workspaceRoot, f);
+        if (rel.startsWith("..") || path.isAbsolute(rel)) {
+          const attDir = path.join(workspaceRoot, ".opencode-attachments");
+          mkdirSync(attDir, { recursive: true });
+          attachPath = path.join(attDir, `${Date.now()}-${path.basename(f)}`);
+          if (existsSync(f)) copyFileSync(f, attachPath);
+        }
+      } catch {}
+      if (existsSync(attachPath)) args.push("--file", attachPath);
+    }
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -95,7 +109,7 @@ function sleep(ms) {
   return new Promise((res) => setTimeout(res, ms));
 }
 
-export async function askModel({ prompt, sessionId, timeoutMs = 480000, env = process.env, preferVariantMax = true, maxRounds = 4, files = [] }) {
+export async function askModel({ prompt, sessionId, timeoutMs = 480000, env = process.env, preferVariantMax = true, maxRounds = 4, files = [], modelOverride, workspace }) {
   let sid = sessionId || "";
   let mode = preferVariantMax ? "max" : "plain";
   let useAuth = true;

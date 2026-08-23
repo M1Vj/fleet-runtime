@@ -25,12 +25,12 @@ jobs:
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
     steps:
       - name: checkout runtime
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           fetch-depth: 1
       - name: checkout private state repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: M1Vj/fleet-control
           token: ${{ secrets.FLEET_GH_TOKEN }}
@@ -38,7 +38,7 @@ jobs:
           fetch-depth: 1
           path: state-control
       - name: setup node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
       - name: install pinned opencode cli
@@ -49,7 +49,7 @@ jobs:
           FLEET_KB_MODE=inventory FLEET_ARTIFACT_DIR=artifacts node scripts/kb.mjs
       - name: upload survey
         if: hashFiles('artifacts/kb-inventory.json') != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: kb-inventory
           path: artifacts/kb-inventory.json
@@ -69,12 +69,12 @@ jobs:
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
     steps:
       - name: checkout runtime
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           fetch-depth: 1
       - name: checkout private state repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: M1Vj/fleet-control
           token: ${{ secrets.FLEET_GH_TOKEN }}
@@ -82,13 +82,13 @@ jobs:
           fetch-depth: 1
           path: state-control
       - name: setup node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
       - name: install pinned opencode cli
         run: npm install -g opencode-ai@1.18.21
       - name: download survey
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: kb-inventory
           path: artifacts
@@ -98,7 +98,7 @@ jobs:
           FLEET_KB_MODE=synthesize FLEET_ARTIFACT_DIR=artifacts node scripts/kb.mjs
       - name: upload draft
         if: hashFiles('artifacts/kb-package.json') != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: kb-package
           path: artifacts/kb-package.json
@@ -115,12 +115,12 @@ jobs:
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
     steps:
       - name: checkout runtime
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           fetch-depth: 1
       - name: checkout private state repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: M1Vj/fleet-control
           token: ${{ secrets.FLEET_GH_TOKEN }}
@@ -128,13 +128,13 @@ jobs:
           fetch-depth: 1
           path: state-control
       - name: setup node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
       - name: install pinned opencode cli
         run: npm install -g opencode-ai@1.18.21
       - name: download draft
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: kb-package
           path: artifacts
@@ -142,7 +142,7 @@ jobs:
         run: FLEET_KB_MODE=ship FLEET_ARTIFACT_DIR=artifacts node scripts/kb.mjs
       - name: upload final
         if: hashFiles('artifacts/kb-package.json') != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: kb-package
           path: artifacts/kb-package.json
@@ -157,12 +157,12 @@ jobs:
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
     steps:
       - name: checkout runtime
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           fetch-depth: 1
       - name: checkout private state repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: M1Vj/fleet-control
           token: ${{ secrets.FLEET_GH_TOKEN }}
@@ -170,11 +170,11 @@ jobs:
           fetch-depth: 1
           path: state-control
       - name: setup node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
       - name: download final (or draft fallback)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           pattern: kb-package
           merge-multiple: true

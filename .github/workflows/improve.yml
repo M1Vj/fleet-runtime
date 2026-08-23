@@ -27,12 +27,12 @@ jobs:
       FLEET_TOP_K: ${{ github.event.inputs.top_k || '2' }}
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           fetch-depth: 1
       - name: checkout private state repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: M1Vj/fleet-control
           token: ${{ secrets.FLEET_GH_TOKEN }}
@@ -40,7 +40,7 @@ jobs:
           fetch-depth: 1
           path: state-control
       - name: setup node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
       - name: pick targets
@@ -66,12 +66,12 @@ jobs:
       FLEET_REPO: ${{ matrix.repo }}
     steps:
       - name: checkout fleet repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           fetch-depth: 1
       - name: checkout private state repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: M1Vj/fleet-control
           token: ${{ secrets.FLEET_GH_TOKEN }}
@@ -79,7 +79,7 @@ jobs:
           fetch-depth: 1
           path: state-control
       - name: setup node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
       - name: install pinned opencode cli
@@ -93,7 +93,7 @@ jobs:
         run: tail -n 60 $HOME/.local/share/opencode/log/*.log 2>/dev/null || true
       - name: upload ideas
         if: hashFiles('artifacts/ideas-*.json') != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ideas-${{ strategy.job-index }}
           path: artifacts/
@@ -111,12 +111,12 @@ jobs:
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
     steps:
       - name: checkout fleet repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           fetch-depth: 1
       - name: checkout private state repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: M1Vj/fleet-control
           token: ${{ secrets.FLEET_GH_TOKEN }}
@@ -124,13 +124,13 @@ jobs:
           fetch-depth: 1
           path: state-control
       - name: setup node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
       - name: install pinned opencode cli
         run: npm install -g opencode-ai@1.18.21
       - name: download ideas
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           pattern: ideas-*
           merge-multiple: true
@@ -154,7 +154,7 @@ jobs:
           exit $CODE
       - name: upload plans
         if: hashFiles('artifacts/plan-*.json') != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: plans
           path: artifacts/plan-*.json
@@ -169,12 +169,12 @@ jobs:
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
     steps:
       - name: checkout fleet repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           fetch-depth: 1
       - name: checkout private state repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: M1Vj/fleet-control
           token: ${{ secrets.FLEET_GH_TOKEN }}
@@ -182,11 +182,11 @@ jobs:
           fetch-depth: 1
           path: state-control
       - name: setup node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
       - name: download plans
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: plans
           path: artifacts
@@ -203,7 +203,7 @@ jobs:
           exit $RC
       - name: upload pr metas
         if: hashFiles('artifacts/prmeta-*.json') != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: prmeta-all
           path: artifacts/prmeta-*.json
@@ -225,12 +225,12 @@ jobs:
       FLEET_LENS: ${{ matrix.lens }}
     steps:
       - name: checkout fleet repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           fetch-depth: 1
       - name: checkout private state repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: M1Vj/fleet-control
           token: ${{ secrets.FLEET_GH_TOKEN }}
@@ -238,13 +238,13 @@ jobs:
           fetch-depth: 1
           path: state-control
       - name: setup node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
       - name: install pinned opencode cli
         run: npm install -g opencode-ai@1.18.21
       - name: download plans and pr metas
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           pattern: "{plans,prmeta-all}"
           merge-multiple: true
@@ -255,7 +255,7 @@ jobs:
           FLEET_IMPROVE_MODE=review FLEET_ARTIFACT_DIR=artifacts node scripts/improve.mjs
       - name: upload reviews
         if: hashFiles('reviews/*.json') != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: reviews-${{ matrix.lens }}
           path: reviews/
@@ -271,12 +271,12 @@ jobs:
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
     steps:
       - name: checkout fleet repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           fetch-depth: 1
       - name: checkout private state repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: M1Vj/fleet-control
           token: ${{ secrets.FLEET_GH_TOKEN }}
@@ -284,11 +284,11 @@ jobs:
           fetch-depth: 1
           path: state-control
       - name: setup node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
       - name: download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           pattern: "{prmeta-*,reviews-*}"
           merge-multiple: true

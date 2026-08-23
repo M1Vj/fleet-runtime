@@ -223,7 +223,7 @@ export async function main() {
       if (r.status === 0 && String(r.stdout).includes("WATCHDOG_DRY_RUN_OK")) {
         audit.note("T11", "PASS watchdog integration canary (dry-run through real gate)");
       } else {
-        audit.incident("T11", `watchdog canary failed exit=${r.status} out=${String(r.stdout).slice(-150)}`);
+        audit.incident("T11", `watchdog canary failed exit=${r.status} out=${String(r.stdout).slice(-200)} err=${String(r.stderr).slice(-300)}`);
         failed = true;
       }
     }

@@ -88,3 +88,22 @@ test("decideStale: fresh/stale/missing/bad-heartbeat matrix", async () => {
   const bad = decideStale("not-a-date", now);
   assert.equal(bad.reason, "bad-heartbeat");
 });
+
+test("planWatchdogActions: stale plans re-enables+alert; fresh plans none", async () => {
+  const { planWatchdogActions } = await import("../scripts/lib/watchdog-decide.mjs");
+  const now = Date.now();
+  const stalePlan = planWatchdogActions({ lastRunUtc: new Date(now - 5 * 3600 * 1000).toISOString() }, now);
+  assert.equal(stalePlan.stale, true);
+  assert.ok(stalePlan.actions.filter((a) => a.kind === "enable-workflow").length >= 6);
+  assert.equal(stalePlan.actions.filter((a) => a.kind === "file-alert-issue").length, 1);
+  const freshPlan = planWatchdogActions({ lastRunUtc: new Date(now - 60000).toISOString() }, now);
+  assert.equal(freshPlan.actions.length, 0);
+});
+
+test("shouldCoalesce: only schedule triggers coalesce", async () => {
+  const { shouldCoalesce } = await import("../scripts/lib/watchdog-decide.mjs");
+  const now = Date.now();
+  assert.equal(shouldCoalesce("manual", new Date(now - 60000).toISOString(), now).coalesce, false);
+  assert.equal(shouldCoalesce("schedule", new Date(now - 60000).toISOString(), now).coalesce, true);
+  assert.equal(shouldCoalesce("schedule", new Date(now - 60 * 60000).toISOString(), now).coalesce, false);
+});

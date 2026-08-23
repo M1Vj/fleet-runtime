@@ -10,6 +10,7 @@ import { validateDirectives } from "./lib/directives.mjs";
 import { askModel } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor, verifyCommentAuthor, verifyIssueAuthor } from "./lib/verify.mjs";
 import { makeTerminal } from "./lib/terminal.mjs";
+import { shouldCoalesce } from "./lib/watchdog-decide.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
@@ -222,13 +223,12 @@ export async function main() {
 
     const trigger = process.env.FLEET_TRIGGER || "manual";
     const heartbeatPre = readJson(heartbeatPath(), {});
-    const lastMs = heartbeatPre.lastRunUtc ? Date.parse(heartbeatPre.lastRunUtc) : 0;
-    const gapMinutes = lastMs ? Math.round(((Date.now() - lastMs) / 60000) * 10) / 10 : null;
-    audit.note("cadence", `trigger=${trigger} gapMinutes=${gapMinutes}`);
-    if (gapMinutes !== null && gapMinutes > 30) audit.note("cadence-drift", `gap ${gapMinutes}min exceeds 30min bound`);
-    if (trigger === "schedule" && lastMs && gapMinutes !== null && gapMinutes < 10) {
-      terminal("NO-OP", { runId, coalesced: true, gapMinutes });
-      console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "coalesced", gapMinutes })}`);
+    const coalesce = shouldCoalesce(trigger, heartbeatPre.lastRunUtc);
+    audit.note("cadence", `trigger=${trigger} gapMinutes=${coalesce.gapMinutes}`);
+    if (coalesce.gapMinutes !== null && coalesce.gapMinutes > 30) audit.note("cadence-drift", `gap ${coalesce.gapMinutes}min exceeds 30min bound`);
+    if (coalesce.coalesce) {
+      terminal("NO-OP", { runId, coalesced: true, gapMinutes: coalesce.gapMinutes });
+      console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "coalesced", gapMinutes: coalesce.gapMinutes })}`);
       return 0;
     }
 

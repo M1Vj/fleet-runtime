@@ -10,7 +10,7 @@ import { askModel } from "./lib/model.mjs";
 import { validateDirectives } from "./lib/directives.mjs";
 import { eventKey, loadLedger, has, append } from "./lib/ledger.mjs";
 import { expectUser, verifyCommit } from "./lib/verify.mjs";
-import { decideStale } from "./lib/watchdog-decide.mjs";
+import { decideStale, planWatchdogActions } from "./lib/watchdog-decide.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
@@ -108,6 +108,18 @@ export async function main() {
       audit.note("T8", "PASS watchdog staleness decisions correct (fresh/stale/missing)");
     } else {
       audit.incident("T8", `watchdog decisions wrong: ${JSON.stringify({ fresh, stale, missing })}`);
+      failed = true;
+    }
+
+    const now2 = Date.now();
+    const stalePlan = planWatchdogActions({ lastRunUtc: new Date(now2 - 4 * 3600 * 1000).toISOString() }, now2);
+    const freshPlan = planWatchdogActions({ lastRunUtc: new Date(now2 - 5 * 60000).toISOString() }, now2);
+    const enables = stalePlan.actions.filter((a) => a.kind === "enable-workflow").length;
+    const alerts = stalePlan.actions.filter((a) => a.kind === "file-alert-issue").length;
+    if (stalePlan.stale && enables >= 6 && alerts === 1 && !freshPlan.stale && freshPlan.actions.length === 0) {
+      audit.note("T9", `PASS watchdog canary: stale plans ${enables} re-enables + alert; fresh plans nothing`);
+    } else {
+      audit.incident("T9", `watchdog canary wrong: ${JSON.stringify({ enables, alerts, freshStale: freshPlan.stale })}`);
       failed = true;
     }
 

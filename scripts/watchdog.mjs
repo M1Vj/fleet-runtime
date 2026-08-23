@@ -6,7 +6,7 @@ import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
 import { verifyCommit, verifyIssueAuthor } from "./lib/verify.mjs";
-import { decideStale } from "./lib/watchdog-decide.mjs";
+import { planWatchdogActions } from "./lib/watchdog-decide.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
@@ -33,11 +33,10 @@ export async function main() {
         heartbeat = null;
       }
     }
-    const decision = decideStale(heartbeat && heartbeat.lastRunUtc);
-    const ageMs = decision.ageMinutes !== null ? decision.ageMinutes * 60000 : Infinity;
-    audit.note("heartbeat", `decision=${decision.reason} ageMinutes=${decision.ageMinutes}`);
+    const plan = planWatchdogActions(heartbeat, Date.now());
+    audit.note("heartbeat", `decision=${plan.reason} ageMinutes=${plan.ageMinutes}`);
 
-    if (!decision.stale) {
+    if (!plan.stale) {
       audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Watchdog", "ok-fresh");
       console.log("FLEET_RUN_RESULT=" + JSON.stringify({ runId, status: "fresh", action: "none" }));
       return 0;
@@ -78,7 +77,7 @@ export async function main() {
     const issue = gh(
       [
         "api", "-X", "POST", "/repos/M1Vj/fleet-control/issues",
-        "-f", `title=[WATCHDOG] patrol stale since ${heartbeat && heartbeat.lastRunUtc ? heartbeat.lastRunUtc : "unknown"}`,
+        "-f", `title=${plan.actions.find((a) => a.kind === "file-alert-issue").title}`,
         "-f", `body=Patrol heartbeat is stale (${Math.round(ageMs / 60000)} minutes).\nRe-enable was attempted. Recent runs:\n${runsList}\n\nCheck model auth secret freshness and Actions quota.`,
       ],
       process.env,

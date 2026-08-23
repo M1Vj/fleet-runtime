@@ -173,12 +173,63 @@ async function main() {
   const consoleBlocker = afterResults.some((r) => r.consoleErrors > 0);
   const a11yBlocker = afterResults.some((r) => r.a11yCritical > 0);
 
+  let vlm = null;
+  try {
+    const { askModel } = await import("./lib/model.mjs");
+    const pairsForVlm = [];
+    for (const r of results.filter((x) => x.label === "after")) {
+      const key = r.viewport + "|" + r.route;
+      if (pairs[key]) pairsForVlm.push({ viewport: r.viewport, route: r.route, before: path.join(OUT_DIR, pairs[key]), after: path.join(OUT_DIR, r.shot) });
+    }
+    if (pairsForVlm.length > 0) {
+      const first = pairsForVlm[0];
+      const vres = await askModel({
+        prompt: [
+          "You are a UI REGRESSION JUDGE with vision. Attached are two screenshots of the same page at the same viewport: FIRST = BEFORE (base), SECOND = AFTER (proposed change).",
+          "Compare them carefully: layout breakage, overlapping/clipped elements, missing content, contrast/readability regressions, broken images/icons.",
+          "Intentional content changes are fine; unexplained visual damage is not.",
+          'Return ONLY strict JSON: {"verdict":"approve|reject","score":<0-100>,"regressions":["..."],"observations":["..."]}',
+          `Context: viewport=${first.viewport}, route=${first.route}.`,
+        ].join("\n"),
+        files: [first.before, first.after],
+        timeoutMs: 300000,
+        env: process.env,
+        preferVariantMax: false,
+        maxRounds: 2,
+      });
+      auditNote(vres);
+      if (vres.complete && vres.reply) {
+        try {
+          const obj = JSON.parse((String(vres.reply).match(/\{[\s\S]*\}/) || ["{}"])[0].replace(/\n/g, "\\n"));
+          vlm = {
+            verdict: obj.verdict === "approve" ? "approve" : "reject",
+            score: Number(obj.score) || 0,
+            regressions: Array.isArray(obj.regressions) ? obj.regressions.slice(0, 6).map(String) : [],
+            observations: Array.isArray(obj.observations) ? obj.observations.slice(0, 6).map(String) : [],
+          };
+        } catch {
+          vlm = { verdict: "reject", score: 0, regressions: ["vlm output unparsable"], observations: [] };
+        }
+      } else {
+        vlm = { verdict: "reject", score: 0, regressions: ["vlm unavailable"], observations: [] };
+      }
+      evidence.push(`vlm verdict=${vlm.verdict} score=${vlm.score} regressions=${JSON.stringify(vlm.regressions)}`);
+    }
+  } catch (err) {
+    evidence.push(`vlm stage error: ${String(err.message).slice(0, 150)}`);
+    vlm = { verdict: "reject", score: 0, regressions: ["vlm stage failed"], observations: [] };
+  }
+
   writeFileSync(
     path.join(OUT_DIR, "visual-evidence.json"),
-    JSON.stringify({ repo: REPO, pr: PR_NUMBER, results, verdict: { consoleBlocker, a11yBlocker }, generatedUtc: new Date().toISOString() }, null, 2),
+    JSON.stringify({ repo: REPO, pr: PR_NUMBER, results, verdict: { consoleBlocker, a11yBlocker, vlm }, generatedUtc: new Date().toISOString() }, null, 2),
   );
   writeFileSync(path.join(OUT_DIR, "visual-evidence.txt"), evidence.join("\n"));
   console.log(`VISUAL_EVIDENCE_WRITTEN consoleBlocker=${consoleBlocker} a11yBlocker=${a11yBlocker}`);
+}
+
+function auditNote(vres) {
+  process.stdout.write(`VLM complete=${vres.complete}\n`);
 }
 
 function diffPercent(aPath, bPath) {

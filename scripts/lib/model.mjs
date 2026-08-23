@@ -26,7 +26,7 @@ function collectText(obj, out = []) {
   return out;
 }
 
-export function runOnce({ prompt, sessionId, variant, timeoutMs, env }) {
+export function runOnce({ prompt, sessionId, variant, timeoutMs, env, files = [] }) {
   return new Promise((resolve) => {
     const missing = !env.FLEET_OPENCODE_AUTH;
     const args = ["run", "--format", "json", "-m", "opencode/x-preview-f-free"];
@@ -92,7 +92,7 @@ function sleep(ms) {
   return new Promise((res) => setTimeout(res, ms));
 }
 
-export async function askModel({ prompt, sessionId, timeoutMs = 480000, env = process.env, preferVariantMax = true, maxRounds = 4 }) {
+export async function askModel({ prompt, sessionId, timeoutMs = 480000, env = process.env, preferVariantMax = true, maxRounds = 4, files = [] }) {
   let sid = sessionId || "";
   let mode = preferVariantMax ? "max" : "plain";
   let useAuth = true;
@@ -104,7 +104,7 @@ export async function askModel({ prompt, sessionId, timeoutMs = 480000, env = pr
       await sleep(backoff);
     }
     const roundEnv = useAuth ? env : stripAuth(env);
-    const r = await runOnce({ prompt: promptNow, sessionId: sid || undefined, variant: mode === "max" ? "max" : undefined, timeoutMs, env: roundEnv });
+    const r = await runOnce({ prompt: promptNow, sessionId: sid || undefined, variant: mode === "max" ? "max" : undefined, timeoutMs, env: roundEnv, files });
     attempts.push({
       round,
       mode,

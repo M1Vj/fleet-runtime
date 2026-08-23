@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import process from "node:process";
-import { appendFileSync, mkdirSync, mkdtempSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { runGate, GateError } from "./lib/gate.mjs";
@@ -120,6 +120,66 @@ export async function main() {
       audit.note("T9", `PASS watchdog canary: stale plans ${enables} re-enables + alert; fresh plans nothing`);
     } else {
       audit.incident("T9", `watchdog canary wrong: ${JSON.stringify({ enables, alerts, freshStale: freshPlan.stale })}`);
+      failed = true;
+    }
+
+    try {
+      const zlibMod = await import("node:zlib");
+      const crcTable = (() => {
+        const t = [];
+        for (let n = 0; n < 256; n++) {
+          let c = n;
+          for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+          t[n] = c >>> 0;
+        }
+        return t;
+      })();
+      const pngChunk = (type, data) => {
+        const len = Buffer.alloc(4);
+        len.writeUInt32BE(data.length);
+        const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+        const crc = Buffer.alloc(4);
+        let c = 0xffffffff;
+        for (const byte of body) c = crcTable[(c ^ byte) & 0xff] ^ (c >>> 8);
+        crc.writeUInt32BE((c ^ 0xffffffff) >>> 0);
+        return Buffer.concat([len, body, crc]);
+      };
+      const solidPng = (r, g, b) => {
+        const w = 8, hgt = 8;
+        const ihdr = Buffer.alloc(13);
+        ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(hgt, 4); ihdr[8] = 8; ihdr[9] = 2;
+        const rowTail = Buffer.alloc(w * 3);
+        for (let x = 0; x < w; x++) { rowTail[x * 3] = r; rowTail[x * 3 + 1] = g; rowTail[x * 3 + 2] = b; }
+        const raw = Buffer.concat(Array.from({ length: hgt }, () => Buffer.concat([Buffer.from([0]), rowTail])));
+        return Buffer.concat([
+          Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+          pngChunk("IHDR", ihdr),
+          pngChunk("IDAT", zlibMod.deflateSync(raw)),
+          pngChunk("IEND", Buffer.alloc(0)),
+        ]);
+      };
+      const dir10 = mkdtempSync(path.join(tmpdir(), "vis-"));
+      const fileA = path.join(dir10, "a.png");
+      const fileB = path.join(dir10, "b.png");
+      writeFileSync(fileA, solidPng(255, 0, 0));
+      writeFileSync(fileB, solidPng(0, 0, 255));
+      const vres = await askModel({
+        prompt: "Two images attached in order. Reply ONLY strict JSON {\"same\":false,\"colors\":[\"<dominant color of first>\",\"<dominant color of second>\"]}",
+        files: [fileA, fileB],
+        timeoutMs: 240000,
+        env: process.env,
+        preferVariantMax: false,
+        maxRounds: 2,
+      });
+      const lower = String(vres.reply || "").toLowerCase();
+      if (vres.complete && lower.includes("red") && lower.includes("blue")) {
+        audit.note("T10", "PASS vision canary distinguished red vs blue");
+      } else {
+        audit.incident("T10", `vision canary weak reply=${String(vres.reply).slice(0, 120)}`);
+        failed = true;
+      }
+    } catch (err) {
+      audit.incident("T10", `vision canary error ${String(err.message).slice(0, 150)}`);
       failed = true;
     }
 

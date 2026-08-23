@@ -249,6 +249,10 @@ async function main() {
     if (existsSync(evJson)) {
       const ve = JSON.parse(readFileSync(evJson, "utf8"));
       visualOk = !(ve.verdict && ve.verdict.consoleBlocker) && !(ve.verdict && ve.verdict.a11yBlocker);
+      if (ve.verdict && ve.verdict.vlm) {
+        visualOk = visualOk && ve.verdict.vlm.verdict === "approve";
+        riskCommentBits.push(`vision judge: ${ve.verdict.vlm.verdict} (${ve.verdict.vlm.score})`);
+      }
       visualEvidence = existsSync(evTxt) ? readFileSync(evTxt, "utf8") : "";
     } else {
       visualEvidence = "visual capture did not produce evidence (app not servable?) — treating as neutral pass with note";

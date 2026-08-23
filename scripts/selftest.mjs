@@ -180,7 +180,7 @@ export async function main() {
           prompt: vresPrompt,
           files: [fileA, fileB],
           timeoutMs: 240000,
-          env: process.env,
+          env: { ...process.env, FLEET_WORKSPACE_ROOT: process.cwd() },
           preferVariantMax: false,
           maxRounds: 2,
         });

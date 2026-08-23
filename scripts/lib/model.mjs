@@ -1,4 +1,7 @@
 import { spawn } from "node:child_process";
+import { existsSync, copyFileSync, mkdirSync, mkdtempSync } from "node:fs";
+import path from "node:path";
+import os from "node:os";
 
 function deepFind(obj, key, out = []) {
   if (obj === null || typeof obj !== "object") return out;

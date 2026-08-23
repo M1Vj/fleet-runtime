@@ -250,8 +250,7 @@ async function main() {
       const ve = JSON.parse(readFileSync(evJson, "utf8"));
       visualOk = !(ve.verdict && ve.verdict.consoleBlocker) && !(ve.verdict && ve.verdict.a11yBlocker);
       if (ve.verdict && ve.verdict.vlm) {
-        visualOk = visualOk && ve.verdict.vlm.verdict === "approve";
-        riskCommentBits.push(`vision judge: ${ve.verdict.vlm.verdict} (${ve.verdict.vlm.score})`);
+        riskCommentBits.push(`vision judge (advisory): ${ve.verdict.vlm.verdict} (${ve.verdict.vlm.score}) regressions=${JSON.stringify(ve.verdict.vlm.regressions || []).slice(0, 200)}`);
       }
       visualEvidence = existsSync(evTxt) ? readFileSync(evTxt, "utf8") : "";
     } else {

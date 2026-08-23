@@ -88,7 +88,7 @@ function parseFindings(reply) {
 
 export async function analyzeOne(repo, kind, audit) {
   const result = await askModel({
-    prompt: buildPromptFor({ repo, kind }),
+    prompt: buildPromptFor({ repo, kind }, workdir),
     timeoutMs: 540000,
     env: process.env,
     preferVariantMax: true,

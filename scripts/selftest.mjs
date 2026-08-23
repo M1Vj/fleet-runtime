@@ -166,6 +166,7 @@ export async function main() {
       const vresPrompt = "Two images attached in order. Reply ONLY strict JSON {\"same\":false,\"colors\":[\"<dominant color of first>\",\"<dominant color of second>\"]}";
       const vres = await askModel({
         prompt: vresPrompt,
+        skipCircuitCheck: true,
         files: [fileA, fileB],
         timeoutMs: 240000,
         env: process.env,

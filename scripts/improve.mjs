@@ -218,6 +218,10 @@ async function modePlan(audit) {
         (await import("node:fs")).rmSync(workdir, { recursive: true, force: true });
       } catch {}
     }
+    if (plan.circuitOpen) {
+      audit.note("plan", "gateway circuit open; skipping plan wave");
+      continue;
+    }
     if (!plan.complete || !plan.reply) continue;
     let parsed;
     try {

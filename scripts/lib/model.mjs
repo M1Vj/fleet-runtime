@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync, copyFileSync, mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { gatewayCircuitOpen, markGatewayDown, markGatewayUp } from "./gateway-health.mjs";
 
 function deepFind(obj, key, out = []) {
   if (obj === null || typeof obj !== "object") return out;
@@ -109,7 +110,11 @@ function sleep(ms) {
   return new Promise((res) => setTimeout(res, ms));
 }
 
-export async function askModel({ prompt, sessionId, timeoutMs = 480000, env = process.env, preferVariantMax = true, maxRounds = 4, files = [], modelOverride, workspace }) {
+export async function askModel({ prompt, sessionId, timeoutMs = 480000, env = process.env, preferVariantMax = true, maxRounds = 4, files = [], modelOverride, workspace, skipCircuitCheck = false }) {
+  const stateRoot = env.FLEET_STATE_ROOT || process.cwd();
+  if (!skipCircuitCheck && !sessionId && gatewayCircuitOpen(stateRoot)) {
+    return { reply: "", sessionId: "", modelMode: "circuit-open", attempts: [{ round: 0, skipped: "circuit-open" }], complete: false, circuitOpen: true };
+  }
   let sid = sessionId || "";
   let mode = preferVariantMax ? "max" : "plain";
   let useAuth = true;
@@ -153,6 +158,7 @@ export async function askModel({ prompt, sessionId, timeoutMs = 480000, env = pr
     promptNow = "You were interrupted mid-task. Continue from where you stopped and finish the job. Output ONLY the requested final answer now.";
     sid = "";
   }
+  try { markGatewayDown(stateRoot, attempts.map((a) => a.errTail || "").join(" ").slice(-200)); } catch {}
   return { reply: "", sessionId: sid, modelMode: mode, attempts, complete: false };
 }
 

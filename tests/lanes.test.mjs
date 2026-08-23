@@ -124,3 +124,20 @@ test("summarizeEvents: window filtering and per-lane counts", async () => {
   assert.equal(s.perLane.merge.SUCCESS, 1);
   assert.equal(s.perLane.old, undefined);
 });
+
+test("gateway breaker: opens on markDown within window, clears after expiry", async () => {
+  const gh = await import("../scripts/lib/gateway-health.mjs");
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const pathMod = await import("node:path");
+  const root = mkdtempSync(pathMod.join(tmpdir(), "gw-"));
+  assert.equal(gh.gatewayCircuitOpen(root), false);
+  gh.markGatewayDown(root, "test outage");
+  assert.equal(gh.gatewayCircuitOpen(root), true);
+  // simulate age beyond OPEN_MS by backdating mtime+content
+  const p = pathMod.join(root, "state", "gateway-health.json");
+  const data = JSON.parse(await import("node:fs").then ? (await import("node:fs")).readFileSync(p, "utf8") : "{}");
+  data.downSince = new Date(Date.now() - 31 * 60 * 1000).toISOString();
+  (await import("node:fs")).writeFileSync(p, JSON.stringify(data));
+  assert.equal(gh.gatewayCircuitOpen(root), false);
+});

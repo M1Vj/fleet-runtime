@@ -125,7 +125,13 @@ async function mainWorker() {
   audit.note("task", `${repo} ${kind}`);
   const { gatewayDown } = await import("./lib/gateway-health.mjs");
   if (gatewayDown(process.env.FLEET_STATE_ROOT || process.cwd())) {
+    const stamp0 = new Date().toISOString();
+    writeFileSync(
+      path.join(process.env.FLEET_ARTIFACT_DIR || ".", `report-${repo.replace("/", "__")}.json`),
+      JSON.stringify({ repo, kind, findings: [{ severity: "low", title: "skipped", detail: "gateway circuit open" }], verdict: "Skipped during gateway outage.", modelMode: "skipped", sessionId: "", finishedUtc: stamp0 }, null, 2),
+    );
     console.log(`DEEP_SKIPPED=circuit-open ${repo}`);
+    console.log(`DEEP_RESULT_FILE=${path.join(process.env.FLEET_ARTIFACT_DIR || ".", `report-${repo.replace("/", "__")}.json`)}`);
     writeFileSync(path.join(process.env.FLEET_ARTIFACT_DIR || ".", `report-${repo.replace("/", "__")}.json`), JSON.stringify({ repo, kind, findings: [{ severity: "low", title: "skipped", detail: "gateway circuit open" }], verdict: "Skipped during gateway outage." }, null, 2));
     console.log(`DEEP_RESULT_FILE=${path.join(process.env.FLEET_ARTIFACT_DIR || ".", `report-${repo.replace("/", "__")}.json`)}`);
     return 0;
@@ -166,7 +172,7 @@ async function mainCommit() {
   let processed = 0;
   for (const f of readdirSync(dir).filter((n) => n.startsWith("report-") && n.endsWith(".json"))) {
     const data = JSON.parse(readFileSync(path.join(dir, f), "utf8"));
-    const day = data.finishedUtc.slice(0, 10);
+    const day = String(data.finishedUtc || new Date().toISOString()).slice(0, 10);
     const file = path.join(reportsDir, `${data.repo.replace("/", "__")}--${data.kind}--${day}.md`);
     const md = [
       `# Deep ${data.kind} — ${data.repo}`,

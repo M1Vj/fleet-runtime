@@ -107,3 +107,20 @@ test("shouldCoalesce: only schedule triggers coalesce", async () => {
   assert.equal(shouldCoalesce("schedule", new Date(now - 60000).toISOString(), now).coalesce, true);
   assert.equal(shouldCoalesce("schedule", new Date(now - 60 * 60000).toISOString(), now).coalesce, false);
 });
+
+test("summarizeEvents: window filtering and per-lane counts", async () => {
+  const { summarizeEvents } = await import("../scripts/lib/status.mjs");
+  const now = Date.now();
+  const lines = [
+    JSON.stringify({ t: new Date(now - 3600 * 1000).toISOString(), lane: "patrol", state: "SUCCESS" }),
+    JSON.stringify({ t: new Date(now - 2 * 86400000).toISOString(), lane: "merge", state: "SUCCESS" }),
+    JSON.stringify({ t: new Date(now - 30 * 86400000).toISOString(), lane: "old", state: "SUCCESS" }),
+    JSON.stringify({ t: new Date(now - 7200 * 1000).toISOString(), lane: "deep", state: "BLOCKED" }),
+  ];
+  const s = summarizeEvents(lines, now);
+  assert.equal(s.total, 3);
+  assert.equal(s.perLane.patrol.SUCCESS, 1);
+  assert.equal(s.perLane.deep.BLOCKED, 1);
+  assert.equal(s.perLane.merge.SUCCESS, 1);
+  assert.equal(s.perLane.old, undefined);
+});

@@ -40,3 +40,6 @@ jobs:
         run: npm install -g opencode-ai@1.18.21
       - name: retrospective sub-agent
         run: FLEET_RETRO_MODE=propose node scripts/retro.mjs
+      - name: status digest
+        if: ${{ always() }}
+        run: node scripts/status.mjs

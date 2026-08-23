@@ -218,12 +218,14 @@ export async function main() {
   let identity = null;
   let status = "failed";
   const terminal = makeTerminal(REPO_ROOT, { lane: "patrol" });
+  let trigger = "manual";
+  let gwRoot = process.env.FLEET_STATE_ROOT || REPO_ROOT;
   try {
     identity = await runGate(process.env);
     configureIdentity(REPO_ROOT, identity);
     audit.note("gate", `identity=${identity.login} id=${identity.id} scopes=${identity.scopes.join(",")}`);
 
-    const gwRoot = process.env.FLEET_STATE_ROOT || REPO_ROOT;
+    gwRoot = process.env.FLEET_STATE_ROOT || REPO_ROOT;
     const { gatewayDown } = await import("./lib/gateway-health.mjs");
     if (gatewayDown(gwRoot)) {
       terminal("STALLED", { runId, why: "gateway-circuit-open" });
@@ -231,7 +233,7 @@ export async function main() {
       return 0;
     }
 
-    const trigger = process.env.FLEET_TRIGGER || "manual";
+    trigger = process.env.FLEET_TRIGGER || "manual";
     const heartbeatPre = readJson(heartbeatPath(), {});
     const coalesce = shouldCoalesce(trigger, heartbeatPre.lastRunUtc);
     audit.note("cadence", `trigger=${trigger} gapMinutes=${coalesce.gapMinutes}`);

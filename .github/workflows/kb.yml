@@ -1,0 +1,189 @@
+name: fleet-kb
+run-name: "fleet kb ${{ github.run_id }}"
+
+on:
+  schedule:
+    - cron: "55 9,21 * * *"
+  workflow_dispatch:
+    inputs:
+      gdrive:
+        description: "attempt Google Drive fetch if configured"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+    steps:
+      - name: checkout runtime
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install pinned opencode cli
+        run: npm install -g opencode-ai@1.18.21
+      - name: survey sub-agent
+        run: |
+          mkdir -p artifacts
+          FLEET_KB_MODE=inventory FLEET_ARTIFACT_DIR=artifacts node scripts/kb.mjs
+      - name: upload survey
+        if: hashFiles('artifacts/kb-inventory.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: kb-inventory
+          path: artifacts/kb-inventory.json
+
+  synthesize:
+    needs: inventory
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+      GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+      GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+      GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+      GDRIVE_FOLDER_ID: ${{ vars.GDRIVE_FOLDER_ID || 'root' }}
+      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+    steps:
+      - name: checkout runtime
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install pinned opencode cli
+        run: npm install -g opencode-ai@1.18.21
+      - name: download survey
+        uses: actions/download-artifact@v4
+        with:
+          name: kb-inventory
+          path: artifacts
+      - name: draft sub-agent
+        run: |
+          mkdir -p artifacts
+          FLEET_KB_MODE=synthesize FLEET_ARTIFACT_DIR=artifacts node scripts/kb.mjs
+      - name: upload draft
+        if: hashFiles('artifacts/kb-package.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: kb-package
+          path: artifacts/kb-package.json
+
+  ship:
+    needs: [inventory, synthesize]
+    if: needs.synthesize.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+    steps:
+      - name: checkout runtime
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install pinned opencode cli
+        run: npm install -g opencode-ai@1.18.21
+      - name: download draft
+        uses: actions/download-artifact@v4
+        with:
+          name: kb-package
+          path: artifacts
+      - name: refine sub-agent
+        run: FLEET_KB_MODE=ship FLEET_ARTIFACT_DIR=artifacts node scripts/kb.mjs
+      - name: upload final
+        if: hashFiles('artifacts/kb-package.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: kb-package
+          path: artifacts/kb-package.json
+
+  deliver:
+    needs: [synthesize, ship]
+    if: ${{ always() && needs.synthesize.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+    steps:
+      - name: checkout runtime
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: download final (or draft fallback)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: kb-package
+          merge-multiple: true
+          path: artifacts
+        continue-on-error: true
+      - name: normalize artifact name
+        run: |
+          mkdir -p shipdir
+          if [ -f artifacts/kb-package.json ]; then cp artifacts/kb-package.json shipdir/kb-package.json;
+          elif [ -f artifacts/kb-package.json ]; then cp artifacts/kb-package.json shipdir/kb-package.json; fi
+      - name: ship draft PR as M1Vj
+        run: FLEET_KB_MODE=ship FLEET_ARTIFACT_DIR=shipdir node scripts/kb.mjs

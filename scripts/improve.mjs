@@ -7,7 +7,7 @@ import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, ghInput, putFileContent, ensureBranch, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, sha256, configureIdentity } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor, verifyCommentAuthor } from "./lib/verify.mjs";
-import { isSafeRepoPath, sanitizeControlChars } from "./lib/directives.mjs";
+import { isSafeRepoPath, sanitizeControlChars, extractJsonObject } from "./lib/directives.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
@@ -80,45 +80,10 @@ async function modeResearch(audit) {
   return 0;
 }
 
-export function firstBalancedObject(text) {
-  let start = -1;
-  let depth = 0;
-  let inStr = false;
-  let esc = false;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (inStr) {
-      if (esc) esc = false;
-      else if (ch === "\\") esc = true;
-      else if (ch === '"') inStr = false;
-      continue;
-    }
-    if (ch === '"') { inStr = true; continue; }
-    if (ch === "{") { if (depth === 0) start = i; depth++; }
-    else if (ch === "}") {
-      depth--;
-      if (depth === 0 && start !== -1) return text.slice(start, i + 1);
-    }
-  }
-  throw new Error("no balanced object found");
-}
+export { extractJsonObject as extractJsonRobust };
 
 export function extractJson(replyText) {
-  const fenced = String(replyText).match(/```(?:json)?\s*([\s\S]*?)```/);
-  const candidate = fenced ? fenced[1].trim() : String(replyText).trim();
-  const start = candidate.indexOf("{");
-  const end = candidate.lastIndexOf("}");
-  if (start === -1 || end <= start) throw new Error("no JSON object found");
-  const slice = candidate.slice(start, end + 1);
-  try {
-    return JSON.parse(slice);
-  } catch {
-    try {
-      return JSON.parse(sanitizeControlChars(slice));
-    } catch {
-      return JSON.parse(firstBalancedObject(candidate));
-    }
-  }
+  return extractJsonObject(replyText);
 }
 
 export function pickBestIdea(replyText) {

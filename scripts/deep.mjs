@@ -7,6 +7,7 @@ import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";
 import { verifyCommit } from "./lib/verify.mjs";
+import { extractJsonObject } from "./lib/directives.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
@@ -75,12 +76,7 @@ function buildPrompt(task) {
 }
 
 function parseFindings(reply) {
-  const fenced = String(reply).match(/```(?:json)?\s*([\s\S]*?)```/);
-  const candidate = fenced ? fenced[1].trim() : String(reply).trim();
-  const start = candidate.indexOf("{");
-  const end = candidate.lastIndexOf("}");
-  if (start === -1 || end <= start) throw new Error("no JSON object in reply");
-  const obj = JSON.parse(candidate.slice(start, end + 1));
+  const obj = extractJsonObject(reply);
   if (!Array.isArray(obj.findings)) throw new Error("missing findings array");
   return {
     findings: obj.findings.slice(0, 12),

@@ -1,0 +1,185 @@
+name: fleet-thesis
+run-name: "fleet thesis ${{ github.run_id }}"
+
+on:
+  schedule:
+    - cron: "40 7,15 * * *"
+  workflow_dispatch:
+    inputs:
+      top_files:
+        description: "max survey excerpt files"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  survey:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+    steps:
+      - name: checkout runtime
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install pinned opencode cli
+        run: npm install -g opencode-ai@1.18.21
+      - name: survey sub-agent
+        run: |
+          mkdir -p artifacts
+          FLEET_THESIS_MODE=survey FLEET_ARTIFACT_DIR=artifacts node scripts/thesis.mjs
+      - name: upload survey
+        if: hashFiles('artifacts/thesis-survey.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: thesis-survey
+          path: artifacts/thesis-survey.json
+
+  draft:
+    needs: survey
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+    steps:
+      - name: checkout runtime
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install pinned opencode cli
+        run: npm install -g opencode-ai@1.18.21
+      - name: download survey
+        uses: actions/download-artifact@v4
+        with:
+          name: thesis-survey
+          path: artifacts
+      - name: draft sub-agent
+        run: |
+          mkdir -p artifacts
+          FLEET_THESIS_MODE=draft FLEET_ARTIFACT_DIR=artifacts node scripts/thesis.mjs
+      - name: upload draft
+        if: hashFiles('artifacts/thesis-draft.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: thesis-draft
+          path: artifacts/thesis-draft.json
+
+  refine:
+    needs: [survey, draft]
+    if: needs.draft.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+    steps:
+      - name: checkout runtime
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install pinned opencode cli
+        run: npm install -g opencode-ai@1.18.21
+      - name: download draft
+        uses: actions/download-artifact@v4
+        with:
+          name: thesis-draft
+          path: artifacts
+      - name: refine sub-agent
+        run: FLEET_THESIS_MODE=refine FLEET_ARTIFACT_DIR=artifacts node scripts/thesis.mjs
+      - name: upload final
+        if: hashFiles('artifacts/thesis-final.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: thesis-final
+          path: artifacts/thesis-final.json
+
+  ship:
+    needs: [draft, refine]
+    if: ${{ always() && needs.draft.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+    steps:
+      - name: checkout runtime
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: checkout private state repo
+        uses: actions/checkout@v4
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: download final (or draft fallback)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "{thesis-final,thesis-draft}"
+          merge-multiple: true
+          path: artifacts
+        continue-on-error: true
+      - name: normalize artifact name
+        run: |
+          mkdir -p shipdir
+          if [ -f artifacts/thesis-final.json ]; then cp artifacts/thesis-final.json shipdir/thesis-final.json;
+          elif [ -f artifacts/thesis-draft.json ]; then cp artifacts/thesis-draft.json shipdir/thesis-final.json; fi
+      - name: ship draft PR as M1Vj
+        run: FLEET_THESIS_MODE=ship FLEET_ARTIFACT_DIR=shipdir node scripts/thesis.mjs

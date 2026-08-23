@@ -18,15 +18,17 @@ const TARGET_REPO = process.env.FLEET_TARGET_REPO || "";
 const PR_NUMBER = Number(process.env.FLEET_PR_NUMBER || 0);
 
 const UI_EXTENSIONS = /\.(html|htm|css|scss|less|jsx|tsx|vue|svelte|astro|mdx)$/i;
-const HIGH_RISK_PATTERNS = [
+const HARD_RISK_PATTERNS = [
   /^\.env/i,
-  /(^|\/)(Dockerfile|docker-compose)/i,
-  /^\.github\/workflows\//i,
   /(^|\/)(migrations?|db\/migrate)/i,
-  /(^|\/)(auth|security)\//i,
-  /(package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$/i,
   /(^|\/)infra\//i,
   /^\.okf\//i,
+];
+const SOFT_RISK_PATTERNS = [
+  /(^|\/)(Dockerfile|docker-compose)/i,
+  /^\.github\/workflows\//i,
+  /(^|\/)(auth|security)\//i,
+  /(package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$/i,
 ];
 const SECRET_PATTERNS = [
   /(ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9_]{20,}/,
@@ -40,21 +42,47 @@ export function classify(files) {
   let additions = 0;
   let deletions = 0;
   let uiTouched = false;
+  let hard = false;
+  let soft = false;
+  const wfFiles = [];
   for (const f of files) {
     additions += f.additions || 0;
     deletions += f.deletions || 0;
     if (UI_EXTENSIONS.test(f.filename)) uiTouched = true;
-    for (const re of HIGH_RISK_PATTERNS) {
+    if (/^\.github\/workflows\//.test(f.filename)) wfFiles.push(f);
+    for (const re of HARD_RISK_PATTERNS) {
       if (re.test(f.filename)) {
-        reasons.push(`high-risk path ${f.filename}`);
+        hard = true;
+        reasons.push(`hard-risk path ${f.filename}`);
         break;
+      }
+    }
+    if (!hard) {
+      for (const re of SOFT_RISK_PATTERNS) {
+        if (re.test(f.filename)) {
+          soft = true;
+          reasons.push(`elevated path ${f.filename}`);
+          break;
+        }
       }
     }
   }
   const size = additions + deletions;
-  if (size > 400) reasons.push(`large diff (${size} lines)`);
-  if (!files.some((f) => f.additions > 0)) reasons.push("no additions");
-  return { risk: reasons.length > 0 ? "HIGH" : "LOW", reasons, uiTouched, size };
+  if (!files.some((f) => f.additions > 0)) {
+    hard = true;
+    reasons.push("no additions");
+  } else if (size > 800) {
+    hard = true;
+    reasons.push(`very large diff (${size} lines)`);
+  } else if (size > 250) {
+    soft = true;
+    reasons.push(`large diff (${size} lines)`);
+  }
+  let risk = hard ? "HIGH" : soft ? "MEDIUM" : "LOW";
+  if (risk === "MEDIUM" && wfFiles.length > 0 && wfFiles.every((f) => (f.deletions || 0) === 0)) {
+    reasons.push("additive-only workflow edits");
+  }
+  return { risk, reasons, uiTouched, size };
 }
 
 export function secretsInDiff(files) {
@@ -192,7 +220,7 @@ async function discoverFleetPRs(limit = 3) {
   for (const r of repos) {
     if (found.length >= limit) break;
     try {
-      const pulls = gh(["api", `/repos/${r.full_name}/pulls?state=open&per_page=20`], process.env) || [];
+      const pulls = gh(["api", `/repos/${r.full_name}/pulls?state=open&sort=created&direction=asc&per_page=20`], process.env) || [];
       for (const p of pulls) {
         if (p.draft && p.user && p.user.login === "M1Vj" && String(p.head.ref || "").startsWith("fleet/")) {
           found.push({ repo: r.full_name, number: p.number });
@@ -349,7 +377,12 @@ async function main() {
   const correctness = await judge({ repo: TARGET_REPO, prNumber: PR_NUMBER, title: pr.title, body: pr.body, files, extraEvidence: combinedEvidence, lens: "correctness-and-security", audit });
   const standards = await judge({ repo: TARGET_REPO, prNumber: PR_NUMBER, title: pr.title, body: pr.body, files, extraEvidence: combinedEvidence, lens: "industry-standards-and-maintainability", audit });
 
-  const approved = correctness.verdict === "approve" && standards.verdict === "approve" && correctness.score >= 80 && standards.score >= 80;
+  const threshold = cls.risk === "MEDIUM" ? 90 : 80;
+  const approved =
+    correctness.verdict === "approve" &&
+    standards.verdict === "approve" &&
+    correctness.score >= threshold &&
+    standards.score >= threshold;
 
   const verdictBody =
     "🔍 **fleet judge panel** (independent maker-checker review)\n\n" +

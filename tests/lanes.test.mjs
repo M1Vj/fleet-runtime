@@ -141,3 +141,21 @@ test("gateway breaker: opens on markDown within window, clears after expiry", as
   (await import("node:fs")).writeFileSync(p, JSON.stringify(data));
   assert.equal(gh.gatewayCircuitOpen(root), false);
 });
+
+test("classify tiers: additive-only workflow edit is MEDIUM", async () => {
+  const { classify } = await import("../scripts/merge.mjs");
+  const r = classify([{ filename: ".github/workflows/ci.yml", additions: 12, deletions: 0, patch: "+foo" }]);
+  assert.equal(r.risk, "MEDIUM");
+});
+
+test("classify tiers: workflow deletion is HIGH", async () => {
+  const { classify } = await import("../scripts/merge.mjs");
+  const r = classify([{ filename: ".github/workflows/ci.yml", additions: 1, deletions: 30 }]);
+  assert.equal(r.risk, "HIGH");
+});
+
+test("classify tiers: migrations stay HARD even small", async () => {
+  const { classify } = await import("../scripts/merge.mjs");
+  const r = classify([{ filename: "migrations/001.sql", additions: 3, deletions: 0 }]);
+  assert.equal(r.risk, "HIGH");
+});

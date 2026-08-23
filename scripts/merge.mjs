@@ -324,12 +324,24 @@ async function main() {
 
   if (pr.draft) {
     try {
-      gh(["api", "-X", "POST", `/repos/${TARGET_REPO}/pulls/${PR_NUMBER}/mark-ready`], process.env);
+      gh(["pr", "ready", String(PR_NUMBER), "-R", TARGET_REPO], process.env);
       audit.note("ready", "marked ready for review");
-    } catch {}
+    } catch (err) {
+      audit.note("ready", `mark-ready failed: ${err.message.slice(0, 100)}`);
+    }
   }
 
-  gh(["pr", "merge", String(PR_NUMBER), "--merge", "--delete-branch", "-R", TARGET_REPO], process.env);
+  try {
+    gh(["pr", "merge", String(PR_NUMBER), "--merge", "--delete-branch", "-R", TARGET_REPO], process.env);
+  } catch (err) {
+    if (/draft/i.test(String(err.message))) {
+      gh(["pr", "ready", String(PR_NUMBER), "-R", TARGET_REPO], process.env);
+      await new Promise((r) => setTimeout(r, 3000));
+      gh(["pr", "merge", String(PR_NUMBER), "--merge", "--delete-branch", "-R", TARGET_REPO], process.env);
+    } else {
+      throw err;
+    }
+  }
   await new Promise((r) => setTimeout(r, 4000));
   const mergedMeta = gh(["api", `/repos/${TARGET_REPO}/pulls/${PR_NUMBER}`], process.env);
   if (!mergedMeta.merged) throw new Error("merge attempted but not merged");

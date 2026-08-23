@@ -1,0 +1,142 @@
+% Chapter VI -- Summary of Findings, Conclusions, Recommendations (rev L-104)
+% Includes the audit-grounded Limitations & Threats to Validity section ---
+% the highest-leverage defense asset. Structure mirrors the validity audit
+% of 2026-07-25 so every threat names its artifact, quantification,
+% mitigation, and residual risk -- nothing hidden for the panel to discover.
+% REV L-104: T11 residual aligned with firewall policy (prohibition lowers
+% risk; it does not eliminate it); T10 completed to match the stated
+% evidence/mitigation/residual pattern; findings gated with VERIFY tokens;
+% practice recommendation hedged behind domain-specific validation.
+
+\chapter{Summary of Findings, Conclusions, and Recommendations}
+
+\section{Summary of Findings}
+Restating by research question, with pointers rather than restatements of
+statistics (full numbers: Chapter~5). [[VERIFY-AGAINST: each finding below
+must match the corresponding Chapter 5 table post-transcription; delete
+token when confirmed.]]
+\begin{enumerate}
+\item \textbf{RQ1 (transfer)}: surrogate-trained detection transferred to
+both external benchmark strata and consent-gated human text at usable
+operating points, with the transfer cost quantified in
+Section~5.3.
+\item \textbf{RQ2 (paired comparison)}: the principal system exceeded
+zero-shot and embedding baselines on the majority of prespecified strata;
+exceptions are enumerated with intervals in Section~5.4.
+\item \textbf{RQ3 (calibration)}: reliability degraded under distribution
+shift in a consistent direction, supporting flagging rather than
+automated-threshold use (Section~5.5).
+\item \textbf{RQ4 (error localization)}: headroom concentrated in specific
+length bands and mixed-authorship slices; evasion sensitivity was bounded
+but nonzero; repair attempts closed part of the gap (Section~5.6).
+\end{enumerate}
+
+\section{Conclusions}
+(1) Training on controlled synthetic proxies is a viable substitute for
+scraped real-model corpora that avoids terms-of-service exposure by
+construction, \emph{provided} the resulting surrogate--real gap is
+measured rather than assumed --- which this study operationalized via its
+external tier. (2) Ranking quality and trustworthy confidence dissociate
+under shift; evaluation protocols for MGT detection should therefore
+report calibration alongside AUROC, a recommendation this thesis advances
+to benchmark practice. (3) Slice-resolved auditing (length, authorship,
+attack) changes the verdict relative to aggregate reporting; the audit
+suite built here is reusable methodological infrastructure. (4) The
+study's own governance instrumentation --- frozen gates, provenance
+ledgers, dual reporting --- is offered as a template for first-party MGT
+research under ethics constraints.
+
+\section{Limitations and Threats to Validity}
+This section is grounded clause-for-clause in the project's validity audit
+of 2026-07-25 (executive summary: Appendix~G); each threat names its
+artifact, quantification, mitigation attempted, and residual risk.
+Self-reporting these before the panel asks is a deliberate defense posture.
+
+\subsection{Construct Validity}
+\textbf{T1 --- Surrogate--real gap.} Detectors trained on surrogate\_v2 may
+key on generator idiosyncrasies absent in wild models. \emph{Evidence}:
+tier-asymmetry in Section~5.3; \emph{mitigation}: multi-family generation
+grid + external tier; \emph{residual}: gap nonzero by design; magnitude
+[[FILL]].
+
+\textbf{T2 --- Construct drift between proposal and execution.} Objectives
+were written before results existed; misalignment would undermine the
+construct the thesis claims to test. \emph{Evidence}: alignment-matrix
+diff of proposal commitments versus deliverables; \emph{mitigation}: the
+alignment pass reconciled objectives to deliverables item-by-item and
+froze the revised RQ wording; \emph{residual}: low, documented.
+
+\subsection{Internal Validity}
+\textbf{T3 --- Mixed authorship confound.} Documents combining human and
+machine text behave as neither class and depress both error types.
+\emph{Evidence}: mixed\_authorship breakdown; \emph{mitigation}: explicit
+stratification and separate reporting, never silent pooling;
+\emph{residual}: moderate within contaminated slices.
+
+\textbf{T4 --- Length/headroom confound.} Aggregate metrics mask
+band-specific failure. \emph{Evidence}: headroom\_by\_length;
+\emph{mitigation}: slice-resolved reporting plus repair attempts;
+\emph{residual}: short-band gap persists [[FILL]].
+
+\textbf{T5 --- Salvage-pathway selection.} phd\_rescued shards entered via
+a non-prospective route and could select atypical writers. \emph{Evidence}:
+chain-of-custody record; \emph{mitigation}: quarantine tier, dual
+reporting of all headlines with/without F2; \emph{residual}: bounded ---
+no headline flips [[FILL: confirm from dual tables]].
+
+\textbf{T6 --- Analytical flexibility.} Many strata invite cherry-picking.
+\emph{Evidence}: stratum count versus prespecification documents;
+\emph{mitigation}: frozen feasibility gate, prespecified comparison family
+with Holm correction, pilot-frozen analysis code; \emph{residual}: low.
+
+\subsection{External Validity}
+\textbf{T7 --- RAID subsampling.} Conclusions generalize to the sampled
+strata, not all of RAID; allocation and floors documented in Appendix~D.
+\emph{Residual}: moderate; exact reconstitution possible.
+
+\textbf{T8 --- Domain, language, and source coverage.} Paraphrase/domain
+breakdowns show uneven coverage, and tangential socio-academic sources
+could ground only motivational, not evidentiary, claims. \emph{Evidence}:
+stratum coverage table; \emph{mitigation}: scoped claims language
+throughout; \emph{residual}: moderate.
+
+\textbf{T9 --- Temporal drift.} Generator families evolve faster than
+publication cycles; results characterize the audited snapshot.
+\emph{Residual}: unavoidable; stated on every generalization claim.
+
+\subsection{Statistical Conclusion Validity}
+\textbf{T10 --- Multiplicity and power.} Many strata inflate false-positive
+risk and small cells yield imprecise estimates. \emph{Evidence}: paired
+delta interval widths per stratum; \emph{mitigation}: prespecified
+comparison families + Holm control + paired bootstrap intervals;
+\emph{residual}: wide intervals on small strata; those cells are
+interpreted conservatively and never carry headline claims.
+
+\subsection{Integrity Threat (Researcher-Level)}
+\textbf{T11 --- Tooling circularity.} The subject of study (detector
+evasion) borders on tooling (humanizer pipelines adjacent to the lineage
+disclosed in Appendix~H) that must never touch manuscript text; doing so
+would create evidentiary circularity and misconduct exposure.
+\emph{Mitigation}: binding integrity firewall policy, composition-
+provenance ledger shipped as Appendix~H, proactive adviser disclosure;
+\emph{residual}: low but nonzero --- prohibition minimizes rather than
+eliminates risk; the ledger and disclosure obligations provide ongoing
+monitoring.
+
+\section{Recommendations}
+\textbf{For practice}: MGT detectors should be evaluated and deployed as
+calibrated triage aids, not automated adjudicators; domain-specific
+validation should precede any operational reliance, and procurement
+evaluations should require slice reports (length, authorship, attack).
+\textbf{For research}: (1) benchmark suites should ship calibration and
+slice audits natively; (2) surrogate-training recipes need theory for when
+proxy-generator diversity closes surrogate--real gaps; (3) first-party
+corpus studies should adopt frozen-gate governance as default; (4) repair
+of short-band headroom is the highest-value open problem surfaced here.
+\textbf{For the institution}: adopt an explicit policy separating research
+use of evasion tooling from authoring workflows, per the shipped firewall
+policy (Appendix~H).
+\textbf{Future work}: extend tiers longitudinally to measure drift;
+expand own corpus past gate ceilings to power subpopulation analyses
+currently underpowered; formalize intrinsic-dimension probes from
+descriptive lens to tested feature family.

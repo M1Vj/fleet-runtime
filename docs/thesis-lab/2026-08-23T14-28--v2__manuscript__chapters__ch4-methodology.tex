@@ -1,0 +1,197 @@
+% Chapter IV -- Methodology (rev L-104)
+% Drafted directly from implementation evidence: key subsections name the
+% scripts/configs that realize them so the panel can verify rigor that would
+% otherwise remain invisible. Tense: past/present-perfect (study executed);
+% proposal-stage future-tense phrasing is retired per the alignment matrix
+% (internal working document; binding rules mirrored in the migration plan).
+% REV L-104: dangling refs removed (fig:pipeline, tab:modelparams,
+% tab:alignment); repro-map pointer corrected to Section 4.7; repo-internal
+% jargon ("learned-rules file", "wiki/log.md") replaced with panel-facing
+% wording; "registered" hypotheses downgraded to "predeclared in writing".
+
+\chapter{Methodology}
+
+\section{Chapter Overview and Design Rationale}
+This chapter narrates the executed study. The investigation is a
+quantitative, multi-tier benchmark study with an internal replication
+structure: a \emph{pilot} established pipeline correctness, effect-size
+order-of-magnitude expectations, and instrumentation stability; the
+\emph{full study} re-ran the locked protocol at scale. Design choices are
+reported with their alternatives and rejection reasons, because several of
+them (synthetic training data, benchmark subsampling, a frozen feasibility
+gate, salvaged data shards) materially shape the validity argument
+assembled in Chapter~6.
+
+Three data tiers support the study: (i) a \emph{surrogate tier} of
+controlled synthetic corpora for training, (ii) an \emph{external tier}
+consisting of a stratified RAID subsample for out-of-distribution
+validation, and (iii) a \emph{first-party tier} of consent-gated human-
+written text (including a separately quarantined tier of recovered device
+shards). Each stage from data construction through training, evaluation,
+and auditing is mapped to its implementing artifact in the reproducibility
+table (Table~\ref{tab:repro}, Section~4.7).
+
+\section{Research Questions and Hypotheses}
+The executed study operationalizes the research questions as revised during
+the proposal-to-results alignment pass (canonical wording in Chapter~1).
+In condensed form:
+RQ1: Can a detector trained solely on surrogate corpora achieve usable
+detection (AUROC/AUPRC) on human-collected and benchmark text?
+RQ2: How does surrogate-trained detection compare, under paired deltas, to
+zero-shot and embedding-based baselines across generator families and
+domains?
+RQ3: How do calibration/reliability properties behave across strata, and
+where does confidence mislead?
+RQ4: What fraction of residual error is attributable to paraphrastic
+evasion, length effects (headroom), and mixed authorship?
+Correspondingly, directional hypotheses H1--H4 were predeclared in writing
+before full-study outcome inspection; the pilot was used for
+instrumentation only and is excluded from hypothesis tests.
+
+\section{Data Construction}
+\subsection{Tier S: Surrogate Synthetic Corpora (surrogate\_v2)}
+Training data were manufactured rather than scraped. The surrogate\_v2
+pipeline generates documents across a factorial grid spanning generator
+family, prompt template, topic band, and target-length bucket, recording a
+provenance tuple for every document. Rationale: (a) licensing and ethics---
+scraping model outputs at scale from live services raises terms-of-service
+conflicts the study avoids by construction; (b) control---strata can be
+balanced deliberately rather than opportunistically; (c) reproducibility---
+generation is deterministic given seed and config. Costs are equally
+explicit and deferred to Section~6.2: surrogate training inherits whatever
+generator idiosyncrasies the chosen families exhibit, creating a
+surrogate--real gap that the external tier is designed to expose.
+Generation configurations are reproduced verbatim (keys redacted) in
+Appendix~C; the licensing gate that blocked non-permissive sources ran
+before any corpus assembly and its verdict log is retained.
+
+\subsection{Tier E: External Validation --- Stratified RAID Subsample}
+Full RAID evaluation was infeasible under the compute budget; the subsample
+was drawn by stratifying on RAID's domain, decoding strategy, and attack
+condition axes with proportional allocation within strata and a floor of
+$n_{\min}$ per cell [[FILL: raid subsample manifest; report exact n and
+allocation]]. Subsampling is a deliberate trade: variance increases, but
+coverage of the adversarial conditions central to RQ4 is preserved. The
+manifest enabling exact reconstitution of the subsample ships as
+Appendix~D.
+
+\subsection{Tier F1: Own Corpus --- Consent-Gated Collection}
+First-party HWT was collected prospectively. Intake forms captured
+demographic and authorship metadata; the consent pipeline attached
+versioned, timestamped consent receipts; the participant-data guard
+screened submissions for personally identifiable content and scope
+violations before admission. Splits (train/validation/test) were
+partitioned at the \emph{author} level, never at the document level, to
+prevent leakage of individual stylistic signatures across splits; the
+partitioner's seed and assignment tables are retained. Class balance,
+metadata completeness, and guard-pass rates fed the feasibility gate.
+
+\subsection{The Frozen Feasibility Gate}
+Before any model consumed Tier F1, a predeclared gate evaluated minimum
+adequacy: corpus volume, HWT/MGT balance within tolerance, guard-pass
+rate, and metadata completeness thresholds [[FILL: exact thresholds from
+gate spec; cite freeze memo date]]. Freezing before outcome inspection is
+the study's principal protection against data-dependent analytic
+flexibility (the ``garden of forking paths'' concern) on the first-party
+tier. The gate's verdict, its inputs, and the freeze date are reproduced
+in Appendix~E. Where the gate constrained science (e.g., limiting subgroup
+analyses to adequately powered strata), the constraint is stated alongside
+the affected result rather than discovered post hoc.
+
+\subsection{Tier F2: Recovered Device Shards (phd\_rescued)}
+A salvage operation recovered partial writing shards from participant
+devices that had failed routine upload. These enter the study as a
+quarantined tier: (i) a documented chain-of-custody record per shard
+(Appendix~F); (ii) re-application of the data guard; (iii) exclusion from
+headline numbers unless robustness analyses show tier inclusion does not
+flip any primary conclusion; (iv) dual reporting (with/without F2) for
+every headline table. The provenance defense rests on demonstrating that
+no analytic conclusion depends on the salvage pathway (Section~6.3).
+
+\section{Models and Baselines}
+The principal system is a discriminative detector trained on Tier S
+(feature representation and architecture per run configuration
+[[FILL: model config JSON; transcribe into a parameter table here]])
+with early stopping on surrogate validation folds. Baselines instantiate
+three families chosen to span resource requirements:
+(a) \emph{Zero-shot statistical}: likelihood-ratio and perplexity-based
+scorers requiring no task-specific training;
+(b) \emph{Embedding-based}: frozen sentence/text encoders with lightweight
+heads or distance scores;
+(c) \emph{Commercial/API detectors}: queried under fixed seeds and logged
+responses where terms permit, else omitted with reason recorded.
+Feature-side analyses reuse the idea-phase constructs: intrinsic-dimension
+estimates and linguistic-splitting slices are computed as descriptive
+lenses, never as unlabeled classifiers.
+
+\section{Evaluation Protocol}
+All evaluation is item-paired. Primary metrics: AUROC (headline), AUPRC
+(prevalence-robust companion), computed per stratum and pooled, with
+bootstrap (item-level resampling, $B$ resamples [[FILL: metrics.py
+default]]) 95\% confidence intervals. Calibration is assessed with
+reliability diagrams and binned ECE per stratum. System comparisons are
+made as \emph{paired deltas} on identical items with paired-bootstrap
+interval estimation; multiplicity is handled by reporting all prespecified
+comparisons and applying Holm correction to the family of headline tests.
+Every figure in Chapter~5 regenerates from a stored run directory; the
+mapping table of result artifact $\rightarrow$ generating script $\rightarrow$
+configuration hash appears in Section~4.7.
+
+\section{Robustness and Evasion Evaluation}
+RQ4 is served by three audits. (1) \emph{Paraphrase evasion}: MGT test
+items are passed through the evader suite (paraphrase strength levels
+[[FILL: evaders config]]) before scoring; degradation curves are reported
+per generator family. (2) \emph{Adversarial RAID strata}: RAID's native
+attack conditions are scored as separate strata rather than pooled.
+(3) \emph{Repair attempts}: where headroom analysis localizes failures
+(e.g., short texts), targeted mitigations are attempted under the same
+protocol and reported regardless of outcome, preventing silent
+file-drawer effects.
+
+\section{Compute Placement and Reproducibility}
+All GPU-bearing steps (generation, training, large-scale scoring) executed
+in cloud notebook sessions with pinned dependency sets; orchestration,
+guards, and audits ran locally. Reproducibility is anchored by three
+instruments: (i) immutable run directories containing config JSON, seeds,
+and environment captures; (ii) a script-to-section map
+(Table~\ref{tab:repro}) connecting every methods subsection to the tool
+that implements it; and (iii) an append-only decision log reconstructing
+the choice points, including the freeze of the feasibility gate and the
+adoption of surrogate\_v2 over its predecessor.
+
+\begin{table}[t]
+\centering\small
+\caption{Reproducibility map: methods subsections to implementing
+artifacts (paths relative to repository root).}
+\label{tab:repro}
+\begin{tabular}{p{5.2cm}p{6.8cm}}
+\toprule
+Methods element & Implementing artifact(s) \\
+\midrule
+Surrogate generation grid & surrogate\_v2 pipeline scripts; generation
+configs (Appendix~C) \\
+Licensing gate & gate runner + verdict log \\
+RAID subsampling & subsample manifest (Appendix~D) \\
+Consent / guard & consent pipeline modules; guard policy (Appendices~A--B) \\
+Splits and partitions & partitioner script; assignment tables \\
+Feasibility gate & gate spec + freeze memo (Appendix~E) \\
+Metrics (AUROC/AUPRC/ECE) & classify.py, metrics.py, embeddings.py \\
+Topological slices & topology.py \\
+Headroom/breakdown audits & validity\_audit\_2026-07-25 artifacts \\
+Results tables/figures & pilot\_results.md, full\_study\_results.md runs \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Ethical Considerations}
+Human participation proceeded under informed consent with withdrawal rights;
+collection minimized demographic capture to what analysis required. The
+guard pipeline enforced privacy scrubbing pre-admission, and raw device
+archives never entered version control---only guarded derivatives and
+manifests, consistent with the participant-data-guard intent. Because the
+thesis's subject matter includes detector-evasion techniques, the study
+distinguishes sharply between (a) evasion as an \emph{object of
+measurement} on experiment data and (b) any application of evasion tooling
+to the researcher's own writing; the latter is prohibited outright by the
+integrity firewall policy (Appendix~H), which also governs disclosure of
+composition provenance for this manuscript itself.

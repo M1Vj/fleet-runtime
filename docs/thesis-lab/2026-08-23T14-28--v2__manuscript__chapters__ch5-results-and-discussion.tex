@@ -1,0 +1,126 @@
+% Chapter V -- Results and Discussion (rev L-104)
+% Interpretive, not enumerative: numbers live in tables regenerated from
+% run artifacts; the chapter argues what they MEAN. Every numeric slot is
+% an explicit [[FILL]] token bound to a named artifact -- transcription
+% replaces invention.
+% REV L-104: fixed stray "#" comment character (compile error); softened
+% "converts to confirmatory" overclaim; added [[VERIFY-AGAINST]] gates on
+% directional claims; inserted [CITATION NEEDED] markers on uncited
+% literature assertions.
+
+\chapter{Presentation, Analysis, and Interpretation of Results}
+
+\section{Reading Guide}
+Results are organized around the four research questions. For each, we
+report the estimate, its paired uncertainty, the audit that stress-tested
+it, and the interpretation. The pilot study is presented first as
+instrumentation evidence, not as confirmatory result: its role was to
+verify pipeline mechanics, surface coding errors, and fix the analysis
+script before unblinding the full study.
+[[VERIFY-AGAINST: every directional claim in this chapter must match
+full\_study\_results.md / paired-delta artifacts exactly once FILL tokens
+are transcribed; delete this token at that time.]]
+
+\section{Pilot Study: Instrumentation Findings}
+The pilot executed the end-to-end path---generation, guarding, training,
+scoring, auditing---at reduced scale. Outcomes ([[FILL: implementation/
+results/pilot\_results.md]]): pipeline ran to completion without manual
+repair; early metric implementations agreed with reference computations;
+preliminary AUROC ordering matched expectations, supporting the decision
+to proceed to full scale without protocol modification; two
+instrumentation defects (binning edge cases in ECE, a stratum-label
+collision) were found and fixed, with fixes locked before full-study
+execution. \emph{Interpretation}: freezing the corrected analysis code
+before full-study execution removes the most common exploratory biases;
+the full study is accordingly treated as \emph{pre-specified}. This is a
+weaker claim than ``confirmatory,'' which would require independent
+replication; the distinction is carried into the limitations discussion.
+
+\section{RQ1 --- Surrogate-Trained Detection on Held-Out Tiers}
+Table~\ref{tab:rq1-headline} reports headline AUROC/AUPRC with 95\%
+bootstrap intervals by data tier (external RAID strata; own-corpus test
+split; dual-reported variants excluding recovered shards).
+[[FILL: full\_study\_results.md headline table; reproduce rows verbatim.]]
+
+\emph{Analysis}. Three patterns organize the reading, contingent on the
+transcribed numbers above. First, usable-but-degraded transfer: surrogate-
+trained detection is expected to retain discriminative signal on real text
+while falling below in-distribution ceilings, quantifying the
+surrogate--real gap rather than assuming it away. Second, tier asymmetry:
+any difference between Tier F1 and Tier E performance localizes whether
+the gap is generator-driven or collection-driven --- collection-driven
+gaps implicate acquisition protocol, generator-driven gaps implicate
+training distribution. Third, shard-insensitivity: the with/without-F2
+contrast bounds the influence of the salvage pathway on headline claims
+(cross-ref Section~6.3).
+
+\section{RQ2 --- Paired Comparison Against Baselines}
+Figure/Table pair [[FILL: paired-deltas artifact]] gives per-stratum
+paired deltas of the principal system against zero-shot statistical and
+embedding baselines, with paired-bootstrap intervals and Holm-adjusted
+significance stars over the prespecified comparison family.
+[[FILL: delta table verbatim.]]
+\emph{Analysis}. Deltas are read jointly with intervals, never as point
+verdicts. Where the surrogate-trained system wins uniformly, training on
+synthetic proxies is vindicated despite the gap of RQ1; where wins invert
+on specific domains, the inversion pattern feeds directly into the
+headroom decomposition (Section~5.6). Baseline parity on any stratum is
+itself informative: it caps the marginal value of surrogate training there
+and redirects effort toward data acquisition rather than modeling.
+
+\section{RQ3 --- Calibration and Reliability Across Strata}
+Reliability diagrams per stratum and binned ECE [[FILL: reliability curve
+artifacts]] answer whether the detector's probabilities deserve trust, a
+question orthogonal to ranking accuracy.
+\emph{Analysis}. The failure mode discussed in the literature---over-
+confident misranking under distribution shift [CITATION NEEDED: wire the
+specific calibration-under-shift source(s) during Chapter~2 migration]---
+is tested against the observed direction [[FILL: over-/under-confidence,
+worst strata]]. Practically, a detector that ranks well but calibrates
+poorly supports triage (flagging) but not threshold automation; this
+distinction disciplines the recommendation language in Chapter~6 away
+from deployment overclaim.
+
+\section{RQ4 --- Where the Error Lives: Headroom, Length, Authorship}
+The headroom-by-length audit decomposes residual error into length bands
+([[FILL: headroom\_by\_length artifact]]), the mixed-authorship breakdown
+isolates contamination-sensitive slices, and paraphrase/domain breakdowns
+plus repair-attempt logs complete the localization.
+\emph{Analysis}. Aggregate AUROC conceals slice pathology wherever slices
+disagree with the pooled number [[FILL: e.g., short-text band retains
+largest reference-gap; mixed-authorship stratum behaves as neither
+class]]. Repair attempts against the largest localized gaps are reported
+even where unsuccessful, converting negative results into boundary
+knowledge: they delimit what current surrogate-training recipes cannot
+yet buy.
+
+\section{Synthesis Against Prior Literature}
+Chapter~2 positions this study against three literatures: statistical
+detection (likelihood/perplexity tradition), representation-based
+detection, and robustness/evasion analyses. The present results speak to
+each, conditionally on the transcribed numbers: (a) if the paired deltas
+of Section~5.4 hold as tabulated, the surrogate-training strategy achieves
+transfer that zero-shot statistics do not, strengthening the benchmark-
+construction line of the RRL relative to the pure-statistics line;
+(b) calibration degradation under shift, if observed as templated in
+Section~5.5, corroborates critiques that headline AUROC benchmarks
+overstate deployment readiness [CITATION NEEDED: attribute the critique,
+e.g., to the RAID robustness evaluation and successor work]; (c) evasion
+sensitivity quantifies, on controlled strata, the fragility arguments made
+in the paraphrase-evasion literature [CITATION NEEDED: bind to
+krishna2023paraphrase at migration]. The novelty chain from the idea-phase
+work---intrinsic-dimension probes, linguistic splitting as a profiling
+lens, evader suites---lands here as the audit apparatus that makes these
+claims slice-resolved rather than aggregate, which is the study's
+principal methodological contribution beyond its empirical ones.
+
+\section{Summary of Chapter Findings}
+(1) Surrogate-only training yields cross-tier detection whose usability
+and transfer cost are quantified in Sections~5.3 [[VERIFY-AGAINST: confirm
+gap magnitude from E-02]]. (2) Paired deltas establish superiority over
+zero-shot baselines on [[FILL: count]] of prespecified strata with
+interval-supported margins. (3) Calibration degrades under shift in
+direction [[FILL]], constraining deployment claims to triage. (4) Residual
+error concentrates in [[FILL: length band / authorship / attack stratum]],
+partially repaired by [[FILL: attempt]], with remaining headroom owned
+explicitly in Chapter~6.

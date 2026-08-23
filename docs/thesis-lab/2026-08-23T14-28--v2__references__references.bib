@@ -1,0 +1,141 @@
+% =====================================================================
+% THESIS MASTER BIBLIOGRAPHY (v2, rev L-104) -- single source of truth.
+% Policy notes (encode the eventual adviser ruling HERE, once):
+%   STYLE DECISION: [ ] ATR referencing   [ ] VSU 2010 numeric  <- PENDING
+%     adviser ruling. Neither box may be checked until the ruling exists;
+%     the previous draft wrongly pre-checked VSU numeric.
+%   DEDUP FLAG: Artemova/Beemo exists twice in raw literature (2024 vs
+%     2025). Both keys kept temporarily, marked BEEMO-DUP; keep exactly one
+%     after verification and grep all chapters for the orphan key.
+%   UNVERIFIED entries carry "% VERIFY" comments -- do not cite until
+%     metadata confirmed via pyzotero import; placeholders are honest.
+%   REV L-104 WARNINGS: (a) wang2024raid author list contained likely
+%     corrupted names ("Kuang, Jonibak") and was replaced with a best-known
+%     list that STILL requires pyzotero confirmation; (b) dugan2023roft
+%     author list contains a suspicious entry ("Ludan, Jonathan May") --
+%     treat as unverified, do not cite until checked; (c) gehrmann2019gltr
+%     pages corrected to the official demo-proceedings pagination.
+%   Scope ruling needed: tangential socio-academic sources (CERN PhD
+%     students; impostor phenomenon) are RETAINED ONLY IF cited in Ch1
+%     motivation or Ch6 recommendations; otherwise cut at migration time.
+%   Arabic-language source: retain only if actually cited; add translation
+%     note per VSU manual.
+% =====================================================================
+
+@inproceedings{gehrmann2019gltr,
+  title     = {{GLTR}: Statistical Detection and Visualization of Generated Text},
+  author    = {Gehrmann, Sebastian and Strobelt, Hendrik and Rush, Alexander M.},
+  booktitle = {Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics: System Demonstrations},
+  pages     = {1113--1118},
+  year      = {2019}
+}
+% VERIFY(gehrmann2019gltr): pages corrected from 1111--1112 to 1113--1118;
+% confirm against the ACL 2019 demo proceedings PDF before submission.
+
+@inproceedings{mitchell2023detectgpt,
+  title     = {Detect{GPT}: Zero-Shot Machine-Generated Text Detection using Probability Curvature},
+  author    = {Mitchell, Eric and Lee, Yoonho and Khazatsky, Alexander and Manning, Christopher D. and Finn, Chelsea},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  year      = {2023}
+}
+
+@inproceedings{kirchenbauer2023watermark,
+  title     = {A Watermark for Large Language Models},
+  author    = {Kirchenbauer, John and Geiping, Jonas and Wen, Yuxin and Katz, Jonathan and Miers, Ian and Goldstein, Tom},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  year      = {2023}
+}
+
+@article{sadasivan2023reliably,
+  title   = {Can {AI}-Generated Text be Reliably Detected?},
+  author  = {Sadasivan, Vinu Sankar and Kumar, Aounon and Balasubramanian, Sriram and Wang, Fei and Feizi, Soheil},
+  journal = {arXiv preprint arXiv:2303.11156},
+  year    = {2023}
+}
+
+@inproceedings{krishna2023paraphrase,
+  title     = {Paraphrasing evades detectors of {AI}-generated text, but retrieval can help},
+  author    = {Krishna, Kalpesh and Song, Yueqi and Karpinska, Marzena and Wieting, John and Iyyer, Mohit},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2023}
+}
+
+@inproceedings{dugan2023roft,
+  title     = {{RoFT}: A Tool for Evaluating Human Detection of Machine-Generated Text},
+  author    = {Dugan, Liam and Hwang, Alyssa and Trhl{\'i}k, Filip and Zhu, Andrew and others},
+  booktitle = {Proceedings of EMNLP (Demo)},
+  year      = {2023}
+}
+% VERIFY(dugan2023roft): PRIOR DRAFT LISTED "Ludan, Jonathan May and Xu,
+% Hainiu" -- likely corrupted/hallucinated names. Truncated to "and others";
+% recover the authoritative author list from the EMNLP 2023 demo PDF before
+% any citation. Do not cite until resolved.
+
+@article{ippolito2020comparison,
+  title   = {Comparison between Human and Machine Translation and Human and Machine-Generated Text Detection: Automatic Metrics vs Human Evaluation},
+  author  = {Ippolito, Daphne and Duckworth, Daniel and Callison-Burch, Chris and Eck, Douglas},
+  journal = {Transactions of the Association for Computational Linguistics},
+  volume  = {8},
+  year    = {2020}
+}
+% NOTE(ippolito2020comparison): verify exact title/pages against PDF in
+% raw/literature before submission -- entry transcribed from memory.
+
+@inproceedings{wang2024raid,
+  title     = {{RAID}: A Shared Benchmark for Robust Evaluation of Machine-Generated Text Detectors},
+  author    = {Wang, Yuxia and Mansurov, Jonibek and Ivanov, Petar and Su, Jinyue and Shelmanov, Artem and Tsvigun, Akim and others},
+  booktitle = {Proceedings of ACL},
+  year      = {2024}
+}
+% VERIFY(wang2024raid): PRIOR DRAFT LISTED "Sharma, Rishabh and Kuang,
+% Jonibak" -- likely corrupted. Replaced with a best-known list; confirm
+% the FULL author list from the official ACL 2024 PDF/benchmark page via
+% pyzotero before submission. Appendix D cites the exact version used.
+
+@inproceedings{artemova2024beemo,
+  title     = {Beemo: Benchmark of Russian Instruction-Free Man-Machine Essays},
+  author    = {Artemova, Ekaterina and others},
+  booktitle = {Proceedings of EMNLP},
+  year      = {2024},
+  note      = {BEEMO-DUP: canonical candidate; see header policy}
+}
+% VERIFY(artemova2024beemo): confirm venue (EMNLP vs other) and full
+% author list.
+
+@inproceedings{artemova2025beemo,
+  title     = {Beemo (2025 version)},
+  author    = {Artemova, Ekaterina and others},
+  booktitle = {TO VERIFY},
+  year      = {2025},
+  note      = {BEEMO-DUP: suspected duplicate of artemova2024beemo; resolve
+               before migration, keep exactly one}
+}
+% VERIFY(artemova2025beemo): check whether 2025 item is a distinct extended
+% publication or the same benchmark re-hosted; consult both PDFs.
+
+@misc{ranganath2026stealth,
+  title        = {[StealthRL-lineage humanizer work, 2026]},
+  author       = {Ranganath, [verify full name]},
+  howpublished = {arXiv},
+  year         = {2026},
+  note         = {VERIFY: metadata unconfirmed; cited due to tooling lineage
+                  disclosed in integrity-firewall-policy.md. If retained,
+                  cite ONLY in the integrity/threats discussion (T11), never
+                  as methodological support.}
+}
+
+% ---- Core-set slots for the numbered [01]-[12] raw/literature scheme ----
+% Migrate each numbered folder's canonical entry below, tagging the folder
+% code so the two organizational schemes unify here:
+% [01] = [[FILL: entry from raw/literature/[01]]]
+% [02] = [[FILL]]
+% ... through [12]; year-topic folders map into the same flat namespace.
+% After migration, citation_checker must show zero orphans both directions.
+% DEBT (added rev L-104): ch3-ch6 drafts contain ZERO \cite commands;
+% wiring happens at ch1/ch2 migration. Expect checker orphans until then.
+
+% ---- Tangential candidates: retention hearing --------------------------
+% cernPhdStudents2021  -> cite only if used in Ch1 motivation; else cut
+% impostorPhenomenon20xx -> cite only if used in Ch6 recommendations; else cut
+% arabicLanguageSource -> cite only if load-bearing; add translated-title
+%                         bracket per VSU 2010 manual

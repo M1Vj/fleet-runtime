@@ -1,0 +1,161 @@
+% Chapter III -- Operational Definition of Terms (rev L-104)
+% Style: alphabetical; each term defined OPERATIONALLY (how it is measured,
+% constructed, or decided in THIS study), not merely conceptually. Every
+% definition below is anchored to the concrete artifact that realizes it so
+% the panel can trace term -> mechanism -> file.
+% REV L-104: cross-references corrected to actual section numbers (shards
+% 4.3.5; RAID scoping -> threat T7 in 6.3; headroom -> 5.6; repairs -> 4.6);
+% internal repo paths replaced with Appendix pointers.
+
+\chapter{Operational Definition of Terms}
+
+The following terms are defined operationally as they are used throughout
+this thesis. Each definition states how the construct was instantiated,
+measured, or adjudicated within the executed study, together with the
+pipeline component that realizes it, so that terminology remains stable
+across the Methodology (Chapter~4), Results (Chapter~5), and the threats-
+to-validity analysis (Chapter~6).
+
+\section{Machine-Generated Text (MGT)}
+Text produced end-to-end by a large language model conditioned on a prompt
+and decoding parameters, without post-generation human rewriting. In this
+study the term refers exclusively to generations captured with recorded
+(model, prompt-template, decoding-parameter) triples in the surrogate
+corpus manifests; any sample whose provenance triple is missing is excluded
+from analysis rather than labeled by assumption.
+
+\section{Human-Written Text (HWT)}
+Text authored by identified humans under the collection protocols of this
+study: (a) participants of the own-corpus arm who provided informed
+consent through the consent pipeline, or (b) verified human documents in
+the RAID subsample as designated by the benchmark's own labeling. Mixed-
+authorship documents---texts begun by humans and completed by machines or
+vice versa---are reported as a separate stratum and never collapsed
+silently into either class, because the validity audit identifies them as
+a confound (threat T3, Chapter~6).
+
+\section{Surrogate Corpus (surrogate\_v2)}
+The synthetic training corpus constructed for this study: machine-generated
+documents sampled across a controlled grid of generator families, prompt
+templates, topics, and lengths, assembled by the surrogate\_v2 pipeline and
+governed by its licensing gate. ``Surrogate'' signals the design decision
+that detector training uses proxy generators rather than the target
+generators evaluated at test time, making the surrogate--real gap a first-
+class object of measurement (Section~4.3.1; conclusions in Section~6.2).
+
+\section{Own Corpus}
+The corpus of participant-authored texts collected directly for this study
+through intake forms, consent capture, and automated guard checks
+(personally identifiable information scrubbing, scope validation) prior to
+admission. Admission of any batch into the experimental splits required the
+feasibility gate (below) to pass; the frozen state of that gate defines the
+exact data snapshot analyzed in Chapter~5.
+
+\section{Own-Corpus Feasibility Gate}
+A predeclared go/no-go rule evaluating whether the accumulated own corpus
+meets minimum adequacy criteria (volume, class balance, metadata
+completeness, guard-pass rate) before any model is trained on it. The gate
+was frozen at the date recorded in its specification memo; ``frozen''
+means the criteria and threshold values were fixed before outcome
+inspection to prevent post hoc data-dependent relaxation. Its outcome and
+the freeze date constitute part of the study's predeclared-analysis record
+(freeze memo reproduced in Appendix~E). This record is analogous to, but
+weaker than, formal preregistration; it is not claimed as the latter.
+
+\section{RAID Subsample}
+The stratified subset of the RAID benchmark used for external, out-of-
+training-distribution validation. Subsampling was necessitated by compute
+budget and implemented as stratification over RAID's native domains,
+decoding strategies (greedy vs.\ sampled), and attack conditions, with the
+stratum manifest retained for reproducibility (Appendix~D). All claims
+about generalization in this thesis are scoped to this subsample (threat
+T7, Section~6.3).
+
+\section{Recovered Device Shards (phd\_rescued)}
+Document shards recovered from participant devices during a salvage
+operation, admitted into the study only after passing a provenance review
+documented in a chain-of-custody record (Appendix~F). Because their
+collection pathway differs from the prospective consent pipeline, they are
+treated as a distinct quarantined data tier with its own robustness checks
+(Section~4.3.5), and headline results are reported both with and without
+them (selection threat T5, Section~6.3).
+
+\section{Detector}
+Any scoring function $s(x)\!\in\![0,1]$ mapping a document to the
+probability that it is machine-generated. The study distinguishes:
+(a) the \emph{surrogate-trained classifier}, the principal system under
+evaluation; (b) \emph{zero-shot statistical baselines} requiring no
+training data; and (c) \emph{embedding-based baselines} using frozen
+representations. Detector identity is always reported jointly with its
+training data tier.
+
+\section{Detection Performance (AUROC / AUPRC)}
+Area under the receiver operating characteristic curve and area under the
+precision--recall curve computed on held-out splits, reported with bootstrap
+confidence intervals. AUROC is the primary headline metric; AUPRC
+accompanies it because class prevalence varies across strata and AUROC
+alone can overstate operating utility.
+
+\section{Reliability / Calibration}
+The agreement between predicted probabilities and empirical error rates,
+assessed via reliability diagrams and Expected Calibration Error (ECE) at
+fixed binning. A detector is called \emph{well-calibrated on a stratum}
+when its reliability curve lies within the predeclared tolerance band of
+the diagonal on that stratum [[FILL: tolerance value from calibration
+configuration; do not state from memory]]. Calibration is treated as a
+co-equal outcome, since deployment-relevant thresholds presuppose
+trustworthy scores.
+
+\section{Paired Delta}
+The difference in a metric between two systems measured on identical
+evaluation items (e.g., surrogate-trained classifier minus zero-shot
+baseline on the same RAID stratum), summarized with the paired bootstrap
+distribution over items. Pairing on items, rather than comparing
+independent aggregates, is the inferential backbone of every ``X improves
+over Y'' claim in Chapter~5.
+
+\section{Headroom}
+For a given length bucket or condition, the gap between achieved detection
+performance and an empirical upper-reference derived from the strongest
+observed system on that slice. This reference is a measured bound, not an
+oracle ceiling; headroom therefore quantifies remaining distance to the
+best demonstrated performance, not to perfect detection. The headroom-by-
+length audit decomposes overall error into slices, revealing where
+apparent aggregate competence conceals localized failure (Section~5.6);
+``residual headroom'' denotes gap remaining after the repair attempts
+described in Section~4.6.
+
+\section{Evasion (Paraphrastic Attack)}
+The transformation of MGT by paraphrasing models or prompts intended to
+defeat detection while preserving meaning, as instantiated by the evader
+suite carried over from the idea-phase work and by the attack conditions
+present natively in RAID. Robustness claims always specify attacker
+strength and whether the detector saw attacked text in training.
+
+\section{Linguistic Splitting}
+The idea-phase construct underlying feature design: partitioning documents
+by measurable linguistic dimensions (register, discourse structure,
+lexical diversity bands) so that detector behavior can be profiled per
+split rather than aggregated. It survives in this thesis as the slicing
+scheme used in the headroom and breakdown audits.
+
+\section{Intrinsic Dimension (of Representations)}
+The estimated dimensionality of the embedding manifold occupied by a
+document set, computed with a fixed estimator in the project's metrics
+toolchain (settings frozen in the run configurations) as a descriptive
+statistic contrasting HWT and MGT manifolds. It is used interpretively
+(Chapter~5), not as a standalone classifier.
+
+\section{Consent Pipeline / Participant-Data Guard}
+The paired mechanisms governing ethical data handling: consent capture
+(versioned forms, timestamped receipts) and automated screening that
+blocks ingestion of material failing privacy or scope checks. Their joint
+pass is a precondition for any text entering the own-corpus tier.
+
+\section{Composition Provenance (Manuscript-Level)}
+The per-section record of how thesis prose was produced (typed by the
+researcher, manually revised, or machine-assisted), shipped as
+Appendix~H. This term exists to draw a bright line between the thesis's
+research objects (detectors, evaders) and its own writing process:
+evasion-oriented tooling is applied to experiment data only, never to
+manuscript text.

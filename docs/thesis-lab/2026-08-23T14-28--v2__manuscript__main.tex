@@ -1,0 +1,211 @@
+% =====================================================================
+% CANONICAL SINGLE-SOURCE-OF-TRUTH MANUSCRIPT (v2, rev L-104)
+% =====================================================================
+% Purpose
+%   This file instantiates the university-thesis template already present at
+%   .agents/skills/writing-academic-paper-all-in-one/templates as the ONE
+%   authoritative manuscript. Nothing outside v2/ is modified or deleted;
+%   existing Chapter 1 (Introduction.docx) and the three competing Chapter 2
+%   versions ('final', 'submitted', Turnitin PDF) are migrated here as
+%   chapters/ch1.tex and chapters/ch2.tex once their prose is transcribed.
+%
+% Compliance targets (per VSU 2010 manual + 2023 ComSci outline):
+%   - Paper size ............ A4 selected below; 8.5"x11" alternative pending
+%                             departmental template ruling
+%   - Margins ............... left 1.5\", top/right/bottom 1\"
+%   - Body font ............. Times-like 12pt, double-spaced
+%   - Pagination ............ lower-right, small Roman numerals for
+%                             preliminary pages; Arabic starting Chapter 1
+%                             (implemented via fancyhdr below)
+%   - Citation style ........ PENDING ADVISER DECISION: ATR referencing vs
+%                             VSU 2010 manual. Encoded once, then enforced by
+%                             manuscript_lint.py as a pre-commit gate.
+%
+% PROGRAM-LEVEL WARNING: the degree program is deliberately a FILL token.
+% Do not render a title page until Master/Doctor/Bachelor is pinned against
+% registrar records; several boilerplate strings below ("Graduate School",
+% "A Thesis") depend on that ruling.
+%
+% Fill convention:
+%   Every token of the form [[FILL: <artifact>]] marks a value that MUST be
+%   transcribed verbatim from the named repository artifact (results file,
+%   config JSON, or validity audit) before compilation for submission.
+%   No number may be typed from memory. This is a hard rule of this package.
+%
+% Pre-commit gates to wire after adoption:
+%   python src/tools/manuscript_lint.py && python src/tools/citation_checker.py
+% =====================================================================
+
+\documentclass[12pt,a4paper]{report}
+
+% ------------------------- Packages -----------------------------------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{times}                 % Times-like body face per VSU manual
+\usepackage[margin=1in,left=1.5in]{geometry}
+\usepackage{setspace}\doublespacing
+\usepackage{graphicx}
+\usepackage{booktabs}              % professional tables (parameter tables)
+\usepackage{longtable}
+\usepackage{amsmath,amssymb}
+\usepackage[hidelinks]{hyperref}
+\usepackage[numbers,sort&compress]{natbib} % numbered scheme; switch per style ruling
+\usepackage{titlesec}
+\usepackage{tocloft}
+\usepackage{xcolor}
+
+% ------------------- Pagination (lower-right, per spec) ----------------
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyfoot[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0pt}
+\fancypagestyle{plain}{% chapter-opening pages follow the same placement
+  \fancyhf{}\fancyfoot[R]{\small\thepage}\renewcommand{\headrulewidth}{0pt}}
+
+% ------------------------- Front matter -------------------------------
+\newcommand{\ThesisTitleA}{Robust Detection of Machine-Generated Academic Text\\
+under Paraphrastic Evasion: A Surrogate-Trained,\\ Human-Corpus-Validated Approach}
+% NOTE: Title above is the working synthesis of the idea-phase novelty chain
+% (intrinsic dimension -> linguistic splitting -> evaders). Confirm exact
+% registered title with adviser; do not silently diverge from it.
+% TITLE-CLAIM CAUTION: "Human-Corpus-Validated" must remain accurate to the
+% executed design -- validation is primarily the stratified RAID subsample,
+% with the consent-gated own corpus as the second tier. Adviser confirms the
+% emphasis is fair; otherwise prefer "Benchmark- and Human-Corpus-Validated".
+
+\newcommand{\ThesisAuthor}{[[FILL: raw/administrative-requirements author block]]}
+\newcommand{\ThesisProgram}{[[FILL: exact degree program --- resolve Bachelor/Master/Doctor discrepancy against registrar records before ANY compile]]}
+\newcommand{\ThesisAdviser}{[[FILL: adviser name]]}
+\newcommand{\ThesisMonthYear}{[[FILL: defense month year]]}
+
+\begin{document}
+
+% ======================= PRELIMINARIES =================================
+\pagenumbering{roman}
+
+% --- Title page --------------------------------------------------------
+\begin{titlepage}
+  \centering
+  \vspace*{1cm}
+  {\large \ThesisTitleA \par}
+  \vspace{2cm}
+  {\large [[FILL: cover boilerplate -- "A Thesis"/"Undergraduate Thesis"
+  Presented to the Faculty of the Graduate School/College" depends on the
+  program-level ruling above]]\\
+  Visayas State University\\[0.5em]
+  In Partial Fulfillment of the Requirements for the Degree of\\
+  \ThesisProgram \par}
+  \vspace{2cm}
+  {\large By\\ \ThesisAuthor \\ \ThesisMonthYear \par}
+\end{titlepage}
+
+% --- Approval sheet ----------------------------------------------------
+\chapter*{Approval Sheet}
+\addcontentsline{toc}{chapter}{Approval Sheet}
+Approved in partial fulfillment of the requirements for the degree
+\ThesisProgram{}.
+
+\ThesisTitleA{}
+
+\vspace{2em}
+\textbf{\ThesisAdviser}\\ Adviser \hfill Date: \rule{3cm}{0.4pt}
+
+\vspace{2em}
+Members of the Thesis Committee:\\[1em]
+\rule{6cm}{0.4pt}\\ Member \hfill Date: \rule{3cm}{0.4pt}
+
+\vspace{1em}
+\rule{6cm}{0.4pt}\\ Member \hfill Date: \rule{3cm}{0.4pt}
+
+\vspace{1em}
+\rule{6cm}{0.4pt}\\ Member \hfill Date: \rule{3cm}{0.4pt}
+
+\vspace{2em}
+Approved by the Graduate School:\\[1em]
+\rule{6cm}{0.4pt}\\ Dean, Graduate School \hfill Date: \rule{3cm}{0.4pt}
+
+% --- Abstract ----------------------------------------------------------
+\chapter*{Abstract}
+\addcontentsline{toc}{chapter}{Abstract}
+\noindent\textbf{Keywords:} machine-generated text detection, paraphrase
+evasion, surrogate training, calibration, RAID, academic integrity
+
+[[FILL: Abstract drafted LAST, after Ch5 numbers are locked. Skeleton:]]
+(1) Problem: academic text authored by large language models evades both
+human raters and deployed detectors, especially under paraphrase
+[CITATION NEEDED: anchor to RRL entries at migration -- e.g., paraphrase
+evasion and benchmark-robustness literature; do not leave the opening
+problem statement uncited].
+(2) Gap: prior work frequently evaluates detectors in-distribution;
+robustness to cross-generator transfer and evasion co-measured with
+calibration remains rare [CITATION NEEDED: ground in wang2024raid and
+calibration-critique literature; soften "train and evaluate on the same
+generator family" unless a cited source supports that exact claim].
+(3) Method: detector trained on surrogate\_v2 synthetic corpora; externally
+validated on a stratified RAID subsample; feasibility-gated own written
+corpus collected under a consent-and-guard pipeline.
+(4) Results: [[FILL: headline AUROC by model/condition from
+implementation/results/full\_study\_results.md]]; paired deltas versus
+baselines [[FILL]]; reliability/calibration summary [[FILL]];
+headroom-by-length audit finding [[FILL]].
+(5) Conclusion: surrogate-only training transfers imperfectly; residual
+headroom concentrates on [[FILL: condition]], motivating the limitations
+agenda in Chapter 6.
+
+% --- Acknowledgment / Dedication / TOC / LoT / LoF ----------------------
+\chapter*{Acknowledgment}
+\addcontentsline{toc}{chapter}{Acknowledgment}
+[[FILL: personal acknowledgments]]
+
+\tableofcontents
+\listoftables
+\listoffigures
+
+% ======================= BODY ==========================================
+\cleardoublepage
+\pagenumbering{arabic}
+
+% Chapter 1 -- migrate from raw/chapters/Introduction.docx AFTER running the
+% proposal-to-results alignment pass documented in
+% v2/writing/objectives-alignment-matrix.md. Do NOT paste the proposal-stage
+% future-tense text unchanged.
+%\include{chapters/ch1-introduction}
+
+% Chapter 2 -- migrate the DEFINITIVE RRL version only ('final'), reconcile
+% against v2/references/references.bib, drop the two superseded variants.
+%\include{chapters/ch2-review-related-literature}
+
+% Chapter 3 -- new, complete draft shipped in this package.
+\include{chapters/ch3-operational-definition-of-terms}
+
+% Chapter 4 -- new, complete draft shipped in this package.
+\include{chapters/ch4-methodology}
+
+% Chapter 5 -- new, complete draft shipped in this package.
+\include{chapters/ch5-results-and-discussion}
+
+% Chapter 6 -- new, complete draft shipped in this package.
+\include{chapters/ch6-summary-conclusions-recommendations}
+
+% ======================= BACK MATTER ===================================
+% references.bib lives at v2/references/references.bib (one directory up);
+% path below is relative to v2/manuscript/.
+\bibliographystyle{plainnat}
+\bibliography{../references/references}
+
+\appendix
+\chapter*{Appendices}
+\addcontentsline{toc}{chapter}{Appendices}
+% Appendix inventory (each appendix lives in its own included file):
+% A. Consent form and participant information sheet (from consent pipeline)
+% B. Participant-data-guard policy excerpt
+% C. surrogate_v2 generation configuration (verbatim JSON, redacted keys)
+% D. RAID subsample stratification manifest
+% E. own_corpus_feasibility gate specification and freeze memo
+% F. Provenance chain-of-custody record for recovered device shards
+% G. Validity audit 2026-07-25 executive summary
+% H. Composition-provenance ledger for this manuscript (see
+%    v2/governance/integrity-firewall-policy.md)
+
+\end{document}

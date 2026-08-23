@@ -40,6 +40,7 @@ function fetchTextFiles(paths, maxBytesPerFile = 12000, maxFiles = 25) {
 
 async function modeSurvey(audit) {
   await runGate(process.env);
+  { const { gatewayDown } = await import("./lib/gateway-health.mjs"); if (gatewayDown(process.env.FLEET_STATE_ROOT || process.cwd())) { console.log("THESIS_SKIPPED=circuit-open"); return 0; } }
   const treeInfo = listThesisTree();
   const digest = [
     `THESIS repo file inventory (${treeInfo.files.length} files):`,
@@ -101,6 +102,7 @@ function validateV2(files) {
 
 async function modeDraft(audit) {
   await runGate(process.env);
+  { const { gatewayDown } = await import("./lib/gateway-health.mjs"); if (gatewayDown(process.env.FLEET_STATE_ROOT || process.cwd())) { console.log("THESIS_SKIPPED=circuit-open"); return 0; } }
   const dir = process.env.FLEET_ARTIFACT_DIR || ".";
   const surveyPath = path.join(dir, "thesis-survey.json");
   if (!existsSync(surveyPath)) throw new Error("thesis-survey.json missing");

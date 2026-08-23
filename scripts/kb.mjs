@@ -63,6 +63,7 @@ function fetchKeyKbText(paths) {
 
 async function modeInventory(audit) {
   await runGate(process.env);
+  { const { gatewayDown } = await import("./lib/gateway-health.mjs"); if (gatewayDown(process.env.FLEET_STATE_ROOT || process.cwd())) { console.log("KB_SKIPPED=circuit-open"); return 0; } }
   const treeInfo = listKbTree();
   const digest = [
     `KB markdown inventory (${treeInfo.files.length} files):`,
@@ -141,6 +142,13 @@ async function gdriveFetchIfConfigured(audit) {
 async function modeSynthesize(audit) {
   await runGate(process.env);
   await gdriveFetchIfConfigured(audit);
+  {
+    const { gatewayDown } = await import("./lib/gateway-health.mjs");
+    if (gatewayDown(process.env.FLEET_STATE_ROOT || process.cwd())) {
+      console.log("KB_SKIPPED=circuit-open");
+      return 0;
+    }
+  }
   const dir = process.env.FLEET_ARTIFACT_DIR || ".";
   const invPath = path.join(dir, "kb-inventory.json");
   let surveyText = "";

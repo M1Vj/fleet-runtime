@@ -123,6 +123,13 @@ async function mainWorker() {
   const repo = process.env.FLEET_REPO;
   const kind = process.env.FLEET_KIND;
   audit.note("task", `${repo} ${kind}`);
+  const { gatewayDown } = await import("./lib/gateway-health.mjs");
+  if (gatewayDown(process.env.FLEET_STATE_ROOT || process.cwd())) {
+    console.log(`DEEP_SKIPPED=circuit-open ${repo}`);
+    writeFileSync(path.join(process.env.FLEET_ARTIFACT_DIR || ".", `report-${repo.replace("/", "__")}.json`), JSON.stringify({ repo, kind, findings: [{ severity: "low", title: "skipped", detail: "gateway circuit open" }], verdict: "Skipped during gateway outage." }, null, 2));
+    console.log(`DEEP_RESULT_FILE=${path.join(process.env.FLEET_ARTIFACT_DIR || ".", `report-${repo.replace("/", "__")}.json`)}`);
+    return 0;
+  }
   const cloneDir = `/tmp/deep-${String(repo).replace("/", "__")}`;
   gh(["repo", "clone", repo, cloneDir, "--", "--depth", "1"], process.env);
   const analysis = await analyzeOne(repo, kind, cloneDir, audit);

@@ -223,6 +223,14 @@ export async function main() {
     const terminal = makeTerminal(REPO_ROOT, { lane: "patrol", requireWrite: true });
     audit.note("gate", `identity=${identity.login} id=${identity.id} scopes=${identity.scopes.join(",")}`);
 
+    const gwRoot = process.env.FLEET_STATE_ROOT || REPO_ROOT;
+    const { gatewayDown } = await import("./lib/gateway-health.mjs");
+    if (gatewayDown(gwRoot)) {
+      terminal("STALLED", { runId, why: "gateway-circuit-open" });
+      console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "skipped-gateway-down" })}`);
+      return 0;
+    }
+
     const trigger = process.env.FLEET_TRIGGER || "manual";
     const heartbeatPre = readJson(heartbeatPath(), {});
     const coalesce = shouldCoalesce(trigger, heartbeatPre.lastRunUtc);

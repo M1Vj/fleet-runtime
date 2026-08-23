@@ -45,3 +45,7 @@ export function gatewayCircuitOpen(root = process.cwd()) {
 function mkdirSyncSafe(p) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
 }
+
+export function gatewayDown(root = process.cwd()) {
+  return gatewayCircuitOpen(root);
+}

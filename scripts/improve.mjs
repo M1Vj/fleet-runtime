@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import process from "node:process";
+import fsMod from "node:fs";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, ghInput, putFileContent, ensureBranch, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, sha256, configureIdentity } from "./lib/util.mjs";
-import { askModel } from "./lib/model.mjs";
+import { askModel, askModelResilient } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor, verifyCommentAuthor } from "./lib/verify.mjs";
 import { makeTerminal } from "./lib/terminal.mjs";
 import { isSafeRepoPath, sanitizeControlChars, extractJsonObject } from "./lib/directives.mjs";
@@ -70,18 +71,49 @@ async function modeResearch(audit) {
   const identity = await runGate(process.env);
   configureIdentity(REPO_ROOT, identity);
   const repo = process.env.FLEET_REPO;
-  const result = await askModel({ prompt: buildResearchPrompt(repo), timeoutMs: 480000, env: process.env, preferVariantMax: true });
-  audit.note("research", `repo=${repo} complete=${result.complete} attempts=${JSON.stringify(result.attempts)}`);
+  {
+    const { gatewayDown } = await import("./lib/gateway-health.mjs");
+    if (gatewayDown(process.env.FLEET_STATE_ROOT || process.cwd())) {
+      audit.note("research", "gateway circuit open; skipping wave");
+      console.log("IMPROVE_SKIPPED=circuit-open");
+      return 0;
+    }
+  }
+  let workdir;
+  try {
+    workdir = `/tmp/improve-${String(repo).replace("/", "__")}`;
+    gh(["repo", "clone", repo0(repo), workdir, "--", "--depth", "1"], process.env);
+  } catch {
+    workdir = undefined;
+  }
+  const result = await askModelResilient({
+    prompt: buildResearchPrompt(repo),
+    timeoutMs: 480000,
+    env: process.env,
+    preferVariantMax: true,
+    maxRounds: 4,
+    workspace: workdir,
+  });
+  audit.note("research", `repo=${repo} complete=${result.complete} ladders=${result.ladders}`);
+  if (workdir) {
+    try {
+      fsRemove(workdir);
+    } catch {}
+  }
   if (!result.complete || !result.reply) throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });
   const outDir = process.env.FLEET_ARTIFACT_DIR || ".";
   mkdirSync(outDir, { recursive: true });
-  const file = path.join(outDir, `ideas-${repo.replace("/", "__")}.json`);
-  writeFileSync(file, JSON.stringify({ repo, reply: result.reply }, null, 2));
+  writeFileSync(path.join(outDir, `ideas-${repo.replace("/", "__")}.json`), JSON.stringify({ repo, reply: result.reply }, null, 2));
   console.log(`IMPROVE_DONE=research:${repo}`);
   return 0;
 }
 
-export { extractJsonObject as extractJsonRobust };
+function repo0(name) {
+  return name;
+}
+function fsRemove(target) {
+  fsMod.rmSync(target, { recursive: true, force: true });
+}
 
 export function extractJson(replyText) {
   return extractJsonObject(replyText);

@@ -210,6 +210,11 @@ async function main() {
   }
 
   const { pr, files } = await getPr();
+  if (pr.state !== "open") {
+    await recordTerminalState("NO-OP", { repo: TARGET_REPO, pr: PR_NUMBER, why: `state=${pr.state}` });
+    console.log("MERGE_TERMINAL_STATE=NO-OP");
+    return finish(audit, runId, "NO-OP");
+  }
   await verifyPullAuthor(TARGET_REPO, PR_NUMBER, identity, process.env.FLEET_GH_TOKEN);
   if (!pr.head || !pr.head.sha) throw new Error("no head sha");
 

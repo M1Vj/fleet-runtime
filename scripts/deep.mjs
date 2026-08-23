@@ -94,7 +94,17 @@ export async function analyzeOne(repo, kind, audit) {
   });
   audit.note("model", `repo=${repo} kind=${kind} complete=${result.complete} attempts=${JSON.stringify(result.attempts)}`);
   if (!result.complete || !result.reply) throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });
-  return { ...parseFindings(result.reply), sessionId: result.sessionId, modelMode: result.modelMode };
+  try {
+    return { ...parseFindings(result.reply), sessionId: result.sessionId, modelMode: result.modelMode };
+  } catch (err) {
+    audit.note("parse-fallback", `unparsable model reply (${String(err.message).slice(0, 100)}); recording degraded findings`);
+    return {
+      findings: [{ severity: "medium", title: "review output unusable", detail: String(err.message).slice(0, 200) }],
+      verdict: "Model reply could not be parsed into structured findings; re-run this lane.",
+      sessionId: result.sessionId,
+      modelMode: result.modelMode,
+    };
+  }
 }
 
 function buildPromptFor(task) {

@@ -167,6 +167,7 @@ async function mainCommit() {
   }
   saveQueue(queue);
   audit.note("reports", `written=${processed}`);
+  makeTerminal(REPO_ROOT)("SUCCESS", { runId, reportsCommitted: processed });
   if (gitHasChanges(REPO_ROOT, ["state/queue.jsonl", "docs/reports"])) {
     gitAdd(REPO_ROOT, ["state/queue.jsonl", "docs/reports"]);
     gitCommit(REPO_ROOT, `[fleet] deep reports ${runId}`, identity);
@@ -176,7 +177,6 @@ async function mainCommit() {
     audit.note("push-verify", `attribution verified sha=${sha.slice(0, 10)}`);
   }
   audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Deep commit", "ok", { lane });
-  makeTerminal(REPO_ROOT)("SUCCESS", { runId, reportsCommitted: processed });
   console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "ok", reportsCommitted: processed })}`);
   return 0;
 }

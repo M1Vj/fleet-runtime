@@ -296,6 +296,8 @@ export async function main() {
 
     const auditFileRel = path.relative(REPO_ROOT, audit.writeMarkdown(AUDIT_DIR, runId, "Patrol run", "ok"));
     status = "ok";
+    const state = status === "ok" ? "SUCCESS" : "NO-OP";
+    terminal(state, { runId, modelMode, mutations, trigger });
 
     enqueueDeepTasks(signals);
     audit.note("deep-queue", `tasks enqueued (rotation)`);
@@ -335,8 +337,6 @@ export async function main() {
         JSON.stringify({ ...(readJson(heartbeatPath(), {})), patrolsSinceSelftest: patrolsSince }, null, 2),
       );
     }
-    const state = status === "ok" ? "SUCCESS" : "NO-OP";
-    terminal(state, { runId, modelMode, mutations, trigger });
     console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status, modelMode, directives: directives.length, mutations, auditFile: auditFileRel })}`);
     return 0;
   } catch (err) {

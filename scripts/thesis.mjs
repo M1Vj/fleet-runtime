@@ -55,7 +55,11 @@ async function modeSurvey(audit) {
     "Snapshot:",
     digest,
   ].join("\n");
-  const result = await askModel({ prompt, timeoutMs: 600000, env: process.env, preferVariantMax: true, maxRounds: 4 });
+  let result = await askModel({ prompt, timeoutMs: 600000, env: process.env, preferVariantMax: true, maxRounds: 4 });
+  if (!result.complete) {
+    await new Promise((r) => setTimeout(r, 90000));
+    result = await askModel({ prompt, timeoutMs: 600000, env: process.env, preferVariantMax: true, maxRounds: 3 });
+  }
   audit.note("survey", `complete=${result.complete}`);
   if (!result.complete || !result.reply) throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });
   const dir = process.env.FLEET_ARTIFACT_DIR || ".";
@@ -117,6 +121,11 @@ async function modeDraft(audit) {
     treeInfo.files.join("\n").slice(0, 8000),
   ].join("\n");
   let result = await askModel({ prompt, timeoutMs: 600000, env: process.env, preferVariantMax: true, maxRounds: 5 });
+  if (!result.complete) {
+    audit.note("draft-retry", "model unavailable; second ladder after cooldown");
+    await new Promise((r) => setTimeout(r, 120000));
+    result = await askModel({ prompt, timeoutMs: 600000, env: process.env, preferVariantMax: true, maxRounds: 4 });
+  }
   audit.note("draft", `complete=${result.complete} attempts=${JSON.stringify(result.attempts)}`);
   if (!result.complete || !result.reply) throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });
 

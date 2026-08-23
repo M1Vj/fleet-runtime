@@ -184,6 +184,11 @@ async function modeSynthesize(audit) {
   ].join("\n");
 
   let result = await askModel({ prompt, timeoutMs: 600000, env: process.env, preferVariantMax: true, maxRounds: 5 });
+  if (!result.complete) {
+    audit.note("synthesize-retry", "model unavailable; second ladder after cooldown");
+    await new Promise((r) => setTimeout(r, 90000));
+    result = await askModel({ prompt, timeoutMs: 600000, env: process.env, preferVariantMax: true, maxRounds: 4 });
+  }
   audit.note("synthesize", `complete=${result.complete}`);
   if (!result.complete || !result.reply) throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });
 
@@ -335,8 +340,9 @@ async function modeShip(audit) {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 16);
   writeFileSync(path.join(labDir, `${stamp}--package.md`),
     ["# KB synthesis package", `- PR: ${pr.html_url}`, `- files: ${files.map((f) => f.path).join(", ")}`, "", ...files.flatMap((f) => ["## " + f.path, "", f.content])].join("\n"));
-  if (gitHasChanges(REPO_ROOT, ["docs/kb-lab", "docs/gdrive-inbox"])) {
-    gitAdd(REPO_ROOT, ["docs/kb-lab", "docs/gdrive-inbox"]);
+  const labPaths = ["docs/kb-lab", "docs/gdrive-inbox"].filter((p2) => existsSync(path.join(REPO_ROOT, p2)));
+  if (labPaths.length > 0 && gitHasChanges(REPO_ROOT, labPaths)) {
+    gitAdd(REPO_ROOT, labPaths);
     gitCommit(REPO_ROOT, `[fleet] kb-lab mirror ${stamp} PR#${pr.number}`, identity);
     gitPush(REPO_ROOT, "main", process.env);
     const sha = gitRevParse(REPO_ROOT, "HEAD");

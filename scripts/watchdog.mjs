@@ -53,10 +53,19 @@ export async function main() {
       return 0;
     }
 
-    for (const repoFullName of ["M1Vj/fleet-runtime", "M1Vj/fleet-control"]) {
-      for (const wf of ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml"]) {
-        gh(["api", "-X", "PUT", `/repos/${repoFullName}/actions/workflows/${wf}/enable`], process.env);
-        audit.note("re-enable", `${repoFullName}/${wf}`);
+    const enablePlan = {
+      "M1Vj/fleet-runtime": ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml"],
+      "M1Vj/fleet-control": ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml"],
+    };
+    for (const [repoFullName, workflows] of Object.entries(enablePlan)) {
+      for (const wf of workflows) {
+        try {
+          gh(["api", "-X", "PUT", `/repos/${repoFullName}/actions/workflows/${wf}/enable`], process.env);
+          audit.note("re-enable", `${repoFullName}/${wf}`);
+        } catch (err) {
+          if (!/404|not found/i.test(String(err.message))) throw err;
+          audit.note("re-enable-skip", `${repoFullName}/${wf} absent`);
+        }
       }
     }
     const queuePath = path.join(REPO_ROOT, "state", "queue.jsonl");

@@ -58,17 +58,19 @@ test("merge classify: mdx counts as UI", async () => {
   assert.equal(r.uiTouched, true);
 });
 
-test("merge classify: workflow edits are HIGH", async () => {
+test("merge classify: workflow edits with deletions are HIGH", async () => {
   const { classify } = await import("../scripts/merge.mjs");
   const r = classify([{ filename: ".github/workflows/ci.yml", additions: 5, deletions: 1 }]);
   assert.equal(r.risk, "HIGH");
 });
 
-test("merge classify: >400 line diff is HIGH", async () => {
+test("merge classify: >800 line diff is HARD, 250-800 MEDIUM", async () => {
   const { classify } = await import("../scripts/merge.mjs");
-  const r = classify([{ filename: "src/big.ts", additions: 300, deletions: 150 }]);
-  assert.equal(r.risk, "HIGH");
-  assert.equal(r.size, 450);
+  const big = classify([{ filename: "src/big.ts", additions: 700, deletions: 150 }]);
+  assert.equal(big.risk, "HIGH");
+  assert.equal(big.size, 850);
+  const mid = classify([{ filename: "src/mid.ts", additions: 200, deletions: 60 }]);
+  assert.equal(mid.risk, "MEDIUM");
 });
 
 test("secretsInDiff flags leaked token patterns", async () => {

@@ -49,7 +49,13 @@ export function classify(files) {
     additions += f.additions || 0;
     deletions += f.deletions || 0;
     if (UI_EXTENSIONS.test(f.filename)) uiTouched = true;
-    if (/^\.github\/workflows\//.test(f.filename)) wfFiles.push(f);
+    if (/^\.github\/workflows\//.test(f.filename)) {
+      wfFiles.push(f);
+      if ((f.deletions || 0) > 0) {
+        hard = true;
+        reasons.push(`workflow deletions in ${f.filename}`);
+      }
+    }
     for (const re of HARD_RISK_PATTERNS) {
       if (re.test(f.filename)) {
         hard = true;

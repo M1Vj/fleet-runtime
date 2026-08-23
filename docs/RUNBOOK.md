@@ -88,3 +88,20 @@ interval by editing `.github/workflows/patrol.yml`.
 
 - Pin actions/checkout and actions/setup-node by commit SHA.
 - Optional: environment protection rules requiring owner review for patrol dispatches.
+
+## Lanes added since v1 (quick reference)
+
+- **fleet-merge-gate** (every 15min + dispatch `repo`/`pr`/`routes`): risk classify →
+  deterministic L1/L2 gates → visual before/after (screenshots + pixelmatch + axe +
+  console) → two independent maker≠checker judges → auto-merge or BLOCKED with reasons.
+  Terminal states recorded in `state/merges.jsonl`. Vision verdicts are advisory.
+- **fleet-retro** (daily 05:19): reads own telemetry, files `[RETRO] <date>` improvement
+  issues; also regenerates `docs/status.md`.
+- **fleet-thesis** (2×/day): THESIS improvement agent — everything lands under `v2/`
+  only; original files untouched. Draft PRs on M1Vj/THESIS.
+- **fleet-kb** (2×/day): OKF-compliant KB synthesis with frontmatter validation; Google
+  Drive ingestion activates when owner sets GDRIVE_* secrets.
+- **Dry-run canary**: selftest T11 runs the real watchdog with FLEET_WATCHDOG_DRY_RUN=1
+  against a synthetic stall — integration proof without side effects.
+- **Backpressure**: deep queue intake caps at 12 open tasks; prune duplicates manually
+  via state/queue.jsonl if ever needed.

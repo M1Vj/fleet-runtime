@@ -187,9 +187,17 @@ async function modePlan(audit) {
       audit.note("plan", `${data.repo}: ideas unparsable (${err.message})`);
       continue;
     }
+    let workdir;
+    try {
+      workdir = `/tmp/improve-plan-${String(data.repo).replace("/", "__")}`;
+      gh(["repo", "clone", repo0(data.repo), workdir, "--", "--depth", "1"], process.env);
+    } catch {
+      workdir = undefined;
+    }
     const planPrompt = [
       `You are the planning sub-agent for repo ${data.repo}. Turn this improvement idea into a concrete minimal implementation plan.`,
       `Idea: ${idea.title}. Rationale: ${idea.rationale}. Evidence: ${idea.evidence}.`,
+      workdir ? `A shallow clone of the repository is mounted at your working directory ('.') — inspect real code with read/grep/glob before planning.` : "",
       "You may fetch authoritative docs via webfetch if needed.",
       "Respond in EXACTLY this plain-text format (no markdown headers, no extra prose):",
       "PLAN",
@@ -203,8 +211,13 @@ async function modePlan(audit) {
       "```",
       "Constraints: at most 6 files; each file under 15000 chars; no .env*, *.pem, *.key, state/, audit/ paths; no '..' in paths.",
     ].join("\n");
-    const plan = await askModel({ prompt: planPrompt, timeoutMs: 480000, env: process.env, preferVariantMax: true });
+    const plan = await askModel({ prompt: planPrompt, timeoutMs: 480000, env: process.env, preferVariantMax: true, maxRounds: 4, workspace: workdir });
     audit.note("plan", `repo=${data.repo} complete=${plan.complete} attempts=${JSON.stringify(plan.attempts)}`);
+    if (workdir) {
+      try {
+        (await import("node:fs")).rmSync(workdir, { recursive: true, force: true });
+      } catch {}
+    }
     if (!plan.complete || !plan.reply) continue;
     let parsed;
     try {

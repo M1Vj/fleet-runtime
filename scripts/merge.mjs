@@ -8,6 +8,7 @@ import { scrub, gh, ghInput, gitRevParse, configureIdentity, safeCommitState, in
 import { askModel } from "./lib/model.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
 import { verifyCommit } from "./lib/verify.mjs";
+import { findSuperseded, isStale } from "./lib/pr-hygiene.mjs";
 import { verifyPullAuthor } from "./lib/verify.mjs";
 
 const REPO_ROOT = process.cwd();
@@ -148,6 +149,43 @@ async function commitState(audit, identity, message) {
   }
 }
 
+async function runHygiene(identity, audit) {
+  const repos = gh(["api", "/user/repos?affiliation=owner&per_page=100&sort=pushed"], process.env) || [];
+  const entries = [];
+  for (const r of repos) {
+    try {
+      const pulls = gh(["api", `/repos/${r.full_name}/pulls?state=open&per_page=30`], process.env) || [];
+      for (const p of pulls) {
+        if (!(p.user && p.user.login === "M1Vj") || !String(p.head.ref || "").startsWith("fleet/")) continue;
+        const files = gh(["api", `/repos/${r.full_name}/pulls/${p.number}/files?per_page=100`], process.env) || [];
+        entries.push({ repo: r.full_name, number: p.number, state: "open", draft: p.draft, created_at: p.created_at, files, title: p.title });
+      }
+    } catch {}
+  }
+  const now = Date.now();
+  for (const sup of findSuperseded(entries, now)) {
+    try {
+      await postComment(sup.repo, sup.number, `♻️ **fleet hygiene**: superseded by #${sup.supersededBy} (overlapping files). Closing this draft; reopen if still relevant.`, audit);
+      gh(["api", "-X", "PATCH", `/repos/${sup.repo}/pulls/${sup.number}`, "-f", "state=closed"], process.env);
+      await recordTerminalState("STALLED", { repo: sup.repo, pr: sup.number, why: "superseded", by: sup.supersededBy });
+      audit.note("hygiene", `closed superseded ${sup.repo}#${sup.number}`);
+    } catch (err) {
+      audit.note("hygiene-error", `${sup.repo}#${sup.number}: ${err.message.slice(0, 120)}`);
+    }
+  }
+  for (const e of entries) {
+    if (!isStale(e, now)) continue;
+    try {
+      await postComment(e.repo, e.number, "🕰 **fleet hygiene**: this draft has been open 14+ days without action. Closing to keep the queue honest — reopen if still relevant.", audit);
+      gh(["api", "-X", "PATCH", `/repos/${e.repo}/pulls/${e.number}`, "-f", "state=closed"], process.env);
+      await recordTerminalState("STALLED", { repo: e.repo, pr: e.number, why: "stale-14d" });
+      audit.note("hygiene", `closed stale ${e.repo}#${e.number}`);
+    } catch (err) {
+      audit.note("hygiene-error", `${e.repo}#${e.number}: ${err.message.slice(0, 120)}`);
+    }
+  }
+}
+
 async function discoverFleetPRs(limit = 3) {
   const repos = gh(["api", "/user/repos?affiliation=owner&per_page=100&sort=pushed"], process.env) || [];
   const found = [];
@@ -203,6 +241,8 @@ async function main() {
         audit.incident("child", `${item.repo}#${item.number}: ${err.message}`);
       }
     }
+    await runHygiene(identity, audit);
+
     audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Merge gate scan", "ok");
     safeCommitState(REPO_ROOT, ["state", "audit"], `[fleet] merge-gate scan ${runId}`, identity, process.env);
     console.log("MERGE_TERMINAL_STATE=SCAN-DONE");

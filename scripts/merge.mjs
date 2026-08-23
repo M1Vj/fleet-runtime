@@ -78,10 +78,13 @@ async function runDeterministicChecks(repo, headSha, audit) {
   const workdir = "/tmp/pr-checkout";
   gh(["repo", "clone", repo, workdir, "--", "--depth", "1"], process.env);
   const { spawnSync } = await import("node:child_process");
-  const fr = spawnSync("git", ["fetch", "-q", "--depth", "1", "origin", headSha], { cwd: workdir, encoding: "utf8" });
+  let fr = spawnSync("git", ["fetch", "-q", "--depth", "1", "origin", headSha], { cwd: workdir, encoding: "utf8" });
+  if (fr.status !== 0) {
+    fr = spawnSync("git", ["fetch", "-q", "--depth", "1", "origin", `refs/pull/${PR_NUMBER}/head`], { cwd: workdir, encoding: "utf8" });
+  }
   const co = spawnSync("git", ["checkout", "-q", "FETCH_HEAD"], { cwd: workdir, encoding: "utf8" });
   if (fr.status !== 0 || co.status !== 0) {
-    evidenceLines.push("checkout: failed to fetch head sha");
+    evidenceLines.push(`checkout failed: fetch=${fr.status}/${String(fr.stderr).slice(-200)} checkout=${co.status}/${String(co.stderr).slice(-200)}`);
     return { ok: false, evidence: evidenceLines.join("\n") };
   }
   evidenceLines.push(`checkout: head ${headSha.slice(0, 10)} ok`);

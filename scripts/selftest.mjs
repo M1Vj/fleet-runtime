@@ -145,7 +145,7 @@ export async function main() {
         return Buffer.concat([len, body, crc]);
       };
       const solidPng = (r, g, b) => {
-        const w = 8, hgt = 8;
+        const w = 96, hgt = 96;
         const ihdr = Buffer.alloc(13);
         ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(hgt, 4); ihdr[8] = 8; ihdr[9] = 2;
         const rowTail = Buffer.alloc(w * 3);

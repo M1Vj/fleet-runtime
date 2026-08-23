@@ -41,6 +41,7 @@ function resolvePlaywright() {
 }
 
 async function main() {
+  if (process.env.FLEET_GH_TOKEN && !process.env.GH_TOKEN) process.env.GH_TOKEN = process.env.FLEET_GH_TOKEN;
   mkdirSync(OUT_DIR, { recursive: true });
   const evidence = [];
   const playwright = resolvePlaywright();

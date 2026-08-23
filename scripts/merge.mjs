@@ -169,6 +169,7 @@ async function main() {
   const audit = new AuditBuffer(scrub(process.env));
   const identity = await runGate(process.env);
   configureIdentity(REPO_ROOT, identity);
+  if (process.env.FLEET_GH_TOKEN && !process.env.GH_TOKEN) process.env.GH_TOKEN = process.env.FLEET_GH_TOKEN;
   audit.note("gate", `identity=${identity.login} target=${TARGET_REPO} pr=${PR_NUMBER}`);
 
   if (!TARGET_REPO || !PR_NUMBER) {

@@ -114,9 +114,69 @@ jobs:
           FLEET_DISPATCH_ID: ${{ inputs.dispatch_id }}
         run: node scripts/merge.mjs
 
-  target-check:
+  materialize-target:
     needs: authorize
     if: ${{ github.event_name == 'workflow_dispatch' && needs.authorize.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      repo: ${{ steps.materialize.outputs.repo }}
+      pr: ${{ steps.materialize.outputs.pr }}
+      head_sha: ${{ steps.materialize.outputs.head_sha }}
+      artifact_name: ${{ steps.materialize.outputs.artifact_name }}
+    steps:
+      - name: checkout target at authorized head with mutation credential
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ needs.authorize.outputs.repo }}
+          ref: ${{ needs.authorize.outputs.head_sha }}
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: target
+      - name: materialize digest-bound source artifact
+        id: materialize
+        env:
+          TARGET_DIR: ${{ github.workspace }}/target
+          TARGET_REPO: ${{ needs.authorize.outputs.repo }}
+          TARGET_PR: ${{ needs.authorize.outputs.pr }}
+          TARGET_SHA: ${{ needs.authorize.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          test -d "$TARGET_DIR"
+          if find "$TARGET_DIR" -type l -print -quit | grep -q .; then
+            echo "source contains symlink" >&2
+            exit 1
+          fi
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner --exclude='./.git' -czf target-source.tgz -C "$TARGET_DIR" .
+          sha256sum target-source.tgz > target-source.sha256
+          printf '%s\n' "$TARGET_SHA" > target-source.head-sha
+          {
+            printf 'repo=%s\n' "$TARGET_REPO"
+            printf 'pr=%s\n' "$TARGET_PR"
+            printf 'head_sha=%s\n' "$TARGET_SHA"
+          } > target-source.meta
+          {
+            printf 'repo=%s\n' "$TARGET_REPO"
+            printf 'pr=%s\n' "$TARGET_PR"
+            printf 'head_sha=%s\n' "$TARGET_SHA"
+            printf 'artifact_name=target-source-%s\n' "$TARGET_SHA"
+          } >> "$GITHUB_OUTPUT"
+      - name: upload digest-bound source artifact
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: target-source-${{ needs.authorize.outputs.head_sha }}
+          path: |
+            target-source.tgz
+            target-source.sha256
+            target-source.head-sha
+            target-source.meta
+          if-no-files-found: error
+          retention-days: 1
+
+  target-check:
+    needs: materialize-target
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.materialize-target.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 35
     outputs:
@@ -127,36 +187,75 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
-      - name: checkout target at exact head
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: download digest-bound source artifact
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
         with:
-          repository: ${{ needs.authorize.outputs.repo }}
-          ref: ${{ needs.authorize.outputs.head_sha }}
-          token: ${{ secrets.FLEET_GH_TOKEN }}
-          persist-credentials: false
-          fetch-depth: 1
-          path: target
+          name: target-source-${{ needs.materialize-target.outputs.head_sha }}
+          path: source-artifact
+      - name: verify and extract exact source digest
+        env:
+          SOURCE_DIR: ${{ github.workspace }}/source-artifact
+          TARGET_SHA: ${{ needs.materialize-target.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          test "$(cat "$SOURCE_DIR/target-source.head-sha")" = "$TARGET_SHA"
+          (cd "$SOURCE_DIR" && sha256sum -c target-source.sha256)
+          mkdir -p target
+          tar --extract --file "$SOURCE_DIR/target-source.tgz" --directory target --no-same-owner --no-same-permissions
+          if find target -type l -print -quit | grep -q .; then
+            echo "extracted source contains symlink" >&2
+            exit 1
+          fi
       - name: setup node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
-      - name: run untrusted target checks without secrets
+      - name: run target checks without secrets or private state
         id: checks
         continue-on-error: true
         env:
           FLEET_TARGET_DIR: ${{ github.workspace }}/target
           FLEET_EVIDENCE_PATH: ${{ github.workspace }}/target-check/evidence.txt
-          FLEET_HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
-          FLEET_PR_NUMBER: ${{ needs.authorize.outputs.pr }}
-          FLEET_TARGET_REPO: ${{ needs.authorize.outputs.repo }}
+          FLEET_HEAD_SHA: ${{ needs.materialize-target.outputs.head_sha }}
+          FLEET_PR_NUMBER: ${{ needs.materialize-target.outputs.pr }}
+          FLEET_TARGET_REPO: ${{ needs.materialize-target.outputs.repo }}
+          MAX_EVIDENCE_CHARS: "8000"
         run: node scripts/pr-check.mjs
+      - name: bound and redact target evidence
+        if: ${{ always() }}
+        env:
+          EVIDENCE_PATH: ${{ github.workspace }}/target-check/evidence.txt
+          MAX_EVIDENCE_CHARS: "8000"
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$EVIDENCE_PATH")"
+          node --input-type=module <<'NODE'
+          import { existsSync, readFileSync, writeFileSync } from "node:fs";
+          const output = process.env.EVIDENCE_PATH;
+          const limit = 8000;
+          const patterns = [
+            /github_pat_[A-Za-z0-9_]{10,}/gi,
+            /(?:gh[pousr]|xox[baprs])[_-][A-Za-z0-9_-]{10,}/gi,
+            /AKIA[0-9A-Z]{16}/g,
+            /\bsk-[A-Za-z0-9_-]{20,}\b/g,
+            /AIza[A-Za-z0-9_-]{20,}/g,
+            /Bearer\s+[A-Za-z0-9._~+\/-]{16,}/gi,
+            /\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*["']?[^\s"']{12,}["']?/gi,
+            /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
+            /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi,
+          ];
+          let text = existsSync(output) ? readFileSync(output, "utf8") : "target-check evidence unavailable\n";
+          for (const pattern of patterns) text = text.replace(pattern, "[REDACTED]");
+          text = text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "").slice(-limit);
+          writeFileSync(output, text, { encoding: "utf8", mode: 0o600 });
+          NODE
       - name: upload bounded target evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
         with:
           name: target-check-evidence
           path: target-check/evidence.txt
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 1
 
   gate:

@@ -8,6 +8,10 @@ export const HEAD_SHA_PATTERN = /^[0-9a-f]{40}$/i;
 export const MAX_REPO_CHARS = 120;
 export const MAX_REF_CHARS = 120;
 export const MAX_POLICY_ERRORS = 8;
+export const PRIVATE_REPOS = new Set([
+  `${TARGET_OWNER}/vj-knowledge-base`,
+  `${TARGET_OWNER}/fleet-control`,
+]);
 
 function bounded(value, max) {
   return String(value ?? "").trim().slice(0, max);
@@ -97,6 +101,7 @@ export function normalizeTargetInput(input = {}) {
 export function isAllowedRepo(repo, { stateRoot, targets } = {}) {
   const normalized = ownerAndName(repo);
   if (!normalized) return false;
+  if (PRIVATE_REPOS.has(normalized)) return false;
   if (normalized === RUNTIME_REPO) return true;
   return readTier1Repos({ stateRoot, targets }).has(normalized);
 }

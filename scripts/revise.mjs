@@ -14,6 +14,7 @@ import {
   memoryPath,
   readMemoryEvents,
   redactText,
+  revisionCountForTarget,
 } from "./lib/pr-memory.mjs";
 import {
   assertTarget,
@@ -85,9 +86,7 @@ export function readRevisionEvidence(rawPath, { workspaceRoot = REPO_ROOT, maxCh
 }
 
 function revisionCount(memoryFile, repo, pr) {
-  return readMemoryEvents(memoryFile).filter(
-    (entry) => entry.lane === "revise" && entry.repo === repo && entry.pr === pr && entry.state === "REVISION_STARTED",
-  ).length;
+  return revisionCountForTarget(readMemoryEvents(memoryFile), { repo, pr });
 }
 
 function boundedSummary(value, fallback) {
@@ -100,16 +99,25 @@ function formatRevisionPath(filePath) {
 }
 
 function blockerIds(blockers) {
-  return (Array.isArray(blockers) ? blockers : []).slice(0, 8).map((blocker) => sha256(String(blocker)));
+  return (Array.isArray(blockers) ? blockers : []).slice(0, 8).map((blocker) => (
+    /^blocker-[a-f0-9]{16}$/i.test(String(blocker)) ? String(blocker) : `blocker-${sha256(String(blocker)).slice(0, 16)}`
+  ));
 }
 
 function extractJudgeBlockers(body) {
-  const section = String(body || "").split("**Blockers:**")[1] || "";
-  return section
-    .split("\n")
-    .filter((line) => line.trim().startsWith("- "))
-    .slice(0, 8)
-    .map((line) => line.trim().slice(2, 500));
+  return [...new Set(String(body || "").match(/\bblocker-[a-f0-9]{16}\b/gi) || [])].slice(0, 8);
+}
+
+/** Canonical judge blockers survive comment rotation; verified comments are fallback only. */
+export function selectRevisionBlockers(events, { repo, pr, verifiedCommentBody = "" } = {}) {
+  const canonical = (Array.isArray(events) ? events : [])
+    .filter((entry) => entry && entry.repo === repo && Number(entry.pr) === Number(pr))
+    .filter((entry) => ["JUDGE_REJECTED", "REVISION_INTENT"].includes(entry.state))
+    .flatMap((entry) => Array.isArray(entry.blockerIds) ? entry.blockerIds : [])
+    .filter((id) => /^blocker-[a-f0-9]{16}$/i.test(String(id)))
+    .slice(-8);
+  if (canonical.length > 0) return [...new Set(canonical)].slice(0, 8);
+  return extractJudgeBlockers(verifiedCommentBody);
 }
 
 function currentHead(pr) {
@@ -173,6 +181,7 @@ function persistEvent(runtime, context, state, details, identity, audit, { requi
       failure.code = 7;
       throw failure;
     }
+    return { eventResult: null, stateOutcome: "memory-error" };
   }
   const stateOutcome = persistState(runtime, identity, audit, `[fleet] revise ${context.repo}#${context.pr} ${state}`, { required });
   return { eventResult, stateOutcome };
@@ -263,10 +272,21 @@ async function reviseTarget(target, identity, audit, context, runtime) {
 
   const comments = gh(["api", `/repos/${target.repo}/issues/${target.pr}/comments?per_page=20`], runtime.env) || [];
   const lastJudge = [...comments].reverse().find((comment) => comment.body && comment.body.includes("fleet judge panel"));
-  if (!lastJudge) throw new Error("no judge feedback found");
-  if (!lastJudge.id) throw new Error("judge comment response missing id");
-  await verifyCommentAuthor(target.repo, lastJudge.id, identity, runtime.env.FLEET_GH_TOKEN);
-  const blockers = extractJudgeBlockers(lastJudge.body);
+  const priorEvents = readMemoryEvents(runtime.memoryFile);
+  let blockers = selectRevisionBlockers(priorEvents, {
+    repo: target.repo,
+    pr: target.pr,
+  });
+  if (blockers.length === 0) {
+    if (!lastJudge) throw new Error("no judge feedback found");
+    if (!lastJudge.id) throw new Error("judge comment response missing id");
+    await verifyCommentAuthor(target.repo, lastJudge.id, identity, runtime.env.FLEET_GH_TOKEN);
+    blockers = selectRevisionBlockers(priorEvents, {
+      repo: target.repo,
+      pr: target.pr,
+      verifiedCommentBody: lastJudge.body,
+    });
+  }
 
   const filesApi = gh(["api", `/repos/${target.repo}/pulls/${target.pr}/files?per_page=100`], runtime.env) || [];
   const diffValidation = validatePrDiffFiles(filesApi);
@@ -435,12 +455,17 @@ export async function main(env = process.env) {
   } catch (error) {
     auditStatus = "failed";
     if (identity) {
-      persistEvent(runtime, context, "ERROR", { summary: "revision failed" }, identity, audit);
+      try {
+        persistEvent(runtime, context, "ERROR", { summary: "revision failed" }, identity, audit);
+      } catch (persistenceError) {
+        audit.incident("memory", `failure event persistence failed: ${String(persistenceError.message).slice(0, 160)}`);
+      }
     }
     throw error;
   } finally {
     try {
-      audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, `Revise ${target.repo}#${target.pr}`, auditStatus, { lane: "revise" });
+      audit.writeMarkdown(path.join(runtime.stateRoot, "audit"), runId, `Revise ${target.repo}#${target.pr}`, auditStatus, { lane: "revise" });
+      safeCommitState(runtime.stateRoot, ["state", "audit"], `[fleet] revise ${target.repo}#${target.pr} ${auditStatus}`, identity, runtime.env);
     } catch {}
   }
 }

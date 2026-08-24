@@ -20,7 +20,7 @@ test("scan and target runs are separate and scan dispatches one explicit SHA", (
   assert.match(workflow, /target-check:[\s\S]*?if:[^\n]*github\.event_name\s*==\s*['"]workflow_dispatch['"]/);
   assert.match(mergeSource, /actions\/workflows\/merge\.yml\/dispatches/);
   assert.match(mergeSource, /ref:\s*["']main["']/);
-  assert.match(mergeSource, /allow_merge:\s*["']true["']/);
+  assert.match(mergeSource, /allowMerge\s*===\s*true\s*\?\s*["']true["']\s*:\s*["']false["']/);
   assert.doesNotMatch(workflow, /gh workflow run/);
   const scanJob = workflow.slice(workflow.indexOf("  scan:"), workflow.indexOf("  target-check:"));
   assert.doesNotMatch(scanJob, /revise\.mjs/);
@@ -30,15 +30,22 @@ test("scan and target runs are separate and scan dispatches one explicit SHA", (
 
 test("authorization precedes target checkout and target jobs consume only authorized outputs", () => {
   const authorize = workflow.indexOf("  authorize:");
+  const materialize = workflow.indexOf("  materialize-target:");
   const target = workflow.indexOf("  target-check:");
   const gate = workflow.indexOf("  gate:");
-  assert.ok(authorize >= 0 && authorize < target && target < gate);
+  assert.ok(authorize >= 0 && authorize < materialize && materialize < target && target < gate);
+  const materializeJob = workflow.slice(materialize, target);
+  assert.match(materializeJob, /needs:\s*authorize/);
+  assert.match(materializeJob, /secrets\.FLEET_GH_TOKEN/);
+  assert.match(materializeJob, /upload-artifact/);
+  assert.match(materializeJob, /sha256sum/);
   const targetJob = workflow.slice(target, gate);
-  assert.match(targetJob, /needs:\s*authorize/);
-  assert.match(targetJob, /repository:\s*\$\{\{\s*needs\.authorize\.outputs\.repo\s*\}\}/);
-  assert.match(targetJob, /ref:\s*\$\{\{\s*needs\.authorize\.outputs\.head_sha\s*\}\}/);
+  assert.match(targetJob, /needs:\s*materialize-target/);
+  assert.match(targetJob, /download-artifact/);
+  assert.match(targetJob, /sha256sum\s+-c/);
   assert.doesNotMatch(targetJob, /repository:\s*\$\{\{\s*inputs\.repo/);
   assert.doesNotMatch(targetJob, /ref:\s*\$\{\{\s*inputs\.head_sha/);
+  assert.doesNotMatch(targetJob, /FLEET_GH_TOKEN|FLEET_OPENCODE_AUTH|secrets\./);
   const authorizeJob = workflow.slice(authorize, target);
   assert.match(authorizeJob, /FLEET_AUTHORIZE_ONLY:\s*["']?true["']?/);
   assert.match(authorizeJob, /FLEET_TARGET_REPO:\s*\$\{\{\s*inputs\.repo\s*\}\}/);
@@ -59,6 +66,7 @@ test("target code has no state checkout or secret-bearing job environment", () =
   assert.doesNotMatch(targetJob, /state-control/);
   assert.doesNotMatch(targetJob, /FLEET_GH_TOKEN\s*:/);
   assert.doesNotMatch(targetJob, /FLEET_OPENCODE_AUTH\s*:/);
+  assert.doesNotMatch(targetJob, /secrets\./);
   const targetRun = targetJob.slice(targetJob.indexOf("run target"));
   assert.doesNotMatch(targetRun, /FLEET_GH_TOKEN|FLEET_OPENCODE_AUTH|GH_TOKEN|OPENCODE_MODELS_URL/);
   assert.match(targetJob, /persist-credentials:\s*false/);
@@ -75,6 +83,15 @@ test("trusted credentials are step-local and state root is explicit", () => {
   assert.doesNotMatch(gateJob, /FLEET_TARGET_REPO:\s*\$\{\{\s*inputs\.repo/);
   assert.match(gateJob, /FLEET_TARGET_REPO:\s*\$\{\{\s*needs\.authorize\.outputs\.repo/);
   assert.match(gateJob.slice(gateJob.indexOf("autonomous revision")), /FLEET_EVIDENCE_PATH:/);
+});
+
+test("target evidence is explicitly bounded and redacted before upload", () => {
+  const targetJob = workflow.slice(workflow.indexOf("  target-check:"), workflow.indexOf("  gate:"));
+  assert.match(targetJob, /MAX_EVIDENCE_CHARS/);
+  assert.match(targetJob, /github_pat_|xox|AIza|Bearer|BEGIN PRIVATE KEY|eyJ/);
+  assert.match(targetJob, /8000/);
+  assert.match(targetJob, /upload-artifact/);
+  assert.match(targetJob, /evidence\.txt/);
 });
 
 test("trusted judge tooling installs before private state is present", () => {

@@ -27,6 +27,8 @@ const MAX_PATHS = 32;
 const MAX_PATH_CHARS = 240;
 const MAX_BLOCKERS = 32;
 const MAX_ARTIFACTS = 32;
+const MAX_REVISION_COUNT_KEYS = 32;
+const REVISION_COUNT_KEY_RE = /^([^\n:]{1,120})#(\d+)$/;
 
 // These patterns deliberately cover provider tokens and common credential forms,
 // while leaving ordinary prose intact. The replacement happens before hashing or
@@ -38,7 +40,7 @@ const SECRET_PATTERNS = [
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
   /\bBearer\s+[A-Za-z]{24,}\b/gi,
   /\bBearer\s+(?=[A-Za-z0-9._~+\/-]{16,}\b)(?=[A-Za-z0-9._~+\/-]*[0-9._~+\/=])[A-Za-z0-9._~+\/-]{16,}\b/gi,
-  /[?&#](?:access_token|refresh_token|id_token|token|api[-_]?key|apikey|client_secret|secret|password|passwd)=[A-Za-z0-9._~+\/%=-]{12,}/gi,
+  /[?&#](?:access_token|refresh_token|id_token|token|api[-_]?key|apikey|client_secret|secret|password|passwd)=[A-Za-z0-9._~+\/%=-]{1,}/gi,
   /\b(?:access_token|refresh_token|id_token|token|api[-_]?key|apikey|client_secret|secret|password|passwd)\s*[:=]\s*["']?[A-Za-z0-9._~+\/%=-]{12,}["']?/gi,
   /(?:gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,})/g,
   /AKIA[0-9A-Z]{16}/g,
@@ -79,6 +81,12 @@ export function redactText(value) {
   return output;
 }
 
+/** Shared diff/output predicate so every lane uses the same secret coverage. */
+export function containsSecretLike(value) {
+  const input = String(value ?? "");
+  return input !== redactText(input);
+}
+
 function redactValue(value) {
   if (Array.isArray(value)) return value.map(redactValue);
   if (value && typeof value === "object") {
@@ -90,6 +98,20 @@ function redactValue(value) {
 function safeArray(value, limit, maxChars) {
   if (!Array.isArray(value)) return [];
   return [...new Set(value.map((item) => truncate(redactText(item), maxChars)).filter(Boolean))].slice(0, limit);
+}
+
+function safeRevisionCounts(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value)
+    .map(([key, count]) => {
+      const match = String(key).match(REVISION_COUNT_KEY_RE);
+      const numeric = Number(count);
+      if (!match || !Number.isSafeInteger(numeric) || numeric < 1) return null;
+      return [`${truncate(match[1], MAX_ID_CHARS)}#${Number(match[2])}`, Math.min(numeric, 100000)];
+    })
+    .filter(Boolean)
+    .slice(0, MAX_REVISION_COUNT_KEYS);
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
 
 function validCreatedAt(value) {
@@ -120,6 +142,8 @@ export function normalizeMemoryEvent(input = {}) {
     blockerIds: safeArray(redacted.blockerIds, MAX_BLOCKERS, MAX_ID_CHARS),
     artifactRefs: safeArray(redacted.artifactRefs, MAX_ARTIFACTS, MAX_ID_CHARS),
   };
+  const revisionCounts = safeRevisionCounts(redacted.revisionCounts);
+  if (revisionCounts) event.revisionCounts = revisionCounts;
   event.eventId = deterministicEventId(event);
   return event;
 }
@@ -137,6 +161,7 @@ export function deterministicEventId(input = {}) {
     changedPaths: event.changedPaths || [],
     blockerIds: event.blockerIds || [],
     artifactRefs: event.artifactRefs || [],
+    revisionCounts: event.revisionCounts || {},
   };
   const material = {
     lane: event.lane || "",
@@ -305,21 +330,57 @@ function readMemoryContents(target) {
   return readSafeFile(previous, { encoding: "utf8" }) ?? "";
 }
 
-function parseMemoryContents(contents) {
+function incompleteJsonFragment(line) {
+  const value = String(line || "").trim();
+  if (!value.startsWith("{")) return false;
+  let objectDepth = 0;
+  let arrayDepth = 0;
+  let inString = false;
+  let escaped = false;
+  for (const character of value) {
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') inString = true;
+    else if (character === "{") objectDepth += 1;
+    else if (character === "}") objectDepth -= 1;
+    else if (character === "[") arrayDepth += 1;
+    else if (character === "]") arrayDepth -= 1;
+    if (objectDepth < 0 || arrayDepth < 0) return false;
+  }
+  return inString || objectDepth > 0 || arrayDepth > 0;
+}
+
+function parseMemoryContents(contents, { allowIncompleteTrailing = false } = {}) {
   const events = [];
-  for (const line of contents.split(/\r?\n/)) {
+  const text = String(contents || "");
+  const lines = text.split(/\r?\n/);
+  const newlineTerminated = /(?:\r?\n)$/.test(text);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
     if (!line.trim()) continue;
     try {
       const parsed = JSON.parse(line);
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         events.push(normalizeMemoryEvent(parsed));
+      } else {
+        throw new Error("record must be a JSON object");
       }
-    } catch {
-      // A partially written line must not prevent future revisions from reading
-      // the valid suffix of this append-only file.
+    } catch (error) {
+      const isTrailingFragment = allowIncompleteTrailing
+        && index === lines.length - 1
+        && !newlineTerminated
+        && incompleteJsonFragment(line);
+      if (isTrailingFragment) {
+        return { events, repairedTrailingFragment: true };
+      }
+      throw new Error(`PR_MEMORY_CORRUPT record ${index + 1}: ${String(error.message || "invalid JSON").slice(0, 120)}`);
     }
   }
-  return events;
+  return { events, repairedTrailingFragment: false };
 }
 
 function recoverCanonical(target) {
@@ -359,10 +420,21 @@ function withWriteLock(target, operation) {
   }
 }
 
-/** Read valid JSON events, ignoring corrupt lines left by interrupted runs. */
+/** Read valid JSON events and fail closed on any interior or terminated corruption. */
 export function readMemoryEvents(filePath) {
   const target = memoryPath(filePath);
-  return parseMemoryContents(readMemoryContents(target));
+  return parseMemoryContents(readMemoryContents(target)).events;
+}
+
+/** Count revision starts across retained history and bounded rotation summaries. */
+export function revisionCountForTarget(eventsOrPath, { repo, pr } = {}) {
+  const source = Array.isArray(eventsOrPath) ? eventsOrPath : readMemoryEvents(eventsOrPath);
+  const key = `${String(repo || "")}#${Number(pr) || 0}`;
+  return source.reduce((count, raw) => {
+    const entry = normalizeMemoryEvent(raw);
+    const direct = entry.state === "REVISION_STARTED" && entry.repo === repo && Number(entry.pr) === Number(pr) ? 1 : 0;
+    return count + direct + Number(entry.revisionCounts && entry.revisionCounts[key] || 0);
+  }, 0);
 }
 
 /**
@@ -377,7 +449,17 @@ export function appendMemoryEvent(filePath, input, options = {}) {
 function appendMemoryEventLocked(target, input, options = {}) {
   recoverCanonical(target);
   const event = normalizeMemoryEvent(input);
-  const current = readMemoryEvents(target);
+  let currentPayload = readMemoryContents(target);
+  let parsed = parseMemoryContents(currentPayload, { allowIncompleteTrailing: true });
+  if (parsed.repairedTrailingFragment) {
+    const repairedPayload = parsed.events.length > 0
+      ? `${parsed.events.map((entry) => JSON.stringify(entry)).join("\n")}\n`
+      : "";
+    atomicReplace(target, repairedPayload, { backup: false });
+    currentPayload = repairedPayload;
+    parsed = parseMemoryContents(currentPayload);
+  }
+  const current = parsed.events;
   if (current.some((entry) => entry.eventId === event.eventId)) {
     return { event, appended: false, rotated: false, count: current.length };
   }
@@ -386,7 +468,8 @@ function appendMemoryEventLocked(target, input, options = {}) {
   let descriptor = null;
   try {
     descriptor = openSync(target, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | (constants.O_NOFOLLOW || 0), FILE_MODE);
-    writeFully(descriptor, Buffer.from(`${JSON.stringify(event)}\n`, "utf8"));
+    const separator = currentPayload.length > 0 && !/(?:\r?\n)$/.test(currentPayload) ? "\n" : "";
+    writeFully(descriptor, Buffer.from(`${separator}${JSON.stringify(event)}\n`, "utf8"));
     fsyncSync(descriptor);
   } finally {
     if (descriptor !== null) closeSync(descriptor);
@@ -423,6 +506,7 @@ function rotateMemoryLocked(target, { maxLines = DEFAULT_MEMORY_MAX_LINES } = {}
     entry.pr === 0 &&
     entry.headSha === ""
   );
+  const rotationSummaries = events.filter(isRotationSummary);
   const history = events.filter((entry) => !isRotationSummary(entry));
   if (events.length <= limit && history.length <= limit) {
     return { rotated: false, kept: events.length, dropped: 0 };
@@ -449,6 +533,17 @@ function rotateMemoryLocked(target, { maxLines = DEFAULT_MEMORY_MAX_LINES } = {}
   const recent = keepCount === 0 ? [] : history.filter((entry) => !activeIds.has(entry.eventId)).slice(-keepCount);
   const keptIds = new Set([...activeIds, ...recent.map((entry) => entry.eventId)]);
   const kept = history.filter((entry) => keptIds.has(entry.eventId));
+  const revisionCounts = {};
+  for (const summaryEntry of rotationSummaries) {
+    for (const [key, count] of Object.entries(summaryEntry.revisionCounts || {})) {
+      revisionCounts[key] = Math.min(100000, (revisionCounts[key] || 0) + Number(count || 0));
+    }
+  }
+  for (const entry of history) {
+    if (keptIds.has(entry.eventId) || entry.state !== "REVISION_STARTED") continue;
+    const key = `${entry.repo}#${entry.pr}`;
+    revisionCounts[key] = Math.min(100000, (revisionCounts[key] || 0) + 1);
+  }
   const latest = history.at(-1) || events.at(-1) || {};
   const summary = normalizeMemoryEvent({
     runId: "memory-rotation",
@@ -463,6 +558,7 @@ function rotateMemoryLocked(target, { maxLines = DEFAULT_MEMORY_MAX_LINES } = {}
     changedPaths: [],
     blockerIds: [],
     artifactRefs: [],
+    revisionCounts,
   });
   const payload = `${[...kept, summary].map((entry) => JSON.stringify(entry)).join("\n")}\n`;
   atomicReplace(target, payload);

@@ -47,33 +47,33 @@ test("extractJsonArray handles prose-wrapped output", async () => {
 
 test("classify depth: docs-only = depth 1", async () => {
   const { classify } = await import("../scripts/merge.mjs");
-  const r = classify([{ filename: "docs/guide.md", additions: 20, deletions: 2 }]);
+  const r = classify([{ filename: "docs/guide.md", additions: 20, deletions: 2, patch: "@@" }]);
   assert.equal(r.depth, 1);
   assert.equal(r.uiTouched, false);
 });
 
 test("classify depth: UI change = depth 2", async () => {
   const { classify } = await import("../scripts/merge.mjs");
-  const r = classify([{ filename: "src/intro.mdx", additions: 10 }]);
+  const r = classify([{ filename: "src/intro.mdx", additions: 10, patch: "@@" }]);
   assert.equal(r.depth, 2);
   assert.equal(r.uiTouched, true);
 });
 
 test("classify depth: workflow deletion = depth 3", async () => {
   const { classify } = await import("../scripts/merge.mjs");
-  const r = classify([{ filename: ".github/workflows/ci.yml", additions: 5, deletions: 30 }]);
+  const r = classify([{ filename: ".github/workflows/ci.yml", additions: 5, deletions: 30, patch: "@@" }]);
   assert.equal(r.depth, 3);
 });
 
 test("classify depth: sensitive path escalates", async () => {
   const { classify } = await import("../scripts/merge.mjs");
-  const r = classify([{ filename: ".env.production", additions: 3 }]);
+  const r = classify([{ filename: ".env.production", additions: 3, patch: "@@" }]);
   assert.ok(r.depth >= 2);
 });
 
 test("classify depth: no additions = max depth", async () => {
   const { classify } = await import("../scripts/merge.mjs");
-  const r = classify([{ filename: "docs/x.md", additions: 0, deletions: 10 }]);
+  const r = classify([{ filename: "docs/x.md", additions: 0, deletions: 10, patch: "@@" }]);
   assert.equal(r.depth, 3);
 });
 
@@ -129,5 +129,4 @@ test("harvestFencedFiles extracts path+content", async () => {
   const files = harvestFencedFiles("V2FILE path=v2/ch.md\n```md\n# Hello\n```");
   assert.equal(files[0].path, "v2/ch.md");
 });
-
 

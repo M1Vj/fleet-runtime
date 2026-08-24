@@ -23,6 +23,7 @@ import {
   memoryPath,
   readMemoryEvents,
   redactText,
+  revisionCountForTarget,
   rotateMemory,
 } from "../scripts/lib/pr-memory.mjs";
 
@@ -249,6 +250,24 @@ test("rotation preserves an old active dispatch claim beyond the nominal line bo
   assert.ok(events.some((entry) => entry.state === "ROTATED"));
 });
 
+test("rotation preserves bounded per-repository revision counts for later caps", () => {
+  const file = tempMemory();
+  const target = { repo: "M1Vj/example-repo", pr: 42 };
+  for (let i = 0; i < 5; i += 1) {
+    appendMemoryEvent(file, event({
+      lane: "revise",
+      kind: "revision",
+      state: "REVISION_STARTED",
+      runId: `revision-${i}`,
+      attempt: i + 1,
+      summary: `revision ${i}`,
+    }));
+  }
+  rotateMemory(file, { maxLines: 2 });
+  assert.equal(revisionCountForTarget(readMemoryEvents(file), target), 5);
+  assert.ok(readMemoryEvents(file).some((entry) => entry.state === "ROTATED" && entry.revisionCounts?.[`${target.repo}#${target.pr}`] === 4));
+});
+
 test("memory context is target-scoped and bounded to recent events", () => {
   const file = tempMemory();
   for (let i = 0; i < 5; i += 1) {
@@ -410,8 +429,29 @@ test("memory context accounts for array framing and tiny character bounds", () =
   assert.equal(JSON.stringify(buildMemoryContext(entries, { maxEvents: 2, maxChars: 2 })).length, 2);
 });
 
-test("malformed lines are ignored while valid memory remains readable", () => {
+test("interior and newline-terminated malformed records fail closed", () => {
   const file = tempMemory();
   writeFileSync(file, "not-json\n" + JSON.stringify(event()) + "\n", "utf8");
-  assert.equal(readMemoryEvents(file).length, 1);
+  assert.throws(() => readMemoryEvents(file), /corrupt|invalid|JSON/i);
+
+  writeFileSync(file, JSON.stringify(event()) + "\nnot-json\n", "utf8");
+  assert.throws(() => readMemoryEvents(file), /corrupt|invalid|JSON/i);
+});
+
+test("only an incomplete trailing fragment is repaired under the append lock", () => {
+  const file = tempMemory();
+  writeFileSync(file, '{"schemaVersion":1,"runId":"interrupted"', "utf8");
+  const result = appendMemoryEvent(file, event({ runId: "repaired" }));
+  assert.equal(result.appended, true);
+  assert.deepEqual(readMemoryEvents(file).map((entry) => entry.runId), ["repaired"]);
+
+  writeFileSync(file, '{"schemaVersion":1,"runId":"not-complete"\n', "utf8");
+  assert.throws(() => appendMemoryEvent(file, event({ runId: "should-not-append" })), /corrupt|invalid|JSON/i);
+});
+
+test("a valid last JSON record without a newline is separated before append", () => {
+  const file = tempMemory();
+  writeFileSync(file, JSON.stringify(event({ runId: "without-newline" })), "utf8");
+  appendMemoryEvent(file, event({ runId: "after-newline", summary: "different content" }));
+  assert.deepEqual(readMemoryEvents(file).map((entry) => entry.runId), ["without-newline", "after-newline"]);
 });

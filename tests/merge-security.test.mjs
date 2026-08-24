@@ -17,9 +17,13 @@ import {
   revisionDisposition,
   sanitizeCommentBody,
   sanitizeLogValue,
+  secretsInDiff,
+  isExactTargetCheckSuccess,
+  buildJudgeComment,
   validateFilesResponse,
 } from "../scripts/merge.mjs";
-import { evaluateTargetPolicy, normalizeTargetInput } from "../scripts/lib/target-policy.mjs";
+import { evaluateTargetPolicy, normalizeTargetInput, isAllowedRepo } from "../scripts/lib/target-policy.mjs";
+import { redactText } from "../scripts/lib/pr-memory.mjs";
 
 const source = readFileSync(new URL("../scripts/merge.mjs", import.meta.url), "utf8");
 
@@ -67,6 +71,52 @@ test("missing or truncated file metadata fails closed", () => {
   assert.equal(validateFilesResponse([{ filename: "src/a.js", patch: "@@" }]).ok, true);
 });
 
+test("classification fails closed when the file response is not complete", () => {
+  const result = classify([{ filename: "src/a.js", additions: 1, deletions: 0 }]);
+  assert.equal(result.humanOnly, true);
+  assert.equal(result.revisionAllowed, false);
+  assert.equal(result.risk, "HIGH");
+  assert.match(result.reasons.join(" "), /file response|patch/i);
+});
+
+test("merge scanning and sinks share complete credential redaction coverage", () => {
+  const secretValues = [
+    "github_pat_abcdefghijklmnopqrstuvwxyz1234567890",
+    "xoxb-1234567890-abcdefghijklmnop",
+    "AIzaSyAbcdefghijklmnopqrstuv1234567890",
+    "Bearer abcdefghijklmnop1234567890",
+    "api_key = 'plaincredential1234567890'",
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturesegment123",
+    "-----BEGIN PRIVATE KEY-----secret-----END PRIVATE KEY-----",
+  ];
+  const patch = secretValues.join("\n");
+  const files = [{ filename: "src/a.js", additions: 7, deletions: 0, patch }];
+  assert.equal(secretValues.every((value) => redactText(value) !== value), true);
+  assert.equal(secretValues.every((value) => sanitizeCommentBody(value).includes("[REDACTED]")), true);
+  assert.equal(secretsInDiff(files).length >= secretValues.length, true);
+});
+
+test("judge comments contain only controlled summaries and hashed blocker identifiers", () => {
+  const raw = "raw model blocker @someone https://example.test/path <script>alert(1)</script>";
+  const comment = buildJudgeComment({
+    correctness: { verdict: "reject", score: 20, blockers: [raw], reasons: [raw] },
+    standards: { verdict: "reject", score: 30, blockers: [raw], reasons: [raw] },
+    evidenceDigest: "0123456789abcdef",
+    targetCheckSucceeded: false,
+  });
+  assert.doesNotMatch(comment, /raw model blocker|@someone|https:\/\/|<script|<details/i);
+  assert.match(comment, /blocker-[a-f0-9]{16}/);
+  assert.match(comment, /target checks did not report exact success/i);
+});
+
+test("target checks require exact success and private KB repositories are never eligible", () => {
+  assert.equal(isExactTargetCheckSuccess("success"), true);
+  for (const value of ["", "failure", "skipped", "neutral", "true", "SUCCESS"]) {
+    assert.equal(isExactTargetCheckSuccess(value), false, value);
+  }
+  assert.equal(isAllowedRepo("M1Vj/vj-knowledge-base", { targets: ["M1Vj/vj-knowledge-base"] }), false);
+});
+
 test("merge uses REST expected-SHA semantics and state checkout", () => {
   assert.doesNotMatch(source, /gh\(\[[^\]]*["']pr["'],\s*["']merge["']/s);
   assert.match(source, /\/pulls\/\$\{(?:prNumber|targetPr)\}\/merge/);
@@ -92,6 +142,44 @@ test("approved targets do not merge without the live-proof allow flag", () => {
   assert.match(source.slice(disabledBranch, mergeCall), /return targetTerminal\("APPROVED_NO_MERGE"/);
 });
 
+test("draft merge attempts remain READY_REQUIRED and never mutate draft status", async () => {
+  let readyCalls = 0;
+  const result = await mergeWithExpectedSha("M1Vj/example-repo", 17, "a".repeat(40), { note() {} }, {
+    identity: { login: "M1Vj", noreply: "123+M1Vj@users.noreply.github.com" },
+    getPr: async () => ({ state: "open", draft: true, head: { sha: "a".repeat(40) } }),
+    markReady: async () => { readyCalls += 1; },
+    merge: async () => { throw new Error("must not merge a draft"); },
+  });
+  assert.deepEqual(result, { ok: false, state: "READY_REQUIRED" });
+  assert.equal(readyCalls, 0);
+});
+
+test("ambiguous merge responses reconcile only after exact merged-result verification", async () => {
+  const expected = "b".repeat(40);
+  const mergeSha = "c".repeat(40);
+  const identity = { login: "M1Vj", noreply: "123+M1Vj@users.noreply.github.com" };
+  const commit = {
+    author: { login: "M1Vj" },
+    commit: { author: { email: identity.noreply }, committer: { email: "noreply@github.com" } },
+    parents: [{ sha: expected }, { sha: "d".repeat(40) }],
+  };
+  const verified = await mergeWithExpectedSha("M1Vj/example-repo", 17, expected, { note() {} }, {
+    identity,
+    getPr: async () => ({ state: "open", draft: false, head: { sha: expected }, merged: true, merge_commit_sha: mergeSha }),
+    merge: async () => { throw new Error("request timed out"); },
+    getCommit: async () => commit,
+  });
+  assert.deepEqual(verified, { ok: true, state: "SUCCESS", mergeCommit: mergeSha });
+
+  const unknown = await mergeWithExpectedSha("M1Vj/example-repo", 17, expected, { note() {} }, {
+    identity,
+    getPr: async () => ({ state: "open", draft: false, head: { sha: expected }, merged: false }),
+    merge: async () => ({ merged: true }),
+    getCommit: async () => commit,
+  });
+  assert.deepEqual(unknown, { ok: false, state: "MERGE_UNKNOWN" });
+});
+
 test("scheduled dispatch persists intent before one correlated explicit target and confirms acceptance", async () => {
   const calls = [];
   const appends = [];
@@ -114,7 +202,7 @@ test("scheduled dispatch persists intent before one correlated explicit target a
     repo: "M1Vj/fleet-runtime",
     pr: "17",
     head_sha: "a".repeat(40),
-    allow_merge: "true",
+    allow_merge: "false",
     dispatch_id: undefined,
   });
   assert.match(calls[0].inputs.dispatch_id, /^[a-f0-9]{64}$/);
@@ -366,7 +454,7 @@ test("scheduled discovery suppresses an outstanding head and returns at most one
 test("dispatch source uses REST workflow dispatch with explicit production inputs", () => {
   assert.match(source, /DISPATCH_ENDPOINT\s*=\s*`\/repos\/\$\{RUNTIME_REPO\}\/actions\/workflows\/merge\.yml\/dispatches`/);
   assert.match(source, /ref:\s*"main"/);
-  assert.match(source, /allow_merge:\s*"true"/);
+  assert.match(source, /allowMerge\s*===\s*true\s*\?\s*"true"\s*:\s*"false"/);
   assert.match(source, /record\("DISPATCHED"/);
   assert.match(source, /dispatch_id:\s*dispatchKey/);
 });
@@ -387,7 +475,7 @@ test("merge comment and state sinks redact secret-like evidence", () => {
 });
 
 test("deterministic evidence is represented by a digest, never raw output", () => {
-  assert.match(source, /evidence artifact digest/i);
+  assert.match(source, /evidence(?: artifact)? digest/i);
   assert.doesNotMatch(source, /body\s*=\s*[^;]*evidence\.text/s);
 });
 
@@ -481,13 +569,11 @@ test("merge verification requires a consistent attributed GitHub merge commit", 
   assert.deepEqual(result, { ok: true, state: "SUCCESS", mergeCommit: mergeSha });
 
   prReads = 0;
-  await assert.rejects(
-    mergeWithExpectedSha("M1Vj/fleet-runtime", 1, head, { note() {} }, {
-      ...dependencies,
-      merge: async () => ({ merged: true }),
-    }),
-    /merge commit SHA/i,
-  );
+  const malformed = await mergeWithExpectedSha("M1Vj/fleet-runtime", 1, head, { note() {} }, {
+    ...dependencies,
+    merge: async () => ({ merged: true }),
+  });
+  assert.deepEqual(malformed, { ok: true, state: "SUCCESS", mergeCommit: mergeSha });
 
   let mergeCalls = 0;
   const stale = await mergeWithExpectedSha("M1Vj/fleet-runtime", 1, head, { note() {} }, {
@@ -499,28 +585,24 @@ test("merge verification requires a consistent attributed GitHub merge commit", 
   assert.equal(mergeCalls, 0);
 
   prReads = 0;
-  await assert.rejects(
-    mergeWithExpectedSha("M1Vj/fleet-runtime", 1, head, { note() {} }, {
-      ...dependencies,
-      getPr: async () => (++prReads === 1
-        ? { state: "open", draft: false, head: { sha: head } }
-        : { state: "closed", merged: true, merge_commit_sha: mergeSha, head: { sha: "e".repeat(40) } }),
-    }),
-    /reviewed head/i,
-  );
+  const mismatchedHead = await mergeWithExpectedSha("M1Vj/fleet-runtime", 1, head, { note() {} }, {
+    ...dependencies,
+    getPr: async () => (++prReads === 1
+      ? { state: "open", draft: false, head: { sha: head } }
+      : { state: "closed", merged: true, merge_commit_sha: mergeSha, head: { sha: "e".repeat(40) } }),
+  });
+  assert.deepEqual(mismatchedHead, { ok: false, state: "MERGE_UNKNOWN" });
 
   prReads = 0;
-  await assert.rejects(
-    mergeWithExpectedSha("M1Vj/fleet-runtime", 1, head, { note() {} }, {
-      ...dependencies,
-      getCommit: async () => ({
-        author: { login: identity.login },
-        commit: { author: { email: identity.noreply }, committer: { email: "noreply@github.com" } },
-        parents: [{ sha: "c".repeat(40) }, { sha: "d".repeat(40) }],
-      }),
+  const mismatchedParents = await mergeWithExpectedSha("M1Vj/fleet-runtime", 1, head, { note() {} }, {
+    ...dependencies,
+    getCommit: async () => ({
+      author: { login: identity.login },
+      commit: { author: { email: identity.noreply }, committer: { email: "noreply@github.com" } },
+      parents: [{ sha: "c".repeat(40) }, { sha: "d".repeat(40) }],
     }),
-    /reviewed head parent/i,
-  );
+  });
+  assert.deepEqual(mismatchedParents, { ok: false, state: "MERGE_UNKNOWN" });
 });
 
 test("judge prompt marks title, body, diff, and evidence as untrusted delimiters", () => {

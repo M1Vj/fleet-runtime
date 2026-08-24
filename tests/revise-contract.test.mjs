@@ -9,9 +9,11 @@ import {
   readRevisionEvidence,
   revisionMemoryContext,
   sanitizeRevisionEvidence,
+  selectRevisionBlockers,
 } from "../scripts/revise.mjs";
 
 const source = readFileSync(new URL("../scripts/revise.mjs", import.meta.url), "utf8");
+const mergeSource = readFileSync(new URL("../scripts/merge.mjs", import.meta.url), "utf8");
 
 test("revision script imports the target, path, memory, and attribution contracts", () => {
   assert.match(source, /from ["']\.\/lib\/revision-queue\.mjs["']/);
@@ -85,8 +87,26 @@ test("revision state records named start, error, and success events without raw 
 
 test("judge feedback is attribution-verified before blockers enter the prompt", () => {
   const verifyIndex = source.indexOf("verifyCommentAuthor(target.repo, lastJudge.id");
-  const blockersIndex = source.indexOf("extractJudgeBlockers(lastJudge.body)");
+  const blockersIndex = source.indexOf("verifiedCommentBody: lastJudge.body");
   assert.ok(verifyIndex >= 0 && verifyIndex < blockersIndex);
+});
+
+test("revision prefers canonical bounded blocker IDs and only falls back to a verified comment", () => {
+  const canonical = [{
+    lane: "merge",
+    kind: "judge",
+    state: "JUDGE_REJECTED",
+    repo: "M1Vj/example-repo",
+    pr: 42,
+    headSha: "a".repeat(40),
+    blockerIds: ["blocker-1111111111111111"],
+  }];
+  assert.deepEqual(selectRevisionBlockers(canonical, { repo: "M1Vj/example-repo", pr: 42 }), ["blocker-1111111111111111"]);
+  assert.deepEqual(selectRevisionBlockers([], {
+    repo: "M1Vj/example-repo",
+    pr: 42,
+    verifiedCommentBody: "**Blockers:**\n- blocker-2222222222222222",
+  }), ["blocker-2222222222222222"]);
 });
 
 test("revision memory context reuses prior heads for the same repo and PR", () => {
@@ -136,6 +156,17 @@ test("revision treats SUCCESS state persistence failure as a failed run", () => 
   assert.doesNotMatch(source, /REVISE_MEMORY_WARNING=STATE_PERSIST_FAILED/);
   const comment = source.indexOf("const comment = gh(");
   assert.ok(success < comment);
+});
+
+test("revision output failure is explicit and cannot silently queue work", () => {
+  assert.match(mergeSource, /REVISION_OUTPUT_FAILED/);
+  assert.match(mergeSource, /writeRevisionOutput[\s\S]*throw/);
+  assert.match(mergeSource, /REVISION_INTENT/);
+});
+
+test("revision audit is written to private state rather than ephemeral runtime audit", () => {
+  assert.doesNotMatch(source, /audit\.writeMarkdown\(path\.join\(REPO_ROOT,\s*["']audit/);
+  assert.match(source, /audit\.writeMarkdown\(path\.join\(runtime\.stateRoot,\s*["']audit/);
 });
 
 test("revision records truthful audit failure status and rejects fork heads before PUT", () => {

@@ -4,9 +4,11 @@ import {
   existsSync,
   mkdtempSync,
   mkdirSync,
+  rmdirSync,
   readFileSync,
   readdirSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -136,15 +138,57 @@ test("append and read redact unterminated PEM bodies and plausible all-alpha bea
   assert.equal(stored.summary.includes(ordinary), true);
 });
 
+test("append and read redact malformed lowercase PEM, URL fragments, and plain key assignments", () => {
+  const file = tempMemory();
+  const lowerPemBody = "lowercase-pem-body-0123456789";
+  const lowerPem = `-----begin rsa private key-----\n${lowerPemBody}\n-----end rsa private key-----`;
+  const plainPemBody = "plain-pem-body-9876543210";
+  const plainPem = `BEGIN rsa private key\n${plainPemBody}\nEND rsa private key`;
+  const fragmentToken = "https://example.test/callback#access_token=fragmentcredential1234567890";
+  const assignmentToken = "api_key = 'plaincredential1234567890'";
+  const ordinary = "token: short prose remains";
+
+  appendMemoryEvent(file, event({
+    summary: `${lowerPem}\n${plainPem}\n${fragmentToken}\n${assignmentToken}\n${ordinary}`,
+  }));
+
+  const raw = readFileSync(file, "utf8");
+  const [stored] = readMemoryEvents(file);
+  assert.equal(raw.includes(lowerPemBody), false);
+  assert.equal(raw.includes("begin rsa private key"), false);
+  assert.equal(raw.includes(plainPemBody), false);
+  assert.equal(raw.includes(fragmentToken), false);
+  assert.equal(raw.includes("fragmentcredential1234567890"), false);
+  assert.equal(raw.includes(assignmentToken), false);
+  assert.equal(raw.includes("plaincredential1234567890"), false);
+  assert.equal(stored.summary.includes(ordinary), true);
+});
+
 test("duplicate append is an idempotent no-op", () => {
   const file = tempMemory();
   const first = appendMemoryEvent(file, event());
-  const second = appendMemoryEvent(file, event());
+  const second = appendMemoryEvent(file, event({ runId: "different-run" }));
   assert.equal(first.appended, true);
   assert.equal(second.appended, false);
   assert.equal(readFileSync(file, "utf8").trim().split("\n").length, 1);
   assert.equal(readMemoryEvents(file).length, 1);
   assert.equal(statSync(file).mode & 0o777, 0o600);
+  assert.equal(statSync(path.dirname(file)).mode & 0o777, 0o700);
+  assert.equal(existsSync(`${file}.lock`), false);
+});
+
+test("local writers fail closed on an existing lock and release it after rotation", () => {
+  const file = tempMemory();
+  const lock = `${file}.lock`;
+  mkdirSync(lock, { mode: 0o700 });
+  assert.throws(() => appendMemoryEvent(file, event()), /busy|lock/i);
+  rmdirSync(lock);
+
+  for (let i = 0; i < 3; i += 1) {
+    appendMemoryEvent(file, event({ runId: `locked-${i}`, summary: `locked-event-${i}` }));
+  }
+  rotateMemory(file, { maxLines: 2 });
+  assert.equal(existsSync(lock), false);
 });
 
 test("memory context is target-scoped and bounded to recent events", () => {
@@ -229,6 +273,43 @@ test("rotation summaries are global, private, recoverable, and do not accumulate
   assert.equal(summaries.length, 1);
   assert.equal(new Set(summaries.map((entry) => entry.eventId)).size, summaries.length);
   assert.equal(readdirSync(path.dirname(file)).some((name) => name.startsWith(`${path.basename(file)}.tmp-`)), false);
+});
+
+test("reading and appending recover from a missing canonical file using the previous generation", () => {
+  const file = tempMemory();
+  for (let i = 0; i < 3; i += 1) {
+    appendMemoryEvent(file, event({ runId: `recover-${i}`, summary: `recover-event-${i}` }));
+  }
+  rotateMemory(file, { maxLines: 2 });
+  const previous = `${file}.prev`;
+  const previousEvents = readFileSync(previous, "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  unlinkSync(file);
+
+  assert.deepEqual(readMemoryEvents(file).map((entry) => entry.eventId), previousEvents.map((entry) => entry.eventId));
+  const result = appendMemoryEvent(file, event({ runId: "recovered-run", summary: "recovered-event" }));
+  assert.equal(result.appended, true);
+  assert.equal(existsSync(file), true);
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+  assert.equal(readMemoryEvents(file).some((entry) => entry.summary === "recovered-event"), true);
+});
+
+test("rotation fault before target replacement leaves the canonical generation intact", () => {
+  const file = tempMemory();
+  for (let i = 0; i < 3; i += 1) {
+    appendMemoryEvent(file, event({ runId: `fault-${i}`, summary: `fault-event-${i}` }));
+  }
+  const before = readFileSync(file, "utf8");
+  const previous = `${file}.prev`;
+  mkdirSync(previous, { mode: 0o700 });
+
+  assert.throws(() => rotateMemory(file, { maxLines: 2 }));
+  assert.equal(readFileSync(file, "utf8"), before);
+  assert.equal(readdirSync(path.dirname(file)).some((name) => name.startsWith(`${path.basename(file)}.tmp-`)), false);
+  assert.equal(readdirSync(path.dirname(file)).some((name) => name.startsWith(`${path.basename(file)}.prev-tmp-`)), false);
+  rmdirSync(previous);
 });
 
 test("rotation with a one-line limit keeps only the summary event", () => {

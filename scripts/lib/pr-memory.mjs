@@ -1,5 +1,4 @@
 import {
-  appendFileSync,
   chmodSync,
   closeSync,
   existsSync,
@@ -7,6 +6,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  rmdirSync,
   renameSync,
   unlinkSync,
   writeSync,
@@ -30,12 +30,14 @@ const MAX_ARTIFACTS = 32;
 // while leaving ordinary prose intact. The replacement happens before hashing or
 // writing so secrets cannot leak through either state or deterministic IDs.
 const SECRET_PATTERNS = [
-  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g,
-  /BEGIN [A-Z0-9 ]*PRIVATE KEY/g,
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi,
+  /\bBEGIN [A-Z0-9 ]*PRIVATE KEY\b[\s\S]*?(?:\bEND [A-Z0-9 ]*PRIVATE KEY\b|$)/gi,
+  /BEGIN [A-Z0-9 ]*PRIVATE KEY/gi,
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
   /\bBearer\s+[A-Za-z]{24,}\b/gi,
   /\bBearer\s+(?=[A-Za-z0-9._~+\/-]{16,}\b)(?=[A-Za-z0-9._~+\/-]*[0-9._~+\/=])[A-Za-z0-9._~+\/-]{16,}\b/gi,
-  /([?&](?:access_token|refresh_token|id_token|token|api[-_]?key|apikey|client_secret|secret|password|passwd)=)[A-Za-z0-9._~+\/%=-]{12,}/gi,
+  /[?&#](?:access_token|refresh_token|id_token|token|api[-_]?key|apikey|client_secret|secret|password|passwd)=[A-Za-z0-9._~+\/%=-]{12,}/gi,
+  /\b(?:access_token|refresh_token|id_token|token|api[-_]?key|apikey|client_secret|secret|password|passwd)\s*[:=]\s*["']?[A-Za-z0-9._~+\/%=-]{12,}["']?/gi,
   /(?:gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,})/g,
   /AKIA[0-9A-Z]{16}/g,
   /sk-[A-Za-z0-9_-]{20,}/g,
@@ -161,16 +163,110 @@ export function memoryPath(stateRootOrFile) {
   return path.join(value, "state", "pr-memory.jsonl");
 }
 
-/** Read valid JSON events, ignoring corrupt lines left by interrupted runs. */
-export function readMemoryEvents(filePath) {
-  const target = memoryPath(filePath);
-  if (!existsSync(target)) return [];
-  let contents;
-  try {
-    contents = readFileSync(target, "utf8");
-  } catch {
-    return [];
+const LOCK_MODE = 0o700;
+const FILE_MODE = 0o600;
+
+function previousMemoryPath(target) {
+  return `${target}.prev`;
+}
+
+function lockMemoryPath(target) {
+  return `${target}.lock`;
+}
+
+function ensurePrivateDirectory(directory) {
+  mkdirSync(directory, { recursive: true, mode: LOCK_MODE });
+  chmodSync(directory, LOCK_MODE);
+}
+
+function writeFully(descriptor, buffer) {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const written = writeSync(descriptor, buffer, offset);
+    if (written <= 0) throw new Error("memory write made no progress");
+    offset += written;
   }
+}
+
+function fsyncDirectory(directory) {
+  let descriptor = null;
+  try {
+    descriptor = openSync(directory, "r");
+    fsyncSync(descriptor);
+  } finally {
+    if (descriptor !== null) closeSync(descriptor);
+  }
+}
+
+function temporaryPath(target, purpose) {
+  return `${target}.${purpose}-${process.pid}-${randomUUID()}`;
+}
+
+function removeExactFile(filePath) {
+  try {
+    unlinkSync(filePath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+function writeDurableFile(filePath, content) {
+  let descriptor = null;
+  try {
+    descriptor = openSync(filePath, "wx", FILE_MODE);
+    writeFully(descriptor, Buffer.isBuffer(content) ? content : Buffer.from(String(content), "utf8"));
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = null;
+    chmodSync(filePath, FILE_MODE);
+  } finally {
+    if (descriptor !== null) closeSync(descriptor);
+  }
+}
+
+function atomicReplace(target, payload, { backup = true } = {}) {
+  const directory = path.dirname(target);
+  ensurePrivateDirectory(directory);
+  const previous = previousMemoryPath(target);
+  const targetTemp = temporaryPath(target, "tmp");
+  let backupTemp = null;
+  try {
+    if (backup && existsSync(target)) {
+      backupTemp = temporaryPath(target, "prev-tmp");
+      writeDurableFile(backupTemp, readFileSync(target));
+      renameSync(backupTemp, previous);
+      backupTemp = null;
+      chmodSync(previous, FILE_MODE);
+      fsyncDirectory(directory);
+    }
+    writeDurableFile(targetTemp, payload);
+    renameSync(targetTemp, target);
+    chmodSync(target, FILE_MODE);
+    fsyncDirectory(directory);
+  } finally {
+    removeExactFile(targetTemp);
+    if (backupTemp !== null) removeExactFile(backupTemp);
+  }
+}
+
+function readMemoryContents(target) {
+  if (existsSync(target)) {
+    try {
+      return readFileSync(target, "utf8");
+    } catch {
+      return "";
+    }
+  }
+  const previous = previousMemoryPath(target);
+  if (!existsSync(previous)) return "";
+  try {
+    return readFileSync(previous, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function parseMemoryContents(contents) {
   const events = [];
   for (const line of contents.split(/\r?\n/)) {
     if (!line.trim()) continue;
@@ -187,23 +283,75 @@ export function readMemoryEvents(filePath) {
   return events;
 }
 
+function recoverCanonical(target) {
+  if (existsSync(target)) return;
+  const previous = previousMemoryPath(target);
+  if (!existsSync(previous)) return;
+  atomicReplace(target, readFileSync(previous), { backup: false });
+}
+
+function acquireWriteLock(target) {
+  ensurePrivateDirectory(path.dirname(target));
+  const lock = lockMemoryPath(target);
+  try {
+    mkdirSync(lock, { mode: LOCK_MODE });
+    chmodSync(lock, LOCK_MODE);
+  } catch (error) {
+    if (error?.code === "EEXIST") throw new Error("memory writer busy: local lock is held");
+    throw error;
+  }
+  return () => {
+    try {
+      rmdirSync(lock);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  };
+}
+
+function withWriteLock(target, operation) {
+  const release = acquireWriteLock(target);
+  try {
+    return operation();
+  } finally {
+    release();
+  }
+}
+
+/** Read valid JSON events, ignoring corrupt lines left by interrupted runs. */
+export function readMemoryEvents(filePath) {
+  const target = memoryPath(filePath);
+  return parseMemoryContents(readMemoryContents(target));
+}
+
 /**
  * Append one redacted event. Existing event ids make retries idempotent; a
  * successful duplicate append never changes the file's mtime or line count.
  */
 export function appendMemoryEvent(filePath, input, options = {}) {
   const target = memoryPath(filePath);
+  return withWriteLock(target, () => appendMemoryEventLocked(target, input, options));
+}
+
+function appendMemoryEventLocked(target, input, options = {}) {
+  recoverCanonical(target);
   const event = normalizeMemoryEvent(input);
   const current = readMemoryEvents(target);
   if (current.some((entry) => entry.eventId === event.eventId)) {
     return { event, appended: false, rotated: false, count: current.length };
   }
-  mkdirSync(path.dirname(target), { recursive: true });
-  // The fleet runtime serializes all shared-state writers globally; this
-  // module intentionally relies on that topology instead of adding a lock.
-  appendFileSync(target, `${JSON.stringify(event)}\n`, { encoding: "utf8", flag: "a", mode: 0o600 });
-  chmodSync(target, 0o600);
-  const rotation = rotateMemory(target, options);
+  ensurePrivateDirectory(path.dirname(target));
+  let descriptor = null;
+  try {
+    descriptor = openSync(target, "a", FILE_MODE);
+    writeFully(descriptor, Buffer.from(`${JSON.stringify(event)}\n`, "utf8"));
+    fsyncSync(descriptor);
+  } finally {
+    if (descriptor !== null) closeSync(descriptor);
+  }
+  chmodSync(target, FILE_MODE);
+  fsyncDirectory(path.dirname(target));
+  const rotation = rotateMemoryLocked(target, options);
   return {
     event,
     appended: true,
@@ -217,8 +365,13 @@ export function appendMemoryEvent(filePath, input, options = {}) {
  * too large. The summary is itself a normal event so consumers can explain why
  * older history is absent.
  */
-export function rotateMemory(filePath, { maxLines = DEFAULT_MEMORY_MAX_LINES } = {}) {
+export function rotateMemory(filePath, options = {}) {
   const target = memoryPath(filePath);
+  return withWriteLock(target, () => rotateMemoryLocked(target, options));
+}
+
+function rotateMemoryLocked(target, { maxLines = DEFAULT_MEMORY_MAX_LINES } = {}) {
+  recoverCanonical(target);
   const limit = Math.max(1, Number(maxLines) || DEFAULT_MEMORY_MAX_LINES);
   const events = readMemoryEvents(target);
   const isRotationSummary = (entry) => (
@@ -250,49 +403,8 @@ export function rotateMemory(filePath, { maxLines = DEFAULT_MEMORY_MAX_LINES } =
     blockerIds: [],
     artifactRefs: [],
   });
-  mkdirSync(path.dirname(target), { recursive: true });
-  const previousPath = `${target}.prev`;
-  const tempPath = `${target}.tmp-${process.pid}-${randomUUID()}`;
   const payload = `${[...kept, summary].map((entry) => JSON.stringify(entry)).join("\n")}\n`;
-  let descriptor = null;
-  let movedPrevious = false;
-  let operationError = null;
-  try {
-    descriptor = openSync(tempPath, "wx", 0o600);
-    writeSync(descriptor, Buffer.from(payload, "utf8"));
-    fsyncSync(descriptor);
-    closeSync(descriptor);
-    descriptor = null;
-
-    if (existsSync(target)) {
-      renameSync(target, previousPath);
-      movedPrevious = true;
-    }
-    renameSync(tempPath, target);
-    chmodSync(target, 0o600);
-  } catch (error) {
-    operationError = error;
-    if (movedPrevious && !existsSync(target) && existsSync(previousPath)) {
-      try {
-        renameSync(previousPath, target);
-      } catch {
-      }
-    }
-    throw error;
-  } finally {
-    if (descriptor !== null) {
-      try {
-        closeSync(descriptor);
-      } catch {
-      }
-      descriptor = null;
-    }
-    try {
-      unlinkSync(tempPath);
-    } catch (error) {
-      if (error?.code !== "ENOENT" && !operationError) throw error;
-    }
-  }
+  atomicReplace(target, payload);
   return { rotated: true, kept: keepCount + 1, dropped: events.length - keepCount };
 }
 

@@ -43,53 +43,29 @@ export function classify(files) {
   let additions = 0;
   let deletions = 0;
   let uiTouched = false;
-  let hard = false;
-  let soft = false;
-  const wfFiles = [];
+  let depth = 1;
+  let wfDeletions = false;
+  let touchesSensitive = false;
   for (const f of files) {
     additions += f.additions || 0;
     deletions += f.deletions || 0;
     if (UI_EXTENSIONS.test(f.filename)) uiTouched = true;
-    if (/^\.github\/workflows\//.test(f.filename)) {
-      wfFiles.push(f);
-      if ((f.deletions || 0) > 0) {
-        hard = true;
-        reasons.push(`workflow deletions in ${f.filename}`);
-      }
+    if (/^\.github\/workflows\//.test(f.filename) && (f.deletions || 0) > 0) {
+      wfDeletions = true;
+      reasons.push(`workflow deletions in ${f.filename}`);
     }
-    for (const re of HARD_RISK_PATTERNS) {
+    for (const re of [...HARD_RISK_PATTERNS, ...SOFT_RISK_PATTERNS]) {
       if (re.test(f.filename)) {
-        hard = true;
-        reasons.push(`hard-risk path ${f.filename}`);
+        touchesSensitive = true;
+        reasons.push(`sensitive path ${f.filename}`);
         break;
-      }
-    }
-    if (!hard) {
-      for (const re of SOFT_RISK_PATTERNS) {
-        if (re.test(f.filename)) {
-          soft = true;
-          reasons.push(`elevated path ${f.filename}`);
-          break;
-        }
       }
     }
   }
   const size = additions + deletions;
-  if (!files.some((f) => f.additions > 0)) {
-    hard = true;
-    reasons.push("no additions");
-  } else if (size > 800) {
-    hard = true;
-    reasons.push(`very large diff (${size} lines)`);
-  } else if (size > 250) {
-    soft = true;
-    reasons.push(`large diff (${size} lines)`);
-  }
-  let risk = hard ? "HIGH" : soft ? "MEDIUM" : "LOW";
-  if (risk === "MEDIUM" && wfFiles.length > 0 && wfFiles.every((f) => (f.deletions || 0) === 0)) {
-    reasons.push("additive-only workflow edits");
-  }
-  return { risk, reasons, uiTouched, size };
+  if (size > 800 || wfDeletions || !files.some((f) => f.additions > 0)) depth = 3;
+  else if (size > 250 || touchesSensitive || uiTouched) depth = 2;
+  return { risk: `depth-${depth}`, reasons, uiTouched, size, depth };
 }
 
 export function secretsInDiff(files) {
@@ -310,7 +286,7 @@ async function main() {
   }
 
   const riskCommentBits = [];
-  if (cls.risk === "HIGH") riskCommentBits.push(...cls.reasons);
+  riskCommentBits.push(...cls.reasons);
 
   let visualEvidence = "not-applicable";
   let visualOk = true;
@@ -381,24 +357,32 @@ async function main() {
     visualEvidence === "not-applicable" ? "" : "VISUAL:\n" + visualEvidence,
   ].filter(Boolean).join("\n\n");
 
+  const threshold = cls.depth >= 3 ? 95 : cls.depth >= 2 ? 90 : 80;
   const correctness = await judge({ repo: TARGET_REPO, prNumber: PR_NUMBER, title: pr.title, body: pr.body, files, extraEvidence: combinedEvidence, lens: "correctness-and-security", audit });
   const standards = await judge({ repo: TARGET_REPO, prNumber: PR_NUMBER, title: pr.title, body: pr.body, files, extraEvidence: combinedEvidence, lens: "industry-standards-and-maintainability", audit });
+  let security = null;
+  if (cls.depth >= 3) {
+    security = await judge({ repo: TARGET_REPO, prNumber: PR_NUMBER, title: pr.title, body: pr.body, files, extraEvidence: combinedEvidence, lens: "security-and-supply-chain", audit });
+  }
 
-  const threshold = cls.risk === "MEDIUM" ? 90 : 80;
-  const approved =
-    correctness.verdict === "approve" &&
-    standards.verdict === "approve" &&
-    correctness.score >= threshold &&
-    standards.score >= threshold;
+  const allJudges = security ? [correctness, standards, security] : [correctness, standards];
+  const approved = allJudges.every((j) => j.verdict === "approve" && j.score >= threshold);
 
+  const judgeRows = [
+    `| correctness+security | ${correctness.verdict.toUpperCase()} | ${correctness.score} |`,
+    `| standards+maintainability | ${standards.verdict.toUpperCase()} | ${standards.score} |`,
+  ];
+  if (security) judgeRows.push(`| security+supply-chain | ${security.verdict.toUpperCase()} | ${security.score} |`);
+  const allBlockers = [...correctness.blockers, ...standards.blockers, ...(security ? security.blockers : [])];
+  const allReasons = [...correctness.reasons, ...standards.reasons, ...(security ? security.reasons : [])];
   const verdictBody =
     "🔍 **fleet judge panel** (independent maker-checker review)\n\n" +
-    `| lens | verdict | score |\n| --- | --- | --- |\n| correctness+security | ${correctness.verdict.toUpperCase()} | ${correctness.score} |\n| standards+maintainability | ${standards.verdict.toUpperCase()} | ${standards.score} |\n\n` +
-    (correctness.blockers.length || standards.blockers.length
-      ? "**Blockers:**\n" + [...correctness.blockers, ...standards.blockers].map((b) => `- ${b}`).join("\n") + "\n\n"
+    `| lens | verdict | score |\n| --- | --- | --- |\n${judgeRows.join("\n")}\n\n` +
+    (allBlockers.length
+      ? "**Blockers:**\n" + allBlockers.map((b) => `- ${b}`).join("\n") + "\n\n"
       : "") +
     "<details><summary>reasons</summary>\n\n" +
-    [...correctness.reasons, ...standards.reasons].map((r) => `- ${r}`).join("\n") +
+    allReasons.map((r) => `- ${r}`).join("\n") +
     "\n</details>";
 
   await postComment(TARGET_REPO, PR_NUMBER, verdictBody, audit);

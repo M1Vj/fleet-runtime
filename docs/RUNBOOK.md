@@ -74,12 +74,12 @@ Edit `state/targets.json` in fleet-control and push to `main`:
 
     { "tier1": ["M1Vj/SomeRepo"], "excluded": ["M1Vj/Ignored"], "allOwned": false }
 
-Only `tier1` repos receive issue comments, labels, or draft PRs (`eligible()` in
-`scripts/patrol.mjs`). Patrol keys open-PR freshness by head SHA and downgrades model-directed
-PR comments to private reports, so its own comments cannot retrigger a PR or publish a public
-review comment. Non-tier1 owned repos are observe-only: their findings surface as issues in
-fleet-control. `fleet_issue` directives always target fleet-control; changes apply on the next
-patrol.
+Only `tier1` repos receive labels or draft PRs (`eligible()` in
+`scripts/patrol.mjs`). Patrol keys open-PR freshness by head SHA and downgrades every
+model-directed comment on an existing PR or issue to a private report, so its own activity cannot
+retrigger a signal or publish a public review comment. Non-tier1 owned repos are observe-only:
+their findings may use the controlled `fleet_issue` path, which always targets fleet-control;
+changes apply on the next patrol.
 
 ## 5. Audit log interpretation
 

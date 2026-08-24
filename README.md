@@ -21,8 +21,8 @@ Public GitHub Actions execution shell that autonomously patrols, audits, improve
 | audit/<date>/<runId>.md   docs/reports/     |
 ---+---------------------------------------+---
    |
-   +-- tier-1 repos (state/targets.json): comments, labels,
-   |   draft PRs, autonomous revisions, manual merge gate
+   +-- tier-1 repos (state/targets.json): labels, draft PRs,
+   |   guarded revision/judge comments, autonomous revisions, manual merge gate
    +-- all other owned repos: observe-only; findings become
        issues in M1Vj/fleet-control
 ```
@@ -31,10 +31,10 @@ Public GitHub Actions execution shell that autonomously patrols, audits, improve
 
 | Workflow | Trigger | Cadence (UTC) | Purpose | Model use |
 | --- | --- | --- | --- | --- |
-| fleet-patrol | cron, dispatch | 3x/hour :03 :23 :43 | triage repo signals; issue comments/labels/draft PRs; enqueue deep tasks; heartbeat | 1 call + repair |
+| fleet-patrol | cron, dispatch | 3x/hour :03 :23 :43 | triage repo signals; private reports, labels/draft PRs; enqueue deep tasks; heartbeat | 1 call + repair |
 | fleet-watchdog | cron | 4x/hour :09 :24 :39 :54 | heartbeat staleness (90 min): re-enable workflows, reclaim queue tasks, alert issue | none |
 | fleet-deep | cron, dispatch | 3x/hour :11 :31 :51 | drain state/queue.jsonl, max 3 workers: security/redteam/code-review/docs reports on real clones | <=3 calls/wave |
-| fleet-improve | cron, dispatch | every 2 h at :25 | pick -> research -> plan -> implement draft PR -> 3-lens review posted | ~5 calls/repo |
+| fleet-improve | cron, dispatch | every 2 h at :25 | pick -> research -> plan -> implement draft PR -> 3-lens review persisted privately | ~5 calls/repo |
 | fleet-merge-gate | cron, dispatch | every 15 min | select at most one draft; isolated deterministic checks; 2 advisory judges; block or bounded autonomous revision; merge only on intentional manual dispatch | 2 judges + optional revision |
 | fleet-retro | cron, dispatch | daily 05:19 | file [RETRO] loop-improvement issue from telemetry; regenerate docs/status.md | 1 call |
 | fleet-selftest | cron, dispatch | daily 06:00 | T1-T11: negatives, idempotency, validator, liveness, attribution proof, watchdog, vision canaries | 2-4 short calls |
@@ -49,8 +49,9 @@ CLI is pinned to `opencode-ai@1.18.21`; model registry served from committed sna
 ## Safety model
 
 - **Attribution fail-closed**: every run verifies the token identity equals `M1Vj` (type User) and holds `repo` + `workflow` scopes before acting; any mismatch aborts (exit 3/4). Commits are made as the M1Vj noreply identity and re-verified against the API post-push; `[bot]` attribution aborts.
-- **Tiered scope**: only `tier1` repos in `state/targets.json` receive comments, labels, or PRs; everything else is observe-only. Fleet-wide findings always land as issues in fleet-control.
-- **Patrol freshness and comment boundary**: open-PR signals are keyed by stable head SHA, so patrol's own comments cannot retrigger the same PR. Patrol never publishes PR comments; those model directives downgrade to private reports, while actionable fixes must use `draft_pr`.
+- **Tiered scope**: only `tier1` repos in `state/targets.json` receive labels or draft PRs; everything else is observe-only. Fleet-wide findings may land as issues in fleet-control through the controlled fleet issue path.
+- **Patrol freshness and comment boundary**: open-PR signals are keyed by stable head SHA, so patrol's own activity cannot retrigger the same PR. Patrol never publishes comments on existing PRs or issues; all such model directives downgrade to private reports, while actionable fixes must use `draft_pr`.
+- **Improve review privacy**: the three improve review lenses are persisted as redacted private findings; they do not post advisory comments. The merge judge and bounded revision loop consume that private state for actionable score improvement.
 - **Directive validation**: model outputs must be strict JSON arrays of whitelisted kinds with size caps, path-safety rules (no `..`, `.env*`, keys, `state/`, `audit/`), branch regex `fleet/<kebab>`, and secret-pattern rejection; one repair round, else exit 5.
 - **Human-only boundaries**: private repositories, UI files, workflows/actions, auth/security, login/oauth, permissions/session/access-control paths, migrations, deployment/infra, manifests and lockfiles, environment/credential paths, symlinks, submodules, incomplete metadata, deletions-only changes, and oversized diffs cannot be revised or merged autonomously.
 - **Maker-checker judges**: two independent advisory judge lenses (correctness-and-security, industry-standards-and-maintainability) must both approve; score threshold 80 (LOW) or 90 (MEDIUM). Missing deterministic evidence or an unavailable/unparsable judge produces `STALLED`, never a revision request. Their output cannot by itself authorize a scheduled merge.

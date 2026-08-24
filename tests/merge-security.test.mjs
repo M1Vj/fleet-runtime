@@ -20,7 +20,9 @@ import {
   secretsInDiff,
   isExactTargetCheckSuccess,
   buildJudgeComment,
+  evidenceUnavailableDisposition,
   findCompletedJudgeEvent,
+  recoverRejectedJudge,
   validateFilesResponse,
 } from "../scripts/merge.mjs";
 import { evaluateTargetPolicy, normalizeTargetInput, isAllowedRepo } from "../scripts/lib/target-policy.mjs";
@@ -644,6 +646,48 @@ test("completed judge dedupe is exact-head only and infrastructure events are no
   const infraStart = source.indexOf("if (correctness.infrastructureFailure");
   const infraEnd = source.indexOf("approved = targetCheckSucceeded", infraStart);
   assert.doesNotMatch(source.slice(infraStart, infraEnd), /postComment/);
+});
+
+test("same-head rejected judge recovery reuses revision intent and queues without a public comment", () => {
+  const target = { repo: "M1Vj/fleet-runtime", pr: 1, headSha: "a".repeat(40) };
+  const persisted = [];
+  const outputs = [];
+  const result = recoverRejectedJudge({
+    target,
+    existingJudge: {
+      state: "JUDGE_REJECTED",
+      blockerIds: ["blocker-0123456789abcdef"],
+      reviewNotes: ["add a null-response regression test"],
+      judgeScores: { correctness: 62, standards: 74, threshold: 80, targetChecksPassed: true },
+    },
+    fleetAuthored: true,
+    revisionAllowed: true,
+    evidenceAvailable: true,
+    revisionAttempts: 0,
+    maxRevisions: 2,
+    runId: "recovery-run",
+    identity: { login: "M1Vj" },
+    persistIntent: (...args) => persisted.push(args),
+    writeOutput: (env) => outputs.push(env),
+  });
+  assert.equal(result.state, "REVISION_QUEUED");
+  assert.equal(result.revisionNeeded, true);
+  assert.equal(persisted.length, 1);
+  assert.equal(outputs.length, 1);
+  assert.equal(result.publicComment, false);
+});
+
+test("evidence-unavailable exact heads are blocked privately without a public comment", () => {
+  const disposition = evidenceUnavailableDisposition();
+  assert.deepEqual(disposition, {
+    revisionNeeded: false,
+    state: "BLOCKED",
+    why: "deterministic target evidence unavailable",
+    publicComment: false,
+  });
+  const evidenceStart = source.indexOf("if (!evidence.available)");
+  const evidenceEnd = source.indexOf("if (secretHits.length > 0)", evidenceStart);
+  assert.doesNotMatch(source.slice(evidenceStart, evidenceEnd), /postComment/);
 });
 
 test("merge verification requires a consistent attributed GitHub merge commit", async () => {

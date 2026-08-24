@@ -13,6 +13,7 @@ import {
   selectRevisionBlockers,
   validateRevisionTargetPolicy,
   screenRevisionOutput,
+  persistRevisionAudit,
 } from "../scripts/revise.mjs";
 
 const source = readFileSync(new URL("../scripts/revise.mjs", import.meta.url), "utf8");
@@ -203,6 +204,19 @@ test("revision append failures fail closed and finally commits audit only", () =
 test("revision audit is written to private state rather than ephemeral runtime audit", () => {
   assert.doesNotMatch(source, /audit\.writeMarkdown\(path\.join\(REPO_ROOT,\s*["']audit/);
   assert.match(source, /audit\.writeMarkdown\(path\.join\(runtime\.stateRoot,\s*["']audit/);
+});
+
+test("pre-identity revision failures do not attempt an audit commit with undefined identity", () => {
+  let writes = 0;
+  let commits = 0;
+  const result = persistRevisionAudit({
+    identity: undefined,
+    audit: { writeMarkdown: () => { writes += 1; } },
+    persist: () => { commits += 1; },
+  });
+  assert.deepEqual(result, { skipped: true, reason: "identity-unverified" });
+  assert.equal(writes, 0);
+  assert.equal(commits, 0);
 });
 
 test("revision records truthful audit failure status and rejects fork heads before PUT", () => {

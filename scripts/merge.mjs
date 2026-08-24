@@ -845,6 +845,52 @@ export function revisionDisposition({
   };
 }
 
+/** Reuse an exact-head rejection without re-judging or reposting public comments. */
+export function recoverRejectedJudge({
+  target,
+  existingJudge,
+  fleetAuthored,
+  revisionAllowed,
+  evidenceAvailable,
+  revisionAttempts = 0,
+  maxRevisions = 2,
+  runId,
+  identity,
+  persistIntent = persistRevisionIntent,
+  writeOutput = writeRevisionOutput,
+  env = process.env,
+} = {}) {
+  const scores = existingJudge && existingJudge.judgeScores;
+  const priorResult = {
+    verdict: "reject",
+    score: Math.min(Number(scores?.correctness) || 0, Number(scores?.standards) || 0),
+    blockers: Array.isArray(existingJudge?.blockerIds) ? existingJudge.blockerIds : [],
+    reasons: Array.isArray(existingJudge?.reviewNotes) ? existingJudge.reviewNotes : [],
+    infrastructureFailure: false,
+  };
+  const disposition = revisionDisposition({
+    fleetAuthored,
+    revisionAllowed,
+    evidenceAvailable,
+    judgeResults: [priorResult],
+    revisionAttempts,
+    maxRevisions,
+  });
+  if (!disposition.revisionNeeded) return { ...disposition, publicComment: false };
+  persistIntent(target, runId, revisionAttempts + 1, priorResult.blockers, identity);
+  writeOutput(env);
+  return { ...disposition, state: "REVISION_QUEUED", revisionNeeded: true, publicComment: false };
+}
+
+export function evidenceUnavailableDisposition() {
+  return {
+    revisionNeeded: false,
+    state: "BLOCKED",
+    why: "deterministic target evidence unavailable",
+    publicComment: false,
+  };
+}
+
 export async function mergeWithExpectedSha(repo, prNumber, expectedSha, audit, dependencies = {}) {
   const identity = dependencies.identity;
   const getPr = dependencies.getPr || ((targetRepo, targetPr) => gh(["api", `/repos/${targetRepo}/pulls/${targetPr}`], process.env));
@@ -1015,6 +1061,10 @@ export async function main(env = process.env) {
     const threshold = cls.depth >= 3 ? 95 : cls.depth >= 2 ? 90 : 80;
     const existingJudge = findCompletedJudgeEvent(memoryEvents, target);
 
+    if (!evidence.available) {
+      const disposition = evidenceUnavailableDisposition();
+      return targetTerminal(disposition.state, { why: disposition.why });
+    }
     if (secretHits.length > 0) {
       await postComment(target.repo, target.pr, "🛑 **fleet merge-gate**: potential secrets detected in the patch. Human review is required; no revision or merge is attempted.", audit, identity);
       return targetTerminal("BLOCKED", { why: "secrets in diff" });
@@ -1022,13 +1072,6 @@ export async function main(env = process.env) {
     if (cls.humanOnly) {
       await postComment(target.repo, target.pr, `🧑‍⚖️ **fleet merge-gate**: human review required.\n\n${cls.reasons.map((reason) => `- ${reason}`).join("\n")}`, audit, identity);
       return targetTerminal("BLOCKED", { why: "human-only policy" });
-    }
-    if (!evidence.available && !existingJudge) {
-      const blocker = "deterministic target evidence unavailable";
-      const body = buildJudgeComment({ evidenceDigest: "unavailable", targetCheckSucceeded: false, extraBlockers: [blocker] });
-      await postComment(target.repo, target.pr, body, audit, identity);
-      const disposition = revisionDisposition({ fleetAuthored, revisionAllowed: cls.revisionAllowed, evidenceAvailable: false });
-      return targetTerminal(disposition.state, { why: disposition.why });
     }
 
     let approved = false;
@@ -1045,22 +1088,19 @@ export async function main(env = process.env) {
         if (scores.correctness < threshold || scores.standards < threshold) return targetTerminal("BLOCKED", { why: "same-head judge score is below the current threshold" });
         approved = true;
       } else {
-        blockers = Array.isArray(existingJudge.blockerIds) ? existingJudge.blockerIds : [];
-        const priorResult = {
-          verdict: "reject",
-          score: Math.min(scores.correctness, scores.standards),
-          blockers,
-          reasons: Array.isArray(existingJudge.reviewNotes) ? existingJudge.reviewNotes : [],
-          infrastructureFailure: false,
-        };
-        const disposition = revisionDisposition({
+        const disposition = recoverRejectedJudge({
+          target,
+          existingJudge,
           fleetAuthored,
           revisionAllowed: cls.revisionAllowed,
-          evidenceAvailable: true,
-          judgeResults: [priorResult],
+          evidenceAvailable: evidence.available,
           revisionAttempts,
           maxRevisions,
+          runId,
+          identity,
+          env,
         });
+        blockers = Array.isArray(existingJudge.blockerIds) ? existingJudge.blockerIds : [];
         return targetTerminal(disposition.state, { why: `same-head judge already completed: ${disposition.why}` });
       }
     } else {

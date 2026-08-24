@@ -216,6 +216,17 @@ function persistEvent(runtime, context, state, details, identity, audit, { requi
   return { eventResult, stateOutcome };
 }
 
+/** Commit the final audit only after the gate has verified identity. */
+export function persistRevisionAudit({ runtime, audit, runId, target, auditStatus, identity, persist = safeCommitState } = {}) {
+  if (!identity) return { skipped: true, reason: "identity-unverified" };
+  audit.writeMarkdown(path.join(runtime.stateRoot, "audit"), runId, `Revise ${target.repo}#${target.pr}`, auditStatus, { lane: "revise" });
+  const outcome = persist === safeCommitState
+    ? safeCommitState(runtime.stateRoot, ["audit"], `[fleet] revise ${target.repo}#${target.pr} ${auditStatus}`, identity, runtime.env)
+    : persist(runtime.stateRoot, ["audit"], `[fleet] revise ${target.repo}#${target.pr} ${auditStatus}`, identity, runtime.env);
+  if (outcome === "no-changes") throw new Error("audit state commit produced no change");
+  return { skipped: false, outcome };
+}
+
 export function revisionMemoryContext(memoryFile, repo, pr) {
   return buildMemoryContext(memoryFile, {
     repo,
@@ -508,14 +519,14 @@ export async function main(env = process.env) {
     }
     throw error;
   } finally {
-    try {
-      audit.writeMarkdown(path.join(runtime.stateRoot, "audit"), runId, `Revise ${target.repo}#${target.pr}`, auditStatus, { lane: "revise" });
-      const outcome = safeCommitState(runtime.stateRoot, ["audit"], `[fleet] revise ${target.repo}#${target.pr} ${auditStatus}`, identity, runtime.env);
-      if (outcome === "no-changes") throw new Error("audit state commit produced no change");
-    } catch (error) {
-      const failure = new Error(`STATE_PERSISTENCE_FAILED ${String(error.message).slice(0, 200)}`);
-      failure.code = 7;
-      throw failure;
+    if (identity) {
+      try {
+        persistRevisionAudit({ runtime, audit, runId, target, auditStatus, identity });
+      } catch (error) {
+        const failure = new Error(`STATE_PERSISTENCE_FAILED ${String(error.message).slice(0, 200)}`);
+        failure.code = 7;
+        throw failure;
+      }
     }
   }
 }

@@ -16,14 +16,14 @@ test("patrol keys PR freshness by stable head SHA, not comment-sensitive updated
   assert.equal(buildDigest(signals, seen), "[]");
 });
 
-test("patrol downgrades every PR-comment directive to a private report", async () => {
+test("patrol downgrades every issue/PR comment directive to a private report", async () => {
   const directives = [
     { kind: "comment", repo: "M1Vj/demo", target: "pr", number: 2, body: "apply this fix" },
-    { kind: "comment", repo: "M1Vj/demo", target: "pr", number: 2, body: "and this one" },
+    { kind: "comment", repo: "M1Vj/demo", target: "issue", number: 3, body: "and this one" },
   ];
   const safe = sanitizePatrolDirectives(directives);
   assert.equal(safe.length, directives.length);
-  assert.ok(safe.every((directive) => directive.kind === "report" && directive.downgraded === "pr-comment-disabled"));
+  assert.ok(safe.every((directive) => directive.kind === "report" && directive.downgraded === "public-comment-disabled"));
   assert.ok(safe.every((directive) => !Object.hasOwn(directive, "body")));
 
   const audit = { incident() {}, note() {} };

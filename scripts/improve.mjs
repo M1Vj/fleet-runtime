@@ -6,10 +6,11 @@ import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, ghInput, putFileContent, ensureBranch, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, sha256, configureIdentity } from "./lib/util.mjs";
 import { askModel, askModelResilient, createDisposableModelWorkspace, disposeModelWorkspace } from "./lib/model.mjs";
-import { verifyCommit, verifyPullAuthor, verifyCommentAuthor } from "./lib/verify.mjs";
+import { verifyCommit, verifyPullAuthor } from "./lib/verify.mjs";
 import { makeTerminal } from "./lib/terminal.mjs";
 import { isSafeRepoPath, sanitizeControlChars, extractJsonObject } from "./lib/directives.mjs";
 import { isAllowedRepo, readTier1Repos } from "./lib/target-policy.mjs";
+import { redactText } from "./lib/pr-memory.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
@@ -454,18 +455,25 @@ async function modeFinalize(audit) {
   const reviews = existsSync(revDir) ? readdirSync(revDir).filter((f) => f.endsWith(".json")).map((f) => JSON.parse(readFileSync(path.join(revDir, f), "utf8"))) : [];
   const state = readJson(STATE_PATH, { runs: [] });
   const byRepo = {};
-  for (const m of metas) byRepo[m.repo] = { ...m, verdicts: {}, commentsPosted: [] };
+  for (const m of metas) byRepo[m.repo] = { ...m, verdicts: {}, reviewFindings: {} };
   for (const r of reviews) {
     const entry = byRepo[r.repo];
     if (!entry) continue;
     entry.verdicts[r.lens] = r.verdict;
-    const lines = [`### ${r.lens} review: **${r.verdict}**`];
-    for (const f of r.findings || []) lines.push(`- [${f.severity}] ${f.title} — ${f.detail}`);
-    const created = gh(["api", "-X", "POST", `/repos/${r.repo}/issues/${r.prNumber}/comments`, "-f", `body=${lines.join("\n")}`], process.env);
-    await verifyCommentAuthor(r.repo, created.id, identity, process.env.FLEET_GH_TOKEN);
-    entry.commentsPosted.push(created.id);
+    entry.reviewFindings[r.lens] = (Array.isArray(r.findings) ? r.findings : []).slice(0, 8).map((finding) => ({
+      severity: redactText(String(finding && finding.severity || "low")).slice(0, 16),
+      title: redactText(String(finding && finding.title || "")).replace(/[\r\n]+/g, " ").slice(0, 160),
+      detail: redactText(String(finding && finding.detail || "")).replace(/[\r\n]+/g, " ").slice(0, 400),
+    }));
   }
-  const runRecord = { utc: new Date().toISOString(), repos: Object.fromEntries(Object.entries(byRepo).map(([k, v]) => [k, { pr: v.prUrl, verdicts: v.verdicts }])) };
+  const runRecord = {
+    utc: new Date().toISOString(),
+    repos: Object.fromEntries(Object.entries(byRepo).map(([k, v]) => [k, {
+      pr: v.prUrl,
+      verdicts: v.verdicts,
+      reviewFindings: v.reviewFindings,
+    }])),
+  };
   state.runs.unshift(runRecord);
   state.runs = state.runs.slice(0, 30);
   writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));

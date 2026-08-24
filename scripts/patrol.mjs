@@ -92,12 +92,11 @@ function buildPrompt(digest) {
     "You are the fleet triage brain for GitHub user M1Vj. Analyze the digest of repository signals below.",
     "Your ENTIRE reply must be exactly one strict JSON array of directive objects and nothing else — no prose, no markdown fences, no code, no examples. Allowed kinds:",
     '{"kind":"report","section":"triage|security|standards|docs|testing|redteam","text":"..."}',
-    '{"kind":"comment","repo":"owner/name","target":"issue","number":N,"body":"..."}',
     '{"kind":"label","repo":"owner/name","target":"issue|pr","number":N,"labels":["..."]}',
     '{"kind":"draft_pr","repo":"owner/name","title":"...","body":"...","branch":"fleet/<kebab>","files":[{"path":"docs/... or scripts/... etc","content":"..."}]}',
     '{"kind":"noop","reason":"..."}',
     "Rules: prioritize security > broken CI > stale PR review comments > standards/docs/testing findings.",
-    "Never emit a comment targeting a pull request: patrol PR comments are downgraded to a private report with no mutation. Use draft_pr for actionable code/documentation fixes, or report/fleet_issue for private findings and blockers.",
+    "Never emit a comment directive targeting an existing issue or pull request: all patrol public comments are downgraded to a private report with no mutation. Use draft_pr for actionable code/documentation fixes, or report/fleet_issue for findings and blockers.",
     "Never propose direct pushes to default branches; draft_pr files only under docs/, src/, scripts/, tests/, .github/workflows/<name>.yml.",
     "Keep total under 25 directives; prefer report entries summarizing minor items.",
     "Digest:",
@@ -149,8 +148,8 @@ export async function executeDirectives(env, identity, directives, targets, audi
   const results = [];
   for (const raw of directives) {
     // Keep the executor fail-closed even if a caller bypasses main's sanitizer.
-    const d = raw && raw.kind === "comment" && raw.target === "pr"
-      ? patrolPrCommentReport(raw)
+    const d = raw && raw.kind === "comment"
+      ? patrolPublicCommentReport(raw)
       : raw;
     try {
       if (d.kind === "report") {
@@ -217,20 +216,23 @@ export async function executeDirectives(env, identity, directives, targets, audi
   return { mutations, results };
 }
 
-/** Downgrade public PR-comment suggestions to a private, non-mutating report. */
-export function patrolPrCommentReport(directive = {}) {
+/** Downgrade every public comment suggestion to a private, non-mutating report. */
+export function patrolPublicCommentReport(directive = {}) {
   return {
     kind: "report",
     section: "triage",
-    text: `suppressed public PR comment directive for ${String(directive.repo || "target").slice(0, 120)}#${Number.isSafeInteger(directive.number) ? directive.number : "?"}; use draft_pr for an actionable fix`,
-    downgraded: "pr-comment-disabled",
+    text: `suppressed public ${directive.target === "pr" ? "PR" : "issue"} comment directive for ${String(directive.repo || "target").slice(0, 120)}#${Number.isSafeInteger(directive.number) ? directive.number : "?"}; use draft_pr for an actionable fix`,
+    downgraded: "public-comment-disabled",
   };
 }
 
+// Backwards-compatible export for callers that named the former PR-only guard.
+export const patrolPrCommentReport = patrolPublicCommentReport;
+
 export function sanitizePatrolDirectives(directives) {
   return (Array.isArray(directives) ? directives : []).map((directive) => (
-    directive && directive.kind === "comment" && directive.target === "pr"
-      ? patrolPrCommentReport(directive)
+    directive && directive.kind === "comment"
+      ? patrolPublicCommentReport(directive)
       : directive
   ));
 }
@@ -313,8 +315,8 @@ export async function main() {
         throw Object.assign(new Error("DIRECTIVES_REJECTED"), { code: 5 });
       }
       directives = sanitizePatrolDirectives(validation.directives);
-      const suppressedPrComments = validation.directives.length - directives.filter((directive) => directive.downgraded !== "pr-comment-disabled").length;
-      if (suppressedPrComments > 0) audit.note("policy", `suppressed ${suppressedPrComments} public PR comment directive(s)`);
+      const suppressedComments = validation.directives.length - directives.filter((directive) => directive.downgraded !== "public-comment-disabled").length;
+      if (suppressedComments > 0) audit.note("policy", `suppressed ${suppressedComments} public comment directive(s)`);
       audit.note("validator", `directives accepted=${directives.length}`);
     }
 

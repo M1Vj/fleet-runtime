@@ -8,6 +8,7 @@ import {
   validatePrDiffFiles,
   validateRevisionFiles,
   validateTarget,
+  normalizeMaxRevisions,
 } from "../scripts/lib/revision-queue.mjs";
 
 const headSha = "a".repeat(40);
@@ -190,6 +191,15 @@ test("fork-origin heads fail closed unless the head repository is the target", (
 test("PR diff metadata requires fewer than 100 files and a usable patch for every file", () => {
   assert.equal(validatePrDiffFiles([{ filename: "src/a.js", patch: "@@ -1 +1 @@" }]).ok, true);
   assert.equal(validatePrDiffFiles([{ filename: "src/a.js", patch: "" }]).ok, false);
+  assert.equal(validatePrDiffFiles([{ filename: "src/a.js", patch: "   \n\t" }]).ok, false);
   assert.equal(validatePrDiffFiles([{ filename: "src/a.js" }]).ok, false);
   assert.equal(validatePrDiffFiles(Array.from({ length: 100 }, (_, i) => ({ filename: `src/${i}.js`, patch: "@@" }))).ok, false);
+});
+
+test("malformed revision limits normalize to a bounded positive default", () => {
+  for (const value of ["NaN", "", "-1", "0", "Infinity", "2.5", "garbage"]) {
+    assert.equal(normalizeMaxRevisions(value), 2, value);
+  }
+  assert.equal(normalizeMaxRevisions("4"), 4);
+  assert.equal(normalizeMaxRevisions("999"), 32);
 });

@@ -1,10 +1,19 @@
 import { isSafeRepoPath } from "./directives.mjs";
+import { containsSecretLike } from "./pr-memory.mjs";
 
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const SHA_RE = /^[a-f0-9]{40}$/i;
 const MAX_FILE_CHARS = 60000;
 const MAX_SUPPORTING_FILES = 2;
 const REVISION_PATH_RE = /^(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+$/;
+const MAX_REVISION_ATTEMPTS = 32;
+
+export function normalizeMaxRevisions(value, fallback = 2) {
+  const candidate = Number(value);
+  const safeFallback = Number.isSafeInteger(Number(fallback)) && Number(fallback) > 0 ? Number(fallback) : 2;
+  if (!Number.isSafeInteger(candidate) || candidate <= 0) return Math.min(MAX_REVISION_ATTEMPTS, safeFallback);
+  return Math.min(MAX_REVISION_ATTEMPTS, candidate);
+}
 
 function positivePr(value) {
   if (typeof value === "number") return Number.isInteger(value) && value > 0 ? value : null;
@@ -90,7 +99,7 @@ const FORBIDDEN_REVISION_PATHS = [
   /(^|\/)(?:state|audit|credential|credentials|secret|secrets)(\/|$)/i,
   /^\.github\/(?:workflows|actions)(\/|$)/i,
   /^\.github\/dependabot(?:$|\/|\.ya?ml$)/i,
-  /(^|\/)(?:auth|security|migration|migrations|infra|deploy|deployment)(\/|$)/i,
+  /(^|\/)(?:auth|security|migration|migrations|infra|deploy|deployment|login|oauth2?|permissions?|sessions?|access[-_]?control)(\/|[._-]|$)/i,
   /(^|\/)(?:package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.ya?ml|pnpm-workspace\.ya?ml|yarn\.lock|bun\.lock(?:b)?|\.npmrc|\.yarnrc(?:\.yml)?|pyproject\.toml|requirements(?:\/.*|[^/]*\.txt)|Pipfile(?:\.lock)?|poetry\.lock|setup\.(?:py|cfg)|Cargo\.toml|Cargo\.lock|go\.(?:mod|sum|work|work\.sum)|Gemfile(?:\.lock)?|[^/]+\.gemspec|composer\.json|composer\.lock|pom\.xml|mvnw|\.mvn(?:\/.*|$)|build\.gradle(?:\.kts)?|settings\.gradle(?:\.kts)?|gradle(?:\.lockfile|\/.*|$)|gradle\.properties|gradlew|Dockerfile(?:\..*)?|docker-compose(?:\..*)?|compose\.(?:ya?ml)|Makefile|\.nvmrc|action\.ya?ml)$/i,
 ];
 
@@ -155,6 +164,25 @@ export function validateRevisionFiles(files, changedPaths = []) {
     supportingPaths,
     files: outputs.map((file) => ({ path: file && typeof file.path === "string" ? file.path.replace(/^\.\//, "") : "", content: file && typeof file.content === "string" ? file.content : "" })),
   };
+}
+
+const PRIVATE_OUTPUT_PATTERNS = [
+  /(?:^|[\\/])(?:state-control|pr-memory\.jsonl|gateway-health\.json|KILL_SWITCH)(?:$|[\\/])/i,
+  /(?:^|[\\/])(?:credentials?|secrets?|private|audit)(?:$|[\\/])/i,
+  /(?:\/Users\/|\/home\/|\/runner\/work\/)/i,
+  /\b(?:FLEET_GH_TOKEN|FLEET_OPENCODE_AUTH|OPENCODE_AUTH_CONTENT|GH_TOKEN)\b/i,
+  /(?:read|cat|print|dump|copy|exfiltrat)[^\n]{0,80}(?:state-control|pr-memory|credentials?|secrets?)/i,
+];
+
+/** Reject secret/private-state material before creating any Git object. */
+export function screenRevisionOutput(files) {
+  const errors = [];
+  for (const file of Array.isArray(files) ? files : []) {
+    const content = String(file && file.content || "");
+    if (containsSecretLike(content)) errors.push(`secret-like revision content: ${file.path || "<unknown>"}`);
+    if (PRIVATE_OUTPUT_PATTERNS.some((pattern) => pattern.test(content))) errors.push(`private-state revision content: ${file.path || "<unknown>"}`);
+  }
+  return { ok: errors.length === 0, errors: errors.slice(0, 8) };
 }
 
 export function assertTarget(target) {

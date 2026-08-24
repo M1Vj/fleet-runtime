@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, writeFileSync, utimesSync, mkdirSync } from "node:fs";
 import * as fs from "node:fs";
 import path from "node:path";
+import { redactText } from "./pr-memory.mjs";
 
 const OPEN_MS = 30 * 60 * 1000;
 
@@ -12,7 +13,7 @@ export function markGatewayDown(root = process.cwd(), reason = "model unavailabl
   try {
     const p = filePath(root);
     mkdirSyncSafe(p);
-    writeFileSync(p, JSON.stringify({ downSince: new Date().toISOString(), reason: String(reason).slice(0, 200) }));
+    writeFileSync(p, JSON.stringify({ downSince: new Date().toISOString(), reason: redactText(String(reason)).slice(0, 200) }));
   } catch {}
 }
 

@@ -54,10 +54,14 @@ export async function verifyCommentAuthor(repoFullName, commentId, identity, tok
   return true;
 }
 
-export async function verifyPullAuthor(repoFullName, number, identity, token, fetchImpl = globalThis.fetch) {
+export async function verifyPullAuthor(repoFullName, number, identity, token, fetchImpl = globalThis.fetch, { requireDraft = true } = {}) {
   const pull = await apiGet(`/repos/${repoFullName}/pulls/${number}`, token, fetchImpl);
   const login = pull.user && pull.user.login;
   if (login !== identity.login) throw new Error(`ATTRIBUTION_MISMATCH pr#${number} creator=${login}`);
-  if (pull.draft !== true) throw new Error(`SAFETY_MISMATCH pr#${number} not draft`);
+  if (requireDraft && pull.draft !== true) throw new Error(`SAFETY_MISMATCH pr#${number} not draft`);
   return true;
+}
+
+export async function verifyMergePullAuthor(repoFullName, number, identity, token, fetchImpl = globalThis.fetch) {
+  return verifyPullAuthor(repoFullName, number, identity, token, fetchImpl, { requireDraft: false });
 }

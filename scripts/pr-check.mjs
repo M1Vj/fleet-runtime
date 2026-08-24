@@ -1,21 +1,28 @@
 #!/usr/bin/env node
 import process from "node:process";
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import {
+  appendFileSync,
+  chmodSync,
+  closeSync,
+  constants,
+  existsSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { redactText } from "./lib/pr-memory.mjs";
 
 export const MAX_EVIDENCE_CHARS = 8000;
 const SAFE_ENV_KEYS = ["CI", "HOME", "LANG", "LC_ALL", "NODE_ENV", "PATH", "TMPDIR"];
-const SECRET_OUTPUT_PATTERNS = [
-  /(ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9_]{20,}/gi,
-  /AKIA[0-9A-Z]{16}/g,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/gi,
-  /\bsk-[A-Za-z0-9]{20,}\b/g,
-  /\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
-  /([?&](?:token|key|secret|password|passwd)=)[^&\s]+/gi,
-];
 
 export function buildTargetEnv(source = process.env) {
   const safe = {};
@@ -31,9 +38,39 @@ export function buildTargetEnv(source = process.env) {
 }
 
 export function sanitizeEvidence(value) {
-  let output = String(value || "");
-  for (const pattern of SECRET_OUTPUT_PATTERNS) output = output.replace(pattern, "[REDACTED]");
-  return output;
+  return redactText(String(value || ""));
+}
+
+function evidenceParent(output) {
+  const absolute = path.resolve(String(output || ""));
+  if (path.basename(absolute) !== "evidence.txt" || path.basename(path.dirname(absolute)) !== "target-check") {
+    throw new Error("EVIDENCE_PATH_INVALID");
+  }
+  const parent = path.dirname(absolute);
+  mkdirSync(parent, { recursive: true, mode: 0o700 });
+  const stat = lstatSync(parent);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("EVIDENCE_PARENT_UNSAFE");
+  return { absolute, parent };
+}
+
+/** Write evidence with a private temp file and atomic same-directory rename. */
+export function writeEvidenceSafe(output, value) {
+  const { absolute, parent } = evidenceParent(output);
+  const temp = path.join(parent, `.evidence-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`);
+  let fd = null;
+  try {
+    fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0), 0o600);
+    writeFileSync(fd, String(value || ""), { encoding: "utf8" });
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    renameSync(temp, absolute);
+    chmodSync(absolute, 0o600);
+  } finally {
+    if (fd !== null) closeSync(fd);
+    try { rmSync(temp, { force: true }); } catch {}
+  }
+  return absolute;
 }
 
 function trimEvidence(value, maxChars) {
@@ -66,19 +103,19 @@ export async function runChecks({
   const safeEnv = buildTargetEnv(env);
   const target = path.resolve(targetDir);
   const output = path.resolve(evidencePath);
-  mkdirSync(path.dirname(output), { recursive: true });
+  evidenceParent(output);
   if (!existsSync(target)) {
     evidence.push("target checkout unavailable");
-    writeFileSync(output, trimEvidence(evidence.join("\n"), maxEvidenceChars), "utf8");
+    writeEvidenceSafe(output, trimEvidence(evidence.join("\n"), maxEvidenceChars));
     return { ok: false, visual: false, evidence: evidence.join("\n") };
   }
   evidence.push("target checkout present");
   const pkgPath = path.join(target, "package.json");
   if (!existsSync(pkgPath)) {
-    evidence.push("no package.json; skipped npm install/build/test");
+    evidence.push("unsupported target: package.json missing; no declared build/test contract");
     const text = trimEvidence(evidence.join("\n"), maxEvidenceChars);
-    writeFileSync(output, text, "utf8");
-    return { ok: true, visual: false, evidence: text };
+    writeEvidenceSafe(output, text);
+    return { ok: false, visual: false, evidence: text };
   }
   let scripts = {};
   try {
@@ -86,7 +123,13 @@ export async function runChecks({
   } catch {
     evidence.push("package.json unreadable");
     const text = trimEvidence(evidence.join("\n"), maxEvidenceChars);
-    writeFileSync(output, text, "utf8");
+    writeEvidenceSafe(output, text);
+    return { ok: false, visual: false, evidence: text };
+  }
+  if (!scripts.build && !scripts.test) {
+    evidence.push("unsupported Node target: package.json declares no build or test script");
+    const text = trimEvidence(evidence.join("\n"), maxEvidenceChars);
+    writeEvidenceSafe(output, text);
     return { ok: false, visual: false, evidence: text };
   }
   const install = runCommand("npm", ["install", "--no-audit", "--no-fund"], target, safeEnv, 420000);
@@ -94,7 +137,7 @@ export async function runChecks({
   if (install.timedOut || install.status !== 0) {
     evidence.push(trimEvidence(install.output, 1800));
     const text = trimEvidence(evidence.join("\n"), maxEvidenceChars);
-    writeFileSync(output, text, "utf8");
+    writeEvidenceSafe(output, text);
     return { ok: false, visual: false, evidence: text };
   }
   if (scripts.build) {
@@ -103,7 +146,7 @@ export async function runChecks({
     if (build.timedOut || build.status !== 0) {
       evidence.push(trimEvidence(build.output, 1800));
       const text = trimEvidence(evidence.join("\n"), maxEvidenceChars);
-      writeFileSync(output, text, "utf8");
+      writeEvidenceSafe(output, text);
       return { ok: false, visual: false, evidence: text };
     }
   }
@@ -113,13 +156,13 @@ export async function runChecks({
     if (testResult.timedOut || testResult.status !== 0) {
       evidence.push(trimEvidence(testResult.output, 1800));
       const text = trimEvidence(evidence.join("\n"), maxEvidenceChars);
-      writeFileSync(output, text, "utf8");
+      writeEvidenceSafe(output, text);
       return { ok: false, visual: false, evidence: text };
     }
   }
   evidence.push("visual checks: skipped by policy");
   const text = trimEvidence(evidence.join("\n"), maxEvidenceChars);
-  writeFileSync(output, text, "utf8");
+  writeEvidenceSafe(output, text);
   return { ok: true, visual: false, evidence: text };
 }
 

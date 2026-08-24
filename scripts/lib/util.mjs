@@ -105,12 +105,13 @@ export function ensureBranch(repo, branch, baseSha, env = process.env) {
 }
 
 export function ghInput(prefixArgs, bodyObj, env = process.env) {
-  const tmp = path.join(mkdtempSync(path.join(tmpdir(), "ghin-")), "body.json");
-  writeFileSync(tmp, JSON.stringify(bodyObj), "utf8");
+  const tempDir = mkdtempSync(path.join(tmpdir(), "ghin-"));
+  const tmp = path.join(tempDir, "body.json");
+  writeFileSync(tmp, JSON.stringify(bodyObj), { encoding: "utf8", mode: 0o600, flag: "wx" });
   try {
     return gh([...prefixArgs, "--input", tmp], env);
   } finally {
-    rmSync(tmp, { force: true });
+    rmSync(tempDir, { recursive: true, force: true });
   }
 }
 

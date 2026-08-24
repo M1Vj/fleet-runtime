@@ -20,8 +20,8 @@ import { AuditBuffer } from "./lib/audit.mjs";
 import { gh, ghInput, safeCommitState, scrub, sha256 } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
-import { verifyCommentAuthor, verifyPullAuthor } from "./lib/verify.mjs";
-import { appendMemoryEvent, containsSecretLike, readMemoryEvents, redactText, revisionCountForTarget } from "./lib/pr-memory.mjs";
+import { verifyCommentAuthor, verifyMergePullAuthor, verifyPullAuthor } from "./lib/verify.mjs";
+import { appendMemoryEvent, containsSecretLike, normalizeAuditRunId, readMemoryEvents, redactText, revisionCountForTarget } from "./lib/pr-memory.mjs";
 import {
   RUNTIME_REPO,
   TARGET_OWNER,
@@ -31,6 +31,8 @@ import {
   readTier1Repos,
   validateFilesResponse,
 } from "./lib/target-policy.mjs";
+import { isFleetRef } from "./lib/target-policy.mjs";
+import { normalizeMaxRevisions } from "./lib/revision-queue.mjs";
 
 const STATE_ROOT = String(process.env.FLEET_STATE_ROOT || "");
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -45,6 +47,7 @@ const UI_EXTENSIONS = /\.(html|htm|css|scss|less|jsx|tsx|vue|svelte|astro|mdx)$/
 const SENSITIVE_PATH_PATTERNS = [
   /^\.github\/(workflows|actions)\//i,
   /(^|\/)(auth|security)(\/|[._-])/i,
+  /(^|\/)(?:login|oauth2?|permissions?|sessions?|access[-_]?control)(\/|[._-])/i,
   /(^|\/)(migrations?|db\/migrate)(\/|$)/i,
   /(^|\/)(infra|deploy|deployment)(\/|$)/i,
   /(^|\/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|pnpm-workspace\.yaml|bun\.lockb|\.npmrc|\.yarnrc|\.yarnrc\.yml|pyproject\.toml|requirements[^/]*\.txt|Pipfile|Pipfile\.lock|poetry\.lock|Cargo\.toml|Cargo\.lock|go\.mod|go\.sum|Gemfile|Gemfile\.lock|composer\.json|composer\.lock|pom\.xml|build\.gradle(?:\.kts)?|gradle\.properties|Dockerfile(?:\..*)?|docker-compose(?:\..*)?|action\.ya?ml|dependabot\.ya?ml)$/i,
@@ -158,6 +161,7 @@ const OUTSTANDING_DISPATCH_STATES = new Set([
   "DISPATCH_HELD",
 ]);
 const COMPLETED_DISPATCH_STATES = new Set(["DISPATCH_RELEASED", "DISPATCH_HELD"]);
+const DISPATCH_HELD_TERMINAL_STATES = new Set(["BLOCKED", "MERGE_UNKNOWN", "MERGE_VERIFY_FAILED", "READY_REQUIRED", "APPROVED_NO_MERGE", "REVISION_QUEUED"]);
 const DEFINITIVE_DISPATCH_FAILURE_STATUSES = new Set([400, 401, 403, 404, 405, 410, 422]);
 const DISPATCH_SUMMARIES = {
   DISPATCH_INTENT: "targeted merge gate dispatch intent persisted",
@@ -261,15 +265,22 @@ export async function dispatchTarget(
     return safeCommitState(root, ["state"], `[fleet] dispatch ${normalized.repo}#${normalized.pr} ${state}`, identity, process.env);
   });
   const record = async (state, dispatchArtifact = "") => {
-    const result = append(memoryFile, dispatchEvent(normalized, {
-      runId,
-      attempt,
-      dispatchKey,
-      state,
-      dispatchArtifact,
-    }));
-    await persistState(state);
-    return result && result.event ? result.event : result;
+    try {
+      const result = append(memoryFile, dispatchEvent(normalized, {
+        runId,
+        attempt,
+        dispatchKey,
+        state,
+        dispatchArtifact,
+      }));
+      const outcome = await persistState(state);
+      if (outcome === "no-changes") throw new Error("dispatch event was not committed");
+      return result && result.event ? result.event : result;
+    } catch (error) {
+      const failure = new Error(`STATE_PERSISTENCE_FAILED ${bounded(error.message, 200)}`);
+      failure.code = 7;
+      throw failure;
+    }
   };
   await record("DISPATCH_INTENT");
   const payload = {
@@ -339,19 +350,26 @@ export async function consumeDispatch(
     throw new Error("DISPATCH_CORRELATION_MISSING_OR_INACTIVE");
   }
   const dispatchArtifact = latest.artifactRefs.find((item) => String(item).startsWith("dispatch-run:")) || "";
-  const result = append(memoryFile, dispatchEvent(normalized, {
-    runId,
-    attempt: Number(latest.attempt) || 0,
-    dispatchKey,
-    state: "DISPATCH_CONSUMED",
-    dispatchArtifact,
-  }));
-  const persistState = persist || ((state) => {
-    if (!identity || !identity.name || !identity.noreply) throw new Error("dispatch persistence identity is required");
-    return safeCommitState(root, ["state"], `[fleet] dispatch ${normalized.repo}#${normalized.pr} ${state}`, identity, process.env);
-  });
-  await persistState("DISPATCH_CONSUMED");
-  return { consumed: true, event: result && result.event ? result.event : result };
+  try {
+    const result = append(memoryFile, dispatchEvent(normalized, {
+      runId,
+      attempt: Number(latest.attempt) || 0,
+      dispatchKey,
+      state: "DISPATCH_CONSUMED",
+      dispatchArtifact,
+    }));
+    const persistState = persist || ((state) => {
+      if (!identity || !identity.name || !identity.noreply) throw new Error("dispatch persistence identity is required");
+      return safeCommitState(root, ["state"], `[fleet] dispatch ${normalized.repo}#${normalized.pr} ${state}`, identity, process.env);
+    });
+    const outcome = await persistState("DISPATCH_CONSUMED");
+    if (outcome === "no-changes") throw new Error("dispatch consumed event was not committed");
+    return { consumed: true, event: result && result.event ? result.event : result };
+  } catch (error) {
+    const failure = new Error(`STATE_PERSISTENCE_FAILED ${bounded(error.message, 200)}`);
+    failure.code = 7;
+    throw failure;
+  }
 }
 
 export function completeDispatch(
@@ -363,6 +381,8 @@ export function completeDispatch(
     runId = process.env.FLEET_RUN_ID || "target",
     append = appendMemoryEvent,
     read = readMemoryEvents,
+    persist,
+    identity,
   } = {},
 ) {
   const dispatchKey = String(rawDispatchKey || "");
@@ -386,17 +406,29 @@ export function completeDispatch(
     throw new Error("DISPATCH_CORRELATION_NOT_CONSUMED");
   }
   const dispatchArtifact = latest.artifactRefs.find((item) => String(item).startsWith("dispatch-run:")) || "";
-  const state = new Set(["BLOCKED", "MERGE_UNKNOWN", "MERGE_VERIFY_FAILED", "READY_REQUIRED"]).has(terminalState)
+  const state = DISPATCH_HELD_TERMINAL_STATES.has(terminalState)
     ? "DISPATCH_HELD"
     : "DISPATCH_RELEASED";
-  const result = append(memoryFile, dispatchEvent(normalized, {
-    runId,
-    attempt: Number(latest.attempt) || 0,
-    dispatchKey,
-    state,
-    dispatchArtifact,
-  }));
-  return { completed: true, event: result && result.event ? result.event : result };
+  try {
+    const result = append(memoryFile, dispatchEvent(normalized, {
+      runId,
+      attempt: Number(latest.attempt) || 0,
+      dispatchKey,
+      state,
+      dispatchArtifact,
+    }));
+    if (persist || identity) {
+      const outcome = persist
+        ? persist(state)
+        : safeCommitState(root, ["state"], `[fleet] dispatch ${normalized.repo}#${normalized.pr} ${state}`, identity, process.env);
+      if (outcome === "no-changes") throw new Error("dispatch terminal event was not committed");
+    }
+    return { completed: true, event: result && result.event ? result.event : result };
+  } catch (error) {
+    const failure = new Error(`STATE_PERSISTENCE_FAILED ${bounded(error.message, 200)}`);
+    failure.code = 7;
+    throw failure;
+  }
 }
 
 export function secretsInDiff(files) {
@@ -442,36 +474,95 @@ function writeMergeState(state, details = {}) {
 
 function finish(audit, runId, state, identity, repo, pr) {
   stateRootOrThrow();
-  audit.writeMarkdown(path.join(STATE_ROOT, "audit"), runId, `Merge gate ${bounded(repo, MAX_REPO_CHARS)}#${pr}`, state);
-  safeCommitState(STATE_ROOT, ["state", "audit"], `[fleet] merge-gate ${bounded(runId, MAX_RUN_CHARS)} ${bounded(state, 80)}`, identity, process.env);
+  try {
+    audit.writeMarkdown(path.join(STATE_ROOT, "audit"), normalizeAuditRunId(runId), `Merge gate ${bounded(repo, MAX_REPO_CHARS)}#${pr}`, state);
+    const outcome = safeCommitState(STATE_ROOT, ["state", "audit"], `[fleet] merge-gate ${bounded(normalizeAuditRunId(runId), MAX_RUN_CHARS)} ${bounded(state, 80)}`, identity, process.env);
+    if (outcome === "no-changes") throw new Error("terminal state/audit commit produced no change");
+  } catch (error) {
+    const failure = new Error(`STATE_PERSISTENCE_FAILED ${bounded(error.message, 200)}`);
+    failure.code = 7;
+    throw failure;
+  }
   return 0;
 }
 
 function persistMergeMemoryEvent(target, runId, attempt, state, details, identity) {
   const memoryFile = path.join(stateRootOrThrow(), "state", "pr-memory.jsonl");
-  const event = appendMemoryEvent(memoryFile, {
-    runId,
-    lane: "merge",
-    repo: target.repo,
-    pr: target.pr,
-    headSha: target.headSha,
-    attempt,
-    kind: "judge",
-    state,
-    summary: details.summary,
-    changedPaths: details.changedPaths || [],
-    blockerIds: details.blockerIds || [],
-    artifactRefs: details.artifactRefs || [],
-  });
-  const outcome = safeCommitState(
-    STATE_ROOT,
-    ["state"],
-    `[fleet] judge ${target.repo}#${target.pr} ${state}`,
-    identity,
-    process.env,
-  );
-  if (event.appended && outcome === "no-changes") throw new Error("JUDGE_MEMORY_PERSISTENCE_FAILED");
+  let event;
+  try {
+    event = appendMemoryEvent(memoryFile, {
+      runId,
+      lane: "merge",
+      repo: target.repo,
+      pr: target.pr,
+      headSha: target.headSha,
+      attempt,
+      kind: "judge",
+      state,
+      summary: details.summary,
+      changedPaths: details.changedPaths || [],
+      blockerIds: details.blockerIds || [],
+      reviewNotes: details.reviewNotes || [],
+      judgeScores: details.judgeScores,
+      judgeStatus: details.judgeStatus,
+      artifactRefs: details.artifactRefs || [],
+    });
+  } catch (error) {
+    const failure = new Error(`STATE_PERSISTENCE_FAILED ${bounded(error.message, 200)}`);
+    failure.code = 7;
+    throw failure;
+  }
+  let outcome;
+  try {
+    outcome = safeCommitState(
+      STATE_ROOT,
+      ["state"],
+      `[fleet] judge ${target.repo}#${target.pr} ${state}`,
+      identity,
+      process.env,
+    );
+  } catch (error) {
+    const failure = new Error(`STATE_PERSISTENCE_FAILED ${bounded(error.message, 200)}`);
+    failure.code = 7;
+    throw failure;
+  }
+  if (event.appended && outcome === "no-changes") {
+    const failure = new Error("STATE_PERSISTENCE_FAILED judge memory event was not committed");
+    failure.code = 7;
+    throw failure;
+  }
   return event;
+}
+
+const COMPLETED_JUDGE_STATES = new Set(["JUDGE_APPROVED", "JUDGE_REJECTED"]);
+
+/** Return the latest completed judge event for this exact PR head. */
+export function findCompletedJudgeEvent(events, target) {
+  const normalized = normalizeTargetInput(target);
+  if (!normalized.ok) return null;
+  return (Array.isArray(events) ? events : [])
+    .filter((event) => event && event.kind === "judge"
+      && COMPLETED_JUDGE_STATES.has(event.state)
+      && event.repo === normalized.repo
+      && Number(event.pr) === normalized.pr
+      && String(event.headSha || "").toLowerCase() === normalized.headSha)
+    .at(-1) || null;
+}
+
+function judgeReviewNotes(results = []) {
+  return [...new Set(results.flatMap((result) => [
+    ...(Array.isArray(result && result.reasons) ? result.reasons : []),
+    ...(Array.isArray(result && result.blockers) ? result.blockers : []),
+  ]).map((value) => redactText(String(value || "")).trim()).filter(Boolean))].slice(0, 8);
+}
+
+function judgeScoreMetadata(correctness, standards, threshold, targetChecksPassed) {
+  return {
+    correctness: Math.max(0, Math.min(100, Math.round(Number(correctness && correctness.score) || 0))),
+    standards: Math.max(0, Math.min(100, Math.round(Number(standards && standards.score) || 0))),
+    threshold: Math.max(0, Math.min(100, Math.round(Number(threshold) || 0))),
+    targetChecksPassed: targetChecksPassed === true,
+  };
 }
 
 function persistRevisionIntent(target, runId, attempt, blockerIds, identity) {
@@ -487,24 +578,36 @@ function persistRevisionIntent(target, runId, attempt, blockerIds, identity) {
 
 function bestEffortPostConsumptionFailure({ audit, runId, identity, targetRepo, targetPr, headSha, dispatchKey, error }) {
   const details = { repo: targetRepo, pr: targetPr, why: bounded(error && error.message) };
+  let persistenceFailure = null;
   try {
     completeDispatch(
       { repo: targetRepo, pr: targetPr, headSha },
       dispatchKey,
       "BLOCKED",
-      { stateRoot: STATE_ROOT, runId },
+      { stateRoot: STATE_ROOT, runId, identity },
     );
   } catch (dispatchError) {
     audit.incident("dispatch", `terminal hold failed: ${bounded(dispatchError.message)}`);
+    if (/STATE_PERSISTENCE|STATE_LOG|audit commit|memory/i.test(String(dispatchError.message))) persistenceFailure = dispatchError;
   }
-  try { writeMergeState("BLOCKED", details); } catch (stateError) { audit.incident("state", `terminal state failed: ${bounded(stateError.message)}`); }
+  try { writeMergeState("BLOCKED", details); } catch (stateError) {
+    audit.incident("state", `terminal state failed: ${bounded(stateError.message)}`);
+    persistenceFailure ||= stateError;
+  }
   try {
-    audit.writeMarkdown(path.join(STATE_ROOT, "audit"), runId, `Merge gate ${bounded(targetRepo, MAX_REPO_CHARS)}#${targetPr}`, "BLOCKED");
-    safeCommitState(STATE_ROOT, ["state", "audit"], `[fleet] merge-gate ${bounded(runId, MAX_RUN_CHARS)} BLOCKED`, identity, process.env);
+    audit.writeMarkdown(path.join(STATE_ROOT, "audit"), normalizeAuditRunId(runId), `Merge gate ${bounded(targetRepo, MAX_REPO_CHARS)}#${targetPr}`, "BLOCKED");
+    const outcome = safeCommitState(STATE_ROOT, ["state", "audit"], `[fleet] merge-gate ${bounded(normalizeAuditRunId(runId), MAX_RUN_CHARS)} BLOCKED`, identity, process.env);
+    if (outcome === "no-changes") throw new Error("failure audit commit produced no change");
   } catch (auditError) {
     audit.incident("audit", `durable audit failed: ${bounded(auditError.message)}`);
+    persistenceFailure ||= auditError;
   }
   console.log("MERGE_TERMINAL_STATE=BLOCKED");
+  if (persistenceFailure) {
+    const failure = new Error(`STATE_PERSISTENCE_FAILED ${bounded(persistenceFailure.message, 200)}`);
+    failure.code = 7;
+    throw failure;
+  }
 }
 
 function terminal(state, details, audit, runId, identity, repo, pr, exitCode = 0, dispatch = {}) {
@@ -512,7 +615,7 @@ function terminal(state, details, audit, runId, identity, repo, pr, exitCode = 0
     { repo, pr, headSha: dispatch.headSha },
     dispatch.key,
     state,
-    { stateRoot: STATE_ROOT, runId },
+    { stateRoot: STATE_ROOT, runId, identity },
   );
   writeMergeState(state, { repo, pr, ...details });
   console.log(`MERGE_TERMINAL_STATE=${bounded(state, 80)}`);
@@ -792,9 +895,12 @@ export async function mergeWithExpectedSha(repo, prNumber, expectedSha, audit, d
     return { ok: false, state: reconciled.kind === "verify-failed" ? "MERGE_VERIFY_FAILED" : "MERGE_UNKNOWN" };
   }
   if (merged && typeof merged === "object" && merged.merged === false) return { ok: false, state: "MERGE_REJECTED" };
-  const responseSha = merged && typeof merged === "object" && /^[a-f0-9]{40}$/i.test(String(merged.sha || ""))
-    ? String(merged.sha)
-    : "";
+  const rawResponseSha = merged && typeof merged === "object" ? merged.sha : undefined;
+  const hasResponseSha = rawResponseSha !== undefined && rawResponseSha !== null && String(rawResponseSha).trim() !== "";
+  if (hasResponseSha && !/^[a-f0-9]{40}$/i.test(String(rawResponseSha))) {
+    return { ok: false, state: "MERGE_VERIFY_FAILED" };
+  }
+  const responseSha = hasResponseSha ? String(rawResponseSha) : "";
   const reconciled = await reconcile(responseSha);
   if (reconciled.kind === "success") {
     audit.note("merged", `expected sha=${expectedSha.slice(0, 10)}`);
@@ -805,13 +911,14 @@ export async function mergeWithExpectedSha(repo, prNumber, expectedSha, audit, d
 
 export async function main(env = process.env) {
   const audit = new AuditBuffer(scrub(env));
-  const runId = bounded(env.FLEET_RUN_ID || `merge-${Date.now()}`, MAX_RUN_CHARS);
+  const runId = normalizeAuditRunId(bounded(env.FLEET_RUN_ID || `merge-${Date.now()}`, MAX_RUN_CHARS));
   const rawTarget = { repo: env.FLEET_TARGET_REPO, pr: env.FLEET_PR_NUMBER, headSha: env.FLEET_HEAD_SHA };
   const hasAnyTarget = Object.values(rawTarget).some((value) => value !== undefined && value !== null);
   const normalized = normalizeTargetInput(rawTarget);
   let identity;
   let targetRepo = normalized.repo || bounded(rawTarget.repo, MAX_REPO_CHARS);
-  const targetPr = normalized.pr || Number(rawTarget.pr) || 0;
+  let targetPr = normalized.pr || Number(rawTarget.pr) || 0;
+  let targetHeadSha = normalized.headSha || "";
   try {
     if (hasAnyTarget && !normalized.ok) {
       const error = new Error(`INVALID_TARGET ${normalized.errors.join("; ")}`);
@@ -860,6 +967,9 @@ export async function main(env = process.env) {
         console.log("MERGE_TERMINAL_STATE=NO-OP");
         return finish(audit, runId, "NO-OP", identity, "scan", 0);
       }
+      targetRepo = candidate.repo;
+      targetPr = candidate.pr;
+      targetHeadSha = candidate.headSha;
       const dispatchResult = await dispatchTarget(candidate, { stateRoot: STATE_ROOT, runId, identity, allowMerge: false });
       writeOutput("target_repo", candidate.repo);
       writeOutput("target_pr", candidate.pr);
@@ -889,18 +999,21 @@ export async function main(env = process.env) {
     if (!filesValidation.ok) return targetTerminal("BLOCKED", { why: filesValidation.errors.join("; ") });
     const policy = evaluateTargetPolicy({ target, pr, files, repoMeta, stateRoot: STATE_ROOT });
     if (!policy.ok) return targetTerminal("BLOCKED", { why: policy.errors.join("; ") });
-    await verifyPullAuthor(target.repo, target.pr, identity, env.FLEET_GH_TOKEN);
+    await verifyMergePullAuthor(target.repo, target.pr, identity, env.FLEET_GH_TOKEN);
     const cls = classify(files);
     const secretHits = secretsInDiff(files);
     audit.note("classify", JSON.stringify({ risk: cls.risk, size: cls.size, humanOnly: cls.humanOnly, secretHits: secretHits.length }));
     const evidence = readEvidence();
     const targetCheckSucceeded = isExactTargetCheckSuccess(String(env.FLEET_TARGET_CHECK_RESULT || ""));
-    const fleetAuthored = String(pr.head && pr.head.ref || "").startsWith("fleet/") && pr.user && pr.user.login === TARGET_OWNER;
-    const revisionAttempts = revisionCountForTarget(readMemoryEvents(path.join(STATE_ROOT, "state", "pr-memory.jsonl")), {
+    const fleetAuthored = isFleetRef(pr.head && pr.head.ref) && pr.user && pr.user.login === TARGET_OWNER;
+    const memoryEvents = readMemoryEvents(path.join(STATE_ROOT, "state", "pr-memory.jsonl"));
+    const revisionAttempts = revisionCountForTarget(memoryEvents, {
       repo: target.repo,
       pr: target.pr,
     });
-    const maxRevisions = Math.max(1, Number(env.FLEET_MAX_REVISIONS) || 2);
+    const maxRevisions = normalizeMaxRevisions(env.FLEET_MAX_REVISIONS, 2);
+    const threshold = cls.depth >= 3 ? 95 : cls.depth >= 2 ? 90 : 80;
+    const existingJudge = findCompletedJudgeEvent(memoryEvents, target);
 
     if (secretHits.length > 0) {
       await postComment(target.repo, target.pr, "🛑 **fleet merge-gate**: potential secrets detected in the patch. Human review is required; no revision or merge is attempted.", audit, identity);
@@ -910,7 +1023,7 @@ export async function main(env = process.env) {
       await postComment(target.repo, target.pr, `🧑‍⚖️ **fleet merge-gate**: human review required.\n\n${cls.reasons.map((reason) => `- ${reason}`).join("\n")}`, audit, identity);
       return targetTerminal("BLOCKED", { why: "human-only policy" });
     }
-    if (!evidence.available) {
+    if (!evidence.available && !existingJudge) {
       const blocker = "deterministic target evidence unavailable";
       const body = buildJudgeComment({ evidenceDigest: "unavailable", targetCheckSucceeded: false, extraBlockers: [blocker] });
       await postComment(target.repo, target.pr, body, audit, identity);
@@ -918,33 +1031,88 @@ export async function main(env = process.env) {
       return targetTerminal(disposition.state, { why: disposition.why });
     }
 
-    const extraEvidence = evidence.text.slice(0, MAX_EVIDENCE_CHARS);
-    const threshold = cls.depth >= 3 ? 95 : cls.depth >= 2 ? 90 : 80;
-    const correctness = await judge({ repo: target.repo, prNumber: target.pr, title: pr.title, body: pr.body, files, extraEvidence, lens: "correctness-and-security", audit });
-    const standards = await judge({ repo: target.repo, prNumber: target.pr, title: pr.title, body: pr.body, files, extraEvidence, lens: "industry-standards-and-maintainability", audit });
-    const approved = targetCheckSucceeded && [correctness, standards].every((result) => result.verdict === "approve" && result.score >= threshold && result.blockers.length === 0);
-    const blockers = [...correctness.blockers, ...standards.blockers].slice(0, 8);
-    const allBlockers = targetCheckSucceeded ? blockers : ["deterministic target checks did not report exact success", ...blockers];
-    const judgeState = approved ? "JUDGE_APPROVED" : "JUDGE_REJECTED";
-    persistMergeMemoryEvent(
-      target,
-      runId,
-      revisionAttempts + 1,
-      judgeState,
-      {
-        summary: approved ? "both independent judges approved the bounded change" : "bounded judge review rejected the change",
-        blockerIds: allBlockers.map(blockerIdentifier),
-      },
-      identity,
-    );
-    const verdictBody = buildJudgeComment({
-      correctness,
-      standards,
-      evidenceDigest: evidence.digest,
-      targetCheckSucceeded,
-      extraBlockers: targetCheckSucceeded ? [] : ["deterministic target checks did not report exact success"],
-    });
-    await postComment(target.repo, target.pr, verdictBody, audit, identity);
+    let approved = false;
+    let blockers = [];
+    let allBlockers = [];
+    let correctness;
+    let standards;
+    if (existingJudge) {
+      audit.note("judge-dedupe", `same-head ${existingJudge.state} reused for ${target.repo}#${target.pr}`);
+      const scores = existingJudge.judgeScores;
+      if (!scores) return targetTerminal("STALLED", { why: "completed judge event lacks normalized score metadata" });
+      if (existingJudge.state === "JUDGE_APPROVED") {
+        if (!targetCheckSucceeded || scores.targetChecksPassed !== true) return targetTerminal("STALLED", { why: "same-head judge requires exact deterministic target success" });
+        if (scores.correctness < threshold || scores.standards < threshold) return targetTerminal("BLOCKED", { why: "same-head judge score is below the current threshold" });
+        approved = true;
+      } else {
+        blockers = Array.isArray(existingJudge.blockerIds) ? existingJudge.blockerIds : [];
+        const priorResult = {
+          verdict: "reject",
+          score: Math.min(scores.correctness, scores.standards),
+          blockers,
+          reasons: Array.isArray(existingJudge.reviewNotes) ? existingJudge.reviewNotes : [],
+          infrastructureFailure: false,
+        };
+        const disposition = revisionDisposition({
+          fleetAuthored,
+          revisionAllowed: cls.revisionAllowed,
+          evidenceAvailable: true,
+          judgeResults: [priorResult],
+          revisionAttempts,
+          maxRevisions,
+        });
+        return targetTerminal(disposition.state, { why: `same-head judge already completed: ${disposition.why}` });
+      }
+    } else {
+      const extraEvidence = evidence.text.slice(0, MAX_EVIDENCE_CHARS);
+      correctness = await judge({ repo: target.repo, prNumber: target.pr, title: pr.title, body: pr.body, files, extraEvidence, lens: "correctness-and-security", audit });
+      standards = await judge({ repo: target.repo, prNumber: target.pr, title: pr.title, body: pr.body, files, extraEvidence, lens: "industry-standards-and-maintainability", audit });
+      const judgeScores = judgeScoreMetadata(correctness, standards, threshold, targetCheckSucceeded);
+      const reviewNotes = judgeReviewNotes([correctness, standards]);
+      if (correctness.infrastructureFailure === true || standards.infrastructureFailure === true) {
+        persistMergeMemoryEvent(
+          target,
+          runId,
+          revisionAttempts + 1,
+          "JUDGE_UNAVAILABLE",
+          {
+            summary: "judge infrastructure unavailable; no public verdict was posted",
+            blockerIds: [],
+            reviewNotes,
+            judgeScores,
+            judgeStatus: "infrastructure",
+          },
+          identity,
+        );
+        return targetTerminal("STALLED", { why: "judge infrastructure unavailable" });
+      }
+      approved = targetCheckSucceeded && [correctness, standards].every((result) => result.verdict === "approve" && result.score >= threshold && result.blockers.length === 0);
+      blockers = [...correctness.blockers, ...standards.blockers].slice(0, 8);
+      allBlockers = targetCheckSucceeded ? blockers : ["deterministic target checks did not report exact success", ...blockers];
+      const judgeState = approved ? "JUDGE_APPROVED" : "JUDGE_REJECTED";
+      persistMergeMemoryEvent(
+        target,
+        runId,
+        revisionAttempts + 1,
+        judgeState,
+        {
+          summary: approved ? "both independent judges approved the bounded change" : "bounded judge review rejected the change",
+          blockerIds: allBlockers.map(blockerIdentifier),
+          reviewNotes,
+          judgeScores,
+          judgeStatus: "completed",
+        },
+        identity,
+      );
+      const verdictBody = buildJudgeComment({
+        correctness,
+        standards,
+        evidenceDigest: evidence.digest,
+        targetCheckSucceeded,
+        extraBlockers: targetCheckSucceeded ? [] : ["deterministic target checks did not report exact success"],
+      });
+      await postComment(target.repo, target.pr, verdictBody, audit, identity);
+    }
     if (!approved) {
       const disposition = revisionDisposition({
         fleetAuthored,
@@ -981,10 +1149,15 @@ export async function main(env = process.env) {
         identity,
         targetRepo,
         targetPr,
-        headSha: normalized.headSha,
+        headSha: targetHeadSha,
         dispatchKey: env.FLEET_DISPATCH_ID,
         error,
       });
+    }
+    if (error && error.code !== 7 && /STATE_(?:LOG|PERSISTENCE)|audit .*commit|terminal .*commit/i.test(String(error.message))) {
+      const failure = new Error(`STATE_PERSISTENCE_FAILED ${bounded(error.message, 200)}`);
+      failure.code = 7;
+      throw failure;
     }
     throw error;
   }

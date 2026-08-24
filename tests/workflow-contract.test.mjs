@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 
 const workflow = readFileSync(new URL("../.github/workflows/merge.yml", import.meta.url), "utf8");
 const mergeSource = readFileSync(new URL("../scripts/merge.mjs", import.meta.url), "utf8");
+const archiveSource = readFileSync(new URL("../scripts/lib/archive-safe.mjs", import.meta.url), "utf8");
+const prCheckSource = readFileSync(new URL("../scripts/pr-check.mjs", import.meta.url), "utf8");
 
 test("manual dispatch has an explicit, fail-closed target contract", () => {
   assert.match(workflow, /workflow_dispatch:\s*\n\s+inputs:/);
@@ -92,13 +94,35 @@ test("trusted credentials are step-local and state root is explicit", () => {
 test("target evidence is explicitly bounded and redacted before upload", () => {
   const targetJob = workflow.slice(workflow.indexOf("  target-check:"), workflow.indexOf("  gate:"));
   assert.match(targetJob, /MAX_EVIDENCE_CHARS/);
-  assert.match(targetJob, /redactText/);
-  assert.match(targetJob, /from ["']\.\/scripts\/lib\/pr-memory\.mjs["']/);
-  assert.match(targetJob, /text\s*=\s*redactText\(text\)/);
+  assert.match(targetJob, /load canonical redactor before target execution/);
+  assert.match(prCheckSource, /redactText/);
+  assert.match(prCheckSource, /constants\.O_NOFOLLOW/);
+  assert.match(prCheckSource, /renameSync\(temp, absolute\)/);
   assert.doesNotMatch(targetJob, /github_pat_|xox|AIza|Bearer|BEGIN PRIVATE KEY|eyJ/);
   assert.match(targetJob, /8000/);
   assert.match(targetJob, /upload-artifact/);
   assert.match(targetJob, /evidence\.txt/);
+});
+
+test("archive extraction validates members and uses safe tar flags", () => {
+  const targetJob = workflow.slice(workflow.indexOf("  target-check:"), workflow.indexOf("  sanitize-evidence:"));
+  assert.match(targetJob, /scripts\/lib\/archive-safe\.mjs/);
+  assert.match(archiveSource, /--no-same-owner/);
+  assert.match(archiveSource, /--no-same-permissions/);
+  assert.match(archiveSource, /--no-overwrite-dir/);
+  assert.match(targetJob, /target-check-evidence-raw/);
+});
+
+test("fresh sanitizer owns the canonical redaction sink while exact target outcome stays authoritative", () => {
+  const sanitizer = workflow.slice(workflow.indexOf("  sanitize-evidence:"), workflow.indexOf("  gate:"));
+  assert.match(sanitizer, /actions\/checkout/);
+  assert.match(sanitizer, /target-check-evidence-raw/);
+  assert.match(sanitizer, /scripts\/sanitize-evidence\.mjs/);
+  assert.match(sanitizer, /target-check-evidence/);
+  assert.doesNotMatch(sanitizer, /FLEET_GH_TOKEN|FLEET_OPENCODE_AUTH|state-control|secrets\./);
+  const gateJob = workflow.slice(workflow.indexOf("  gate:"));
+  assert.match(gateJob, /needs:\s*\[authorize, target-check, sanitize-evidence\]/);
+  assert.match(gateJob, /FLEET_TARGET_CHECK_RESULT:\s*\$\{\{\s*needs\.target-check\.outputs\.check_result\s*\}\}/);
 });
 
 test("trusted judge tooling installs before private state is present", () => {

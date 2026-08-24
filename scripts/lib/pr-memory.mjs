@@ -27,6 +27,8 @@ const MAX_PATHS = 32;
 const MAX_PATH_CHARS = 240;
 const MAX_BLOCKERS = 32;
 const MAX_ARTIFACTS = 32;
+const MAX_REVIEW_NOTES = 8;
+const MAX_REVIEW_NOTE_CHARS = 240;
 const REVISION_COUNT_KEY_RE = /^([^\n:]{1,120})#(\d+)$/;
 
 // These patterns deliberately cover provider tokens and common credential forms,
@@ -46,6 +48,10 @@ const SECRET_PATTERNS = [
   /sk-[A-Za-z0-9_-]{20,}/g,
   /xox[baprs]-[A-Za-z0-9-]{10,}/g,
   /AIza[0-9A-Za-z_-]{20,}/g,
+  /\bnpm_[A-Za-z0-9]{20,}\b/g,
+  /\b(?:glpat|pypi)-[A-Za-z0-9_-]{20,}\b/gi,
+  /\bBasic\s+[A-Za-z0-9+/]{16,}={0,2}\b/gi,
+  /\b(?:https?|postgres(?:ql)?|mysql):\/\/[^\s/:@]+:[^\s@]+@[^\s]+/gi,
 ];
 
 function sha256(value) {
@@ -86,6 +92,15 @@ export function containsSecretLike(value) {
   return input !== redactText(input);
 }
 
+/** Keep audit filenames bounded and filesystem-safe even for direct invocations. */
+export function normalizeAuditRunId(value, fallback = "run") {
+  const normalized = String(value ?? "")
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^[.-]+|[.-]+$/g, "")
+    .slice(0, 80);
+  return normalized || fallback;
+}
+
 function redactValue(value) {
   if (Array.isArray(value)) return value.map(redactValue);
   if (value && typeof value === "object") {
@@ -117,6 +132,19 @@ function validCreatedAt(value) {
   return candidate && Number.isFinite(Date.parse(candidate)) ? new Date(candidate).toISOString() : new Date().toISOString();
 }
 
+function safeJudgeScores(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const score = (candidate) => {
+    const numeric = Number(candidate);
+    return Number.isFinite(numeric) ? Math.max(0, Math.min(100, Math.round(numeric))) : undefined;
+  };
+  const correctness = score(value.correctness);
+  const standards = score(value.standards);
+  const threshold = score(value.threshold);
+  if (correctness === undefined || standards === undefined || threshold === undefined || typeof value.targetChecksPassed !== "boolean") return undefined;
+  return { correctness, standards, threshold, targetChecksPassed: value.targetChecksPassed };
+}
+
 /**
  * Normalize an event to the bounded, redacted schema used by fleet-control.
  * This helper is intentionally permissive; target authorization belongs to the
@@ -138,8 +166,12 @@ export function normalizeMemoryEvent(input = {}) {
     summary: truncate(redacted.summary || "", MAX_SUMMARY_CHARS),
     changedPaths: safeArray(redacted.changedPaths, MAX_PATHS, MAX_PATH_CHARS),
     blockerIds: safeArray(redacted.blockerIds, MAX_BLOCKERS, MAX_ID_CHARS),
+    reviewNotes: safeArray(redacted.reviewNotes, MAX_REVIEW_NOTES, MAX_REVIEW_NOTE_CHARS),
     artifactRefs: safeArray(redacted.artifactRefs, MAX_ARTIFACTS, MAX_ID_CHARS),
   };
+  const judgeScores = safeJudgeScores(redacted.judgeScores);
+  if (judgeScores) event.judgeScores = judgeScores;
+  if (["completed", "infrastructure"].includes(String(redacted.judgeStatus || ""))) event.judgeStatus = String(redacted.judgeStatus);
   const revisionCounts = safeRevisionCounts(redacted.revisionCounts);
   if (revisionCounts) event.revisionCounts = revisionCounts;
   event.eventId = deterministicEventId(event);
@@ -158,6 +190,9 @@ export function deterministicEventId(input = {}) {
     summary: event.summary || "",
     changedPaths: event.changedPaths || [],
     blockerIds: event.blockerIds || [],
+    reviewNotes: event.reviewNotes || [],
+    judgeScores: event.judgeScores || {},
+    judgeStatus: event.judgeStatus || "",
     artifactRefs: event.artifactRefs || [],
     revisionCounts: event.revisionCounts || {},
   };

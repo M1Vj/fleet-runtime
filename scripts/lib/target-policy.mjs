@@ -4,6 +4,8 @@ import path from "node:path";
 export const TARGET_OWNER = "M1Vj";
 export const RUNTIME_REPO = `${TARGET_OWNER}/fleet-runtime`;
 export const FLEET_REF_PREFIX = "fleet/";
+// Keep authorization identical to the atomic Git Data updater.
+export const FLEET_BRANCH_RE = /^fleet\/[a-z0-9][a-z0-9-]{4,100}$/;
 export const HEAD_SHA_PATTERN = /^[0-9a-f]{40}$/i;
 export const MAX_REPO_CHARS = 120;
 export const MAX_REF_CHARS = 120;
@@ -121,7 +123,7 @@ export function evaluateTargetPolicy({ target, pr, files, stateRoot, targets, re
   } else {
     if (pr.state !== "open") errors.push("pull request is not open");
     if (!pr.user || pr.user.login !== TARGET_OWNER) errors.push("pull request author must be M1Vj");
-    if (!pr.head || !String(pr.head.ref || "").startsWith(FLEET_REF_PREFIX)) errors.push("head ref must start with fleet/");
+    if (!pr.head || !FLEET_BRANCH_RE.test(String(pr.head.ref || ""))) errors.push("head ref must match fleet/<kebab> policy");
     if (headRepo(pr) !== normalized.repo) errors.push("pull request head must be a same-repo nonfork head");
     if (!pr.head || String(pr.head.sha || "").toLowerCase() !== normalized.headSha) errors.push("pull request head SHA does not match the mandatory target SHA");
     if (pr.head && (pr.head.fork === true || pr.head.repo && pr.head.repo.fork === true)) errors.push("fork-origin pull request heads are not eligible");
@@ -129,7 +131,7 @@ export function evaluateTargetPolicy({ target, pr, files, stateRoot, targets, re
     if (!pr.base || !pr.base.repo || pr.base.repo.full_name !== normalized.repo) errors.push("pull request base must be the target repository");
     if (repoMeta && repoMeta.default_branch && (!pr.base || pr.base.ref !== repoMeta.default_branch)) errors.push("pull request base must be the repository default branch");
   }
-  if (!repoMeta || repoMeta.private !== false) errors.push("target repository must be explicitly public");
+  if (!repoMeta || repoMeta.private !== false || repoMeta.visibility !== "public") errors.push("target repository must be explicitly public");
   const fileResult = validateFilesResponse(files);
   if (!fileResult.ok) errors.push(...fileResult.errors);
   return {
@@ -148,12 +150,12 @@ export function validateFilesResponse(files) {
     if (files.length >= 100) errors.push("pull request has 100 or more files; human review required");
     files.forEach((file, index) => {
       if (!file || typeof file.filename !== "string" || !file.filename) errors.push(`file ${index + 1} has no filename`);
-      if (!file || typeof file.patch !== "string" || file.patch.length === 0) errors.push(`patch unavailable for file ${index + 1}`);
+      if (!file || typeof file.patch !== "string" || file.patch.trim().length === 0) errors.push(`patch unavailable for file ${index + 1}`);
     });
   }
   return { ok: errors.length === 0, errors: errors.slice(0, MAX_POLICY_ERRORS) };
 }
 
 export function isFleetRef(ref) {
-  return bounded(ref, MAX_REF_CHARS).startsWith(FLEET_REF_PREFIX);
+  return FLEET_BRANCH_RE.test(bounded(ref, MAX_REF_CHARS));
 }

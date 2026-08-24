@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -38,10 +38,25 @@ test("target evidence redacts token, JWT, PEM, and query-credential output", () 
 test("target checks write bounded fixed evidence and do not execute visual tooling", async () => {
   const root = mkdtempSync(path.join(tmpdir(), "fleet-pr-check-"));
   writeFileSync(path.join(root, "package.json"), JSON.stringify({ scripts: { test: "node -e 'process.stdout.write(\"ok\")'" } }));
-  const evidence = path.join(root, "evidence.txt");
+  const evidence = path.join(root, "target-check", "evidence.txt");
   const result = await runChecks({ targetDir: root, evidencePath: evidence, maxEvidenceChars: 200 });
   assert.equal(result.ok, true);
   assert.equal(result.visual, false);
   assert.ok(readFileSync(evidence, "utf8").length <= 200);
   assert.match(readFileSync(evidence, "utf8"), /npm test/);
+});
+
+test("unsupported and untested Node targets fail closed", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "fleet-pr-check-unsupported-"));
+  const evidence = path.join(root, "target-check", "evidence.txt");
+  try {
+    const missing = await runChecks({ targetDir: root, evidencePath: evidence });
+    assert.equal(missing.ok, false);
+    writeFileSync(path.join(root, "package.json"), JSON.stringify({ scripts: {} }));
+    const noChecks = await runChecks({ targetDir: root, evidencePath: evidence });
+    assert.equal(noChecks.ok, false);
+    assert.match(readFileSync(evidence, "utf8"), /no build or test script/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

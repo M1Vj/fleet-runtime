@@ -4,12 +4,15 @@ import { readFileSync, writeFileSync, symlinkSync } from "node:fs";
 import { mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { appendMemoryEvent } from "../scripts/lib/pr-memory.mjs";
+import { appendMemoryEvent, normalizeMemoryEvent } from "../scripts/lib/pr-memory.mjs";
 import {
   readRevisionEvidence,
   revisionMemoryContext,
+  selectRevisionFeedback,
   sanitizeRevisionEvidence,
   selectRevisionBlockers,
+  validateRevisionTargetPolicy,
+  screenRevisionOutput,
 } from "../scripts/revise.mjs";
 
 const source = readFileSync(new URL("../scripts/revise.mjs", import.meta.url), "utf8");
@@ -107,6 +110,32 @@ test("revision prefers canonical bounded blocker IDs and only falls back to a ve
     pr: 42,
     verifiedCommentBody: "**Blockers:**\n- blocker-2222222222222222",
   }), ["blocker-2222222222222222"]);
+});
+
+test("revision receives bounded private judge notes and score history tied to each head", () => {
+  const first = normalizeMemoryEvent({
+    lane: "merge",
+    kind: "judge",
+    state: "JUDGE_REJECTED",
+    repo: "M1Vj/example-repo",
+    pr: 42,
+    headSha: "a".repeat(40),
+    reviewNotes: ["add a regression test for the null response"],
+    judgeScores: { correctness: 62, standards: 74, threshold: 80, targetChecksPassed: true },
+  });
+  const second = normalizeMemoryEvent({
+    ...first,
+    state: "JUDGE_APPROVED",
+    headSha: "b".repeat(40),
+    reviewNotes: ["verified exact-head update"],
+    judgeScores: { correctness: 95, standards: 93, threshold: 90, targetChecksPassed: true },
+  });
+  assert.deepEqual(first.reviewNotes, ["add a regression test for the null response"]);
+  assert.deepEqual(first.judgeScores, { correctness: 62, standards: 74, threshold: 80, targetChecksPassed: true });
+  const feedback = selectRevisionFeedback([first, second], { repo: "M1Vj/example-repo", pr: 42 });
+  assert.deepEqual(feedback.latestReviewNotes, ["verified exact-head update"]);
+  assert.deepEqual(feedback.scoreHistory.map((entry) => entry.headSha), ["a".repeat(40), "b".repeat(40)]);
+  assert.match(source, /untrustedData\("REVIEW_FEEDBACK", JSON\.stringify\(reviewFeedback\)\)/);
 });
 
 test("revision memory context reuses prior heads for the same repo and PR", () => {
@@ -233,4 +262,52 @@ test("revision evidence is bounded, redacted, and restricted to the canonical ar
   mkdirSync(oversizedDir, { recursive: true });
   writeFileSync(path.join(oversizedDir, "evidence.txt"), "x".repeat(32001), "utf8");
   assert.equal(readRevisionEvidence(path.join(oversizedDir, "evidence.txt"), { workspaceRoot: oversizedWorkspace }), "");
+});
+
+test("revision entry point enforces tier/public/base policy before model work", () => {
+  const sha = "a".repeat(40);
+  const target = { repo: "M1Vj/example-repo", pr: 42, headSha: sha };
+  const files = [{ filename: "src/app.js", patch: "@@" }];
+  const base = {
+    state: "open", user: { login: "M1Vj" },
+    head: { ref: "fleet/fix-one", sha, repo: { full_name: target.repo } },
+    base: { ref: "main", repo: { full_name: target.repo } },
+  };
+  const meta = { full_name: target.repo, default_branch: "main", private: false, visibility: "public" };
+  assert.equal(validateRevisionTargetPolicy({ target, pr: base, files, repoMeta: meta, targets: [target.repo] }).ok, true);
+  for (const variant of [
+    { repoMeta: { ...meta, private: true } },
+    { repoMeta: { ...meta, private: undefined } },
+    { pr: { ...base, base: { ...base.base, ref: "develop" } } },
+    { pr: { ...base, head: { ...base.head, ref: "fleet/fix" } } },
+    { files: [{ filename: "src/app.js", patch: " \t" }] },
+  ]) {
+    assert.equal(validateRevisionTargetPolicy({ target, pr: variant.pr || base, files: variant.files || files, repoMeta: variant.repoMeta || meta, targets: [target.repo] }).ok, false);
+  }
+});
+
+test("revision target policy blocks sensitive PR paths before model work", () => {
+  const result = validateRevisionTargetPolicy({
+    target: { repo: "M1Vj/demo", pr: 7, headSha: "a".repeat(40) },
+    pr: {
+      state: "open",
+      user: { login: "M1Vj" },
+      head: { ref: "fleet/fix-one", sha: "a".repeat(40), repo: { full_name: "M1Vj/demo", fork: false } },
+      base: { ref: "main", repo: { full_name: "M1Vj/demo" } },
+    },
+    files: [{ filename: "src/oauth/login.js", patch: "@@ -1 +1 @@\n-old\n+new" }],
+    repoMeta: { full_name: "M1Vj/demo", default_branch: "main", private: false, visibility: "public" },
+    targets: { tier1: ["M1Vj/demo"] },
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.errors.join(" "), /non-sensitive revision path/);
+});
+
+test("model revision content is screened before any Git object creation", () => {
+  assert.equal(screenRevisionOutput([{ path: "src/app.js", content: "const token = 'ghp_abcdefghijklmnopqrstuvwxyz1234567890';" }]).ok, false);
+  assert.equal(screenRevisionOutput([{ path: "src/app.js", content: "read state-control/state/pr-memory.jsonl" }]).ok, false);
+  assert.equal(screenRevisionOutput([{ path: "src/app.js", content: "export const fixed = true;" }]).ok, true);
+  const applyIndex = source.indexOf("applyAtomicRevision({");
+  const screenIndex = source.indexOf("screenRevisionOutput");
+  assert.ok(screenIndex >= 0 && screenIndex < applyIndex);
 });

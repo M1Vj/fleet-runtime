@@ -20,10 +20,11 @@ import {
   secretsInDiff,
   isExactTargetCheckSuccess,
   buildJudgeComment,
+  findCompletedJudgeEvent,
   validateFilesResponse,
 } from "../scripts/merge.mjs";
 import { evaluateTargetPolicy, normalizeTargetInput, isAllowedRepo } from "../scripts/lib/target-policy.mjs";
-import { redactText } from "../scripts/lib/pr-memory.mjs";
+import { normalizeMemoryEvent, redactText } from "../scripts/lib/pr-memory.mjs";
 
 const source = readFileSync(new URL("../scripts/merge.mjs", import.meta.url), "utf8");
 
@@ -133,16 +134,20 @@ test("target policy rejects private or unknown repository visibility", () => {
   const pr = {
     state: "open",
     user: { login: "M1Vj" },
-    head: { ref: "fleet/fix", sha, repo: { full_name: "M1Vj/fleet-runtime" } },
+    head: { ref: "fleet/fix-one", sha, repo: { full_name: "M1Vj/fleet-runtime" } },
     base: { ref: "main", repo: { full_name: "M1Vj/fleet-runtime" } },
   };
   const files = [{ filename: "src/a.js", patch: "@@" }];
-  const baseMeta = { full_name: "M1Vj/fleet-runtime", default_branch: "main" };
+  const baseMeta = { full_name: "M1Vj/fleet-runtime", default_branch: "main", visibility: "public" };
   for (const visibility of [true, undefined, "false"]) {
     const repoMeta = visibility === undefined ? baseMeta : { ...baseMeta, private: visibility };
     assert.equal(evaluateTargetPolicy({ target, pr, files, repoMeta }).ok, false, String(visibility));
   }
   assert.equal(evaluateTargetPolicy({ target, pr, files, repoMeta: { ...baseMeta, private: false } }).ok, true);
+  for (const visibility of [undefined, "private", "internal"]) {
+    const repoMeta = { ...baseMeta, private: false, visibility };
+    assert.equal(evaluateTargetPolicy({ target, pr, files, repoMeta }).ok, false, String(visibility));
+  }
 });
 
 test("merge uses REST expected-SHA semantics and state checkout", () => {
@@ -438,6 +443,44 @@ test("a consumed target remains claimed until an explicit release or hold", asyn
   });
   assert.equal(hold.event.state, "DISPATCH_HELD");
   assert.equal(hasOutstandingDispatch(held, target), true);
+
+  const queued = [{ ...target, lane: "merge", kind: "dispatch", state: "DISPATCH_CONSUMED", attempt: 1, artifactRefs: [`dispatch-key:${key}`] }];
+  const queuedHold = completeDispatch(target, key, "REVISION_QUEUED", {
+    stateRoot: "/tmp/fleet-dispatch-contract",
+    read: () => queued,
+    append: (_file, event) => { queued.push(event); return { event }; },
+  });
+  assert.equal(queuedHold.event.state, "DISPATCH_HELD");
+  assert.equal(hasOutstandingDispatch(queued, target), true);
+});
+
+test("terminal dispatch persistence failure is visible as state-persistence failure", () => {
+  const target = { repo: "M1Vj/fleet-runtime", pr: 17, headSha: "8".repeat(40) };
+  const key = "9".repeat(64);
+  const events = [{ ...target, lane: "merge", kind: "dispatch", state: "DISPATCH_CONSUMED", attempt: 1, artifactRefs: [`dispatch-key:${key}`] }];
+  assert.throws(() => completeDispatch(target, key, "BLOCKED", {
+    stateRoot: "/tmp/fleet-dispatch-contract",
+    read: () => events,
+    append: (_file, event) => { events.push(event); return { event }; },
+    persist: () => "no-changes",
+  }), (error) => error && error.code === 7 && /STATE_PERSISTENCE_FAILED/.test(error.message));
+});
+
+test("injected dispatch append failures are visible as state-persistence failures", async () => {
+  const target = { repo: "M1Vj/fleet-runtime", pr: 17, headSha: "8".repeat(40) };
+  await assert.rejects(dispatchTarget(target, {
+    stateRoot: "/tmp/fleet-dispatch-contract",
+    append: () => { throw new Error("append unavailable"); },
+    persist() {},
+  }), (error) => error && error.code === 7 && /STATE_PERSISTENCE_FAILED/.test(error.message));
+
+  const key = "a".repeat(64);
+  const events = [{ ...target, lane: "merge", kind: "dispatch", state: "DISPATCH_CONSUMED", attempt: 1, artifactRefs: [`dispatch-key:${key}`] }];
+  assert.throws(() => completeDispatch(target, key, "BLOCKED", {
+    stateRoot: "/tmp/fleet-dispatch-contract",
+    read: () => events,
+    append: () => { throw new Error("append unavailable"); },
+  }), (error) => error && error.code === 7 && /STATE_PERSISTENCE_FAILED/.test(error.message));
 });
 
 test("scheduled discovery suppresses an outstanding head and returns at most one eligible target", async () => {
@@ -447,7 +490,7 @@ test("scheduled discovery suppresses an outstanding head and returns at most one
     state: "open",
     draft: true,
     user: { login: "M1Vj" },
-    head: { ref: "fleet/fix", sha: head, repo: { full_name: "M1Vj/fleet-runtime" } },
+    head: { ref: "fleet/fix-one", sha: head, repo: { full_name: "M1Vj/fleet-runtime" } },
     base: { ref: "main", repo: { full_name: "M1Vj/fleet-runtime" } },
   };
   const files = [{ filename: "src/a.js", additions: 1, deletions: 0, patch: "@@", metadataAvailable: true, mode: "100644", type: "blob" }];
@@ -457,7 +500,7 @@ test("scheduled discovery suppresses an outstanding head and returns at most one
     listPulls: async () => [candidate, { ...candidate, number: 18 }],
     inspectPr: async (_repo, number) => {
       inspectCalls.push(number);
-      return { pr: { ...candidate, number }, files, repoMeta: { full_name: "M1Vj/fleet-runtime", default_branch: "main", private: false } };
+    return { pr: { ...candidate, number }, files, repoMeta: { full_name: "M1Vj/fleet-runtime", default_branch: "main", private: false, visibility: "public" } };
     },
   };
   const pending = [{
@@ -575,6 +618,34 @@ test("unavailable and unparsable judges are marked as infrastructure failures", 
   assert.equal(unparsable.infrastructureFailure, true);
 });
 
+test("completed judge dedupe is exact-head only and infrastructure events are not completed", () => {
+  const oldHead = "a".repeat(40);
+  const newHead = "b".repeat(40);
+  const target = { repo: "M1Vj/fleet-runtime", pr: 1, headSha: oldHead };
+  const completed = normalizeMemoryEvent({
+    lane: "merge",
+    kind: "judge",
+    state: "JUDGE_REJECTED",
+    repo: target.repo,
+    pr: target.pr,
+    headSha: oldHead,
+    reviewNotes: ["add a null-response regression test"],
+    judgeScores: { correctness: 62, standards: 74, threshold: 80, targetChecksPassed: true },
+  });
+  const infrastructure = normalizeMemoryEvent({
+    ...completed,
+    state: "JUDGE_UNAVAILABLE",
+    judgeStatus: "infrastructure",
+  });
+  assert.equal(findCompletedJudgeEvent([completed], target).state, "JUDGE_REJECTED");
+  assert.equal(findCompletedJudgeEvent([infrastructure], target), null);
+  assert.equal(findCompletedJudgeEvent([completed], { ...target, headSha: newHead }), null);
+  assert.match(source, /JUDGE_UNAVAILABLE/);
+  const infraStart = source.indexOf("if (correctness.infrastructureFailure");
+  const infraEnd = source.indexOf("approved = targetCheckSucceeded", infraStart);
+  assert.doesNotMatch(source.slice(infraStart, infraEnd), /postComment/);
+});
+
 test("merge verification requires a consistent attributed GitHub merge commit", async () => {
   const head = "a".repeat(40);
   const mergeSha = "b".repeat(40);
@@ -675,10 +746,66 @@ test("target policy requires decimal PRs, same-repo fleet head, and default base
   const base = {
     state: "open",
     user: { login: "M1Vj" },
+    head: { ref: "fleet/fix-one", sha, repo: { full_name: "M1Vj/fleet-runtime" } },
+    base: { ref: "main", repo: { full_name: "M1Vj/fleet-runtime" } },
+  };
+  assert.equal(evaluateTargetPolicy({ target, pr: base, files: [{ filename: "src/a.js", patch: "@@" }], repoMeta: { full_name: "M1Vj/fleet-runtime", default_branch: "main", private: false, visibility: "public" } }).ok, true);
+  assert.equal(evaluateTargetPolicy({ target, pr: base, files: [{ filename: "src/a.js", patch: "@@" }] }).ok, false);
+  assert.equal(evaluateTargetPolicy({ target, pr: { ...base, base: { ref: "develop", repo: { full_name: "M1Vj/fleet-runtime" } } }, files: [{ filename: "src/a.js", patch: "@@" }], repoMeta: { full_name: "M1Vj/fleet-runtime", default_branch: "main" } }).ok, false);
+});
+
+test("target policy rejects malformed fleet branches and whitespace-only patches", () => {
+  const sha = "A".repeat(40);
+  const target = normalizeTargetInput({ repo: "M1Vj/fleet-runtime", pr: "1", headSha: sha });
+  const base = {
+    state: "open",
+    user: { login: "M1Vj" },
     head: { ref: "fleet/fix", sha, repo: { full_name: "M1Vj/fleet-runtime" } },
     base: { ref: "main", repo: { full_name: "M1Vj/fleet-runtime" } },
   };
-  assert.equal(evaluateTargetPolicy({ target, pr: base, files: [{ filename: "src/a.js", patch: "@@" }], repoMeta: { full_name: "M1Vj/fleet-runtime", default_branch: "main", private: false } }).ok, true);
-  assert.equal(evaluateTargetPolicy({ target, pr: base, files: [{ filename: "src/a.js", patch: "@@" }] }).ok, false);
-  assert.equal(evaluateTargetPolicy({ target, pr: { ...base, base: { ref: "develop", repo: { full_name: "M1Vj/fleet-runtime" } } }, files: [{ filename: "src/a.js", patch: "@@" }], repoMeta: { full_name: "M1Vj/fleet-runtime", default_branch: "main" } }).ok, false);
+  const meta = { full_name: "M1Vj/fleet-runtime", default_branch: "main", private: false, visibility: "public" };
+  assert.equal(evaluateTargetPolicy({ target, pr: base, files: [{ filename: "src/a.js", patch: "@@" }], repoMeta: meta }).ok, false);
+  assert.equal(evaluateTargetPolicy({ target, pr: { ...base, head: { ...base.head, ref: "fleet/fix-one" } }, files: [{ filename: "src/a.js", patch: " \t" }], repoMeta: meta }).ok, false);
+});
+
+test("merge author verification permits a ready PR while revision remains draft-only", () => {
+  assert.match(source, /verifyMergePullAuthor\(target\.repo, target\.pr, identity, env\.FLEET_GH_TOKEN\)/);
+  assert.match(readFileSync(new URL("../scripts/lib/verify.mjs", import.meta.url), "utf8"), /requireDraft\s*=\s*true/);
+});
+
+test("manual allow_merge=true ready flow contract reaches REST merge", async () => {
+  const head = "a".repeat(40);
+  const mergeSha = "b".repeat(40);
+  let mergeCalled = false;
+  const ready = { state: "open", draft: false, head: { sha: head }, merged: false };
+  const merged = { state: "closed", merged: true, head: { sha: head }, merge_commit_sha: mergeSha };
+  const result = await mergeWithExpectedSha("M1Vj/fleet-runtime", 12, head, { note() {} }, {
+    identity: { login: "M1Vj", noreply: "123+M1Vj@users.noreply.github.com" },
+    getPr: async () => mergeCalled ? merged : ready,
+    merge: async () => { mergeCalled = true; return { merged: true, sha: mergeSha }; },
+    getCommit: async () => ({
+      author: { login: "M1Vj" },
+      commit: { author: { email: "123+M1Vj@users.noreply.github.com" }, committer: { email: "noreply@github.com" } },
+      parents: [{ sha: head }, { sha: "c".repeat(40) }],
+    }),
+  });
+  assert.equal(mergeCalled, true);
+  assert.deepEqual(result, { ok: true, state: "SUCCESS", mergeCommit: mergeSha });
+});
+
+test("malformed nonempty merge response SHA fails closed", async () => {
+  const head = "a".repeat(40);
+  const ready = { state: "open", draft: false, head: { sha: head }, merged: false };
+  let reads = 0;
+  const result = await mergeWithExpectedSha("M1Vj/fleet-runtime", 12, head, { note() {} }, {
+    identity: { login: "M1Vj", noreply: "123+M1Vj@users.noreply.github.com" },
+    getPr: async () => reads++ === 0 ? ready : ({ ...ready, merged: true, state: "closed", merge_commit_sha: "b".repeat(40) }),
+    merge: async () => ({ merged: true, sha: "not-a-sha" }),
+  });
+  assert.deepEqual(result, { ok: false, state: "MERGE_VERIFY_FAILED" });
+});
+
+test("approved no-merge retains the scanner claim", () => {
+  assert.match(source, /APPROVED_NO_MERGE/);
+  assert.match(source, /DISPATCH_HELD_TERMINAL_STATES/);
 });

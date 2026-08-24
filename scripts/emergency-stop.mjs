@@ -10,6 +10,21 @@ import { verifyCommit, verifyIssueAuthor } from "./lib/verify.mjs";
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
 
+export function disableFleetWorkflows({
+  repos = ["M1Vj/fleet-runtime", "M1Vj/fleet-control"],
+  workflows = ["patrol.yml", "watchdog.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml"],
+  disable = (repo, workflow) => gh(["api", "-X", "PUT", `/repos/${repo}/actions/workflows/${workflow}/disable`], process.env),
+} = {}) {
+  const disabled = [];
+  for (const repo of repos) {
+    for (const workflow of workflows) {
+      disable(repo, workflow);
+      disabled.push(`${repo}:${workflow}`);
+    }
+  }
+  return disabled;
+}
+
 export async function main() {
   const runId = `stop-${Date.now()}`;
   const redact = scrub(process.env);
@@ -30,12 +45,8 @@ export async function main() {
     await verifyCommit("M1Vj/fleet-control", sha, identity, process.env.FLEET_GH_TOKEN);
     audit.note("kill-switch", `committed sha=${sha.slice(0, 10)}`);
 
-    for (const repoFullName of ["M1Vj/fleet-runtime", "M1Vj/fleet-control"]) {
-      for (const wf of ["patrol.yml", "watchdog.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml"]) {
-        gh(["api", "-X", "PUT", `/repos/${repoFullName}/actions/workflows/${wf}/disable`], process.env);
-      }
-      audit.note("disable", wf);
-    }
+    const disabled = disableFleetWorkflows();
+    for (const entry of disabled) audit.note("disable", entry);
 
     const issue = gh(
       [

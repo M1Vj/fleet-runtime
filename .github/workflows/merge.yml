@@ -209,8 +209,7 @@ jobs:
           set -euo pipefail
           test "$(cat "$SOURCE_DIR/target-source.head-sha")" = "$TARGET_SHA"
           (cd "$SOURCE_DIR" && sha256sum -c target-source.sha256)
-          mkdir -p target
-          tar --extract --file "$SOURCE_DIR/target-source.tgz" --directory target --no-same-owner --no-same-permissions
+          node scripts/lib/archive-safe.mjs "$SOURCE_DIR/target-source.tgz" "$GITHUB_WORKSPACE/target"
           if find target -type l -print -quit | grep -q .; then
             echo "extracted source contains symlink" >&2
             exit 1
@@ -219,6 +218,13 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
+      - name: load canonical redactor before target execution
+        run: |
+          node --input-type=module <<'NODE'
+          import { redactText } from "./scripts/lib/pr-memory.mjs";
+          const text = redactText("canonical-redactor-loaded");
+          if (text !== "canonical-redactor-loaded") throw new Error("canonical redactor self-check failed");
+          NODE
       - name: run target checks without secrets or private state
         id: checks
         continue-on-error: true
@@ -230,25 +236,50 @@ jobs:
           FLEET_TARGET_REPO: ${{ needs.materialize-target.outputs.repo }}
           MAX_EVIDENCE_CHARS: "8000"
         run: node scripts/pr-check.mjs
-      - name: bound and redact target evidence
+      - name: verify target evidence path before upload
         if: ${{ always() }}
         env:
           EVIDENCE_PATH: ${{ github.workspace }}/target-check/evidence.txt
-          MAX_EVIDENCE_CHARS: "8000"
         run: |
           set -euo pipefail
-          mkdir -p "$(dirname "$EVIDENCE_PATH")"
-          node --input-type=module <<'NODE'
-          import { existsSync, readFileSync, writeFileSync } from "node:fs";
-          import { redactText } from "./scripts/lib/pr-memory.mjs";
-          const output = process.env.EVIDENCE_PATH;
-          const limit = 8000;
-          let text = existsSync(output) ? readFileSync(output, "utf8") : "target-check evidence unavailable\n";
-          text = redactText(text);
-          text = text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "").slice(-limit);
-          writeFileSync(output, text, { encoding: "utf8", mode: 0o600 });
-          NODE
-      - name: upload bounded target evidence
+          test -d "$(dirname "$EVIDENCE_PATH")"
+          test ! -L "$(dirname "$EVIDENCE_PATH")"
+          test -f "$EVIDENCE_PATH"
+          test ! -L "$EVIDENCE_PATH"
+          test "$(wc -c < "$EVIDENCE_PATH")" -le 8000
+      - name: upload raw target evidence for fresh sanitizer
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: target-check-evidence-raw
+          path: target-check/evidence.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  sanitize-evidence:
+    needs: [authorize, target-check]
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.authorize.result == 'success' && always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: checkout trusted sanitizer
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: download untrusted evidence artifact
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: target-check-evidence-raw
+          path: evidence-input
+        continue-on-error: true
+      - name: sanitize evidence in fresh trusted context
+        env:
+          EVIDENCE_INPUT: ${{ github.workspace }}/evidence-input/evidence.txt
+          EVIDENCE_OUTPUT: ${{ github.workspace }}/target-check/evidence.txt
+          MAX_EVIDENCE_CHARS: "8000"
+        run: node scripts/sanitize-evidence.mjs
+      - name: upload canonical target evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
         with:
@@ -258,7 +289,7 @@ jobs:
           retention-days: 1
 
   gate:
-    needs: [authorize, target-check]
+    needs: [authorize, target-check, sanitize-evidence]
     if: ${{ github.event_name == 'workflow_dispatch' && needs.authorize.result == 'success' && always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 80

@@ -15,6 +15,7 @@ jobs:
     timeout-minutes: 45
     env:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}

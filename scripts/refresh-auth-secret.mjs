@@ -5,8 +5,20 @@ import { spawnSync } from "node:child_process";
 
 const usage = "usage: node scripts/refresh-auth-secret.mjs [--token] <file>\n  default file is auth.json -> secret FLEET_OPENCODE_AUTH\n  --token file -> secret FLEET_GH_TOKEN";
 
+const REPOS = ["M1Vj/fleet-runtime", "M1Vj/fleet-control"];
 function setSecret(name, value) {
-  const res = spawnSync("gh", ["secret", "set", name, "-R", "M1Vj/fleet-control"], {
+  for (const repo of REPOS) {
+    const res = spawnSync("gh", ["secret", "set", name, "-R", repo], {
+      input: value,
+      encoding: "utf8",
+      stdio: ["pipe", "inherit", "inherit"],
+    });
+    if (res.status !== 0) process.exit(res.status || 1);
+    process.stdout.write(`secret ${name} updated on ${repo}\n`);
+  }
+}
+function setSecretLegacy(name, value) {
+  const res = spawnSync("gh", ["secret", "set", name, "-R", repo], {
     input: value,
     encoding: "utf8",
     stdio: ["pipe", "inherit", "inherit"],

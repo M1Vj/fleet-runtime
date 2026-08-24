@@ -2,6 +2,7 @@
 import process from "node:process";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import path from "node:path";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { runGate } from "./lib/gate.mjs";
 import { ghInput, putFileContent } from "./lib/util.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";

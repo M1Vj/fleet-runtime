@@ -98,7 +98,7 @@ export async function main() {
       [
         "api", "-X", "POST", "/repos/M1Vj/fleet-control/issues",
         "-f", `title=${plan.actions.find((a) => a.kind === "file-alert-issue").title}`,
-        "-f", `body=Patrol heartbeat is stale (${Math.round(ageMs / 60000)} minutes).\nRe-enable was attempted. Recent runs:\n${runsList}\n\nCheck model auth secret freshness and Actions quota.`,
+        "-f", `body=Patrol heartbeat is stale (${plan.ageMinutes} minutes).\nRe-enable was attempted. Recent runs:\n${runsList}\n\nCheck model auth secret freshness and Actions quota.`,
       ],
       process.env,
     );

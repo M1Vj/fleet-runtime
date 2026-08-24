@@ -22,6 +22,7 @@ jobs:
       matrix: ${{ steps.pick.outputs.matrix }}
     env:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_TOP_K: ${{ github.event.inputs.top_k || '2' }}
@@ -60,6 +61,7 @@ jobs:
       matrix: ${{ fromJSON(needs.pick.outputs.matrix) }}
     env:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
@@ -106,6 +108,7 @@ jobs:
       implmatrix: ${{ steps.plan.outputs.implmatrix }}
     env:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
@@ -166,6 +169,7 @@ jobs:
     timeout-minutes: 25
     env:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
     steps:
       - name: checkout fleet repo
@@ -219,6 +223,7 @@ jobs:
         lens: [correctness, redteam, standards]
     env:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
@@ -267,6 +272,7 @@ jobs:
     timeout-minutes: 10
     env:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
     steps:

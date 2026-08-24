@@ -1,8 +1,10 @@
 import {
   chmodSync,
   closeSync,
-  existsSync,
+  constants,
+  fstatSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -176,7 +178,45 @@ function lockMemoryPath(target) {
 
 function ensurePrivateDirectory(directory) {
   mkdirSync(directory, { recursive: true, mode: LOCK_MODE });
+  const stat = lstatSync(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error("memory state directory must be a real non-symlink directory");
+  }
   chmodSync(directory, LOCK_MODE);
+}
+
+function lstatOrNull(filePath) {
+  try {
+    return lstatSync(filePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function assertRegularFileOrMissing(filePath) {
+  const stat = lstatOrNull(filePath);
+  if (stat && (!stat.isFile() || stat.isSymbolicLink())) {
+    throw new Error(`memory path must be a regular non-symlink file: ${filePath}`);
+  }
+  return stat;
+}
+
+function readSafeFile(filePath, { throwUnsafe = false, encoding = null } = {}) {
+  let descriptor = null;
+  try {
+    const stat = assertRegularFileOrMissing(filePath);
+    if (!stat) return null;
+    descriptor = openSync(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+    const opened = fstatSync(descriptor);
+    if (!opened.isFile()) throw new Error(`memory path changed before read: ${filePath}`);
+    return readFileSync(descriptor, encoding || undefined);
+  } catch (error) {
+    if (throwUnsafe) throw error;
+    return null;
+  } finally {
+    if (descriptor !== null) closeSync(descriptor);
+  }
 }
 
 function writeFully(descriptor, buffer) {
@@ -228,12 +268,14 @@ function atomicReplace(target, payload, { backup = true } = {}) {
   const directory = path.dirname(target);
   ensurePrivateDirectory(directory);
   const previous = previousMemoryPath(target);
+  const currentPayload = readSafeFile(target, { throwUnsafe: true });
+  assertRegularFileOrMissing(previous);
   const targetTemp = temporaryPath(target, "tmp");
   let backupTemp = null;
   try {
-    if (backup && existsSync(target)) {
+    if (backup && currentPayload !== null) {
       backupTemp = temporaryPath(target, "prev-tmp");
-      writeDurableFile(backupTemp, readFileSync(target));
+      writeDurableFile(backupTemp, currentPayload);
       renameSync(backupTemp, previous);
       backupTemp = null;
       chmodSync(previous, FILE_MODE);
@@ -250,20 +292,17 @@ function atomicReplace(target, payload, { backup = true } = {}) {
 }
 
 function readMemoryContents(target) {
-  if (existsSync(target)) {
-    try {
-      return readFileSync(target, "utf8");
-    } catch {
-      return "";
-    }
-  }
-  const previous = previousMemoryPath(target);
-  if (!existsSync(previous)) return "";
   try {
-    return readFileSync(previous, "utf8");
+    const directory = path.dirname(target);
+    const directoryStat = lstatOrNull(directory);
+    if (!directoryStat || !directoryStat.isDirectory() || directoryStat.isSymbolicLink()) return "";
   } catch {
     return "";
   }
+  const current = readSafeFile(target, { encoding: "utf8" });
+  if (current !== null) return current;
+  const previous = previousMemoryPath(target);
+  return readSafeFile(previous, { encoding: "utf8" }) ?? "";
 }
 
 function parseMemoryContents(contents) {
@@ -284,10 +323,12 @@ function parseMemoryContents(contents) {
 }
 
 function recoverCanonical(target) {
-  if (existsSync(target)) return;
+  const current = readSafeFile(target, { throwUnsafe: true });
+  if (current !== null) return;
   const previous = previousMemoryPath(target);
-  if (!existsSync(previous)) return;
-  atomicReplace(target, readFileSync(previous), { backup: false });
+  const recovery = readSafeFile(previous, { throwUnsafe: true });
+  if (recovery === null) return;
+  atomicReplace(target, recovery, { backup: false });
 }
 
 function acquireWriteLock(target) {
@@ -341,9 +382,10 @@ function appendMemoryEventLocked(target, input, options = {}) {
     return { event, appended: false, rotated: false, count: current.length };
   }
   ensurePrivateDirectory(path.dirname(target));
+  assertRegularFileOrMissing(target);
   let descriptor = null;
   try {
-    descriptor = openSync(target, "a", FILE_MODE);
+    descriptor = openSync(target, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | (constants.O_NOFOLLOW || 0), FILE_MODE);
     writeFully(descriptor, Buffer.from(`${JSON.stringify(event)}\n`, "utf8"));
     fsyncSync(descriptor);
   } finally {

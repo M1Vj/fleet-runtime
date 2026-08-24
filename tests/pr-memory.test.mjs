@@ -8,6 +8,7 @@ import {
   readFileSync,
   readdirSync,
   statSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -189,6 +190,32 @@ test("local writers fail closed on an existing lock and release it after rotatio
   }
   rotateMemory(file, { maxLines: 2 });
   assert.equal(existsSync(lock), false);
+});
+
+test("canonical and recovery symlinks never expose or modify external memory", () => {
+  for (const linkKind of ["canonical", "previous"]) {
+    const file = tempMemory();
+    const outsideRoot = mkdtempSync(path.join(tmpdir(), "pr-memory-outside-"));
+    const outside = path.join(outsideRoot, "sentinel.jsonl");
+    const sentinel = `${JSON.stringify(event({ summary: `external-${linkKind}` }))}\n`;
+    writeFileSync(outside, sentinel, "utf8");
+    symlinkSync(outside, linkKind === "canonical" ? file : `${file}.prev`);
+
+    assert.deepEqual(readMemoryEvents(file), []);
+    assert.throws(() => appendMemoryEvent(file, event({ summary: `attempt-${linkKind}` })), /symlink|regular file|unsafe/i);
+    assert.equal(readFileSync(outside, "utf8"), sentinel);
+  }
+});
+
+test("a symlinked state directory fails closed without writing outside the state root", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "pr-memory-root-"));
+  const outside = mkdtempSync(path.join(tmpdir(), "pr-memory-state-outside-"));
+  const file = path.join(root, "state", "pr-memory.jsonl");
+  symlinkSync(outside, path.join(root, "state"));
+
+  assert.deepEqual(readMemoryEvents(file), []);
+  assert.throws(() => appendMemoryEvent(file, event()), /symlink|directory|unsafe/i);
+  assert.equal(existsSync(path.join(outside, "pr-memory.jsonl")), false);
 });
 
 test("memory context is target-scoped and bounded to recent events", () => {

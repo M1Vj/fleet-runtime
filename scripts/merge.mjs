@@ -202,7 +202,10 @@ function dispatchEvent(target, { runId, attempt, dispatchKey, state, dispatchArt
 }
 
 function dispatchFailureState(value) {
-  const status = Number(value && typeof value === "object" ? value.status : NaN);
+  const directStatus = Number(value && typeof value === "object" ? value.status : NaN);
+  const messageStatus = String(value && typeof value === "object" ? value.message || "" : value || "")
+    .match(/\b(?:HTTP\s+|status[=: ]+)(\d{3})\b/i);
+  const status = Number.isInteger(directStatus) ? directStatus : Number(messageStatus && messageStatus[1]);
   return Number.isInteger(status) && status >= 400 && status < 500
     ? "DISPATCH_FAILED"
     : "DISPATCH_UNKNOWN";

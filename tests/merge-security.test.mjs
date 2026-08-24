@@ -187,6 +187,20 @@ test("ambiguous dispatch failure stays pending while a definitive client rejecti
   );
   assert.deepEqual(rejectedEvents.map(({ state }) => state), ["DISPATCH_INTENT", "DISPATCH_FAILED"]);
   assert.equal(hasOutstandingDispatch(rejectedEvents, target), false);
+
+  const thrownClientEvents = [];
+  await assert.rejects(
+    dispatchTarget(target, {
+      stateRoot: "/tmp/fleet-dispatch-contract",
+      dispatch: async () => { throw new Error("gh api failed: HTTP 422: Validation Failed"); },
+      append: (_file, event) => { thrownClientEvents.push(event); return { event }; },
+      read: () => thrownClientEvents,
+      persist() {},
+    }),
+    /HTTP 422/,
+  );
+  assert.deepEqual(thrownClientEvents.map(({ state }) => state), ["DISPATCH_INTENT", "DISPATCH_FAILED"]);
+  assert.equal(hasOutstandingDispatch(thrownClientEvents, target), false);
 });
 
 test("authorization consumes only its matching dispatch correlation and is idempotent on rerun", async () => {

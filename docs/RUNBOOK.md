@@ -25,7 +25,7 @@ Optional KB ingestion: set `GDRIVE_REFRESH_TOKEN`, `GDRIVE_CLIENT_ID`,
 
 Auth freshness: `scripts/install-keepalive.sh` installs LaunchAgent
 `com.m1vj.fleet-auth-refresh`, refreshing `FLEET_OPENCODE_AUTH` every 30 minutes while the
-Mac is on. Uninstall:
+owner's active user session is running. Uninstall:
 
     launchctl unload ~/Library/LaunchAgents/com.m1vj.fleet-auth-refresh.plist && rm ~/Library/LaunchAgents/com.m1vj.fleet-auth-refresh.plist
 

@@ -144,6 +144,13 @@ export async function askModel({ prompt, sessionId, timeoutMs = 480000, env = pr
   return { reply: "", sessionId: lastSid, modelMode: lastMode, attempts: allAttempts, complete: false };
 }
 
+function stripAuth(env) {
+  const clone = { ...env };
+  delete clone.FLEET_OPENCODE_AUTH;
+  delete clone.OPENCODE_AUTH_CONTENT;
+  return clone;
+}
+
 async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env, preferVariantMax, maxRounds, files, workspace }) {
   const stateRoot = env.FLEET_STATE_ROOT || process.cwd();
   let sid = sessionId || "";

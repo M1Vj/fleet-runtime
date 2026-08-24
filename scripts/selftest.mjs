@@ -86,6 +86,7 @@ export async function main() {
       timeoutMs: 240000,
       env: process.env,
       preferVariantMax: true,
+      skipCircuitCheck: true,
     });
     if (modelResult.complete && modelResult.reply.includes("ALIVE") && modelResult.sessionId) {
       audit.note("T5", `PASS model liveness mode=${modelResult.modelMode} session=${modelResult.sessionId} attempts=${JSON.stringify(modelResult.attempts)}`);

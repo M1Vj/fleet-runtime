@@ -108,7 +108,18 @@ async function main() {
   }
 
   const branch = pr.head.ref;
-  for (const f of files) {
+  const validationErrors = [];
+    for (const f of files) {
+      if (!f.path.startsWith("v2/")) validationErrors.push(`outside v2/: ${f.path}`);
+      if (!isSafeRepoPath(f.path)) validationErrors.push(`unsafe path: ${f.path}`);
+      if (f.content.length > 60000) validationErrors.push(`too large: ${f.path} (${f.content.length})`);
+    }
+    if (validationErrors.length > 0) {
+      audit.incident("validate", validationErrors.slice(0, 5).join("; "));
+      console.log(`REVISE_STATE=REJECTED ${validationErrors[0]}`);
+      return 5;
+    }
+    for (const f of files) {
     let sha;
     try {
       const ex = gh(["api", `/repos/${repo}/contents/${f.path}?ref=${branch}`], process.env);

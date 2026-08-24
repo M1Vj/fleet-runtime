@@ -11,6 +11,10 @@ on:
         type: string
         default: ""
 
+concurrency:
+  group: fleet-thesis
+  cancel-in-progress: false
+
 permissions:
   contents: read
 

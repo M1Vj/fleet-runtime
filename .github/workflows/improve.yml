@@ -11,6 +11,10 @@ on:
         type: string
         default: "2"
 
+concurrency:
+  group: fleet-improve
+  cancel-in-progress: false
+
 permissions:
   contents: read
 

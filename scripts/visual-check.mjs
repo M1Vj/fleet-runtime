@@ -2,6 +2,8 @@
 import process from "node:process";
 import { writeFileSync, mkdirSync, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 
 const req = createRequire(import.meta.url);
@@ -49,7 +51,7 @@ async function main() {
   const browser = await chromium.launch({ headless: true });
 
   function workdirFor(label) {
-    return path.join("/tmp", `vis-${label}-${PR_NUMBER}`);
+    return path.join(mkdtempSync(path.join(tmpdir(), `vis-${label}-`)), "repo");
   }
 
   function fetchRef(label, sha) {

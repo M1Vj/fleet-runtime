@@ -37,8 +37,7 @@ export function retry(fn, { tries = 3, baseMs = 500 } = {}, onAttempt = () => {}
       lastErr = err;
       if (i < tries) {
         const ms = baseMs * Math.pow(2, i - 1);
-        const until = Date.now() + ms;
-        while (Date.now() < until) {}
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
       }
     }
   }

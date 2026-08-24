@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import process from "node:process";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
@@ -111,7 +112,7 @@ async function getPr() {
 
 async function runDeterministicChecks(repo, headSha, audit) {
   const evidenceLines = [];
-  const workdir = "/tmp/pr-checkout";
+  const workdir = path.join(mkdtempSync(path.join(tmpdir(), "pr-checkout-")), "repo");
   gh(["repo", "clone", repo, workdir, "--", "--depth", "1"], process.env);
   installCredentialHelper(workdir, process.env);
   const { spawnSync } = await import("node:child_process");
@@ -439,7 +440,12 @@ async function main() {
   await new Promise((r) => setTimeout(r, 4000));
   const mergedMeta = gh(["api", `/repos/${TARGET_REPO}/pulls/${PR_NUMBER}`], process.env);
   if (!mergedMeta.merged) throw new Error("merge attempted but not merged");
-  await verifyCommit(TARGET_REPO, mergedMeta.merge_commit_sha, identity, process.env.FLEET_GH_TOKEN).catch(() => {});
+  try {
+    await verifyCommit(TARGET_REPO, mergedMeta.merge_commit_sha, identity, process.env.FLEET_GH_TOKEN);
+  } catch (err) {
+    audit.incident("post-merge-verify", `ATTRIBUTION FAILURE after merge: ${err.message}`);
+    throw err;
+  }
   audit.note("merged", `merge_commit=${String(mergedMeta.merge_commit_sha).slice(0, 10)}`);
   await terminal("SUCCESS", { mergeCommit: mergedMeta.merge_commit_sha, scores: [correctness.score, standards.score] });
   return finish(audit, runId, "SUCCESS");

@@ -64,6 +64,9 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs, env, files = []
     let stderr = "";
     let timedOut = false;
     const childEnv = { ...env };
+    for (const key of Object.keys(childEnv)) {
+      if (/TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL/i.test(key) && key !== "OPENCODE_AUTH_CONTENT") delete childEnv[key];
+    }
     delete childEnv.FLEET_GH_TOKEN;
     delete childEnv.GH_TOKEN;
     delete childEnv.GDRIVE_REFRESH_TOKEN;

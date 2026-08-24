@@ -11,6 +11,10 @@ on:
         type: boolean
         default: true
 
+concurrency:
+  group: fleet-kb
+  cancel-in-progress: false
+
 permissions:
   contents: read
 

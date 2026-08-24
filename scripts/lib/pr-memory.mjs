@@ -1,12 +1,18 @@
 import {
   appendFileSync,
+  chmodSync,
+  closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
-  writeFileSync,
+  renameSync,
+  unlinkSync,
+  writeSync,
 } from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export const MEMORY_SCHEMA_VERSION = 1;
 export const DEFAULT_MEMORY_MAX_LINES = 2000;
@@ -24,13 +30,17 @@ const MAX_ARTIFACTS = 32;
 // while leaving ordinary prose intact. The replacement happens before hashing or
 // writing so secrets cannot leak through either state or deterministic IDs.
 const SECRET_PATTERNS = [
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g,
+  /BEGIN [A-Z0-9 ]*PRIVATE KEY/g,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
+  /\bBearer\s+[A-Za-z]{24,}\b/gi,
+  /\bBearer\s+(?=[A-Za-z0-9._~+\/-]{16,}\b)(?=[A-Za-z0-9._~+\/-]*[0-9._~+\/=])[A-Za-z0-9._~+\/-]{16,}\b/gi,
+  /([?&](?:access_token|refresh_token|id_token|token|api[-_]?key|apikey|client_secret|secret|password|passwd)=)[A-Za-z0-9._~+\/%=-]{12,}/gi,
   /(?:gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,})/g,
   /AKIA[0-9A-Z]{16}/g,
-  /BEGIN [A-Z ]*PRIVATE KEY/g,
   /sk-[A-Za-z0-9_-]{20,}/g,
   /xox[baprs]-[A-Za-z0-9-]{10,}/g,
   /AIza[0-9A-Za-z_-]{20,}/g,
-  /Bearer\s+[A-Za-z0-9._~+/=-]{16,}/gi,
 ];
 
 function sha256(value) {
@@ -112,15 +122,12 @@ export function normalizeMemoryEvent(input = {}) {
 
 /**
  * Produce the stable event id described by the PR-memory contract. The run id
- * distinguishes legitimate events from separate workflow runs; retries of the
- * same run and event payload remain no-ops.
+ * is retained for diagnostics but excluded from logical duplicate identity so
+ * equivalent events from separate workflow runs remain no-ops.
  */
 export function deterministicEventId(input = {}) {
   const event = redactValue(input);
   const content = {
-    // A run id differentiates two legitimate attempts with identical bounded
-    // status text while keeping retries from the same workflow idempotent.
-    runId: event.runId || "",
     state: event.state || "",
     summary: event.summary || "",
     changedPaths: event.changedPaths || [],
@@ -140,8 +147,18 @@ export function deterministicEventId(input = {}) {
 }
 
 export function memoryPath(stateRootOrFile) {
-  const value = String(stateRootOrFile || "");
-  return value.endsWith(".jsonl") ? value : path.join(value, "state", "pr-memory.jsonl");
+  const value = String(stateRootOrFile ?? "");
+  const directSuffix = `${path.sep}state${path.sep}pr-memory.jsonl`;
+  const basename = path.basename(value);
+  const lowerBasename = basename.toLowerCase();
+  if (!value || !path.isAbsolute(value) || path.resolve(value) !== value || value.endsWith(path.sep)) {
+    throw new Error("memory path must be a canonical absolute path");
+  }
+  if (value.endsWith(directSuffix)) return value;
+  if (lowerBasename.endsWith(".jsonl") || lowerBasename.includes(".jsonl.")) {
+    throw new Error("memory file must end with state/pr-memory.jsonl");
+  }
+  return path.join(value, "state", "pr-memory.jsonl");
 }
 
 /** Read valid JSON events, ignoring corrupt lines left by interrupted runs. */
@@ -182,7 +199,10 @@ export function appendMemoryEvent(filePath, input, options = {}) {
     return { event, appended: false, rotated: false, count: current.length };
   }
   mkdirSync(path.dirname(target), { recursive: true });
-  appendFileSync(target, `${JSON.stringify(event)}\n`, "utf8");
+  // The fleet runtime serializes all shared-state writers globally; this
+  // module intentionally relies on that topology instead of adding a lock.
+  appendFileSync(target, `${JSON.stringify(event)}\n`, { encoding: "utf8", flag: "a", mode: 0o600 });
+  chmodSync(target, 0o600);
   const rotation = rotateMemory(target, options);
   return {
     event,
@@ -201,27 +221,78 @@ export function rotateMemory(filePath, { maxLines = DEFAULT_MEMORY_MAX_LINES } =
   const target = memoryPath(filePath);
   const limit = Math.max(1, Number(maxLines) || DEFAULT_MEMORY_MAX_LINES);
   const events = readMemoryEvents(target);
-  if (events.length <= limit) return { rotated: false, kept: events.length, dropped: 0 };
+  const isRotationSummary = (entry) => (
+    entry.kind === "terminal" &&
+    entry.state === "ROTATED" &&
+    entry.repo === "" &&
+    entry.pr === 0 &&
+    entry.headSha === ""
+  );
+  const history = events.filter((entry) => !isRotationSummary(entry));
+  if (events.length <= limit && history.length <= limit) {
+    return { rotated: false, kept: events.length, dropped: 0 };
+  }
 
   const keepCount = Math.max(0, limit - 1);
-  const kept = keepCount === 0 ? [] : events.slice(-keepCount);
-  const latest = events.at(-1) || {};
+  const kept = keepCount === 0 ? [] : history.slice(-keepCount);
+  const latest = history.at(-1) || events.at(-1) || {};
   const summary = normalizeMemoryEvent({
     runId: "memory-rotation",
     lane: latest.lane || "merge",
-    repo: latest.repo || "",
-    pr: latest.pr || 0,
-    headSha: latest.headSha || "",
+    repo: "",
+    pr: 0,
+    headSha: "",
     attempt: latest.attempt || 0,
     kind: "terminal",
     state: "ROTATED",
-    summary: `rotated PR memory: dropped ${events.length - keepCount} older events; retained ${keepCount}`,
+    summary: `rotated PR memory: dropped ${Math.max(0, history.length - keepCount)} older events; retained ${keepCount}`,
     changedPaths: [],
     blockerIds: [],
     artifactRefs: [],
   });
   mkdirSync(path.dirname(target), { recursive: true });
-  writeFileSync(target, `${[...kept, summary].map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+  const previousPath = `${target}.prev`;
+  const tempPath = `${target}.tmp-${process.pid}-${randomUUID()}`;
+  const payload = `${[...kept, summary].map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+  let descriptor = null;
+  let movedPrevious = false;
+  let operationError = null;
+  try {
+    descriptor = openSync(tempPath, "wx", 0o600);
+    writeSync(descriptor, Buffer.from(payload, "utf8"));
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = null;
+
+    if (existsSync(target)) {
+      renameSync(target, previousPath);
+      movedPrevious = true;
+    }
+    renameSync(tempPath, target);
+    chmodSync(target, 0o600);
+  } catch (error) {
+    operationError = error;
+    if (movedPrevious && !existsSync(target) && existsSync(previousPath)) {
+      try {
+        renameSync(previousPath, target);
+      } catch {
+      }
+    }
+    throw error;
+  } finally {
+    if (descriptor !== null) {
+      try {
+        closeSync(descriptor);
+      } catch {
+      }
+      descriptor = null;
+    }
+    try {
+      unlinkSync(tempPath);
+    } catch (error) {
+      if (error?.code !== "ENOENT" && !operationError) throw error;
+    }
+  }
   return { rotated: true, kept: keepCount + 1, dropped: events.length - keepCount };
 }
 
@@ -245,12 +316,15 @@ export function buildMemoryContext(eventsOrPath, {
     .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
 
   const selected = [];
-  let chars = 0;
+  const parsedMaxChars = Number(maxChars);
+  const charLimit = Number.isFinite(parsedMaxChars)
+    ? Math.max(0, parsedMaxChars)
+    : DEFAULT_CONTEXT_MAX_CHARS;
+  if (charLimit < 2) return selected;
   for (const entry of filtered.slice(0, Math.max(0, Number(maxEvents) || 0))) {
-    const nextChars = JSON.stringify(entry).length;
-    if (chars + nextChars > maxChars) break;
+    const candidate = [...selected, entry];
+    if (JSON.stringify(candidate).length > charLimit) break;
     selected.push(entry);
-    chars += nextChars;
   }
   return selected;
 }

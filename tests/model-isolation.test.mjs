@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -46,6 +46,23 @@ test("legacy or implicit workspaces cannot bypass the deny-all profile", async (
     );
   } finally {
     rmSync(legacy, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("model workspace creation rejects a temp base that resolves into private state", () => {
+  const repo = mkdtempSync(path.join(tmpdir(), "fleet-model-symlink-repo-"));
+  const state = mkdtempSync(path.join(tmpdir(), "fleet-model-symlink-state-"));
+  const link = path.join(tmpdir(), `fleet-model-base-link-${process.pid}-${Date.now()}`);
+  try {
+    symlinkSync(repo, link, "dir");
+    assert.throws(
+      () => createDisposableModelWorkspace({ repoRoot: repo, stateRoot: state, baseDir: link }),
+      /MODEL_WORKSPACE_NOT_ISOLATED/,
+    );
+  } finally {
+    rmSync(link, { recursive: true, force: true });
     rmSync(repo, { recursive: true, force: true });
     rmSync(state, { recursive: true, force: true });
   }

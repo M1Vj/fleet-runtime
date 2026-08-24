@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { gatewayCircuitOpen, markGatewayDown, markGatewayUp } from "./gateway-health.mjs";
@@ -56,8 +56,12 @@ function policyFor(profile = "deny-all", publicTarget) {
   return PUBLIC_READ_MODEL_POLICY;
 }
 
+function canonicalPath(value) {
+  try { return realpathSync(path.resolve(String(value))); } catch { return path.resolve(String(value)); }
+}
+
 function isWithin(child, parent) {
-  const relative = path.relative(path.resolve(parent), path.resolve(child));
+  const relative = path.relative(canonicalPath(parent), canonicalPath(child));
   return relative === "" || (relative && !relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
@@ -97,13 +101,17 @@ export function createDisposableModelWorkspace({
 
 export function assertDisposableModelWorkspace(workspace, { repoRoot = process.cwd(), stateRoot = process.env.FLEET_STATE_ROOT || "", profile = "deny-all", publicTarget } = {}) {
   const candidate = typeof workspace === "string" && path.isAbsolute(workspace) ? path.resolve(workspace) : "";
-  if (!candidate || !existsSync(candidate) || isWithin(candidate, path.resolve(String(repoRoot || process.cwd())))
-    || (stateRoot && isWithin(candidate, path.resolve(String(stateRoot))))) {
+  if (!candidate || !existsSync(candidate) || isWithin(candidate, repoRoot || process.cwd())
+    || (stateRoot && isWithin(candidate, stateRoot))) {
     throw new Error("MODEL_WORKSPACE_NOT_ISOLATED");
   }
+  const candidateStat = lstatSync(candidate);
+  if (!candidateStat.isDirectory() || candidateStat.isSymbolicLink()) throw new Error("MODEL_WORKSPACE_NOT_ISOLATED");
   const policyPath = path.join(candidate, "opencode.json");
   if (!existsSync(policyPath)) throw new Error("MODEL_POLICY_REQUIRED");
   try {
+    const policyStat = lstatSync(policyPath);
+    if (!policyStat.isFile() || policyStat.isSymbolicLink()) throw new Error("MODEL_POLICY_INVALID");
     const policy = JSON.parse(readFileSync(policyPath, "utf8"));
     const expected = policyFor(profile, publicTarget);
     if (policy.profile !== profile || !policy.permission) throw new Error("MODEL_POLICY_PROFILE_MISMATCH");

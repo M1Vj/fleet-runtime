@@ -76,8 +76,8 @@ Edit `state/targets.json` in fleet-control and push to `main`:
 
 Only `tier1` repos receive labels or draft PRs (`eligible()` in
 `scripts/patrol.mjs`). Patrol keys open-PR freshness by head SHA and downgrades every
-model-directed comment on an existing PR or issue to a private report, so its own activity cannot
-retrigger a signal or publish a public review comment. Non-tier1 owned repos are observe-only:
+model-directed comment on an existing PR or issue to a private report, so a patrol comment cannot
+retrigger the same signal or publish a public review comment. Non-tier1 owned repos are observe-only:
 their findings may use the controlled `fleet_issue` path, which always targets fleet-control;
 changes apply on the next patrol.
 

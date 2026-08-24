@@ -147,6 +147,24 @@ export function classify(files) {
 export { validateFilesResponse };
 
 const DISPATCH_ENDPOINT = `/repos/${RUNTIME_REPO}/actions/workflows/merge.yml/dispatches`;
+const OUTSTANDING_DISPATCH_STATES = new Set([
+  "DISPATCH_INTENT",
+  "DISPATCHED",
+  "DISPATCH_UNKNOWN",
+  "DISPATCH_CONSUMED",
+  "DISPATCH_HELD",
+]);
+const COMPLETED_DISPATCH_STATES = new Set(["DISPATCH_RELEASED", "DISPATCH_HELD"]);
+const DEFINITIVE_DISPATCH_FAILURE_STATUSES = new Set([400, 401, 403, 404, 405, 410, 422]);
+const DISPATCH_SUMMARIES = {
+  DISPATCH_INTENT: "targeted merge gate dispatch intent persisted",
+  DISPATCHED: "targeted merge gate dispatch accepted",
+  DISPATCH_FAILED: "targeted merge gate dispatch definitively rejected",
+  DISPATCH_UNKNOWN: "targeted merge gate dispatch acceptance unknown",
+  DISPATCH_CONSUMED: "targeted merge gate dispatch consumed",
+  DISPATCH_RELEASED: "targeted merge gate dispatch completed and released",
+  DISPATCH_HELD: "targeted merge gate dispatch completed and held for a new head",
+};
 
 function dispatchKeyReference(dispatchKey) {
   return `dispatch-key:${dispatchKey}`;
@@ -166,7 +184,7 @@ function dispatchEventsForTarget(events, target) {
 
 export function hasOutstandingDispatch(events, target) {
   const latest = dispatchEventsForTarget(events, target).at(-1);
-  return Boolean(latest && new Set(["DISPATCH_INTENT", "DISPATCHED", "DISPATCH_UNKNOWN"]).has(latest.state));
+  return Boolean(latest && OUTSTANDING_DISPATCH_STATES.has(latest.state));
 }
 
 function nextDispatchAttempt(events, target) {
@@ -186,15 +204,7 @@ function dispatchEvent(target, { runId, attempt, dispatchKey, state, dispatchArt
     attempt,
     kind: "dispatch",
     state,
-    summary: state === "DISPATCH_INTENT"
-      ? "targeted merge gate dispatch intent persisted"
-      : state === "DISPATCHED"
-        ? "targeted merge gate dispatch accepted"
-        : state === "DISPATCH_FAILED"
-          ? "targeted merge gate dispatch definitively rejected"
-          : state === "DISPATCH_UNKNOWN"
-            ? "targeted merge gate dispatch acceptance unknown"
-            : "targeted merge gate dispatch consumed",
+    summary: DISPATCH_SUMMARIES[state] || "targeted merge gate dispatch state changed",
     changedPaths: [],
     blockerIds: [],
     artifactRefs: [dispatchKeyReference(dispatchKey), dispatchArtifact].filter(Boolean),
@@ -206,7 +216,7 @@ function dispatchFailureState(value) {
   const messageStatus = String(value && typeof value === "object" ? value.message || "" : value || "")
     .match(/\b(?:HTTP\s+|status[=: ]+)(\d{3})\b/i);
   const status = Number.isInteger(directStatus) ? directStatus : Number(messageStatus && messageStatus[1]);
-  return Number.isInteger(status) && status >= 400 && status < 500
+  return DEFINITIVE_DISPATCH_FAILURE_STATUSES.has(status)
     ? "DISPATCH_FAILED"
     : "DISPATCH_UNKNOWN";
 }
@@ -340,6 +350,49 @@ export async function consumeDispatch(
   return { consumed: true, event: result && result.event ? result.event : result };
 }
 
+export function completeDispatch(
+  target,
+  rawDispatchKey,
+  terminalState,
+  {
+    stateRoot = STATE_ROOT,
+    runId = process.env.FLEET_RUN_ID || "target",
+    append = appendMemoryEvent,
+    read = readMemoryEvents,
+  } = {},
+) {
+  const dispatchKey = String(rawDispatchKey || "");
+  if (!dispatchKey) return { completed: false, manualDispatch: true };
+  if (!/^[a-f0-9]{64}$/.test(dispatchKey)) throw new Error("DISPATCH_CORRELATION_INVALID");
+  const normalized = normalizeTargetInput(target);
+  if (!normalized.ok) throw new Error(`INVALID_DISPATCH_TARGET ${normalized.errors.join("; ")}`);
+  const root = String(stateRoot || "");
+  if (!root || !path.isAbsolute(root) || path.resolve(root) !== root) {
+    throw new Error("FLEET_STATE_ROOT is required for dispatch completion");
+  }
+  const memoryFile = path.join(root, "state", "pr-memory.jsonl");
+  const reference = dispatchKeyReference(dispatchKey);
+  const matching = dispatchEventsForTarget(read(memoryFile), normalized)
+    .filter((event) => Array.isArray(event.artifactRefs) && event.artifactRefs.includes(reference));
+  const latest = matching.at(-1);
+  if (latest && COMPLETED_DISPATCH_STATES.has(latest.state)) {
+    return { completed: false, alreadyCompleted: true, event: latest };
+  }
+  if (!latest || latest.state !== "DISPATCH_CONSUMED") {
+    throw new Error("DISPATCH_CORRELATION_NOT_CONSUMED");
+  }
+  const dispatchArtifact = latest.artifactRefs.find((item) => String(item).startsWith("dispatch-run:")) || "";
+  const state = terminalState === "BLOCKED" ? "DISPATCH_HELD" : "DISPATCH_RELEASED";
+  const result = append(memoryFile, dispatchEvent(normalized, {
+    runId,
+    attempt: Number(latest.attempt) || 0,
+    dispatchKey,
+    state,
+    dispatchArtifact,
+  }));
+  return { completed: true, event: result && result.event ? result.event : result };
+}
+
 export function secretsInDiff(files) {
   const hits = [];
   for (const file of Array.isArray(files) ? files : []) {
@@ -384,7 +437,13 @@ function finish(audit, runId, state, identity, repo, pr) {
   return 0;
 }
 
-function terminal(state, details, audit, runId, identity, repo, pr, exitCode = 0) {
+function terminal(state, details, audit, runId, identity, repo, pr, exitCode = 0, dispatch = {}) {
+  completeDispatch(
+    { repo, pr, headSha: dispatch.headSha },
+    dispatch.key,
+    state,
+    { stateRoot: STATE_ROOT, runId },
+  );
   writeMergeState(state, { repo, pr, ...details });
   console.log(`MERGE_TERMINAL_STATE=${bounded(state, 80)}`);
   finish(audit, runId, state, identity, repo, pr);
@@ -547,12 +606,22 @@ export async function judge({ repo, prNumber, title, body, files, extraEvidence,
   }
 }
 
-export function revisionDisposition({ fleetAuthored, revisionAllowed, evidenceAvailable, judgeResults = [] } = {}) {
+export function revisionDisposition({
+  fleetAuthored,
+  revisionAllowed,
+  evidenceAvailable,
+  judgeResults = [],
+  revisionAttempts = 0,
+  maxRevisions = 2,
+} = {}) {
   if (!evidenceAvailable) {
     return { revisionNeeded: false, state: "STALLED", why: "deterministic target evidence unavailable" };
   }
   if (judgeResults.some((result) => result && result.infrastructureFailure === true)) {
     return { revisionNeeded: false, state: "STALLED", why: "judge infrastructure unavailable" };
+  }
+  if (fleetAuthored && revisionAllowed && Number(revisionAttempts) >= Number(maxRevisions)) {
+    return { revisionNeeded: false, state: "BLOCKED", why: "revision cap reached" };
   }
   return {
     revisionNeeded: Boolean(fleetAuthored && revisionAllowed),
@@ -583,6 +652,9 @@ export async function mergeWithExpectedSha(repo, prNumber, expectedSha, audit, d
   if (!mergedPr || mergedPr.merged !== true || mergedPr.merge_commit_sha !== mergeSha) {
     throw new Error("merged pull request does not confirm the response merge commit SHA");
   }
+  if (!mergedPr.head || mergedPr.head.sha !== expectedSha) {
+    throw new Error("merged pull request does not confirm the reviewed head SHA");
+  }
   const commit = await getCommit(repo, mergeSha);
   const authorLogin = commit && commit.author && commit.author.login;
   const authorEmail = commit && commit.commit && commit.commit.author && commit.commit.author.email;
@@ -591,6 +663,9 @@ export async function mergeWithExpectedSha(repo, prNumber, expectedSha, audit, d
     || !new Set([identity.noreply, "noreply@github.com"]).has(committerEmail)
     || !Array.isArray(commit && commit.parents) || commit.parents.length < 2) {
     throw new Error("merge commit attribution or parent structure mismatch");
+  }
+  if (!commit.parents.some((parent) => parent && parent.sha === expectedSha)) {
+    throw new Error("merge commit does not contain the reviewed head parent");
   }
   audit.note("merged", `expected sha=${expectedSha.slice(0, 10)}`);
   return { ok: true, state: "SUCCESS", mergeCommit: mergeSha };
@@ -660,9 +735,20 @@ export async function main(env = process.env) {
 
     targetRepo = normalized.repo;
     const target = normalized;
+    const targetTerminal = (state, details, exitCode = 0) => terminal(
+      state,
+      details,
+      audit,
+      runId,
+      identity,
+      target.repo,
+      target.pr,
+      exitCode,
+      { key: env.FLEET_DISPATCH_ID, headSha: target.headSha },
+    );
     const { pr, files, repoMeta } = await getPr(target.repo, target.pr);
     const policy = evaluateTargetPolicy({ target, pr, files, repoMeta, stateRoot: STATE_ROOT });
-    if (!policy.ok) return terminal("BLOCKED", { why: policy.errors.join("; ") }, audit, runId, identity, target.repo, target.pr);
+    if (!policy.ok) return targetTerminal("BLOCKED", { why: policy.errors.join("; ") });
     await verifyPullAuthor(target.repo, target.pr, identity, env.FLEET_GH_TOKEN);
     const cls = classify(files);
     const secretHits = secretsInDiff(files);
@@ -671,21 +757,25 @@ export async function main(env = process.env) {
     const targetCheckFailed = String(env.FLEET_TARGET_CHECK_RESULT || "").toLowerCase() === "failure"
       || String(env.FLEET_TARGET_CHECK_OK || "").toLowerCase() === "false";
     const fleetAuthored = String(pr.head && pr.head.ref || "").startsWith("fleet/") && pr.user && pr.user.login === TARGET_OWNER;
+    const revisionAttempts = readMemoryEvents(path.join(STATE_ROOT, "state", "pr-memory.jsonl")).filter(
+      (event) => event.lane === "revise" && event.repo === target.repo && event.pr === target.pr && event.state === "REVISION_STARTED",
+    ).length;
+    const maxRevisions = Math.max(1, Number(env.FLEET_MAX_REVISIONS) || 2);
 
     if (secretHits.length > 0) {
       await postComment(target.repo, target.pr, "🛑 **fleet merge-gate**: potential secrets detected in the patch. Human review is required; no revision or merge is attempted.", audit, identity);
-      return terminal("BLOCKED", { why: "secrets in diff" }, audit, runId, identity, target.repo, target.pr);
+      return targetTerminal("BLOCKED", { why: "secrets in diff" });
     }
     if (cls.humanOnly) {
       await postComment(target.repo, target.pr, `🧑‍⚖️ **fleet merge-gate**: human review required.\n\n${cls.reasons.map((reason) => `- ${reason}`).join("\n")}`, audit, identity);
-      return terminal("BLOCKED", { why: "human-only policy" }, audit, runId, identity, target.repo, target.pr);
+      return targetTerminal("BLOCKED", { why: "human-only policy" });
     }
     if (!evidence.available) {
       const blocker = "deterministic target evidence unavailable";
       const body = `🔍 **fleet judge panel** (deterministic gate)\n\n**Blockers:**\n- ${blocker}\n\nNo raw target output is copied into this comment.`;
       await postComment(target.repo, target.pr, body, audit, identity);
       const disposition = revisionDisposition({ fleetAuthored, revisionAllowed: cls.revisionAllowed, evidenceAvailable: false });
-      return terminal(disposition.state, { why: disposition.why }, audit, runId, identity, target.repo, target.pr);
+      return targetTerminal(disposition.state, { why: disposition.why });
     }
 
     const extraEvidence = evidence.text.slice(0, MAX_EVIDENCE_CHARS);
@@ -712,24 +802,26 @@ export async function main(env = process.env) {
         revisionAllowed: cls.revisionAllowed,
         evidenceAvailable: true,
         judgeResults: [correctness, standards],
+        revisionAttempts,
+        maxRevisions,
       });
       if (disposition.revisionNeeded) {
         writeRevisionOutput();
-        return terminal("REVISION_QUEUED", { why: targetCheckFailed ? "deterministic target checks failed" : "judges rejected" }, audit, runId, identity, target.repo, target.pr);
+        return targetTerminal("REVISION_QUEUED", { why: targetCheckFailed ? "deterministic target checks failed" : "judges rejected" });
       }
-      return terminal(disposition.state, { why: disposition.why }, audit, runId, identity, target.repo, target.pr);
+      return targetTerminal(disposition.state, { why: disposition.why });
     }
     if (String(env.FLEET_ALLOW_MERGE || "") !== "true") {
-      return terminal("APPROVED_NO_MERGE", { why: "live merge proof flag is not exactly true" }, audit, runId, identity, target.repo, target.pr);
+      return targetTerminal("APPROVED_NO_MERGE", { why: "live merge proof flag is not exactly true" });
     }
     let mergeResult;
     try {
       mergeResult = await mergeWithExpectedSha(target.repo, target.pr, target.headSha, audit, { identity });
     } catch (error) {
-      return terminal("MERGE_VERIFY_FAILED", { why: bounded(error.message) }, audit, runId, identity, target.repo, target.pr, 1);
+      return targetTerminal("MERGE_VERIFY_FAILED", { why: bounded(error.message) }, 1);
     }
-    if (!mergeResult.ok) return terminal(mergeResult.state, { why: "head changed or REST merge rejected" }, audit, runId, identity, target.repo, target.pr);
-    return terminal("SUCCESS", { mergeCommit: mergeResult.mergeCommit }, audit, runId, identity, target.repo, target.pr);
+    if (!mergeResult.ok) return targetTerminal(mergeResult.state, { why: "head changed or REST merge rejected" });
+    return targetTerminal("SUCCESS", { mergeCommit: mergeResult.mergeCommit });
   } catch (error) {
     audit.incident("failure", bounded(error.message));
     if (identity && targetPr > 0) {

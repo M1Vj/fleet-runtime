@@ -429,7 +429,26 @@ function rotateMemoryLocked(target, { maxLines = DEFAULT_MEMORY_MAX_LINES } = {}
   }
 
   const keepCount = Math.max(0, limit - 1);
-  const kept = keepCount === 0 ? [] : history.slice(-keepCount);
+  const latestDispatchByTarget = new Map();
+  for (const entry of history) {
+    if (entry.kind !== "dispatch") continue;
+    latestDispatchByTarget.set(`${entry.repo}\n${entry.pr}\n${entry.headSha}`, entry);
+  }
+  const activeStates = new Set([
+    "DISPATCH_INTENT",
+    "DISPATCHED",
+    "DISPATCH_UNKNOWN",
+    "DISPATCH_CONSUMED",
+    "DISPATCH_HELD",
+  ]);
+  const activeIds = new Set(
+    [...latestDispatchByTarget.values()]
+      .filter((entry) => activeStates.has(entry.state))
+      .map((entry) => entry.eventId),
+  );
+  const recent = keepCount === 0 ? [] : history.filter((entry) => !activeIds.has(entry.eventId)).slice(-keepCount);
+  const keptIds = new Set([...activeIds, ...recent.map((entry) => entry.eventId)]);
+  const kept = history.filter((entry) => keptIds.has(entry.eventId));
   const latest = history.at(-1) || events.at(-1) || {};
   const summary = normalizeMemoryEvent({
     runId: "memory-rotation",
@@ -440,14 +459,14 @@ function rotateMemoryLocked(target, { maxLines = DEFAULT_MEMORY_MAX_LINES } = {}
     attempt: latest.attempt || 0,
     kind: "terminal",
     state: "ROTATED",
-    summary: `rotated PR memory: dropped ${Math.max(0, history.length - keepCount)} older events; retained ${keepCount}`,
+    summary: `rotated PR memory: dropped ${Math.max(0, history.length - kept.length)} older events; retained ${kept.length}`,
     changedPaths: [],
     blockerIds: [],
     artifactRefs: [],
   });
   const payload = `${[...kept, summary].map((entry) => JSON.stringify(entry)).join("\n")}\n`;
   atomicReplace(target, payload);
-  return { rotated: true, kept: keepCount + 1, dropped: events.length - keepCount };
+  return { rotated: true, kept: kept.length + 1, dropped: Math.max(0, events.length - kept.length) };
 }
 
 /**

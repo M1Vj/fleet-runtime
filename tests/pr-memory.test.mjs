@@ -6,6 +6,7 @@ import {
   mkdirSync,
   rmdirSync,
   readFileSync,
+  realpathSync,
   readdirSync,
   statSync,
   symlinkSync,
@@ -216,6 +217,36 @@ test("a symlinked state directory fails closed without writing outside the state
   assert.deepEqual(readMemoryEvents(file), []);
   assert.throws(() => appendMemoryEvent(file, event()), /symlink|directory|unsafe/i);
   assert.equal(existsSync(path.join(outside, "pr-memory.jsonl")), false);
+});
+
+test("a trusted system ancestor alias does not invalidate a real state directory", () => {
+  const lexicalTmp = path.resolve(tmpdir());
+  if (realpathSync(lexicalTmp) === lexicalTmp) return;
+  const root = mkdtempSync(path.join(lexicalTmp, "pr-memory-alias-"));
+  const file = path.join(root, "state", "pr-memory.jsonl");
+  const result = appendMemoryEvent(file, event({ summary: "ancestor alias accepted" }));
+  assert.equal(result.appended, true);
+  assert.equal(readMemoryEvents(file).length, 1);
+});
+
+test("rotation preserves an old active dispatch claim beyond the nominal line bound", () => {
+  const file = tempMemory();
+  appendMemoryEvent(file, event({
+    repo: "M1Vj/fleet-runtime",
+    pr: 17,
+    headSha: "7".repeat(40),
+    lane: "merge",
+    kind: "dispatch",
+    state: "DISPATCH_UNKNOWN",
+    artifactRefs: [`dispatch-key:${"6".repeat(64)}`],
+  }), { maxLines: 100 });
+  for (let index = 0; index < 8; index += 1) {
+    appendMemoryEvent(file, event({ repo: "M1Vj/other", pr: index + 1, summary: `later-${index}` }), { maxLines: 100 });
+  }
+  rotateMemory(file, { maxLines: 3 });
+  const events = readMemoryEvents(file);
+  assert.ok(events.some((entry) => entry.state === "DISPATCH_UNKNOWN" && entry.pr === 17));
+  assert.ok(events.some((entry) => entry.state === "ROTATED"));
 });
 
 test("memory context is target-scoped and bounded to recent events", () => {

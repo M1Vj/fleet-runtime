@@ -70,6 +70,7 @@ test("trusted credentials are step-local and state root is explicit", () => {
   assert.match(gateJob, /FLEET_GH_TOKEN:\s*\$\{\{\s*secrets\.FLEET_GH_TOKEN\s*\}\}/);
   assert.match(gateJob, /FLEET_OPENCODE_AUTH:\s*\$\{\{\s*secrets\.FLEET_OPENCODE_AUTH\s*\}\}/);
   assert.match(gateJob, /FLEET_ALLOW_MERGE:\s*\$\{\{\s*inputs\.allow_merge\s*\}\}/);
+  assert.match(gateJob, /FLEET_DISPATCH_ID:\s*\$\{\{\s*inputs\.dispatch_id\s*\}\}/);
   assert.match(gateJob, /FLEET_STATE_ROOT:/);
   assert.doesNotMatch(gateJob, /FLEET_TARGET_REPO:\s*\$\{\{\s*inputs\.repo/);
   assert.match(gateJob, /FLEET_TARGET_REPO:\s*\$\{\{\s*needs\.authorize\.outputs\.repo/);

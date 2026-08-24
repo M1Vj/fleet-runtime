@@ -6,6 +6,7 @@ import path from "node:path";
 
 import {
   classify,
+  completeDispatch,
   consumeDispatch,
   dispatchTarget,
   discoverFleetPR,
@@ -85,6 +86,10 @@ test("approved targets do not merge without the live-proof allow flag", () => {
   assert.match(source, /APPROVED_NO_MERGE/);
   assert.match(source, /FLEET_ALLOW_MERGE/);
   assert.match(source, /===\s*["']true["']/);
+  const disabledBranch = source.indexOf('if (String(env.FLEET_ALLOW_MERGE || "") !== "true")');
+  const mergeCall = source.indexOf("mergeWithExpectedSha(target.repo", disabledBranch);
+  assert.ok(disabledBranch >= 0 && mergeCall > disabledBranch);
+  assert.match(source.slice(disabledBranch, mergeCall), /return targetTerminal\("APPROVED_NO_MERGE"/);
 });
 
 test("scheduled dispatch persists intent before one correlated explicit target and confirms acceptance", async () => {
@@ -125,7 +130,8 @@ test("scheduled dispatch persists intent before one correlated explicit target a
 });
 
 test("accepted dispatch with confirmation persistence failure leaves durable intent and never retries blindly", async () => {
-  const events = [];
+  const workingEvents = [];
+  let remoteEvents = [];
   const persisted = [];
   let dispatchCount = 0;
   await assert.rejects(
@@ -133,10 +139,11 @@ test("accepted dispatch with confirmation persistence failure leaves durable int
       stateRoot: "/tmp/fleet-dispatch-contract",
       runId: "scan-run-2",
       dispatch: async () => { dispatchCount += 1; return { workflow_run_id: 2222 }; },
-      append: (_file, event) => { events.push(event); return { event }; },
-      read: () => events,
+      append: (_file, event) => { workingEvents.push(event); return { event }; },
+      read: () => workingEvents,
       persist: (state) => {
         if (state === "DISPATCHED") throw new Error("state push failed");
+        remoteEvents = structuredClone(workingEvents);
         persisted.push(state);
       },
     }),
@@ -144,18 +151,34 @@ test("accepted dispatch with confirmation persistence failure leaves durable int
   );
   assert.equal(dispatchCount, 1);
   assert.deepEqual(persisted, ["DISPATCH_INTENT"]);
-  assert.equal(hasOutstandingDispatch(events, { repo: "M1Vj/fleet-runtime", pr: 17, headSha: "B".repeat(40) }), true);
+  assert.deepEqual(remoteEvents.map(({ state }) => state), ["DISPATCH_INTENT"]);
+  assert.equal(hasOutstandingDispatch(remoteEvents, { repo: "M1Vj/fleet-runtime", pr: 17, headSha: "B".repeat(40) }), true);
   await assert.rejects(
     dispatchTarget({ repo: "M1Vj/fleet-runtime", pr: 17, headSha: "B".repeat(40) }, {
       stateRoot: "/tmp/fleet-dispatch-contract",
       dispatch: async () => { dispatchCount += 1; },
-      append: (_file, event) => { events.push(event); return { event }; },
-      read: () => events,
+      append: (_file, event) => { throw new Error(`unexpected append ${event.state}`); },
+      read: () => structuredClone(remoteEvents),
       persist() {},
     }),
     /already.pending/i,
   );
   assert.equal(dispatchCount, 1);
+});
+
+test("intent persistence failure prevents the dispatch API call", async () => {
+  let dispatchCount = 0;
+  await assert.rejects(
+    dispatchTarget({ repo: "M1Vj/fleet-runtime", pr: 17, headSha: "9".repeat(40) }, {
+      stateRoot: "/tmp/fleet-dispatch-contract",
+      dispatch: async () => { dispatchCount += 1; },
+      append: (_file, event) => ({ event }),
+      read: () => [],
+      persist: () => { throw new Error("intent push conflict"); },
+    }),
+    /intent push conflict/,
+  );
+  assert.equal(dispatchCount, 0);
 });
 
 test("ambiguous dispatch failure stays pending while a definitive client rejection can retry", async () => {
@@ -174,6 +197,16 @@ test("ambiguous dispatch failure stays pending while a definitive client rejecti
   assert.deepEqual(ambiguousEvents.map(({ state }) => state), ["DISPATCH_INTENT", "DISPATCH_UNKNOWN"]);
   assert.equal(hasOutstandingDispatch(ambiguousEvents, target), true);
 
+  const timeoutEvents = [];
+  await assert.rejects(dispatchTarget(target, {
+    stateRoot: "/tmp/fleet-dispatch-contract",
+    dispatch: async () => { throw new Error("request timed out before response"); },
+    append: (_file, event) => { timeoutEvents.push(event); return { event }; },
+    read: () => timeoutEvents,
+    persist() {},
+  }), /timed out/);
+  assert.deepEqual(timeoutEvents.map(({ state }) => state), ["DISPATCH_INTENT", "DISPATCH_UNKNOWN"]);
+
   const rejectedEvents = [];
   await assert.rejects(
     dispatchTarget(target, {
@@ -188,6 +221,18 @@ test("ambiguous dispatch failure stays pending while a definitive client rejecti
   assert.deepEqual(rejectedEvents.map(({ state }) => state), ["DISPATCH_INTENT", "DISPATCH_FAILED"]);
   assert.equal(hasOutstandingDispatch(rejectedEvents, target), false);
 
+  for (const status of [409, 429]) {
+    const statusEvents = [];
+    await assert.rejects(dispatchTarget(target, {
+      stateRoot: "/tmp/fleet-dispatch-contract",
+      dispatch: async () => ({ status }),
+      append: (_file, event) => { statusEvents.push(event); return { event }; },
+      read: () => statusEvents,
+      persist() {},
+    }), new RegExp(`status=${status}`));
+    assert.deepEqual(statusEvents.map(({ state }) => state), ["DISPATCH_INTENT", "DISPATCH_UNKNOWN"]);
+  }
+
   const thrownClientEvents = [];
   await assert.rejects(
     dispatchTarget(target, {
@@ -201,6 +246,19 @@ test("ambiguous dispatch failure stays pending while a definitive client rejecti
   );
   assert.deepEqual(thrownClientEvents.map(({ state }) => state), ["DISPATCH_INTENT", "DISPATCH_FAILED"]);
   assert.equal(hasOutstandingDispatch(thrownClientEvents, target), false);
+});
+
+test("a no-body dispatch success records DISPATCHED", async () => {
+  const events = [];
+  const result = await dispatchTarget({ repo: "M1Vj/fleet-runtime", pr: 17, headSha: "8".repeat(40) }, {
+    stateRoot: "/tmp/fleet-dispatch-contract",
+    dispatch: async () => null,
+    append: (_file, event) => { events.push(event); return { event }; },
+    read: () => events,
+    persist() {},
+  });
+  assert.deepEqual(events.map(({ state }) => state), ["DISPATCH_INTENT", "DISPATCHED"]);
+  assert.equal(result.dispatchRunId, "");
 });
 
 test("authorization consumes only its matching dispatch correlation and is idempotent on rerun", async () => {
@@ -219,7 +277,7 @@ test("authorization consumes only its matching dispatch correlation and is idemp
   assert.equal(events.at(-1).state, "DISPATCH_CONSUMED");
   assert.equal(events.at(-1).attempt, 3);
   assert.deepEqual(persisted, ["DISPATCH_CONSUMED"]);
-  assert.equal(hasOutstandingDispatch(events, target), false);
+  assert.equal(hasOutstandingDispatch(events, target), true);
 
   const rerun = await consumeDispatch(target, key, {
     stateRoot: "/tmp/fleet-dispatch-contract",
@@ -232,6 +290,38 @@ test("authorization consumes only its matching dispatch correlation and is idemp
     stateRoot: "/tmp/fleet-dispatch-contract",
     read: () => events,
   }), /correlation/i);
+  for (const mismatch of [
+    { ...target, repo: "M1Vj/fleet-control" },
+    { ...target, pr: 18 },
+    { ...target, headSha: "5".repeat(40) },
+  ]) {
+    await assert.rejects(consumeDispatch(mismatch, key, {
+      stateRoot: "/tmp/fleet-dispatch-contract",
+      read: () => events,
+    }), /correlation/i);
+  }
+});
+
+test("a consumed target remains claimed until an explicit release or hold", async () => {
+  const target = { repo: "M1Vj/fleet-runtime", pr: 17, headSha: "7".repeat(40) };
+  const key = "6".repeat(64);
+  const released = [{ ...target, lane: "merge", kind: "dispatch", state: "DISPATCH_CONSUMED", attempt: 1, artifactRefs: [`dispatch-key:${key}`] }];
+  const release = completeDispatch(target, key, "STALLED", {
+    stateRoot: "/tmp/fleet-dispatch-contract",
+    read: () => released,
+    append: (_file, event) => { released.push(event); return { event }; },
+  });
+  assert.equal(release.event.state, "DISPATCH_RELEASED");
+  assert.equal(hasOutstandingDispatch(released, target), false);
+
+  const held = [{ ...target, lane: "merge", kind: "dispatch", state: "DISPATCH_CONSUMED", attempt: 1, artifactRefs: [`dispatch-key:${key}`] }];
+  const hold = completeDispatch(target, key, "BLOCKED", {
+    stateRoot: "/tmp/fleet-dispatch-contract",
+    read: () => held,
+    append: (_file, event) => { held.push(event); return { event }; },
+  });
+  assert.equal(hold.event.state, "DISPATCH_HELD");
+  assert.equal(hasOutstandingDispatch(held, target), true);
 });
 
 test("scheduled discovery suppresses an outstanding head and returns at most one eligible target", async () => {
@@ -260,7 +350,7 @@ test("scheduled discovery suppresses an outstanding head and returns at most one
     headSha: head,
     lane: "merge",
     kind: "dispatch",
-    state: "DISPATCH_INTENT",
+    state: "DISPATCH_CONSUMED",
     artifactRefs: [`dispatch-key:${"2".repeat(64)}`],
   }];
   const selectedAfterSkip = await discoverFleetPR({ ...dependencies, memoryEvents: pending });
@@ -339,6 +429,17 @@ test("infrastructure failures never queue revision while deterministic rejection
     why: "judge infrastructure unavailable",
   });
   assert.equal(revisionDisposition({ ...base, evidenceAvailable: true, judgeResults: [{ infrastructureFailure: false }] }).revisionNeeded, true);
+  assert.deepEqual(revisionDisposition({
+    ...base,
+    evidenceAvailable: true,
+    judgeResults: [{ infrastructureFailure: false }],
+    revisionAttempts: 2,
+    maxRevisions: 2,
+  }), {
+    revisionNeeded: false,
+    state: "BLOCKED",
+    why: "revision cap reached",
+  });
 });
 
 test("unavailable and unparsable judges are marked as infrastructure failures", async () => {
@@ -386,6 +487,39 @@ test("merge verification requires a consistent attributed GitHub merge commit", 
       merge: async () => ({ merged: true }),
     }),
     /merge commit SHA/i,
+  );
+
+  let mergeCalls = 0;
+  const stale = await mergeWithExpectedSha("M1Vj/fleet-runtime", 1, head, { note() {} }, {
+    ...dependencies,
+    getPr: async () => ({ state: "open", draft: false, head: { sha: "d".repeat(40) } }),
+    merge: async () => { mergeCalls += 1; throw new Error("must not merge stale head"); },
+  });
+  assert.deepEqual(stale, { ok: false, state: "STALE_HEAD" });
+  assert.equal(mergeCalls, 0);
+
+  prReads = 0;
+  await assert.rejects(
+    mergeWithExpectedSha("M1Vj/fleet-runtime", 1, head, { note() {} }, {
+      ...dependencies,
+      getPr: async () => (++prReads === 1
+        ? { state: "open", draft: false, head: { sha: head } }
+        : { state: "closed", merged: true, merge_commit_sha: mergeSha, head: { sha: "e".repeat(40) } }),
+    }),
+    /reviewed head/i,
+  );
+
+  prReads = 0;
+  await assert.rejects(
+    mergeWithExpectedSha("M1Vj/fleet-runtime", 1, head, { note() {} }, {
+      ...dependencies,
+      getCommit: async () => ({
+        author: { login: identity.login },
+        commit: { author: { email: identity.noreply }, committer: { email: "noreply@github.com" } },
+        parents: [{ sha: "c".repeat(40) }, { sha: "d".repeat(40) }],
+      }),
+    }),
+    /reviewed head parent/i,
   );
 });
 

@@ -34,10 +34,12 @@ Use existing GitHub Actions and the private `fleet-control` repository. No third
   "headSha": "40-hex-sha",
   "attempt": 1,
   "kind": "dispatch|judge|revision|terminal|error",
-  "state": "DISPATCH_INTENT|DISPATCHED|DISPATCH_UNKNOWN|DISPATCH_FAILED|DISPATCH_CONSUMED|DISPATCH_RELEASED|DISPATCH_HELD|REVISION_STARTED|REVISION_QUEUED|SUCCESS|BLOCKED|STALLED|EXHAUSTED|ERROR",
+  "state": "DISPATCH_INTENT|DISPATCHED|DISPATCH_UNKNOWN|DISPATCH_FAILED|DISPATCH_CONSUMED|DISPATCH_RELEASED|DISPATCH_HELD|REVISION_INTENT|REVISION_STARTED|REVISION_QUEUED|JUDGE_APPROVED|JUDGE_REJECTED|JUDGE_UNAVAILABLE|ROTATED|SUCCESS|BLOCKED|STALLED|EXHAUSTED|ERROR",
   "createdAt": "ISO-8601",
   "summary": "bounded sanitized text",
   "changedPaths": ["src/example.js"],
+  "reviewNotes": ["bounded redacted actionable judge note"],
+  "judgeScores": {"correctness": 0, "standards": 0, "threshold": 0, "targetChecksPassed": false},
   "blockerIds": ["sha256(...)"],
   "artifactRefs": ["audit/...md"]
 }
@@ -60,7 +62,7 @@ scheduled scan
   -> uncredentialed public exact-SHA materialization
   -> fresh credential-free target-check job
   -> target merge gate
-  -> persist DISPATCH_RELEASED after a retryable/completed result, or DISPATCH_HELD after a policy block
+  -> persist DISPATCH_RELEASED after a retryable/completed result, or DISPATCH_HELD after policy BLOCKED, APPROVED_NO_MERGE, READY_REQUIRED, MERGE_UNKNOWN, or MERGE_VERIFY_FAILED
   -> judge result + memory event + bounded PR mirror
   -> rejected fleet PR
   -> revision step with same explicit target
@@ -80,6 +82,7 @@ scheduled scan
 - At most 200 recent events per target are retained in the prompt; the state file rotates around 2,000 lines while preserving a summary, durable per-PR revision totals, and every latest active dispatch claim, even when that temporarily exceeds the nominal bound.
 - Memory appends are durable before they report success. Rotation keeps the canonical file visible until one atomic replacement, maintains a private recovery copy, and fails closed under competing local writers.
 - Stale head SHA, closed PR, kill switch, identity mismatch, or pre-mutation state-push conflict produces a named terminal event and no branch mutation. A post-mutation success-state conflict fails the run visibly; it never rewrites or rolls back the target branch automatically.
+- Every promised terminal event and identity-verified audit must durably persist; otherwise the run exits code 7 with `STATE_PERSISTENCE_FAILED`.
 - Discovery suppresses a target/head while its latest dispatch state is `DISPATCH_INTENT`, `DISPATCHED`, `DISPATCH_UNKNOWN`, `DISPATCH_CONSUMED`, or `DISPATCH_HELD`. A gate terminal state explicitly records `DISPATCH_RELEASED` when a later same-head attempt is allowed; policy `BLOCKED` records `DISPATCH_HELD` until the head changes. A definite non-ambiguous client rejection records `DISPATCH_FAILED`. An ambiguous result is never retried blindly; a correlated target run may consume it, otherwise an operator reconciles it from GitHub Actions before clearing or retrying.
 - Raw model replies, full judge comments, raw diffs, prompts, and raw target test output are never persisted or mirrored. The cross-job evidence artifact is a bounded redacted summary with a digest, and public/private PR comments use controlled wording, blocker hashes, and validated safe paths only.
 

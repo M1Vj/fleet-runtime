@@ -7,7 +7,8 @@ All commands assume `gh` authenticated as M1Vj on the owner Mac. Workflows live 
 ## 1. Secrets setup and rotation
 
 Required secrets on BOTH repos: `FLEET_GH_TOKEN` (PAT with `repo` + `workflow` scopes;
-the gate exits 4 without them) and `FLEET_OPENCODE_AUTH`.
+the gate exits 3 when it is missing or its identity is wrong, and exits 4 when scopes are
+insufficient) and `FLEET_OPENCODE_AUTH`.
 
 Refresh model auth (values never displayed; helper targets both `M1Vj/fleet-runtime` and
 `M1Vj/fleet-control`):
@@ -73,10 +74,12 @@ Edit `state/targets.json` in fleet-control and push to `main`:
 
     { "tier1": ["M1Vj/SomeRepo"], "excluded": ["M1Vj/Ignored"], "allOwned": false }
 
-Only `tier1` repos receive comments, labels, or draft PRs (`eligible()` in
-`scripts/patrol.mjs`). Non-tier1 owned repos are observe-only: their findings surface as
-issues in fleet-control. `fleet_issue` directives always target fleet-control; changes
-apply on the next patrol.
+Only `tier1` repos receive issue comments, labels, or draft PRs (`eligible()` in
+`scripts/patrol.mjs`). Patrol keys open-PR freshness by head SHA and downgrades model-directed
+PR comments to private reports, so its own comments cannot retrigger a PR or publish a public
+review comment. Non-tier1 owned repos are observe-only: their findings surface as issues in
+fleet-control. `fleet_issue` directives always target fleet-control; changes apply on the next
+patrol.
 
 ## 5. Audit log interpretation
 
@@ -111,7 +114,12 @@ before the REST request, `DISPATCHED` confirms acceptance, `DISPATCH_UNKNOWN` pr
 ambiguous result without blind retry, `DISPATCH_FAILED` records a definite client rejection,
 `DISPATCH_CONSUMED` binds a target run to its scanner correlation key,
 `DISPATCH_RELEASED` permits a later same-head attempt after completion or a retryable stall,
-and `DISPATCH_HELD` requires a new head after a policy block. See
+and `DISPATCH_HELD` requires a new head after policy `BLOCKED`, `REVISION_QUEUED`,
+`APPROVED_NO_MERGE`, `READY_REQUIRED`, `MERGE_UNKNOWN`, or `MERGE_VERIFY_FAILED`. Judge and
+revision events also use `REVISION_INTENT`, `JUDGE_APPROVED`, `JUDGE_REJECTED`, `JUDGE_UNAVAILABLE`,
+and `ROTATED`. Every promised
+terminal event and identity-verified audit must persist or the run exits code 7 with
+`STATE_PERSISTENCE_FAILED`. See
 [PR memory and dispatch recovery](runbooks/pr-memory.md).
 
 ## 6. Session resume
@@ -138,6 +146,13 @@ Semantics (`scripts/lib/model.mjs`):
   and 600 for thesis, KB, or revision work.
 - The breaker opens for 30 minutes only after the entire chain fails. Judges may use
   `FLEET_JUDGE_MODEL`; the default remains Ox/Alpha-only.
+- Merge/revise/patrol judges receive a fresh disposable workspace with a deny-all OpenCode
+  policy; no repository or private-state checkout is attached. Improve research/plan may use
+  the explicit `public-read` profile only after target metadata proves `private=false` and
+  `visibility=public` (plus any available tier-1 allowlist), using a fresh shallow clone under
+  `./source`. That profile permits read/list/glob/grep (and webfetch) but still denies edit,
+  shell, task, skill, external-directory, and web-search tools. Private/internal targets fail
+  before clone or model execution.
 - On upstream errors such as 429, `opencode run` may hang silently (issues
   #8203/#22243/#29134). Hard timeouts, failure-log tails, and `max-parallel` limits contain
   the failure. If hangs become chronic, pin another model ID in `scripts/lib/model.mjs`;
@@ -153,7 +168,10 @@ Semantics (`scripts/lib/model.mjs`):
   fleet drafts open >14 days untouched ("stale").
 - Scheduled runs always dispatch with `allow_merge=false`; they may revise eligible rejected
   public fleet PRs but cannot merge them. Private repositories remain human-only because the
-  public runtime does not copy private source into Actions artifacts. A live merge requires an intentional manual dispatch with
+  public runtime does not copy private source into Actions artifacts. Target authorization also
+  requires GitHub to report `private=false` and `visibility=public`; targets without
+  `package.json` or without a declared `build` or `test` script are unsupported and fail closed.
+  A live merge requires an intentional manual dispatch with
   `allow_merge=true`, an already-ready PR, no diff secret hits, successful isolated deterministic
   checks, two advisory judges approving at >=80 (LOW) or >=90 (MEDIUM), and an unchanged reviewed
   head. UI and sensitive paths remain human-only. The merge request includes the expected SHA;
@@ -171,6 +189,20 @@ Semantics (`scripts/lib/model.mjs`):
   Confirm `APPROVED_NO_MERGE` or the expected non-merge terminal state, verify that both source
   materialization and target execution ran without secrets, and inspect the private memory event before
   re-enabling the schedule. An empty `dispatch_id` is correct for this intentional manual run.
+
+For partial revision recovery, do not force-update or roll back the target branch. Reconcile
+the exact commit and private state with read-only checks, then append/commit recovery through
+the normal tools:
+
+    gh api repos/M1Vj/<repo>/pulls/<number> --jq '{state,head:.head.sha,merged,merge_commit_sha}'
+    gh api repos/M1Vj/<repo>/commits/<commit-sha> --jq '{sha,author:.author.login,author_email:.commit.author.email,parents:[.parents[].sha]}'
+    git -C ../fleet-control log --oneline -- state/pr-memory.jsonl
+    node scripts/status.mjs -R M1Vj/fleet-control
+
+If the commit is attributed and only the state push failed, preserve the branch, repair the
+private checkout with a normal append/retry, and rerun the exact `allow_merge=false` target
+dispatch. For `DISPATCH_UNKNOWN` or any held merge state, correlate the dispatch ID with
+GitHub Actions first; never delete or hand-edit append-only memory.
 
 ## 9. Quota notes
 

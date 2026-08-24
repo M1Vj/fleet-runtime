@@ -8,7 +8,7 @@ Public GitHub Actions execution shell that autonomously patrols, audits, improve
 +---------------------------------------------+
 | M1Vj/fleet-runtime  (PUBLIC, this repo)     |
 | .github/workflows/*.yml + scripts/*.mjs     |
-| free Actions minutes; no durable private data|
+| free Actions minutes; no private source, credentials, or raw state are durably stored here|
 ---+---------------------------------------+---
    | checkout/push state + audit           | gh api mutations: issues,
    | into private repo (FLEET_GH_TOKEN)    | comments, labels, draft PRs,
@@ -31,7 +31,7 @@ Public GitHub Actions execution shell that autonomously patrols, audits, improve
 
 | Workflow | Trigger | Cadence (UTC) | Purpose | Model use |
 | --- | --- | --- | --- | --- |
-| fleet-patrol | cron, dispatch | 3x/hour :03 :23 :43 | triage repo signals; comments/labels/draft PRs; enqueue deep tasks; heartbeat | 1 call + repair |
+| fleet-patrol | cron, dispatch | 3x/hour :03 :23 :43 | triage repo signals; issue comments/labels/draft PRs; enqueue deep tasks; heartbeat | 1 call + repair |
 | fleet-watchdog | cron | 4x/hour :09 :24 :39 :54 | heartbeat staleness (90 min): re-enable workflows, reclaim queue tasks, alert issue | none |
 | fleet-deep | cron, dispatch | 3x/hour :11 :31 :51 | drain state/queue.jsonl, max 3 workers: security/redteam/code-review/docs reports on real clones | <=3 calls/wave |
 | fleet-improve | cron, dispatch | every 2 h at :25 | pick -> research -> plan -> implement draft PR -> 3-lens review posted | ~5 calls/repo |
@@ -50,10 +50,12 @@ CLI is pinned to `opencode-ai@1.18.21`; model registry served from committed sna
 
 - **Attribution fail-closed**: every run verifies the token identity equals `M1Vj` (type User) and holds `repo` + `workflow` scopes before acting; any mismatch aborts (exit 3/4). Commits are made as the M1Vj noreply identity and re-verified against the API post-push; `[bot]` attribution aborts.
 - **Tiered scope**: only `tier1` repos in `state/targets.json` receive comments, labels, or PRs; everything else is observe-only. Fleet-wide findings always land as issues in fleet-control.
+- **Patrol freshness and comment boundary**: open-PR signals are keyed by stable head SHA, so patrol's own comments cannot retrigger the same PR. Patrol never publishes PR comments; those model directives downgrade to private reports, while actionable fixes must use `draft_pr`.
 - **Directive validation**: model outputs must be strict JSON arrays of whitelisted kinds with size caps, path-safety rules (no `..`, `.env*`, keys, `state/`, `audit/`), branch regex `fleet/<kebab>`, and secret-pattern rejection; one repair round, else exit 5.
-- **Human-only boundaries**: private repositories, UI files, workflows/actions, auth/security, migrations, deployment/infra, manifests and lockfiles, environment/credential paths, symlinks, submodules, incomplete metadata, deletions-only changes, and oversized diffs cannot be revised or merged autonomously.
+- **Human-only boundaries**: private repositories, UI files, workflows/actions, auth/security, login/oauth, permissions/session/access-control paths, migrations, deployment/infra, manifests and lockfiles, environment/credential paths, symlinks, submodules, incomplete metadata, deletions-only changes, and oversized diffs cannot be revised or merged autonomously.
 - **Maker-checker judges**: two independent advisory judge lenses (correctness-and-security, industry-standards-and-maintainability) must both approve; score threshold 80 (LOW) or 90 (MEDIUM). Missing deterministic evidence or an unavailable/unparsable judge produces `STALLED`, never a revision request. Their output cannot by itself authorize a scheduled merge.
-- **Secretless deterministic gates**: an uncredentialed materialization job fetches the exact authorized head of an explicitly public target and emits a digest-bound source artifact. A fresh job that has never received the PAT, model credential, or private state checkout runs target-controlled install, build, and test commands. Private repositories and UI work stay human-only.
+- **Secretless deterministic gates**: an uncredentialed materialization job fetches the exact authorized head of an explicitly public target and emits a digest-bound source artifact. A fresh job that has never received the PAT, model credential, or private state checkout runs target-controlled install, build, and test commands; a separate fresh sanitizer job loads the canonical redactor and writes advisory evidence atomically. The exact target-check step outcome remains authoritative. Private repositories and UI work stay human-only.
+- **Model workspace profiles**: merge/revise/patrol judges run in a fresh disposable deny-all OpenCode workspace with no repository or private-state checkout. The improve research/plan loop may opt into a fresh `public-read` workspace only after GitHub reports `private=false` and `visibility=public` (and an available tier-1 allowlist permits the repo); read/list/grep/glob are allowed there, while edit, shell, task, external-directory, and web-search tools remain denied. Private/internal targets are rejected before clone or model execution.
 - **Expected-SHA mutation**: revisions use one attributed Git Data commit plus a non-forced ref update. A live merge requires an intentional `allow_merge=true` manual dispatch and an already-ready PR; it uses the PR merge endpoint with the re-fetched reviewed SHA and verifies the resulting PR and merge commit. Ambiguous responses are reconciled or held as `MERGE_UNKNOWN`.
 - **Durable PR memory**: redacted idempotent events in private `state/pr-memory.jsonl` enforce the two-round revision cap and prevent blind duplicate dispatch after ambiguous failures. See [the PR-memory runbook](docs/runbooks/pr-memory.md).
 - **Steadiness**: sha256 idempotency ledger prevents duplicate actions; schedule runs within 10 minutes of the last patrol coalesce to NO-OP; a gateway circuit breaker (30-minute open window) converts sustained model outages into STALLED skips instead of red cascades.
@@ -75,7 +77,7 @@ Exit codes (defined in `scripts/lib/gate.mjs` and lane scripts):
 | 6 | MODEL_UNAVAILABLE after the full fallback ladder |
 | 7 | required private-state persistence failed |
 
-Core lane terminal states written to `state/events.jsonl` are `SUCCESS`, `NO-OP`, `BLOCKED`, `STALLED`, and `EXHAUSTED`. Merge-gate decisions in `state/merges.jsonl` additionally use `SCAN-DONE`, `REVISION_QUEUED`, `APPROVED_NO_MERGE`, `READY_REQUIRED`, `STALE_HEAD`, `MERGE_REJECTED`, `MERGE_UNKNOWN`, and `MERGE_VERIFY_FAILED`; these are merge output states, not additions to the shared lane enum.
+Core lane terminal states written to `state/events.jsonl` are `SUCCESS`, `NO-OP`, `BLOCKED`, `STALLED`, and `EXHAUSTED`. PR-memory events also use `REVISION_INTENT`, `JUDGE_APPROVED`, `JUDGE_REJECTED`, `JUDGE_UNAVAILABLE`, and `ROTATED`, plus the dispatch states documented in the PR-memory runbook. Merge-gate decisions in `state/merges.jsonl` additionally use `SCAN-DONE`, `REVISION_QUEUED`, `APPROVED_NO_MERGE`, `READY_REQUIRED`, `STALE_HEAD`, `MERGE_REJECTED`, `MERGE_UNKNOWN`, and `MERGE_VERIFY_FAILED`; `REVISION_QUEUED`, `APPROVED_NO_MERGE`, `READY_REQUIRED`, `MERGE_UNKNOWN`, `MERGE_VERIFY_FAILED`, and policy `BLOCKED` hold a scanner claim until a changed head or explicit reconciliation. These are merge output states, not additions to the shared lane enum.
 
 ## Known limitations
 

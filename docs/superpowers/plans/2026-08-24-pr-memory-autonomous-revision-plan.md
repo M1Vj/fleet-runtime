@@ -65,6 +65,8 @@
 - [x] Split uncredentialed public-target materialization from fresh credential-free target execution; prove by workflow contract test that neither job receives a mutation token or private state.
 - [x] Keep scheduled dispatches at `allow_merge=false`; require an already-ready PR for a manually authorized live merge.
 - [x] Unify secret detection/redaction and restrict public comments to controlled wording.
+- [x] Isolate every judge/revision model in a deny-all disposable workspace, screen model output before Git objects, and keep target evidence on a fresh trusted sanitizer path.
+- [x] Retain `APPROVED_NO_MERGE` and other held dispatch claims, make terminal/audit persistence fail visibly with code 7, and reject malformed merge response SHAs.
 - [x] Run focused and full tests, syntax checks, diff check, and commit the hardening revisions (`b3cbe14`, `9ed7123`).
 
 ### Task 4: Documentation and operational diagnostics
@@ -76,6 +78,7 @@
 
 - [x] Document the event schema, redaction boundary, retention, target dispatch, and recovery procedure.
 - [x] Add a failure taxonomy for missing target, stale head, model unavailable, validation rejection, dispatch ambiguity, and state-push conflict.
+- [x] Document `REVISION_INTENT`, `JUDGE_APPROVED`, `JUDGE_REJECTED`, `ROTATED`, all held causes, explicit-public/declared-check constraints, and exact partial-revision reconciliation commands.
 - [x] Run the final local secret-pattern scan and actionlint after the documentation commit candidate is frozen; actionlint is clean after ignoring only its documented stale `concurrency.queue` diagnostic.
 - [x] Commit `docs: document autonomous PR memory and recovery` (`3e85357` after rebase).
 

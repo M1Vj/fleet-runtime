@@ -34,7 +34,7 @@ newline is preserved and separated before the next append.
 | `DISPATCH_FAILED` | A definite client rejection means no run was accepted | A later scan may make a new attempt after the cause is fixed |
 | `DISPATCH_CONSUMED` | Authorization matched the target and correlation key | Keep the same head claimed while the globally serialized target run proceeds |
 | `DISPATCH_RELEASED` | The gate completed or reached a retryable terminal state | A later scan may make a new same-head attempt if the PR remains eligible |
-| `DISPATCH_HELD` | The gate reached a policy `BLOCKED` result | Suppress the same head; a changed head is evaluated as a new target |
+| `DISPATCH_HELD` | The gate reached policy `BLOCKED`, `REVISION_QUEUED`, `APPROVED_NO_MERGE`, `READY_REQUIRED`, `MERGE_UNKNOWN`, or `MERGE_VERIFY_FAILED` | Suppress the same head; a changed head or explicit reconciliation is required |
 
 Scanner-generated runs carry a 64-hex `dispatch_id`. Authorization validates the live PR
 policy first, then consumes only the matching active event before any target checkout.
@@ -44,7 +44,14 @@ number, and 40-hex head SHA.
 
 ## Revision lifecycle
 
-`REVISION_STARTED` must be appended and pushed before the model call or branch mutation.
+`REVISION_INTENT` is the durable pre-dispatch request; `JUDGE_APPROVED` and
+`JUDGE_REJECTED` record the bounded judge result, while `JUDGE_UNAVAILABLE` records an
+infrastructure-only judge failure without a public comment. Each completed judge event keeps
+redacted private `reviewNotes` and normalized score metadata for the revision prompt.
+`REVISION_STARTED` must be appended and
+pushed before the model call or branch mutation. `ROTATED` is the bounded summary emitted
+when old events are compacted. Every promised terminal event and identity-verified audit must
+persist or the run exits with code 7 (`STATE_PERSISTENCE_FAILED`).
 `SUCCESS` is appended and pushed immediately after the single attributed commit and
 non-forced ref update, before the public status comment. `ERROR`, `BLOCKED`, `STALLED`, and
 `EXHAUSTED` explain bounded terminal outcomes. The default cap is two

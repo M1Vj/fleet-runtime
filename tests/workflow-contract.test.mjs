@@ -11,6 +11,7 @@ test("manual dispatch has an explicit, fail-closed target contract", () => {
   assert.match(workflow, /pr:[\s\S]*?required:\s*true/);
   assert.match(workflow, /head_sha:[\s\S]*?required:\s*true/);
   assert.match(workflow, /allow_merge:[\s\S]*?default:\s*false/);
+  assert.match(workflow, /dispatch_id:[\s\S]*?required:\s*false[\s\S]*?default:\s*["']{2}/);
   assert.doesNotMatch(workflow, /routes:/);
 });
 
@@ -42,6 +43,7 @@ test("authorization precedes target checkout and target jobs consume only author
   assert.match(authorizeJob, /FLEET_AUTHORIZE_ONLY:\s*["']?true["']?/);
   assert.match(authorizeJob, /FLEET_TARGET_REPO:\s*\$\{\{\s*inputs\.repo\s*\}\}/);
   assert.match(authorizeJob, /FLEET_HEAD_SHA:\s*\$\{\{\s*inputs\.head_sha\s*\}\}/);
+  assert.match(authorizeJob, /FLEET_DISPATCH_ID:\s*\$\{\{\s*inputs\.dispatch_id\s*\}\}/);
   assert.match(authorizeJob, /FLEET_KILL_SWITCH_PATH:/);
 });
 

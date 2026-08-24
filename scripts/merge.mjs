@@ -2,9 +2,15 @@
 import process from "node:process";
 import {
   appendFileSync,
+  closeSync,
+  constants,
   existsSync,
+  fstatSync,
+  lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  realpathSync,
 } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,8 +20,8 @@ import { AuditBuffer } from "./lib/audit.mjs";
 import { gh, ghInput, safeCommitState, scrub, sha256 } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
-import { verifyCommentAuthor, verifyCommit, verifyPullAuthor } from "./lib/verify.mjs";
-import { appendMemoryEvent } from "./lib/pr-memory.mjs";
+import { verifyCommentAuthor, verifyPullAuthor } from "./lib/verify.mjs";
+import { appendMemoryEvent, readMemoryEvents } from "./lib/pr-memory.mjs";
 import {
   RUNTIME_REPO,
   TARGET_OWNER,
@@ -27,11 +33,13 @@ import {
 } from "./lib/target-policy.mjs";
 
 const STATE_ROOT = String(process.env.FLEET_STATE_ROOT || "");
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const MERGES_PATH = STATE_ROOT ? path.join(STATE_ROOT, "state", "merges.jsonl") : "";
 const MAX_REPO_CHARS = 120;
 const MAX_RUN_CHARS = 80;
 const MAX_LOG_CHARS = 600;
 const MAX_EVIDENCE_CHARS = 8000;
+const MAX_EVIDENCE_BYTES = MAX_EVIDENCE_CHARS * 4;
 const MAX_COMMENT_CHARS = 6000;
 const UI_EXTENSIONS = /\.(html|htm|css|scss|less|jsx|tsx|vue|svelte|astro|mdx)$/i;
 const SENSITIVE_PATH_PATTERNS = [
@@ -140,9 +148,69 @@ export { validateFilesResponse };
 
 const DISPATCH_ENDPOINT = `/repos/${RUNTIME_REPO}/actions/workflows/merge.yml/dispatches`;
 
+function dispatchKeyReference(dispatchKey) {
+  return `dispatch-key:${dispatchKey}`;
+}
+
+function dispatchEventsForTarget(events, target) {
+  const normalized = normalizeTargetInput(target);
+  if (!normalized.ok) return [];
+  return (Array.isArray(events) ? events : []).filter((event) => (
+    event
+    && event.kind === "dispatch"
+    && event.repo === normalized.repo
+    && Number(event.pr) === normalized.pr
+    && String(event.headSha || "").toLowerCase() === normalized.headSha
+  ));
+}
+
+export function hasOutstandingDispatch(events, target) {
+  const latest = dispatchEventsForTarget(events, target).at(-1);
+  return Boolean(latest && new Set(["DISPATCH_INTENT", "DISPATCHED", "DISPATCH_UNKNOWN"]).has(latest.state));
+}
+
+function nextDispatchAttempt(events, target) {
+  return dispatchEventsForTarget(events, target).reduce(
+    (highest, event) => Math.max(highest, Number(event.attempt) || 0),
+    0,
+  ) + 1;
+}
+
+function dispatchEvent(target, { runId, attempt, dispatchKey, state, dispatchArtifact = "" }) {
+  return {
+    runId: bounded(runId, MAX_RUN_CHARS),
+    lane: "merge",
+    repo: target.repo,
+    pr: target.pr,
+    headSha: target.headSha,
+    attempt,
+    kind: "dispatch",
+    state,
+    summary: state === "DISPATCH_INTENT"
+      ? "targeted merge gate dispatch intent persisted"
+      : state === "DISPATCHED"
+        ? "targeted merge gate dispatch accepted"
+        : state === "DISPATCH_FAILED"
+          ? "targeted merge gate dispatch definitively rejected"
+          : state === "DISPATCH_UNKNOWN"
+            ? "targeted merge gate dispatch acceptance unknown"
+            : "targeted merge gate dispatch consumed",
+    changedPaths: [],
+    blockerIds: [],
+    artifactRefs: [dispatchKeyReference(dispatchKey), dispatchArtifact].filter(Boolean),
+  };
+}
+
+function dispatchFailureState(value) {
+  const status = Number(value && typeof value === "object" ? value.status : NaN);
+  return Number.isInteger(status) && status >= 400 && status < 500
+    ? "DISPATCH_FAILED"
+    : "DISPATCH_UNKNOWN";
+}
+
 /**
  * Dispatch one explicitly authorized target and persist the canonical
- * dispatch event only after GitHub accepts the request. The injected
+ * dispatch intent before the API call, then its accepted/unknown result. The injected
  * functions keep this boundary deterministic in contract tests; production
  * uses the REST API and PR-memory append implementation below.
  */
@@ -153,6 +221,9 @@ export async function dispatchTarget(
     runId = process.env.FLEET_RUN_ID || "scan",
     dispatch = (payload) => ghInput(["api", "-X", "POST", DISPATCH_ENDPOINT], payload, process.env),
     append = appendMemoryEvent,
+    read = readMemoryEvents,
+    persist,
+    identity,
   } = {},
 ) {
   const normalized = normalizeTargetInput(target);
@@ -161,6 +232,29 @@ export async function dispatchTarget(
   if (!root || !path.isAbsolute(root) || path.resolve(root) !== root) {
     throw new Error("FLEET_STATE_ROOT is required for dispatch persistence");
   }
+  const memoryFile = path.join(root, "state", "pr-memory.jsonl");
+  const existing = read(memoryFile);
+  if (hasOutstandingDispatch(existing, normalized)) {
+    throw new Error(`DISPATCH_ALREADY_PENDING ${normalized.repo}#${normalized.pr}@${normalized.headSha}`);
+  }
+  const attempt = nextDispatchAttempt(existing, normalized);
+  const dispatchKey = sha256(`${bounded(runId, MAX_RUN_CHARS)}:${normalized.repo}:${normalized.pr}:${normalized.headSha}:${attempt}`);
+  const persistState = persist || ((state) => {
+    if (!identity || !identity.name || !identity.noreply) throw new Error("dispatch persistence identity is required");
+    return safeCommitState(root, ["state"], `[fleet] dispatch ${normalized.repo}#${normalized.pr} ${state}`, identity, process.env);
+  });
+  const record = async (state, dispatchArtifact = "") => {
+    const result = append(memoryFile, dispatchEvent(normalized, {
+      runId,
+      attempt,
+      dispatchKey,
+      state,
+      dispatchArtifact,
+    }));
+    await persistState(state);
+    return result && result.event ? result.event : result;
+  };
+  await record("DISPATCH_INTENT");
   const payload = {
     ref: "main",
     inputs: {
@@ -168,11 +262,19 @@ export async function dispatchTarget(
       pr: String(normalized.pr),
       head_sha: normalized.headSha,
       allow_merge: "true",
+      dispatch_id: dispatchKey,
     },
   };
-  const dispatchResponse = await dispatch(payload);
+  let dispatchResponse;
+  try {
+    dispatchResponse = await dispatch(payload);
+  } catch (error) {
+    await record(dispatchFailureState(error));
+    throw error;
+  }
   if (dispatchResponse && typeof dispatchResponse === "object" && Number.isInteger(dispatchResponse.status)
     && (dispatchResponse.status < 200 || dispatchResponse.status >= 300)) {
+    await record(dispatchFailureState(dispatchResponse));
     throw new Error(`workflow dispatch rejected status=${dispatchResponse.status}`);
   }
   const runIdentifier = dispatchResponse && typeof dispatchResponse === "object"
@@ -181,26 +283,58 @@ export async function dispatchTarget(
   const dispatchArtifact = runIdentifier === undefined || runIdentifier === null
     ? ""
     : `dispatch-run:${sanitizeLogValue(runIdentifier, 72)}`;
-  const eventInput = {
-    runId: bounded(runId, MAX_RUN_CHARS),
-    lane: "merge",
-    repo: normalized.repo,
-    pr: normalized.pr,
-    headSha: normalized.headSha,
-    attempt: 0,
-    kind: "dispatch",
-    state: "DISPATCHED",
-    summary: "targeted merge gate dispatched",
-    changedPaths: [],
-    blockerIds: [],
-    artifactRefs: dispatchArtifact ? [dispatchArtifact] : [],
-  };
-  const eventResult = append(path.join(root, "state", "pr-memory.jsonl"), eventInput);
+  const event = await record("DISPATCHED", dispatchArtifact);
   return {
     payload,
     dispatchRunId: dispatchArtifact,
-    event: eventResult && eventResult.event ? eventResult.event : eventResult,
+    event,
   };
+}
+
+export async function consumeDispatch(
+  target,
+  rawDispatchKey,
+  {
+    stateRoot = STATE_ROOT,
+    runId = process.env.FLEET_RUN_ID || "target",
+    append = appendMemoryEvent,
+    read = readMemoryEvents,
+    persist,
+    identity,
+  } = {},
+) {
+  const dispatchKey = String(rawDispatchKey || "");
+  if (!dispatchKey) return { consumed: false, manualDispatch: true };
+  if (!/^[a-f0-9]{64}$/.test(dispatchKey)) throw new Error("DISPATCH_CORRELATION_INVALID");
+  const normalized = normalizeTargetInput(target);
+  if (!normalized.ok) throw new Error(`INVALID_DISPATCH_TARGET ${normalized.errors.join("; ")}`);
+  const root = String(stateRoot || "");
+  if (!root || !path.isAbsolute(root) || path.resolve(root) !== root) {
+    throw new Error("FLEET_STATE_ROOT is required for dispatch consumption");
+  }
+  const memoryFile = path.join(root, "state", "pr-memory.jsonl");
+  const reference = dispatchKeyReference(dispatchKey);
+  const matching = dispatchEventsForTarget(read(memoryFile), normalized)
+    .filter((event) => Array.isArray(event.artifactRefs) && event.artifactRefs.includes(reference));
+  const latest = matching.at(-1);
+  if (latest && latest.state === "DISPATCH_CONSUMED") return { consumed: false, alreadyConsumed: true };
+  if (!latest || !new Set(["DISPATCH_INTENT", "DISPATCHED", "DISPATCH_UNKNOWN"]).has(latest.state)) {
+    throw new Error("DISPATCH_CORRELATION_MISSING_OR_INACTIVE");
+  }
+  const dispatchArtifact = latest.artifactRefs.find((item) => String(item).startsWith("dispatch-run:")) || "";
+  const result = append(memoryFile, dispatchEvent(normalized, {
+    runId,
+    attempt: Number(latest.attempt) || 0,
+    dispatchKey,
+    state: "DISPATCH_CONSUMED",
+    dispatchArtifact,
+  }));
+  const persistState = persist || ((state) => {
+    if (!identity || !identity.name || !identity.noreply) throw new Error("dispatch persistence identity is required");
+    return safeCommitState(root, ["state"], `[fleet] dispatch ${normalized.repo}#${normalized.pr} ${state}`, identity, process.env);
+  });
+  await persistState("DISPATCH_CONSUMED");
+  return { consumed: true, event: result && result.event ? result.event : result };
 }
 
 export function secretsInDiff(files) {
@@ -247,10 +381,11 @@ function finish(audit, runId, state, identity, repo, pr) {
   return 0;
 }
 
-function terminal(state, details, audit, runId, identity, repo, pr) {
+function terminal(state, details, audit, runId, identity, repo, pr, exitCode = 0) {
   writeMergeState(state, { repo, pr, ...details });
   console.log(`MERGE_TERMINAL_STATE=${bounded(state, 80)}`);
-  return finish(audit, runId, state, identity, repo, pr);
+  finish(audit, runId, state, identity, repo, pr);
+  return exitCode;
 }
 
 async function postComment(repo, number, body, audit, identity) {
@@ -263,14 +398,42 @@ async function postComment(repo, number, body, audit, identity) {
   return comment;
 }
 
-function readEvidence() {
-  const evidencePath = String(process.env.FLEET_EVIDENCE_PATH || "");
-  if (!evidencePath || !existsSync(evidencePath)) return { available: false, text: "target-check evidence unavailable" };
+export function readEvidence(rawPath = process.env.FLEET_EVIDENCE_PATH, { workspaceRoot = REPO_ROOT } = {}) {
+  const evidencePath = String(rawPath || "");
+  const workspace = typeof workspaceRoot === "string" && path.isAbsolute(workspaceRoot) ? path.resolve(workspaceRoot) : "";
+  const expected = workspace ? path.join(workspace, "target-check", "evidence.txt") : "";
+  if (!evidencePath || !path.isAbsolute(evidencePath) || path.resolve(evidencePath) !== expected || !existsSync(evidencePath)) {
+    return { available: false, text: "target-check evidence unavailable" };
+  }
+  let descriptor = null;
   try {
-    const text = readFileSync(evidencePath, "utf8").slice(-MAX_EVIDENCE_CHARS);
+    const workspaceStat = lstatSync(workspace);
+    const parent = path.dirname(expected);
+    const parentStat = lstatSync(parent);
+    const fileStat = lstatSync(expected);
+    if (!workspaceStat.isDirectory() || workspaceStat.isSymbolicLink()
+      || !parentStat.isDirectory() || parentStat.isSymbolicLink()
+      || !fileStat.isFile() || fileStat.isSymbolicLink()
+      || fileStat.size > MAX_EVIDENCE_BYTES) {
+      return { available: false, text: "target-check evidence unavailable" };
+    }
+    const workspaceReal = realpathSync(workspace);
+    const parentReal = realpathSync(parent);
+    const fileReal = realpathSync(expected);
+    if (parentReal !== path.join(workspaceReal, "target-check") || fileReal !== path.join(parentReal, "evidence.txt")) {
+      return { available: false, text: "target-check evidence unavailable" };
+    }
+    descriptor = openSync(expected, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+    const openedStat = fstatSync(descriptor);
+    if (!openedStat.isFile() || openedStat.size > MAX_EVIDENCE_BYTES) {
+      return { available: false, text: "target-check evidence unavailable" };
+    }
+    const text = readFileSync(descriptor, "utf8").slice(-MAX_EVIDENCE_CHARS);
     return { available: true, text: sanitizeCommentBody(text, MAX_EVIDENCE_CHARS), digest: sha256(text).slice(0, 16) };
   } catch {
     return { available: false, text: "target-check evidence unreadable", digest: "unavailable" };
+  } finally {
+    if (descriptor !== null) closeSync(descriptor);
   }
 }
 
@@ -303,13 +466,21 @@ function enrichFileMetadata(repo, headSha, files) {
   }
 }
 
-export async function discoverFleetPR({ stateRoot = STATE_ROOT } = {}) {
+export async function discoverFleetPR({
+  stateRoot = STATE_ROOT,
+  listPulls = (repo) => gh(["api", `/repos/${repo}/pulls?state=open&sort=created&direction=asc&per_page=20`], process.env) || [],
+  inspectPr = getPr,
+  memoryEvents,
+} = {}) {
   const repos = [RUNTIME_REPO, ...readTier1Repos({ stateRoot })].filter((repo, index, all) => all.indexOf(repo) === index);
+  const dispatchMemory = Array.isArray(memoryEvents)
+    ? memoryEvents
+    : readMemoryEvents(path.join(stateRoot, "state", "pr-memory.jsonl"));
   for (const repo of repos) {
     if (!isAllowedRepo(repo, { stateRoot })) continue;
     let pulls;
     try {
-      pulls = gh(["api", `/repos/${repo}/pulls?state=open&sort=created&direction=asc&per_page=20`], process.env) || [];
+      pulls = await listPulls(repo);
     } catch {
       continue;
     }
@@ -320,20 +491,21 @@ export async function discoverFleetPR({ stateRoot = STATE_ROOT } = {}) {
       let files;
       let repoMeta;
       try {
-        ({ pr: detailedPr, files, repoMeta } = await getPr(repo, target.pr));
+        ({ pr: detailedPr, files, repoMeta } = await inspectPr(repo, target.pr));
       } catch {
         continue;
       }
       const candidatePr = detailedPr || pr;
       const policy = evaluateTargetPolicy({ target, pr: candidatePr, files, repoMeta, stateRoot });
       const cls = classify(files);
-      if (policy.ok && !cls.humanOnly && candidatePr.draft && candidatePr.user && candidatePr.user.login === TARGET_OWNER) return target;
+      if (policy.ok && !cls.humanOnly && candidatePr.draft && candidatePr.user && candidatePr.user.login === TARGET_OWNER
+        && !hasOutstandingDispatch(dispatchMemory, target)) return target;
     }
   }
   return null;
 }
 
-async function judge({ repo, prNumber, title, body, files, extraEvidence, lens, audit }) {
+export async function judge({ repo, prNumber, title, body, files, extraEvidence, lens, audit, ask = askModel }) {
   const diff = files
     .map((file) => `--- ${bounded(file.filename, 180)} (+${file.additions || 0}/-${file.deletions || 0})\n${String(file.patch || "").slice(0, 5000)}`)
     .join("\n\n")
@@ -350,12 +522,14 @@ async function judge({ repo, prNumber, title, body, files, extraEvidence, lens, 
     "Return ONLY strict JSON. approve requires score>=80 AND zero blockers.",
     "UNTRUSTED_DIFF_BEGIN", diff, "UNTRUSTED_DIFF_END",
   ].join("\n");
-  const result = await askModel({
+  const result = await ask({
     prompt, timeoutMs: 480000, env: process.env, preferVariantMax: true, maxRounds: 3,
     ...(process.env.FLEET_JUDGE_MODEL ? { modelOverride: process.env.FLEET_JUDGE_MODEL } : {}),
   });
   audit.note("judge", `${lens} complete=${Boolean(result.complete)}`);
-  if (!result.complete || !result.reply) return { verdict: "reject", score: 0, reasons: ["judge unavailable"], blockers: ["judge unavailable"] };
+  if (!result.complete || !result.reply) {
+    return { verdict: "reject", score: 0, reasons: ["judge unavailable"], blockers: ["judge unavailable"], infrastructureFailure: true };
+  }
   try {
     const value = extractJsonObject(result.reply);
     return {
@@ -363,31 +537,67 @@ async function judge({ repo, prNumber, title, body, files, extraEvidence, lens, 
       score: Math.max(0, Math.min(100, Number(value.score) || 0)),
       reasons: Array.isArray(value.reasons) ? value.reasons.map((item) => bounded(item, 240)).slice(0, 6) : [],
       blockers: Array.isArray(value.blockers) ? value.blockers.map((item) => bounded(item, 240)).slice(0, 6) : [],
+      infrastructureFailure: false,
     };
   } catch {
-    return { verdict: "reject", score: 0, reasons: ["judge output unparsable"], blockers: ["unparsable judge output"] };
+    return { verdict: "reject", score: 0, reasons: ["judge output unparsable"], blockers: ["unparsable judge output"], infrastructureFailure: true };
   }
 }
 
-export async function mergeWithExpectedSha(repo, prNumber, expectedSha, audit) {
-  let latest = gh(["api", `/repos/${repo}/pulls/${prNumber}`], process.env);
+export function revisionDisposition({ fleetAuthored, revisionAllowed, evidenceAvailable, judgeResults = [] } = {}) {
+  if (!evidenceAvailable) {
+    return { revisionNeeded: false, state: "STALLED", why: "deterministic target evidence unavailable" };
+  }
+  if (judgeResults.some((result) => result && result.infrastructureFailure === true)) {
+    return { revisionNeeded: false, state: "STALLED", why: "judge infrastructure unavailable" };
+  }
+  return {
+    revisionNeeded: Boolean(fleetAuthored && revisionAllowed),
+    state: fleetAuthored && revisionAllowed ? "REVISION_QUEUED" : "BLOCKED",
+    why: "judges or deterministic checks rejected",
+  };
+}
+
+export async function mergeWithExpectedSha(repo, prNumber, expectedSha, audit, dependencies = {}) {
+  const identity = dependencies.identity;
+  const getPr = dependencies.getPr || ((targetRepo, targetPr) => gh(["api", `/repos/${targetRepo}/pulls/${targetPr}`], process.env));
+  const markReady = dependencies.markReady || ((targetRepo, targetPr) => gh(["api", "-X", "PATCH", `/repos/${targetRepo}/pulls/${targetPr}`, "-F", "draft=false"], process.env));
+  const merge = dependencies.merge || ((targetRepo, targetPr, body) => ghInput(["api", "-X", "PUT", `/repos/${targetRepo}/pulls/${targetPr}/merge`], body, process.env));
+  const getCommit = dependencies.getCommit || ((targetRepo, sha) => gh(["api", `/repos/${targetRepo}/commits/${sha}`], process.env));
+  if (!identity || !identity.login || !identity.noreply) throw new Error("merge verification identity is required");
+  let latest = await getPr(repo, prNumber);
   if (!latest || latest.state !== "open" || !latest.head || latest.head.sha !== expectedSha) return { ok: false, state: "STALE_HEAD" };
   if (latest.draft) {
-    gh(["api", "-X", "PATCH", `/repos/${repo}/pulls/${prNumber}`, "-F", "draft=false"], process.env);
-    latest = gh(["api", `/repos/${repo}/pulls/${prNumber}`], process.env);
+    await markReady(repo, prNumber);
+    latest = await getPr(repo, prNumber);
     if (!latest || latest.state !== "open" || !latest.head || latest.head.sha !== expectedSha) return { ok: false, state: "STALE_HEAD" };
   }
-  const merged = ghInput(["api", "-X", "PUT", `/repos/${repo}/pulls/${prNumber}/merge`], { sha: expectedSha, merge_method: "merge" }, process.env);
+  const merged = await merge(repo, prNumber, { sha: expectedSha, merge_method: "merge" });
   if (!merged || merged.merged !== true) return { ok: false, state: "MERGE_REJECTED" };
+  const mergeSha = String(merged.sha || "");
+  if (!/^[a-f0-9]{40}$/i.test(mergeSha)) throw new Error("merge commit SHA missing from successful response");
+  const mergedPr = await getPr(repo, prNumber);
+  if (!mergedPr || mergedPr.merged !== true || mergedPr.merge_commit_sha !== mergeSha) {
+    throw new Error("merged pull request does not confirm the response merge commit SHA");
+  }
+  const commit = await getCommit(repo, mergeSha);
+  const authorLogin = commit && commit.author && commit.author.login;
+  const authorEmail = commit && commit.commit && commit.commit.author && commit.commit.author.email;
+  const committerEmail = commit && commit.commit && commit.commit.committer && commit.commit.committer.email;
+  if (authorLogin !== identity.login || authorEmail !== identity.noreply
+    || !new Set([identity.noreply, "noreply@github.com"]).has(committerEmail)
+    || !Array.isArray(commit && commit.parents) || commit.parents.length < 2) {
+    throw new Error("merge commit attribution or parent structure mismatch");
+  }
   audit.note("merged", `expected sha=${expectedSha.slice(0, 10)}`);
-  return { ok: true, state: "SUCCESS", mergeCommit: merged.sha || "" };
+  return { ok: true, state: "SUCCESS", mergeCommit: mergeSha };
 }
 
 export async function main(env = process.env) {
   const audit = new AuditBuffer(scrub(env));
   const runId = bounded(env.FLEET_RUN_ID || `merge-${Date.now()}`, MAX_RUN_CHARS);
   const rawTarget = { repo: env.FLEET_TARGET_REPO, pr: env.FLEET_PR_NUMBER, headSha: env.FLEET_HEAD_SHA };
-  const hasAnyTarget = Object.values(rawTarget).some((value) => String(value || "").trim());
+  const hasAnyTarget = Object.values(rawTarget).some((value) => value !== undefined && value !== null);
   const normalized = normalizeTargetInput(rawTarget);
   let identity;
   let targetRepo = normalized.repo || bounded(rawTarget.repo, MAX_REPO_CHARS);
@@ -413,6 +623,11 @@ export async function main(env = process.env) {
         error.code = 5;
         throw error;
       }
+      await consumeDispatch(normalized, env.FLEET_DISPATCH_ID, {
+        stateRoot: STATE_ROOT,
+        runId,
+        identity,
+      });
       writeOutput("target_repo", normalized.repo);
       writeOutput("target_pr", normalized.pr);
       writeOutput("target_head_sha", normalized.headSha);
@@ -429,7 +644,7 @@ export async function main(env = process.env) {
         console.log("MERGE_TERMINAL_STATE=NO-OP");
         return finish(audit, runId, "NO-OP", identity, "scan", 0);
       }
-      const dispatchResult = await dispatchTarget(candidate, { stateRoot: STATE_ROOT, runId });
+      const dispatchResult = await dispatchTarget(candidate, { stateRoot: STATE_ROOT, runId, identity });
       writeOutput("target_repo", candidate.repo);
       writeOutput("target_pr", candidate.pr);
       writeOutput("target_head_sha", candidate.headSha);
@@ -466,11 +681,8 @@ export async function main(env = process.env) {
       const blocker = "deterministic target evidence unavailable";
       const body = `🔍 **fleet judge panel** (deterministic gate)\n\n**Blockers:**\n- ${blocker}\n\nNo raw target output is copied into this comment.`;
       await postComment(target.repo, target.pr, body, audit, identity);
-      if (fleetAuthored && cls.revisionAllowed) {
-        writeRevisionOutput();
-        return terminal("REVISION_QUEUED", { why: blocker }, audit, runId, identity, target.repo, target.pr);
-      }
-      return terminal("BLOCKED", { why: blocker }, audit, runId, identity, target.repo, target.pr);
+      const disposition = revisionDisposition({ fleetAuthored, revisionAllowed: cls.revisionAllowed, evidenceAvailable: false });
+      return terminal(disposition.state, { why: disposition.why }, audit, runId, identity, target.repo, target.pr);
     }
 
     const extraEvidence = evidence.text.slice(0, MAX_EVIDENCE_CHARS);
@@ -492,18 +704,28 @@ export async function main(env = process.env) {
     ].join("\n");
     await postComment(target.repo, target.pr, verdictBody, audit, identity);
     if (!approved) {
-      if (fleetAuthored && cls.revisionAllowed) {
+      const disposition = revisionDisposition({
+        fleetAuthored,
+        revisionAllowed: cls.revisionAllowed,
+        evidenceAvailable: true,
+        judgeResults: [correctness, standards],
+      });
+      if (disposition.revisionNeeded) {
         writeRevisionOutput();
         return terminal("REVISION_QUEUED", { why: targetCheckFailed ? "deterministic target checks failed" : "judges rejected" }, audit, runId, identity, target.repo, target.pr);
       }
-      return terminal("BLOCKED", { why: "judges rejected" }, audit, runId, identity, target.repo, target.pr);
+      return terminal(disposition.state, { why: disposition.why }, audit, runId, identity, target.repo, target.pr);
     }
     if (String(env.FLEET_ALLOW_MERGE || "") !== "true") {
       return terminal("APPROVED_NO_MERGE", { why: "live merge proof flag is not exactly true" }, audit, runId, identity, target.repo, target.pr);
     }
-    const mergeResult = await mergeWithExpectedSha(target.repo, target.pr, target.headSha, audit);
+    let mergeResult;
+    try {
+      mergeResult = await mergeWithExpectedSha(target.repo, target.pr, target.headSha, audit, { identity });
+    } catch (error) {
+      return terminal("MERGE_VERIFY_FAILED", { why: bounded(error.message) }, audit, runId, identity, target.repo, target.pr, 1);
+    }
     if (!mergeResult.ok) return terminal(mergeResult.state, { why: "head changed or REST merge rejected" }, audit, runId, identity, target.repo, target.pr);
-    if (mergeResult.mergeCommit) await verifyCommit(target.repo, mergeResult.mergeCommit, identity, env.FLEET_GH_TOKEN);
     return terminal("SUCCESS", { mergeCommit: mergeResult.mergeCommit }, audit, runId, identity, target.repo, target.pr);
   } catch (error) {
     audit.incident("failure", bounded(error.message));

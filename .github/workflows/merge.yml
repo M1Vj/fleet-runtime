@@ -23,6 +23,11 @@ on:
         type: boolean
         required: true
         default: false
+      dispatch_id:
+        description: "scanner correlation key; leave empty for an intentional manual run"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -99,12 +104,14 @@ jobs:
         id: authorize
         env:
           FLEET_AUTHORIZE_ONLY: "true"
+          FLEET_RUN_ID: ${{ github.run_id }}
           FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
           FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
           FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
           FLEET_TARGET_REPO: ${{ inputs.repo }}
           FLEET_PR_NUMBER: ${{ inputs.pr }}
           FLEET_HEAD_SHA: ${{ inputs.head_sha }}
+          FLEET_DISPATCH_ID: ${{ inputs.dispatch_id }}
         run: node scripts/merge.mjs
 
   target-check:

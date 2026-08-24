@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -106,9 +106,10 @@ export function ensureBranch(repo, branch, baseSha, env = process.env) {
 
 export function ghInput(prefixArgs, bodyObj, env = process.env) {
   const tempDir = mkdtempSync(path.join(tmpdir(), "ghin-"));
-  const tmp = path.join(tempDir, "body.json");
-  writeFileSync(tmp, JSON.stringify(bodyObj), { encoding: "utf8", mode: 0o600, flag: "wx" });
+  chmodSync(tempDir, 0o700);
   try {
+    const tmp = path.join(tempDir, "body.json");
+    writeFileSync(tmp, JSON.stringify(bodyObj), { encoding: "utf8", mode: 0o600, flag: "wx" });
     return gh([...prefixArgs, "--input", tmp], env);
   } finally {
     rmSync(tempDir, { recursive: true, force: true });

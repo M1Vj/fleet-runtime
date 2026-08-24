@@ -134,6 +134,8 @@ test("revision treats SUCCESS state persistence failure as a failed run", () => 
   assert.ok(success >= 0);
   assert.match(source.slice(success, success + 360), /required:\s*true/);
   assert.doesNotMatch(source, /REVISE_MEMORY_WARNING=STATE_PERSIST_FAILED/);
+  const comment = source.indexOf("const comment = gh(");
+  assert.ok(success < comment);
 });
 
 test("revision records truthful audit failure status and rejects fork heads before PUT", () => {

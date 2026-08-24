@@ -391,6 +391,7 @@ async function reviseTarget(target, identity, audit, context, runtime) {
   });
   await verifyCommit(target.repo, atomic.commitSha, identity, runtime.env.FLEET_GH_TOKEN);
   const controlledSummary = `updated ${validation.files.length} validated files`;
+  persistEvent(runtime, context, "SUCCESS", { summary: controlledSummary, changedPaths: validation.files.map((file) => file.path), blockers }, identity, audit, { required: true });
   const safeCommentPaths = validation.files.map((file) => formatRevisionPath(file.path)).join(", ");
   const comment = gh(
     ["api", "-X", "POST", `/repos/${target.repo}/issues/${target.pr}/comments`, "-F", `body=<!-- fleet-pr-memory: revision -->\n🔧 **fleet revision agent** (round ${used + 1}/${max}): ${controlledSummary} (${safeCommentPaths}).\n\nMerge gate re-evaluates automatically.`],
@@ -398,7 +399,6 @@ async function reviseTarget(target, identity, audit, context, runtime) {
   );
   if (!comment || !comment.id) throw new Error("revision comment response missing id");
   await verifyCommentAuthor(target.repo, comment.id, identity, runtime.env.FLEET_GH_TOKEN);
-  persistEvent(runtime, context, "SUCCESS", { summary: controlledSummary, changedPaths: validation.files.map((file) => file.path), blockers }, identity, audit, { required: true });
   audit.note("attribution", `verified one commit ${atomic.commitSha.slice(0, 10)} and comment #${comment.id}`);
   console.log("REVISE_STATE=SUCCESS");
   return 0;

@@ -1,5 +1,5 @@
 name: fleet-merge-gate
-run-name: "merge gate ${{ github.event.inputs.repo || 'scan' }}#${{ github.event.inputs.pr || '' }}"
+run-name: fleet merge gate
 
 on:
   schedule:
@@ -7,17 +7,22 @@ on:
   workflow_dispatch:
     inputs:
       repo:
-        description: "target repo (owner/name); empty = scan all open fleet PRs"
+        description: "target repo (M1Vj/name or owner/name)"
         type: string
-        default: ""
+        required: true
       pr:
-        description: "PR number (requires repo)"
+        description: "positive pull request number"
         type: string
-        default: ""
-      routes:
-        description: "UI routes to verify, comma separated"
+        required: true
+      head_sha:
+        description: "mandatory 40-hex pull request head SHA"
         type: string
-        default: "/"
+        required: true
+      allow_merge:
+        description: "live proof: permit the final REST merge"
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: read
@@ -25,24 +30,28 @@ permissions:
 concurrency:
   group: fleet-merge-gate
   cancel-in-progress: false
+  queue: max
 
 jobs:
-  gate:
+  scan:
+    if: ${{ github.event_name == 'schedule' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 80
-    env:
-      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
-      FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
-      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
-      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
-      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
-      FLEET_UI_ROUTES: ${{ github.event.inputs.routes || '/' }}
+    timeout-minutes: 20
+    outputs:
+      target_found: ${{ steps.discover.outputs.target_found }}
+      target_repo: ${{ steps.discover.outputs.target_repo }}
+      target_pr: ${{ steps.discover.outputs.target_pr }}
+      target_head_sha: ${{ steps.discover.outputs.target_head_sha }}
     steps:
       - name: checkout runtime
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           fetch-depth: 1
+      - name: setup node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
       - name: checkout private state repo
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -51,30 +60,155 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
           path: state-control
+      - name: discover one explicit target
+        id: discover
+        env:
+          FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+          FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+          FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
+          FLEET_RUN_ID: ${{ github.run_id }}
+        run: node scripts/merge.mjs
+
+  authorize:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      repo: ${{ steps.authorize.outputs.target_repo }}
+      pr: ${{ steps.authorize.outputs.target_pr }}
+      head_sha: ${{ steps.authorize.outputs.target_head_sha }}
+    steps:
+      - name: checkout runtime
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 1
       - name: setup node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
-      - name: install pinned opencode cli
+      - name: checkout private state repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: authorize exact target before checkout
+        id: authorize
+        env:
+          FLEET_AUTHORIZE_ONLY: "true"
+          FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+          FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+          FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
+          FLEET_TARGET_REPO: ${{ inputs.repo }}
+          FLEET_PR_NUMBER: ${{ inputs.pr }}
+          FLEET_HEAD_SHA: ${{ inputs.head_sha }}
+        run: node scripts/merge.mjs
+
+  target-check:
+    needs: authorize
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.authorize.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    outputs:
+      check_result: ${{ steps.checks.outcome }}
+    steps:
+      - name: checkout runtime scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: checkout target at exact head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ needs.authorize.outputs.repo }}
+          ref: ${{ needs.authorize.outputs.head_sha }}
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: target
+      - name: setup node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+      - name: run untrusted target checks without secrets
+        id: checks
+        continue-on-error: true
+        env:
+          FLEET_TARGET_DIR: ${{ github.workspace }}/target
+          FLEET_EVIDENCE_PATH: ${{ github.workspace }}/target-check/evidence.txt
+          FLEET_HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
+          FLEET_PR_NUMBER: ${{ needs.authorize.outputs.pr }}
+          FLEET_TARGET_REPO: ${{ needs.authorize.outputs.repo }}
+        run: node scripts/pr-check.mjs
+      - name: upload bounded target evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: target-check-evidence
+          path: target-check/evidence.txt
+          if-no-files-found: warn
+          retention-days: 1
+
+  gate:
+    needs: [authorize, target-check]
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.authorize.result == 'success' && always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - name: checkout runtime
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: setup node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+      - name: install pinned judge cli
         run: npm install -g opencode-ai@1.18.21
-      - name: install visual toolchain
-        run: |
-          npm install -g playwright@1.54.0 pngjs pixelmatch
-          npx --yes playwright@1.54.0 install chromium --with-deps || npx --yes playwright@1.54.0 install chromium
+      - name: checkout private state repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: download untrusted target evidence
+        if: ${{ always() }}
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: target-check-evidence
+          path: target-check
+        continue-on-error: true
       - name: merge gate
         id: gate
-        env:
-          FLEET_TARGET_REPO: ${{ github.event.inputs.repo }}
-          FLEET_PR_NUMBER: ${{ github.event.inputs.pr }}
-        run: node scripts/merge.mjs
-      - name: autonomous revision
-        if: ${{ steps.gate.outputs.revision_needed == 'true' }}
         env:
           FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
           FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
           FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
           FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
           OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
-          FLEET_REPO: ${{ github.event.inputs.repo }}
-          FLEET_PR_NUMBER: ${{ github.event.inputs.pr }}
+          FLEET_TARGET_REPO: ${{ needs.authorize.outputs.repo }}
+          FLEET_PR_NUMBER: ${{ needs.authorize.outputs.pr }}
+          FLEET_HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
+          FLEET_ALLOW_MERGE: ${{ inputs.allow_merge }}
+          FLEET_TARGET_CHECK_RESULT: ${{ needs.target-check.outputs.check_result }}
+          FLEET_EVIDENCE_PATH: ${{ github.workspace }}/target-check/evidence.txt
+        run: node scripts/merge.mjs
+      - name: autonomous revision
+        if: ${{ github.event_name == 'workflow_dispatch' && needs.authorize.result == 'success' && needs.authorize.outputs.repo != '' && needs.authorize.outputs.pr != '' && needs.authorize.outputs.head_sha != '' && steps.gate.outputs.revision_needed == 'true' }}
+        env:
+          FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+          FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+          FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+          FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
+          OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+          FLEET_REPO: ${{ needs.authorize.outputs.repo }}
+          FLEET_PR_NUMBER: ${{ needs.authorize.outputs.pr }}
+          FLEET_HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
+          FLEET_EVIDENCE_PATH: ${{ github.workspace }}/target-check/evidence.txt
         run: node scripts/revise.mjs

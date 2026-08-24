@@ -1,0 +1,96 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+const workflow = readFileSync(new URL("../.github/workflows/merge.yml", import.meta.url), "utf8");
+const mergeSource = readFileSync(new URL("../scripts/merge.mjs", import.meta.url), "utf8");
+
+test("manual dispatch has an explicit, fail-closed target contract", () => {
+  assert.match(workflow, /workflow_dispatch:\s*\n\s+inputs:/);
+  assert.match(workflow, /repo:[\s\S]*?required:\s*true/);
+  assert.match(workflow, /pr:[\s\S]*?required:\s*true/);
+  assert.match(workflow, /head_sha:[\s\S]*?required:\s*true/);
+  assert.match(workflow, /allow_merge:[\s\S]*?default:\s*false/);
+  assert.doesNotMatch(workflow, /routes:/);
+});
+
+test("scan and target runs are separate and scan dispatches one explicit SHA", () => {
+  assert.match(workflow, /scan:[\s\S]*?if:\s*\$\{\{\s*github\.event_name\s*==\s*['"]schedule['"]\s*\}\}/);
+  assert.match(workflow, /target-check:[\s\S]*?if:[^\n]*github\.event_name\s*==\s*['"]workflow_dispatch['"]/);
+  assert.match(mergeSource, /actions\/workflows\/merge\.yml\/dispatches/);
+  assert.match(mergeSource, /ref:\s*["']main["']/);
+  assert.match(mergeSource, /allow_merge:\s*["']true["']/);
+  assert.doesNotMatch(workflow, /gh workflow run/);
+  const scanJob = workflow.slice(workflow.indexOf("  scan:"), workflow.indexOf("  target-check:"));
+  assert.doesNotMatch(scanJob, /revise\.mjs/);
+  assert.doesNotMatch(workflow, /visual-check\.mjs/);
+  assert.doesNotMatch(workflow, /install visual/i);
+});
+
+test("authorization precedes target checkout and target jobs consume only authorized outputs", () => {
+  const authorize = workflow.indexOf("  authorize:");
+  const target = workflow.indexOf("  target-check:");
+  const gate = workflow.indexOf("  gate:");
+  assert.ok(authorize >= 0 && authorize < target && target < gate);
+  const targetJob = workflow.slice(target, gate);
+  assert.match(targetJob, /needs:\s*authorize/);
+  assert.match(targetJob, /repository:\s*\$\{\{\s*needs\.authorize\.outputs\.repo\s*\}\}/);
+  assert.match(targetJob, /ref:\s*\$\{\{\s*needs\.authorize\.outputs\.head_sha\s*\}\}/);
+  assert.doesNotMatch(targetJob, /repository:\s*\$\{\{\s*inputs\.repo/);
+  assert.doesNotMatch(targetJob, /ref:\s*\$\{\{\s*inputs\.head_sha/);
+  const authorizeJob = workflow.slice(authorize, target);
+  assert.match(authorizeJob, /FLEET_AUTHORIZE_ONLY:\s*["']?true["']?/);
+  assert.match(authorizeJob, /FLEET_TARGET_REPO:\s*\$\{\{\s*inputs\.repo\s*\}\}/);
+  assert.match(authorizeJob, /FLEET_HEAD_SHA:\s*\$\{\{\s*inputs\.head_sha\s*\}\}/);
+  assert.match(authorizeJob, /FLEET_KILL_SWITCH_PATH:/);
+});
+
+test("the workflow uses one global non-canceling concurrency group", () => {
+  const groups = [...workflow.matchAll(/^\s+group:\s*(.+)$/gm)].map((match) => match[1].trim());
+  assert.deepEqual(groups, ["fleet-merge-gate"]);
+  assert.match(workflow, /cancel-in-progress:\s*false/);
+  assert.match(workflow, /queue:\s*max/);
+});
+
+test("target code has no state checkout or secret-bearing job environment", () => {
+  const targetJob = workflow.slice(workflow.indexOf("  target-check:"), workflow.indexOf("  gate:"));
+  assert.doesNotMatch(targetJob, /state-control/);
+  assert.doesNotMatch(targetJob, /FLEET_GH_TOKEN\s*:/);
+  assert.doesNotMatch(targetJob, /FLEET_OPENCODE_AUTH\s*:/);
+  const targetRun = targetJob.slice(targetJob.indexOf("run target"));
+  assert.doesNotMatch(targetRun, /FLEET_GH_TOKEN|FLEET_OPENCODE_AUTH|GH_TOKEN|OPENCODE_MODELS_URL/);
+  assert.match(targetJob, /persist-credentials:\s*false/);
+});
+
+test("trusted credentials are step-local and state root is explicit", () => {
+  const gateJob = workflow.slice(workflow.indexOf("  gate:"));
+  assert.doesNotMatch(gateJob.slice(0, gateJob.indexOf("steps:")), /FLEET_GH_TOKEN|FLEET_OPENCODE_AUTH/);
+  assert.match(gateJob, /FLEET_GH_TOKEN:\s*\$\{\{\s*secrets\.FLEET_GH_TOKEN\s*\}\}/);
+  assert.match(gateJob, /FLEET_OPENCODE_AUTH:\s*\$\{\{\s*secrets\.FLEET_OPENCODE_AUTH\s*\}\}/);
+  assert.match(gateJob, /FLEET_ALLOW_MERGE:\s*\$\{\{\s*inputs\.allow_merge\s*\}\}/);
+  assert.match(gateJob, /FLEET_STATE_ROOT:/);
+  assert.doesNotMatch(gateJob, /FLEET_TARGET_REPO:\s*\$\{\{\s*inputs\.repo/);
+  assert.match(gateJob, /FLEET_TARGET_REPO:\s*\$\{\{\s*needs\.authorize\.outputs\.repo/);
+  assert.match(gateJob.slice(gateJob.indexOf("autonomous revision")), /FLEET_EVIDENCE_PATH:/);
+});
+
+test("trusted judge tooling installs before private state is present", () => {
+  const gateJob = workflow.slice(workflow.indexOf("  gate:"));
+  assert.ok(gateJob.indexOf("install pinned judge cli") < gateJob.indexOf("checkout private state repo"));
+});
+
+test("scan dispatch uses the REST helper and kill switch", () => {
+  const scan = workflow.slice(workflow.indexOf("  scan:"), workflow.indexOf("  authorize:"));
+  assert.match(scan, /FLEET_GH_TOKEN:\s*\$\{\{\s*secrets\.FLEET_GH_TOKEN\s*\}\}/);
+  assert.match(scan, /FLEET_KILL_SWITCH_PATH:/);
+});
+
+test("revision is gated by manual dispatch, authorization, normalized outputs, and judge signal", () => {
+  const revision = workflow.slice(workflow.indexOf("      - name: autonomous revision"));
+  assert.match(revision, /github\.event_name\s*==\s*['"]workflow_dispatch['"]/);
+  assert.match(revision, /needs\.authorize\.result\s*==\s*['"]success['"]/);
+  assert.match(revision, /needs\.authorize\.outputs\.repo\s*!=\s*['"]['"]/);
+  assert.match(revision, /needs\.authorize\.outputs\.pr\s*!=\s*['"]['"]/);
+  assert.match(revision, /needs\.authorize\.outputs\.head_sha\s*!=\s*['"]['"]/);
+  assert.match(revision, /steps\.gate\.outputs\.revision_needed\s*==\s*['"]true['"]/);
+});

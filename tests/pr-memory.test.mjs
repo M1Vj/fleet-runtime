@@ -268,6 +268,49 @@ test("rotation preserves bounded per-repository revision counts for later caps",
   assert.ok(readMemoryEvents(file).some((entry) => entry.state === "ROTATED" && entry.revisionCounts?.[`${target.repo}#${target.pr}`] === 4));
 });
 
+test("rotation preserves revision counts for more than 32 distinct PR targets", () => {
+  const file = tempMemory();
+  const targets = Array.from({ length: 40 }, (_, index) => ({ repo: "M1Vj/example-repo", pr: index + 1 }));
+  for (const [index, target] of targets.entries()) {
+    appendMemoryEvent(file, event({
+      lane: "revise",
+      kind: "revision",
+      state: "REVISION_STARTED",
+      repo: target.repo,
+      pr: target.pr,
+      runId: `many-targets-${index}`,
+      attempt: 1,
+      summary: `revision target ${index}`,
+    }));
+  }
+  rotateMemory(file, { maxLines: 2 });
+  const events = readMemoryEvents(file);
+  assert.equal(revisionCountForTarget(events, targets[0]), 1);
+  assert.equal(revisionCountForTarget(events, targets.at(-1)), 1);
+  assert.equal(Object.keys(events.at(-1).revisionCounts || {}).length, targets.length - 1);
+});
+
+test("append source uses atomic replacement rather than direct O_APPEND mutation", () => {
+  const source = readFileSync(new URL("../scripts/lib/pr-memory.mjs", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /O_APPEND/);
+  assert.match(source, /const replace = .*atomicReplace/);
+  assert.match(source, /replace\(target, payload/);
+});
+
+test("injected append replacement failure leaves the canonical generation intact", () => {
+  const file = tempMemory();
+  appendMemoryEvent(file, event({ runId: "before-injected-failure" }));
+  const before = readFileSync(file, "utf8");
+  assert.throws(
+    () => appendMemoryEvent(file, event({ runId: "after-injected-failure", summary: "different event" }), {
+      atomicReplace: () => { throw new Error("injected atomic replacement failure"); },
+    }),
+    /injected atomic replacement failure/,
+  );
+  assert.equal(readFileSync(file, "utf8"), before);
+  assert.deepEqual(readMemoryEvents(file).map((entry) => entry.runId), ["before-injected-failure"]);
+});
+
 test("memory context is target-scoped and bounded to recent events", () => {
   const file = tempMemory();
   for (let i = 0; i < 5; i += 1) {

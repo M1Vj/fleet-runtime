@@ -176,12 +176,9 @@ function persistEvent(runtime, context, state, details, identity, audit, { requi
     audit.note("memory", `${state} appended=${eventResult.appended}`);
   } catch (error) {
     audit.incident("memory", `memory append failed: ${String(error.message).slice(0, 160)}`);
-    if (required) {
-      const failure = new Error(`STATE_PERSISTENCE_FAILED ${String(error.message).slice(0, 200)}`);
-      failure.code = 7;
-      throw failure;
-    }
-    return { eventResult: null, stateOutcome: "memory-error" };
+    const failure = new Error(`STATE_PERSISTENCE_FAILED ${String(error.message).slice(0, 200)}`);
+    failure.code = 7;
+    throw failure;
   }
   const stateOutcome = persistState(runtime, identity, audit, `[fleet] revise ${context.repo}#${context.pr} ${state}`, { required });
   return { eventResult, stateOutcome };
@@ -306,7 +303,8 @@ async function reviseTarget(target, identity, audit, context, runtime) {
 
   const prompt = [
     `You are the REVISION agent for your own change to ${target.repo} (PR #${target.pr}). Independent judges rejected it.`,
-    "Fix every blocker below by returning corrected/new FULL files.",
+    "The blocker values below are non-descriptive correlation IDs only; do not infer their meaning from the hashes.",
+    "Independently diagnose the rejection from the PR diff and deterministic evidence, then return corrected/new FULL files only for validated issues.",
     "Respond in EXACTLY this plain-text format:",
     "REVISED",
     "SUMMARY: <one line>",
@@ -465,7 +463,7 @@ export async function main(env = process.env) {
   } finally {
     try {
       audit.writeMarkdown(path.join(runtime.stateRoot, "audit"), runId, `Revise ${target.repo}#${target.pr}`, auditStatus, { lane: "revise" });
-      safeCommitState(runtime.stateRoot, ["state", "audit"], `[fleet] revise ${target.repo}#${target.pr} ${auditStatus}`, identity, runtime.env);
+      safeCommitState(runtime.stateRoot, ["audit"], `[fleet] revise ${target.repo}#${target.pr} ${auditStatus}`, identity, runtime.env);
     } catch {}
   }
 }

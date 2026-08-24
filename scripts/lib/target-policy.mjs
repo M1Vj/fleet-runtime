@@ -129,6 +129,7 @@ export function evaluateTargetPolicy({ target, pr, files, stateRoot, targets, re
     if (!pr.base || !pr.base.repo || pr.base.repo.full_name !== normalized.repo) errors.push("pull request base must be the target repository");
     if (repoMeta && repoMeta.default_branch && (!pr.base || pr.base.ref !== repoMeta.default_branch)) errors.push("pull request base must be the repository default branch");
   }
+  if (!repoMeta || repoMeta.private !== false) errors.push("target repository must be explicitly public");
   const fileResult = validateFilesResponse(files);
   if (!fileResult.ok) errors.push(...fileResult.errors);
   return {

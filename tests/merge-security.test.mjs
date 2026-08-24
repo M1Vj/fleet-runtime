@@ -96,6 +96,16 @@ test("merge scanning and sinks share complete credential redaction coverage", ()
   assert.equal(secretsInDiff(files).length >= secretValues.length, true);
 });
 
+test("canonical redaction covers refresh-token query and assignment forms", () => {
+  const values = [
+    "https://example.test/callback?refresh_token=refreshcredential1234567890",
+    "refresh_token = 'assignmentcredential1234567890'",
+    "refresh_token: assignmentcredential1234567890",
+  ];
+  for (const value of values) assert.notEqual(redactText(value), value);
+  assert.equal(secretsInDiff([{ filename: "src/config.js", patch: values.join("\\n") }]).length, 1);
+});
+
 test("judge comments contain only controlled summaries and hashed blocker identifiers", () => {
   const raw = "raw model blocker @someone https://example.test/path <script>alert(1)</script>";
   const comment = buildJudgeComment({
@@ -115,6 +125,24 @@ test("target checks require exact success and private KB repositories are never 
     assert.equal(isExactTargetCheckSuccess(value), false, value);
   }
   assert.equal(isAllowedRepo("M1Vj/vj-knowledge-base", { targets: ["M1Vj/vj-knowledge-base"] }), false);
+});
+
+test("target policy rejects private or unknown repository visibility", () => {
+  const sha = "A".repeat(40);
+  const target = normalizeTargetInput({ repo: "M1Vj/fleet-runtime", pr: "1", headSha: sha });
+  const pr = {
+    state: "open",
+    user: { login: "M1Vj" },
+    head: { ref: "fleet/fix", sha, repo: { full_name: "M1Vj/fleet-runtime" } },
+    base: { ref: "main", repo: { full_name: "M1Vj/fleet-runtime" } },
+  };
+  const files = [{ filename: "src/a.js", patch: "@@" }];
+  const baseMeta = { full_name: "M1Vj/fleet-runtime", default_branch: "main" };
+  for (const visibility of [true, undefined, "false"]) {
+    const repoMeta = visibility === undefined ? baseMeta : { ...baseMeta, private: visibility };
+    assert.equal(evaluateTargetPolicy({ target, pr, files, repoMeta }).ok, false, String(visibility));
+  }
+  assert.equal(evaluateTargetPolicy({ target, pr, files, repoMeta: { ...baseMeta, private: false } }).ok, true);
 });
 
 test("merge uses REST expected-SHA semantics and state checkout", () => {
@@ -429,7 +457,7 @@ test("scheduled discovery suppresses an outstanding head and returns at most one
     listPulls: async () => [candidate, { ...candidate, number: 18 }],
     inspectPr: async (_repo, number) => {
       inspectCalls.push(number);
-      return { pr: { ...candidate, number }, files, repoMeta: { full_name: "M1Vj/fleet-runtime", default_branch: "main" } };
+      return { pr: { ...candidate, number }, files, repoMeta: { full_name: "M1Vj/fleet-runtime", default_branch: "main", private: false } };
     },
   };
   const pending = [{
@@ -591,7 +619,7 @@ test("merge verification requires a consistent attributed GitHub merge commit", 
       ? { state: "open", draft: false, head: { sha: head } }
       : { state: "closed", merged: true, merge_commit_sha: mergeSha, head: { sha: "e".repeat(40) } }),
   });
-  assert.deepEqual(mismatchedHead, { ok: false, state: "MERGE_UNKNOWN" });
+  assert.deepEqual(mismatchedHead, { ok: false, state: "MERGE_VERIFY_FAILED" });
 
   prReads = 0;
   const mismatchedParents = await mergeWithExpectedSha("M1Vj/fleet-runtime", 1, head, { note() {} }, {
@@ -602,7 +630,14 @@ test("merge verification requires a consistent attributed GitHub merge commit", 
       parents: [{ sha: "c".repeat(40) }, { sha: "d".repeat(40) }],
     }),
   });
-  assert.deepEqual(mismatchedParents, { ok: false, state: "MERGE_UNKNOWN" });
+  assert.deepEqual(mismatchedParents, { ok: false, state: "MERGE_VERIFY_FAILED" });
+
+  prReads = 0;
+  const commitUnavailable = await mergeWithExpectedSha("M1Vj/fleet-runtime", 1, head, { note() {} }, {
+    ...dependencies,
+    getCommit: async () => { throw new Error("commit fetch unavailable"); },
+  });
+  assert.deepEqual(commitUnavailable, { ok: false, state: "MERGE_UNKNOWN" });
 });
 
 test("judge prompt marks title, body, diff, and evidence as untrusted delimiters", () => {
@@ -643,7 +678,7 @@ test("target policy requires decimal PRs, same-repo fleet head, and default base
     head: { ref: "fleet/fix", sha, repo: { full_name: "M1Vj/fleet-runtime" } },
     base: { ref: "main", repo: { full_name: "M1Vj/fleet-runtime" } },
   };
-  assert.equal(evaluateTargetPolicy({ target, pr: base, files: [{ filename: "src/a.js", patch: "@@" }], repoMeta: { full_name: "M1Vj/fleet-runtime", default_branch: "main" } }).ok, true);
+  assert.equal(evaluateTargetPolicy({ target, pr: base, files: [{ filename: "src/a.js", patch: "@@" }], repoMeta: { full_name: "M1Vj/fleet-runtime", default_branch: "main", private: false } }).ok, true);
   assert.equal(evaluateTargetPolicy({ target, pr: base, files: [{ filename: "src/a.js", patch: "@@" }] }).ok, false);
   assert.equal(evaluateTargetPolicy({ target, pr: { ...base, base: { ref: "develop", repo: { full_name: "M1Vj/fleet-runtime" } } }, files: [{ filename: "src/a.js", patch: "@@" }], repoMeta: { full_name: "M1Vj/fleet-runtime", default_branch: "main" } }).ok, false);
 });

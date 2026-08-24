@@ -27,7 +27,6 @@ const MAX_PATHS = 32;
 const MAX_PATH_CHARS = 240;
 const MAX_BLOCKERS = 32;
 const MAX_ARTIFACTS = 32;
-const MAX_REVISION_COUNT_KEYS = 32;
 const REVISION_COUNT_KEY_RE = /^([^\n:]{1,120})#(\d+)$/;
 
 // These patterns deliberately cover provider tokens and common credential forms,
@@ -109,8 +108,7 @@ function safeRevisionCounts(value) {
       if (!match || !Number.isSafeInteger(numeric) || numeric < 1) return null;
       return [`${truncate(match[1], MAX_ID_CHARS)}#${Number(match[2])}`, Math.min(numeric, 100000)];
     })
-    .filter(Boolean)
-    .slice(0, MAX_REVISION_COUNT_KEYS);
+    .filter(Boolean);
   return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
 
@@ -449,6 +447,7 @@ export function appendMemoryEvent(filePath, input, options = {}) {
 function appendMemoryEventLocked(target, input, options = {}) {
   recoverCanonical(target);
   const event = normalizeMemoryEvent(input);
+  const replace = typeof options.atomicReplace === "function" ? options.atomicReplace : atomicReplace;
   let currentPayload = readMemoryContents(target);
   let parsed = parseMemoryContents(currentPayload, { allowIncompleteTrailing: true });
   if (parsed.repairedTrailingFragment) {
@@ -463,19 +462,8 @@ function appendMemoryEventLocked(target, input, options = {}) {
   if (current.some((entry) => entry.eventId === event.eventId)) {
     return { event, appended: false, rotated: false, count: current.length };
   }
-  ensurePrivateDirectory(path.dirname(target));
-  assertRegularFileOrMissing(target);
-  let descriptor = null;
-  try {
-    descriptor = openSync(target, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | (constants.O_NOFOLLOW || 0), FILE_MODE);
-    const separator = currentPayload.length > 0 && !/(?:\r?\n)$/.test(currentPayload) ? "\n" : "";
-    writeFully(descriptor, Buffer.from(`${separator}${JSON.stringify(event)}\n`, "utf8"));
-    fsyncSync(descriptor);
-  } finally {
-    if (descriptor !== null) closeSync(descriptor);
-  }
-  chmodSync(target, FILE_MODE);
-  fsyncDirectory(path.dirname(target));
+  const payload = `${[...current, event].map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+  replace(target, payload, { backup: false });
   const rotation = rotateMemoryLocked(target, options);
   return {
     event,

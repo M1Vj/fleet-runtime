@@ -753,24 +753,31 @@ export async function mergeWithExpectedSha(repo, prNumber, expectedSha, audit, d
   if (latest.draft) return { ok: false, state: "READY_REQUIRED" };
 
   const reconcile = async (responseSha = "") => {
+    let mergedPr;
     try {
-      const mergedPr = await getPr(repo, prNumber);
-      if (!mergedPr || mergedPr.merged !== true || !mergedPr.head || mergedPr.head.sha !== expectedSha) return null;
-      const mergeSha = String(mergedPr.merge_commit_sha || responseSha || "");
-      if (!/^[a-f0-9]{40}$/i.test(mergeSha)) return null;
-      if (responseSha && mergeSha !== responseSha) return null;
-      const commit = await getCommit(repo, mergeSha);
-      const authorLogin = commit && commit.author && commit.author.login;
-      const authorEmail = commit && commit.commit && commit.commit.author && commit.commit.author.email;
-      const committerEmail = commit && commit.commit && commit.commit.committer && commit.commit.committer.email;
-      const parents = Array.isArray(commit && commit.parents) ? commit.parents : [];
-      if (authorLogin !== identity.login || authorEmail !== identity.noreply
-        || !new Set([identity.noreply, "noreply@github.com"]).has(committerEmail)
-        || parents.length < 2 || !parents.some((parent) => parent && parent.sha === expectedSha)) return null;
-      return { ok: true, state: "SUCCESS", mergeCommit: mergeSha };
+      mergedPr = await getPr(repo, prNumber);
     } catch {
-      return null;
+      return { kind: "unknown" };
     }
+    if (!mergedPr || mergedPr.merged !== true) return { kind: "unknown" };
+    if (!mergedPr.head || mergedPr.head.sha !== expectedSha) return { kind: "verify-failed" };
+    const mergeSha = String(mergedPr.merge_commit_sha || responseSha || "");
+    if (!/^[a-f0-9]{40}$/i.test(mergeSha)) return { kind: "verify-failed" };
+    if (responseSha && mergeSha !== responseSha) return { kind: "verify-failed" };
+    let commit;
+    try {
+      commit = await getCommit(repo, mergeSha);
+    } catch {
+      return { kind: "unknown" };
+    }
+    const authorLogin = commit && commit.author && commit.author.login;
+    const authorEmail = commit && commit.commit && commit.commit.author && commit.commit.author.email;
+    const committerEmail = commit && commit.commit && commit.commit.committer && commit.commit.committer.email;
+    const parents = Array.isArray(commit && commit.parents) ? commit.parents : [];
+    if (authorLogin !== identity.login || authorEmail !== identity.noreply
+      || !new Set([identity.noreply, "noreply@github.com"]).has(committerEmail)
+      || parents.length < 2 || !parents.some((parent) => parent && parent.sha === expectedSha)) return { kind: "verify-failed" };
+    return { kind: "success", result: { ok: true, state: "SUCCESS", mergeCommit: mergeSha } };
   };
 
   let merged;
@@ -778,22 +785,22 @@ export async function mergeWithExpectedSha(repo, prNumber, expectedSha, audit, d
     merged = await merge(repo, prNumber, { sha: expectedSha, merge_method: "merge" });
   } catch {
     const reconciled = await reconcile();
-    if (reconciled) {
+    if (reconciled.kind === "success") {
       audit.note("merged", `reconciled expected sha=${expectedSha.slice(0, 10)}`);
-      return reconciled;
+      return reconciled.result;
     }
-    return { ok: false, state: "MERGE_UNKNOWN" };
+    return { ok: false, state: reconciled.kind === "verify-failed" ? "MERGE_VERIFY_FAILED" : "MERGE_UNKNOWN" };
   }
   if (merged && typeof merged === "object" && merged.merged === false) return { ok: false, state: "MERGE_REJECTED" };
   const responseSha = merged && typeof merged === "object" && /^[a-f0-9]{40}$/i.test(String(merged.sha || ""))
     ? String(merged.sha)
     : "";
   const reconciled = await reconcile(responseSha);
-  if (reconciled) {
+  if (reconciled.kind === "success") {
     audit.note("merged", `expected sha=${expectedSha.slice(0, 10)}`);
-    return reconciled;
+    return reconciled.result;
   }
-  return { ok: false, state: "MERGE_UNKNOWN" };
+  return { ok: false, state: reconciled.kind === "verify-failed" ? "MERGE_VERIFY_FAILED" : "MERGE_UNKNOWN" };
 }
 
 export async function main(env = process.env) {

@@ -125,15 +125,24 @@ jobs:
       head_sha: ${{ steps.materialize.outputs.head_sha }}
       artifact_name: ${{ steps.materialize.outputs.artifact_name }}
     steps:
-      - name: checkout target at authorized head with mutation credential
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          repository: ${{ needs.authorize.outputs.repo }}
-          ref: ${{ needs.authorize.outputs.head_sha }}
-          token: ${{ secrets.FLEET_GH_TOKEN }}
-          persist-credentials: false
-          fetch-depth: 1
-          path: target
+      - name: fetch public target at authorized head without credentials
+        id: fetch-target
+        env:
+          TARGET_DIR: ${{ github.workspace }}/target
+          TARGET_REPO: ${{ needs.authorize.outputs.repo }}
+          TARGET_SHA: ${{ needs.authorize.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          case "$TARGET_REPO" in
+            M1Vj/*) ;;
+            *) echo "target repository owner is not normalized" >&2; exit 1 ;;
+          esac
+          test ! -e "$TARGET_DIR"
+          git -c credential.helper= init "$TARGET_DIR"
+          git -C "$TARGET_DIR" -c credential.helper= remote add origin "https://github.com/${TARGET_REPO}.git"
+          git -C "$TARGET_DIR" -c credential.helper= -c protocol.version=2 fetch --depth=1 --no-tags origin "$TARGET_SHA"
+          test "$(git -C "$TARGET_DIR" rev-parse FETCH_HEAD^{commit})" = "$TARGET_SHA"
+          git -C "$TARGET_DIR" -c credential.helper= checkout --detach "$TARGET_SHA"
       - name: materialize digest-bound source artifact
         id: materialize
         env:
@@ -231,21 +240,11 @@ jobs:
           mkdir -p "$(dirname "$EVIDENCE_PATH")"
           node --input-type=module <<'NODE'
           import { existsSync, readFileSync, writeFileSync } from "node:fs";
+          import { redactText } from "./scripts/lib/pr-memory.mjs";
           const output = process.env.EVIDENCE_PATH;
           const limit = 8000;
-          const patterns = [
-            /github_pat_[A-Za-z0-9_]{10,}/gi,
-            /(?:gh[pousr]|xox[baprs])[_-][A-Za-z0-9_-]{10,}/gi,
-            /AKIA[0-9A-Z]{16}/g,
-            /\bsk-[A-Za-z0-9_-]{20,}\b/g,
-            /AIza[A-Za-z0-9_-]{20,}/g,
-            /Bearer\s+[A-Za-z0-9._~+\/-]{16,}/gi,
-            /\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*["']?[^\s"']{12,}["']?/gi,
-            /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
-            /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi,
-          ];
           let text = existsSync(output) ? readFileSync(output, "utf8") : "target-check evidence unavailable\n";
-          for (const pattern of patterns) text = text.replace(pattern, "[REDACTED]");
+          text = redactText(text);
           text = text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "").slice(-limit);
           writeFileSync(output, text, { encoding: "utf8", mode: 0o600 });
           NODE

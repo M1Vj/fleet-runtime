@@ -36,9 +36,13 @@ test("authorization precedes target checkout and target jobs consume only author
   assert.ok(authorize >= 0 && authorize < materialize && materialize < target && target < gate);
   const materializeJob = workflow.slice(materialize, target);
   assert.match(materializeJob, /needs:\s*authorize/);
-  assert.match(materializeJob, /secrets\.FLEET_GH_TOKEN/);
   assert.match(materializeJob, /upload-artifact/);
   assert.match(materializeJob, /sha256sum/);
+  assert.doesNotMatch(materializeJob, /secrets\.|FLEET_GH_TOKEN/);
+  assert.doesNotMatch(materializeJob, /actions\/checkout/);
+  assert.match(materializeJob, /credential\.helper=/);
+  assert.match(materializeJob, /fetch --depth=1 --no-tags origin/);
+  assert.match(materializeJob, /rev-parse FETCH_HEAD/);
   const targetJob = workflow.slice(target, gate);
   assert.match(targetJob, /needs:\s*materialize-target/);
   assert.match(targetJob, /download-artifact/);
@@ -88,7 +92,10 @@ test("trusted credentials are step-local and state root is explicit", () => {
 test("target evidence is explicitly bounded and redacted before upload", () => {
   const targetJob = workflow.slice(workflow.indexOf("  target-check:"), workflow.indexOf("  gate:"));
   assert.match(targetJob, /MAX_EVIDENCE_CHARS/);
-  assert.match(targetJob, /github_pat_|xox|AIza|Bearer|BEGIN PRIVATE KEY|eyJ/);
+  assert.match(targetJob, /redactText/);
+  assert.match(targetJob, /from ["']\.\/scripts\/lib\/pr-memory\.mjs["']/);
+  assert.match(targetJob, /text\s*=\s*redactText\(text\)/);
+  assert.doesNotMatch(targetJob, /github_pat_|xox|AIza|Bearer|BEGIN PRIVATE KEY|eyJ/);
   assert.match(targetJob, /8000/);
   assert.match(targetJob, /upload-artifact/);
   assert.match(targetJob, /evidence\.txt/);

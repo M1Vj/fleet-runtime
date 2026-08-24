@@ -164,6 +164,13 @@ test("revision output failure is explicit and cannot silently queue work", () =>
   assert.match(mergeSource, /REVISION_INTENT/);
 });
 
+test("revision append failures fail closed and finally commits audit only", () => {
+  assert.match(source, /STATE_PERSISTENCE_FAILED/);
+  assert.doesNotMatch(source, /return \{ eventResult: null, stateOutcome: ["']memory-error["'] \}/);
+  assert.match(source, /safeCommitState\(runtime\.stateRoot, \["audit"\]/);
+  assert.doesNotMatch(source, /safeCommitState\(runtime\.stateRoot, \["state",\s*"audit"\]/);
+});
+
 test("revision audit is written to private state rather than ephemeral runtime audit", () => {
   assert.doesNotMatch(source, /audit\.writeMarkdown\(path\.join\(REPO_ROOT,\s*["']audit/);
   assert.match(source, /audit\.writeMarkdown\(path\.join\(runtime\.stateRoot,\s*["']audit/);
@@ -184,6 +191,9 @@ test("revision uses untrusted delimiters, controlled summaries, and one Git Data
   assert.match(source, /untrustedData\("DIFF"/);
   assert.match(source, /untrustedData\("EVIDENCE"/);
   assert.doesNotMatch(source, /FULL JUDGE COMMENT/);
+  assert.doesNotMatch(source, /Fix every blocker/);
+  assert.match(source, /correlation IDs/);
+  assert.match(source, /independently diagnose[\s\S]*diff[\s\S]*deterministic evidence/i);
   assert.doesNotMatch(source, /extractSummary/);
   assert.match(source, /updated \$\{validation\.files\.length\} validated files/);
   assert.match(source, /formatRevisionPath/);

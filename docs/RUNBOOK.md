@@ -9,7 +9,8 @@ All commands assume `gh` authenticated as M1Vj on the owner Mac. Workflows live 
 Required secrets on BOTH repos: `FLEET_GH_TOKEN` (PAT with `repo` + `workflow` scopes;
 the gate exits 4 without them) and `FLEET_OPENCODE_AUTH`.
 
-Refresh model auth (values never displayed; helper targets fleet-control only):
+Refresh model auth (values never displayed; helper targets both `M1Vj/fleet-runtime` and
+`M1Vj/fleet-control`):
 
     node scripts/refresh-auth-secret.mjs ~/.local/share/opencode/auth.json
 
@@ -17,10 +18,7 @@ Refresh the GitHub token:
 
     gh auth token > /tmp/t && node scripts/refresh-auth-secret.mjs --token /tmp/t && rm /tmp/t
 
-The helper writes only to `M1Vj/fleet-control`; mirror manually for the runtime repo:
-
-    gh secret set FLEET_OPENCODE_AUTH -R M1Vj/fleet-runtime < ~/.local/share/opencode/auth.json
-    gh auth token | gh secret set FLEET_GH_TOKEN -R M1Vj/fleet-runtime
+The helper writes both repositories; no manual mirror is required.
 
 Optional KB ingestion: set `GDRIVE_REFRESH_TOKEN`, `GDRIVE_CLIENT_ID`,
 `GDRIVE_CLIENT_SECRET` (+ optional `GDRIVE_FOLDER_ID` var, default `root`) on fleet-runtime.

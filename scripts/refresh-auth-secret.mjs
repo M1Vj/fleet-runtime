@@ -17,15 +17,6 @@ function setSecret(name, value) {
     process.stdout.write(`secret ${name} updated on ${repo}\n`);
   }
 }
-function setSecretLegacy(name, value) {
-  const res = spawnSync("gh", ["secret", "set", name, "-R", repo], {
-    input: value,
-    encoding: "utf8",
-    stdio: ["pipe", "inherit", "inherit"],
-  });
-  if (res.status !== 0) process.exit(res.status || 1);
-  process.stdout.write(`secret ${name} updated (value never displayed)\n`);
-}
 
 const args = process.argv.slice(2);
 if (args.length === 0) {

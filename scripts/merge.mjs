@@ -389,6 +389,20 @@ async function main() {
 
   if (!approved) {
     const fleetAuthored = String(pr.head && pr.head.ref || "").startsWith("fleet/");
+    if (fleetAuthored) {
+      const { readFileSync: rf, existsSync: es } = await import("node:fs");
+      const revPath = path.join(process.env.FLEET_STATE_ROOT || REPO_ROOT, "state", "revisions.jsonl");
+      const revCount = es(revPath)
+        ? rf(revPath, "utf8").split("\n").filter(Boolean).map((l) => { try { const r = JSON.parse(l); return r.repo === TARGET_REPO && r.pr === PR_NUMBER ? r : null; } catch { return null; } }).filter(Boolean).length
+        : 0;
+      if (revCount >= 2) {
+        await postComment(TARGET_REPO, PR_NUMBER, "🛡️ **fleet merge-gate**: maximum revisions reached and judges still reject. Auto-closing this draft — the improvement lane will propose a fresh approach informed by this feedback.", audit);
+        gh(["api", "-X", "PATCH", `/repos/${TARGET_REPO}/pulls/${PR_NUMBER}`, "-f", "state=closed"], process.env);
+        await recordTerminalState("EXHAUSTED", { repo: TARGET_REPO, pr: PR_NUMBER, why: "max revisions; still rejected", scores: [correctness.score, standards.score] });
+        console.log("MERGE_TERMINAL_STATE=EXHAUSTED");
+        return finish(audit, runId, "EXHAUSTED");
+      }
+    }
     if (fleetAuthored && process.env.GITHUB_OUTPUT) {
       try {
         appendFileSync(process.env.GITHUB_OUTPUT, "revision_needed=true\n");

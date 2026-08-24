@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -25,6 +25,7 @@ function makeGhFixture() {
       "#!/usr/bin/env node",
       'import { appendFileSync, readFileSync } from "node:fs";',
       "const args = process.argv.slice(2);",
+      'if (args[0] === "auth" && args[1] === "token") { process.stdout.write(process.env.GH_AUTH_TOKEN_FIXTURE || ""); process.exit(0); }',
       "const value = readFileSync(0, \"utf8\");",
       "appendFileSync(process.env.GH_LOG, JSON.stringify({ args, value }) + \"\\n\");",
       'const repoIndex = args.indexOf("-R");',
@@ -34,6 +35,12 @@ function makeGhFixture() {
     { mode: 0o755 },
   );
   return { root, bin, ghPath, logPath };
+}
+
+function tokenRefreshSnippet() {
+  const match = runbook.match(/Refresh the GitHub token:\s*\n\n((?: {4}.*(?:\n|$))+)/);
+  assert.ok(match, "runbook must include an indented token-refresh shell block");
+  return match[1].split("\n").map((line) => line.replace(/^ {4}/, "")).join("\n").trim();
 }
 
 function callsFrom(logPath) {
@@ -172,4 +179,39 @@ test("runbook documents one helper refresh for both repositories and active sess
   assert.match(runbook, /helper targets both `M1Vj\/fleet-runtime` and\s+`M1Vj\/fleet-control`/);
   assert.match(runbook, /active user session/);
   assert.doesNotMatch(runbook, /helper targets fleet-control only|mirror manually|while this Mac is on/);
+});
+
+test("documented token refresh uses a private temporary file and always removes it", () => {
+  const snippet = tokenRefreshSnippet();
+  assert.match(snippet, /umask 077/);
+  assert.match(snippet, /mktemp/);
+  assert.match(snippet, /trap ['"]rm -f -- \"\$token_file\"['"] EXIT/);
+  assert.doesNotMatch(snippet, /\/tmp\/t(?:\s|$)/);
+
+  for (const failRepo of ["", "M1Vj/fleet-control"]) {
+    const fixture = makeGhFixture();
+    const token = "ghp_documented_fixture_token_1234567890";
+    symlinkSync(process.execPath, path.join(fixture.bin, "node"));
+    try {
+      const run = spawnSync("/bin/bash", ["-c", snippet], {
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${fixture.bin}:/usr/bin:/bin`,
+          TMPDIR: fixture.root,
+          FLEET_GH_BIN: fixture.ghPath,
+          GH_LOG: fixture.logPath,
+          GH_AUTH_TOKEN_FIXTURE: token,
+          GH_FAIL_REPO: failRepo,
+        },
+      });
+      assert.equal(run.status, failRepo ? 23 : 0, run.stderr);
+      assert.equal(callsFrom(fixture.logPath).length, 2);
+      assert.equal(readdirSync(fixture.root).some((name) => name.startsWith("fleet-gh-token.")), false);
+      assert.equal(`${run.stdout}${run.stderr}`.includes(token), false);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }
 });

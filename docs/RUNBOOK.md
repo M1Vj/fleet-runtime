@@ -16,7 +16,14 @@ Refresh model auth (values never displayed; helper targets both `M1Vj/fleet-runt
 
 Refresh the GitHub token:
 
-    gh auth token > /tmp/t && node scripts/refresh-auth-secret.mjs --token /tmp/t && rm /tmp/t
+    (
+      set -e
+      umask 077
+      token_file="$(mktemp "${TMPDIR:-/tmp}/fleet-gh-token.XXXXXX")"
+      trap 'rm -f -- "$token_file"' EXIT
+      gh auth token >"$token_file"
+      node scripts/refresh-auth-secret.mjs --token "$token_file"
+    )
 
 The helper writes both repositories; no manual mirror is required.
 

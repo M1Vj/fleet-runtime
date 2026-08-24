@@ -24,4 +24,3 @@ test("improve target honors an available tier-1 allowlist", () => {
   assert.equal(result.ok, false);
   assert.match(result.errors.join(" "), /tier1/);
 });
-

@@ -77,21 +77,21 @@
 - [x] Document the event schema, redaction boundary, retention, target dispatch, and recovery procedure.
 - [x] Add a failure taxonomy for missing target, stale head, model unavailable, validation rejection, dispatch ambiguity, and state-push conflict.
 - [x] Run the final local secret-pattern scan and actionlint after the documentation commit candidate is frozen; actionlint is clean after ignoring only its documented stale `concurrency.queue` diagnostic.
-- [ ] Commit `docs: document autonomous PR memory and recovery`.
+- [x] Commit `docs: document autonomous PR memory and recovery` (`3e85357` after rebase).
 
 ### Task 5: Independent review and live proof
 
 **Files:**
 - Review all changed files and commits; no additional source files unless a review finding requires them.
 
-- [ ] Rebase onto current `origin/main`, resolve drift, and run the complete local suite.
+- [x] Rebase onto current `origin/main` (`aef1d93`) without conflicts and run the complete local suite.
 - [ ] Freeze the candidate commit and obtain independent correctness/security reviews of the actual diff plus an independent documentation review of the frozen hashes.
 - [ ] Keep `merge.yml` disabled while merging the implementation and restoring credentials.
 - [ ] Enable only long enough to dispatch a controlled `allow_merge=false` canary, verify non-empty target inputs, isolated target checks, atomic revision behavior, and private memory, then reconcile the canary.
 - [ ] Re-enable scheduled operation only after the canary passes; otherwise leave it disabled and record the exact blocker.
 
-- [ ] Run `node --test tests/*.mjs` and actionlint on all workflows.
-- [ ] Run a read-only static check that no tracked secret-like values or raw model prompts are persisted.
+- [x] Run `node --test tests/*.test.mjs` (164/164) and actionlint on all workflows; ignore only actionlint 1.7.12's documented stale `concurrency.queue` diagnostic.
+- [x] Run a read-only static secret-pattern scan; hits are confined to deliberate scanner/test fixtures, and the commit hook passed the documentation packet.
 - [ ] Dispatch one targeted merge-gate run against an existing fleet draft with no merge permission and inspect the workflow logs, private state event, and target inputs.
 - [ ] Re-fetch both remotes, inspect the complete diff, and verify attribution on any state commit/comment.
 - [ ] Record PASS/BLOCK evidence in the task ledger and only then consider pushing the implementation branch.

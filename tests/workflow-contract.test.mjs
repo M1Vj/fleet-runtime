@@ -162,3 +162,11 @@ test("an always-equivalent finalizer releases only a consumed claim when the gat
   assert.match(finalizeJob, /FLEET_TARGET_REPO:\s*\$\{\{\s*needs\.authorize\.outputs\.repo\s*\}\}/);
   assert.doesNotMatch(finalizeJob, /FLEET_OPENCODE_AUTH|OPENCODE_API_KEY/);
 });
+
+test("the setup-failure finalizer runs even when the gate job failed", () => {
+  const finalizeJob = workflow.slice(workflow.indexOf("  finalize-setup-failure:"));
+  const condition = finalizeJob.match(/^\s+if:\s*(.+)$/m)?.[1] || "";
+  assert.match(condition, /^\$\{\{\s*always\(\)/);
+  assert.match(condition, /github\.event_name == 'workflow_dispatch'/);
+  assert.match(condition, /needs\.gate\.result != 'success'/);
+});

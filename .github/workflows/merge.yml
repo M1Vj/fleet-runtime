@@ -355,7 +355,7 @@ jobs:
 
   finalize-setup-failure:
     needs: [authorize, gate]
-    if: ${{ github.event_name == 'workflow_dispatch' && needs.gate.result != 'success' }}
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && needs.gate.result != 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

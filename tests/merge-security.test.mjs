@@ -25,6 +25,7 @@ import {
   findCompletedJudgeEvent,
   recoverRejectedJudge,
   releaseHeldDispatch,
+  releaseSetupFailedDispatch,
   validateFilesResponse,
 } from "../scripts/merge.mjs";
 import { evaluateTargetPolicy, normalizeTargetInput, isAllowedRepo } from "../scripts/lib/target-policy.mjs";
@@ -645,6 +646,80 @@ test("dispatch release requires the latest held state and exact correlation", ()
       append() { throw new Error("append should not run for a mismatched claim"); },
     }), /DISPATCH_CORRELATION_NOT_HELD/);
   }
+});
+
+test("setup-failure finalizer releases only the exact consumed claim, durably", () => {
+  const target = { repo: "M1Vj/fleet-runtime", pr: 21, headSha: "4".repeat(40) };
+  const key = "c".repeat(64);
+  const events = [{ ...target, lane: "merge", kind: "dispatch", state: "DISPATCH_CONSUMED", attempt: 2, artifactRefs: [`dispatch-key:${key}`, "dispatch-run:77"] }];
+  const persisted = [];
+  const result = releaseSetupFailedDispatch(target, key, {
+    stateRoot: "/tmp/fleet-finalize-contract",
+    runId: "finalize-run",
+    read: () => events,
+    append: (_file, event) => { events.push(event); return { event }; },
+    persist: (state) => { persisted.push(state); },
+  });
+  assert.equal(result.released, true);
+  assert.deepEqual(events.map(({ state }) => state), ["DISPATCH_CONSUMED", "DISPATCH_RELEASED"]);
+  assert.equal(events.at(-1).headSha, target.headSha);
+  assert.equal(events.at(-1).attempt, 2);
+  assert.deepEqual(persisted, ["DISPATCH_RELEASED"]);
+
+  const rerun = releaseSetupFailedDispatch(target, key, {
+    stateRoot: "/tmp/fleet-finalize-contract",
+    read: () => events,
+    append() { throw new Error("append should not run for an idempotent release"); },
+    persist() { throw new Error("persist should not run for an idempotent release"); },
+  });
+  assert.equal(rerun.released, false);
+});
+
+test("setup-failure finalizer never releases held claims, recorded gate states, or live merges", () => {
+  const target = { repo: "M1Vj/fleet-runtime", pr: 22, headSha: "5".repeat(40) };
+  const key = "d".repeat(64);
+  const refuse = (events, options = {}) => releaseSetupFailedDispatch(target, key, {
+    stateRoot: "/tmp/fleet-finalize-contract",
+    read: () => events,
+    append() { throw new Error("finalizer must not append"); },
+    persist() { throw new Error("finalizer must not persist"); },
+    ...options,
+  });
+
+  const held = [
+    { ...target, lane: "merge", kind: "dispatch", state: "DISPATCH_CONSUMED", attempt: 1, artifactRefs: [`dispatch-key:${key}`] },
+    { ...target, lane: "merge", kind: "dispatch", state: "DISPATCH_HELD", attempt: 1, artifactRefs: [`dispatch-key:${key}`] },
+  ];
+  let outcome = refuse(held);
+  assert.equal(outcome.released, false);
+
+  const judged = [
+    { ...target, lane: "merge", kind: "dispatch", state: "DISPATCH_CONSUMED", attempt: 1, artifactRefs: [`dispatch-key:${key}`] },
+    { ...target, lane: "revise", kind: "judge", state: "JUDGE_REJECTED", attempt: 1, artifactRefs: [] },
+  ];
+  outcome = refuse(judged);
+  assert.equal(outcome.released, false);
+  assert.match(outcome.reason, /gate-recorded/);
+
+  const started = [
+    { ...target, lane: "merge", kind: "dispatch", state: "DISPATCH_CONSUMED", attempt: 1, artifactRefs: [`dispatch-key:${key}`] },
+    { ...target, lane: "revise", kind: "revision", state: "REVISION_STARTED", attempt: 2, artifactRefs: [] },
+  ];
+  outcome = refuse(started);
+  assert.equal(outcome.released, false);
+  assert.match(outcome.reason, /gate-recorded/);
+
+  const live = [{ ...target, lane: "merge", kind: "dispatch", state: "DISPATCH_CONSUMED", attempt: 1, artifactRefs: [`dispatch-key:${key}`] }];
+  outcome = refuse(live, { allowMerge: true });
+  assert.equal(outcome.released, false);
+  assert.equal(live.length, 1);
+
+  const unconsumed = [{ ...target, lane: "merge", kind: "dispatch", state: "DISPATCHED", attempt: 1, artifactRefs: [`dispatch-key:${key}`] }];
+  outcome = refuse(unconsumed);
+  assert.equal(outcome.released, false);
+
+  const unknownKey = refuse([{ ...target, lane: "merge", kind: "dispatch", state: "DISPATCH_CONSUMED", attempt: 1, artifactRefs: [`dispatch-key:${"e".repeat(64)}`] }]);
+  assert.equal(unknownKey.released, false);
 });
 
 test("judge mirror failure is private and cannot suppress a queued revision", async () => {

@@ -148,3 +148,17 @@ test("revision is gated by manual dispatch, authorization, normalized outputs, a
   assert.match(revision, /FLEET_DISPATCH_ID:\s*\$\{\{\s*inputs\.dispatch_id\s*\}\}/);
   assert.match(revision, /steps\.gate\.outputs\.revision_needed\s*==\s*['"]true['"]/);
 });
+
+test("an always-equivalent finalizer releases only a consumed claim when the gate never ran", () => {
+  const finalizeIndex = workflow.indexOf("  finalize-setup-failure:");
+  assert.ok(finalizeIndex > workflow.indexOf("  gate:"), "finalizer job must follow the gate job");
+  const finalizeJob = workflow.slice(finalizeIndex);
+  assert.match(finalizeJob, /needs:\s*\[authorize,\s*gate\]/);
+  assert.match(finalizeJob, /github\.event_name == 'workflow_dispatch'/);
+  assert.match(finalizeJob, /needs\.gate\.result != 'success'/);
+  assert.match(finalizeJob, /node scripts\/merge-finalize\.mjs/);
+  assert.match(finalizeJob, /FLEET_DISPATCH_ID:\s*\$\{\{\s*inputs\.dispatch_id\s*\}\}/);
+  assert.match(finalizeJob, /FLEET_ALLOW_MERGE:\s*\$\{\{\s*inputs\.allow_merge\s*\}\}/);
+  assert.match(finalizeJob, /FLEET_TARGET_REPO:\s*\$\{\{\s*needs\.authorize\.outputs\.repo\s*\}\}/);
+  assert.doesNotMatch(finalizeJob, /FLEET_OPENCODE_AUTH|OPENCODE_API_KEY/);
+});

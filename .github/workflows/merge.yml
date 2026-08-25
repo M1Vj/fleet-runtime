@@ -350,3 +350,39 @@ jobs:
           FLEET_DISPATCH_ID: ${{ inputs.dispatch_id }}
           FLEET_EVIDENCE_PATH: ${{ github.workspace }}/target-check/evidence.txt
         run: node scripts/revise.mjs
+
+  finalize-setup-failure:
+    needs: [authorize, gate]
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.gate.result != 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: checkout runtime
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: setup node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+      - name: checkout private state repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: release consumed claim when setup failed before any gate state
+        env:
+          FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+          FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+          FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
+          FLEET_TARGET_REPO: ${{ needs.authorize.outputs.repo }}
+          FLEET_PR_NUMBER: ${{ needs.authorize.outputs.pr }}
+          FLEET_HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
+          FLEET_DISPATCH_ID: ${{ inputs.dispatch_id }}
+          FLEET_ALLOW_MERGE: ${{ inputs.allow_merge }}
+          FLEET_RUN_ID: ${{ github.run_id }}
+        run: node scripts/merge-finalize.mjs

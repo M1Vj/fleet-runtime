@@ -676,6 +676,56 @@ export function releaseHeldDispatch(
   }
 }
 
+/**
+ * Merge-gate finalizer for workflow setup failures. Releases ONLY the exact
+ * latest DISPATCH_CONSUMED claim for this correlation when setup failed after
+ * authorization consumed it but before the trusted gate script recorded any
+ * other correlated state. DISPATCH_HELD, REVISION_STARTED, judge states,
+ * policy holds, and live-merge attempts are never released here.
+ */
+export function releaseSetupFailedDispatch(
+  target,
+  rawDispatchKey,
+  {
+    stateRoot = STATE_ROOT,
+    runId = process.env.FLEET_RUN_ID || "finalize",
+    append = appendMemoryEvent,
+    read = readMemoryEvents,
+    persist,
+    identity,
+    allowMerge = false,
+  } = {},
+) {
+  if (allowMerge === true) return { released: false, reason: "live-merge" };
+  const dispatchKey = String(rawDispatchKey || "");
+  if (!dispatchKey) return { released: false, manualDispatch: true };
+  if (!/^[a-f0-9]{64}$/.test(dispatchKey)) throw new Error("DISPATCH_CORRELATION_INVALID");
+  const normalized = normalizeTargetInput(target);
+  if (!normalized.ok) throw new Error(`INVALID_DISPATCH_TARGET ${normalized.errors.join("; ")}`);
+  const root = String(stateRoot || "");
+  if (!root || !path.isAbsolute(root) || path.resolve(root) !== root) throw new Error("FLEET_STATE_ROOT is required for setup-failure release");
+  const memoryFile = path.join(root, "state", "pr-memory.jsonl");
+  const reference = dispatchKeyReference(dispatchKey);
+  const events = read(memoryFile);
+  const matching = dispatchEventsForTarget(events, normalized)
+    .filter((event) => Array.isArray(event.artifactRefs) && event.artifactRefs.includes(reference));
+  const consumed = matching.at(-1);
+  if (!consumed || consumed.state !== "DISPATCH_CONSUMED") {
+    return { released: false, reason: consumed ? `latest-${consumed.state}` : "no-consumed-dispatch" };
+  }
+  const lastRelated = (Array.isArray(events) ? events : []).filter((event) => (
+    event
+    && event.repo === normalized.repo
+    && Number(event.pr) === normalized.pr
+    && String(event.headSha || "").toLowerCase() === normalized.headSha
+  )).at(-1);
+  if (!lastRelated || lastRelated !== consumed) {
+    return { released: false, reason: lastRelated ? `gate-recorded-${lastRelated.state || lastRelated.kind}` : "no-correlated-events" };
+  }
+  const completion = completeDispatch(target, dispatchKey, "SETUP_FAILED", { stateRoot: root, runId, append, read, persist, identity });
+  return { released: Boolean(completion.completed), event: completion.event };
+}
+
 async function postComment(repo, number, body, audit, identity) {
   const comment = gh([
     "api", "-X", "POST", `/repos/${repo}/issues/${number}/comments`, "-F", `body=${sanitizeCommentBody(body, MAX_COMMENT_CHARS)}`,

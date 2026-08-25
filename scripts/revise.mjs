@@ -56,6 +56,18 @@ export const MAX_REVISION_PROMPT_CHARS = 200000;
 
 export { screenRevisionOutput };
 
+function completeSourceResult({ errors = [], files = [], treePaths = new Set(), retryable = false, blocked = false } = {}) {
+  const disposition = blocked ? "blocked" : retryable ? "retryable" : "complete";
+  return {
+    ok: disposition === "complete",
+    disposition,
+    retryable: disposition === "retryable",
+    errors: errors.slice(0, 8),
+    files,
+    treePaths,
+  };
+}
+
 function boundedLimit(value, fallback = REVISION_EVIDENCE_MAX_CHARS) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? Math.max(0, Math.min(fallback, Math.floor(parsed))) : fallback;
@@ -110,40 +122,81 @@ export function fetchCompleteRevisionSources({
 } = {}) {
   const errors = [];
   const paths = [...new Set((Array.isArray(changedPaths) ? changedPaths : []).filter((value) => typeof value === "string" && value))];
-  if (typeof getTree !== "function" || typeof getBlob !== "function") return { ok: false, errors: ["complete exact-head source API unavailable"], files: [], treePaths: new Set() };
+  if (typeof getTree !== "function" || typeof getBlob !== "function") {
+    return completeSourceResult({ errors: ["complete exact-head source API unavailable"], retryable: true });
+  }
   let tree;
-  try { tree = getTree(repo, headSha); } catch (error) { tree = null; errors.push(`exact-head tree unavailable: ${String(error.message || error).slice(0, 120)}`); }
-  if (!tree || tree.truncated === true || !Array.isArray(tree.tree)) {
-    errors.push(tree?.truncated === true ? "exact-head tree response truncated" : "exact-head tree response incomplete");
-    return { ok: false, errors: errors.slice(0, 8), files: [], treePaths: new Set() };
+  let treeRetryable = false;
+  try {
+    tree = getTree(repo, headSha);
+  } catch (error) {
+    tree = null;
+    treeRetryable = true;
+    errors.push(`exact-head tree unavailable: ${String(error.message || error).slice(0, 120)}`);
+  }
+  if (tree?.truncated === true) {
+    errors.push("exact-head tree response truncated");
+    return completeSourceResult({ errors, blocked: true });
+  }
+  if (treeRetryable || !tree || !Array.isArray(tree.tree)) {
+    errors.push("exact-head tree response incomplete");
+    return completeSourceResult({ errors, retryable: true });
   }
   const treeEntries = new Map(tree.tree.filter((entry) => entry && typeof entry.path === "string").map((entry) => [entry.path, entry]));
   const treePaths = new Set(treeEntries.keys());
   const files = [];
   let totalChars = 0;
+  let retryableFailure = false;
+  let blockedFailure = false;
   for (const filePath of paths) {
     const entry = treeEntries.get(filePath);
-    if (!entry || !entry.sha) {
-      errors.push(`complete exact-head blob missing: ${filePath}`);
+    if (!entry) {
+      errors.push(`complete exact-head source path missing from tree: ${filePath}`);
+      blockedFailure = true;
+      continue;
+    }
+    if (!entry.sha) {
+      errors.push(`complete exact-head source tree entry is incomplete: ${filePath}`);
+      retryableFailure = true;
       continue;
     }
     if (entry.mode === "120000" || entry.type === "symlink") {
       errors.push(`exact-head source is a symlink: ${filePath}`);
+      blockedFailure = true;
       continue;
     }
     if (entry.mode === "160000" || entry.type === "commit") {
       errors.push(`exact-head source is a submodule: ${filePath}`);
+      blockedFailure = true;
+      continue;
+    }
+    if (!entry.type) {
+      errors.push(`exact-head source tree entry is incomplete: ${filePath}`);
+      retryableFailure = true;
       continue;
     }
     if (entry.type !== "blob") {
       errors.push(`exact-head source is not a regular blob: ${filePath}`);
+      blockedFailure = true;
       continue;
     }
     let blob;
-    try { blob = getBlob(repo, entry.sha); } catch (error) { blob = null; errors.push(`exact-head blob unavailable: ${filePath}`); }
+    let blobRetryable = false;
+    try {
+      blob = getBlob(repo, entry.sha);
+    } catch (error) {
+      blob = null;
+      blobRetryable = true;
+      errors.push(`exact-head blob unavailable: ${filePath}`);
+    }
+    if (blobRetryable) {
+      retryableFailure = true;
+      continue;
+    }
     const encoded = String(blob?.content || "").replace(/\s+/g, "");
     if (!blob || blob.encoding !== "base64" || !encoded || encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
       errors.push(`exact-head blob content missing: ${filePath}`);
+      retryableFailure = true;
       continue;
     }
     const bytes = Buffer.from(encoded, "base64");
@@ -151,20 +204,29 @@ export function fetchCompleteRevisionSources({
     if (!content || Buffer.from(content, "utf8").compare(bytes) !== 0
       || /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(content)) {
       errors.push(`exact-head blob is not complete text: ${filePath}`);
+      blockedFailure = true;
       continue;
     }
     if (content.length > maxFileChars) {
       errors.push(`exact-head source too large: ${filePath}`);
+      blockedFailure = true;
       continue;
     }
     totalChars += content.length;
     if (totalChars > maxTotalChars) {
       errors.push("exact-head source exceeds total prompt bound");
+      blockedFailure = true;
       break;
     }
     files.push({ path: filePath, content });
   }
-  return { ok: errors.length === 0 && files.length === paths.length, errors: errors.slice(0, 8), files, treePaths };
+  return completeSourceResult({
+    errors,
+    files,
+    treePaths,
+    retryable: retryableFailure && !blockedFailure,
+    blocked: blockedFailure,
+  });
 }
 
 function revisionCount(memoryFile, repo, pr) {
@@ -303,10 +365,24 @@ function releaseRetryableClaim(target, runtime, context, identity, audit) {
   return result;
 }
 
-function recordRetryableFailure(target, runtime, context, details, identity, audit, code) {
-  persistEvent(runtime, context, "ERROR", details, identity, audit, { required: true });
-  releaseRetryableClaim(target, runtime, context, identity, audit);
+export function handleRetryableSourceFailure({
+  target,
+  runtime,
+  context,
+  details,
+  identity,
+  audit,
+  persist = persistEvent,
+  release = releaseRetryableClaim,
+  code = 1,
+} = {}) {
+  persist(runtime, context, "ERROR", details, identity, audit, { required: true });
+  release(target, runtime, context, identity, audit);
   return code;
+}
+
+function recordRetryableFailure(target, runtime, context, details, identity, audit, code) {
+  return handleRetryableSourceFailure({ target, runtime, context, details, identity, audit, code });
 }
 
 /** Mirror a successful revision without allowing the public API to relabel it as failed. */
@@ -432,7 +508,16 @@ async function fetchRevisionTarget(target, identity, runtime) {
     getTree: (repo, sha) => gh(["api", `/repos/${repo}/git/trees/${encodeURIComponent(sha)}?recursive=1`], runtime.env),
     getBlob: (repo, sha) => gh(["api", `/repos/${repo}/git/blobs/${encodeURIComponent(sha)}`], runtime.env),
   });
-  if (!completeSource.ok) return { pr, files, repoMeta, policy, completeSource, terminal: "complete-source" };
+  if (!completeSource.ok) {
+    return {
+      pr,
+      files,
+      repoMeta,
+      policy,
+      completeSource,
+      terminal: completeSource.retryable ? "complete-source-retryable" : "complete-source",
+    };
+  }
   return { pr, files, repoMeta, policy, completeSource, terminal: null };
 }
 
@@ -454,9 +539,16 @@ async function reviseTarget(target, identity, audit, context, runtime) {
         ? "fork-origin PR head is not the target repository"
         : fetched.terminal === "policy"
           ? `target policy rejected: ${(fetched.policy?.errors || []).slice(0, 3).join("; ")}`
+          : fetched.terminal === "complete-source-retryable"
+            ? `temporary exact-head source failure: ${(fetched.completeSource?.errors || []).slice(0, 3).join("; ")}`
           : fetched.terminal === "complete-source"
             ? `complete exact-head source unavailable: ${(fetched.completeSource?.errors || []).slice(0, 3).join("; ")}`
           : "PR is not open";
+    if (fetched.terminal === "complete-source-retryable") {
+      recordRetryableFailure(target, runtime, context, { summary: terminalSummary }, identity, audit, 1);
+      console.log("REVISE_STATE=SOURCE_UNAVAILABLE");
+      return 1;
+    }
     const terminalState = fetched.terminal === "policy" || fetched.terminal === "complete-source" ? "BLOCKED" : "STALLED";
     persistEvent(runtime, context, terminalState, { summary: terminalSummary }, identity, audit);
     console.log(`REVISE_STATE=${fetched.terminal === "stale-head" ? "STALE_HEAD" : fetched.terminal === "fork-head" ? "FORK_HEAD" : fetched.terminal === "policy" ? "POLICY_BLOCKED" : fetched.terminal === "complete-source" ? "HUMAN_REVIEW" : "NO_OP"}`);

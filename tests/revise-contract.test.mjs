@@ -17,7 +17,9 @@ import {
   fetchCompleteRevisionSources,
   attemptRevisionMirror,
   applyValidatedRevision,
+  handleRetryableSourceFailure,
 } from "../scripts/revise.mjs";
+import { hasOutstandingDispatch, releaseHeldDispatch } from "../scripts/merge.mjs";
 
 const source = readFileSync(new URL("../scripts/revise.mjs", import.meta.url), "utf8");
 const mergeSource = readFileSync(new URL("../scripts/merge.mjs", import.meta.url), "utf8");
@@ -361,12 +363,16 @@ test("revision fails closed when exact-head blobs are missing or oversized", () 
   };
   const missing = fetchCompleteRevisionSources({ ...base, getBlob: () => ({ sha: "blob-1", encoding: "base64", content: "" }) });
   assert.equal(missing.ok, false);
+  assert.equal(missing.retryable, true);
+  assert.equal(missing.disposition, "retryable");
   assert.match(missing.errors.join(" "), /missing|empty/i);
   const oversized = fetchCompleteRevisionSources({
     ...base,
     getBlob: () => ({ sha: "blob-1", encoding: "base64", content: Buffer.from("x".repeat(60001), "utf8").toString("base64") }),
   });
   assert.equal(oversized.ok, false);
+  assert.equal(oversized.retryable, false);
+  assert.equal(oversized.disposition, "blocked");
   assert.match(oversized.errors.join(" "), /large|bound/i);
   const symlink = fetchCompleteRevisionSources({
     ...base,
@@ -374,7 +380,147 @@ test("revision fails closed when exact-head blobs are missing or oversized", () 
     getBlob: () => ({ sha: "blob-1", encoding: "base64", content: Buffer.from("target", "utf8").toString("base64") }),
   });
   assert.equal(symlink.ok, false);
+  assert.equal(symlink.retryable, false);
+  assert.equal(symlink.disposition, "blocked");
   assert.match(symlink.errors.join(" "), /symlink/i);
+
+  const removed = fetchCompleteRevisionSources({
+    ...base,
+    getTree: () => ({ truncated: false, tree: [] }),
+    getBlob: () => { throw new Error("blob must not run"); },
+  });
+  assert.equal(removed.ok, false);
+  assert.equal(removed.retryable, false);
+  assert.equal(removed.disposition, "blocked");
+  assert.match(removed.errors.join(" "), /path missing|tree/i);
+
+  const truncated = fetchCompleteRevisionSources({
+    ...base,
+    getTree: () => ({ truncated: true, tree: [] }),
+    getBlob: () => { throw new Error("blob must not run"); },
+  });
+  assert.equal(truncated.ok, false);
+  assert.equal(truncated.retryable, false);
+  assert.equal(truncated.disposition, "blocked");
+
+  const incompleteEntry = fetchCompleteRevisionSources({
+    ...base,
+    getTree: () => ({ truncated: false, tree: [{ path: "src/app.js", type: "blob" }] }),
+    getBlob: () => { throw new Error("blob must not run"); },
+  });
+  assert.equal(incompleteEntry.ok, false);
+  assert.equal(incompleteEntry.retryable, true);
+  assert.equal(incompleteEntry.disposition, "retryable");
+  assert.match(incompleteEntry.errors.join(" "), /incomplete/i);
+
+  const incompleteType = fetchCompleteRevisionSources({
+    ...base,
+    getTree: () => ({ truncated: false, tree: [{ path: "src/app.js", sha: "blob-1" }] }),
+    getBlob: () => { throw new Error("blob must not run"); },
+  });
+  assert.equal(incompleteType.ok, false);
+  assert.equal(incompleteType.retryable, true);
+  assert.equal(incompleteType.disposition, "retryable");
+  assert.match(incompleteType.errors.join(" "), /incomplete/i);
+
+  const binary = fetchCompleteRevisionSources({
+    ...base,
+    getTree: () => ({ truncated: false, tree: [{ path: "src/app.js", type: "blob", sha: "blob-1" }] }),
+    getBlob: () => ({ sha: "blob-1", encoding: "base64", content: Buffer.from([0xff, 0xfe, 0xfd]).toString("base64") }),
+  });
+  assert.equal(binary.ok, false);
+  assert.equal(binary.retryable, false);
+  assert.equal(binary.disposition, "blocked");
+});
+
+test("complete-source tree/blob API failures are retryable while incomplete responses remain eligible for the same head", () => {
+  const base = {
+    repo: "M1Vj/example-repo",
+    headSha: "a".repeat(40),
+    changedPaths: ["src/app.js"],
+  };
+  const treeThrows = fetchCompleteRevisionSources({
+    ...base,
+    getTree: () => { throw new Error("GitHub tree timeout"); },
+    getBlob: () => { throw new Error("blob must not run"); },
+  });
+  assert.equal(treeThrows.ok, false);
+  assert.equal(treeThrows.retryable, true);
+  assert.equal(treeThrows.disposition, "retryable");
+
+  const incompleteTree = fetchCompleteRevisionSources({
+    ...base,
+    getTree: () => ({ truncated: false }),
+    getBlob: () => { throw new Error("blob must not run"); },
+  });
+  assert.equal(incompleteTree.ok, false);
+  assert.equal(incompleteTree.retryable, true);
+  assert.equal(incompleteTree.disposition, "retryable");
+
+  const blobThrows = fetchCompleteRevisionSources({
+    ...base,
+    getTree: () => ({ truncated: false, tree: [{ path: "src/app.js", type: "blob", sha: "blob-1" }] }),
+    getBlob: () => { throw new Error("GitHub blob timeout"); },
+  });
+  assert.equal(blobThrows.ok, false);
+  assert.equal(blobThrows.retryable, true);
+  assert.equal(blobThrows.disposition, "retryable");
+  assert.match(source, /completeSource\.retryable/);
+  assert.match(source, /recordRetryableFailure\(target, runtime, context, \{ summary: terminalSummary \}/);
+  assert.match(source, /terminal: completeSource\.retryable \? "complete-source-retryable"/);
+  assert.match(source, /REVISE_STATE=SOURCE_UNAVAILABLE/);
+  assert.match(source, /recordRetryableFailure\(target, runtime, context, \{ summary: terminalSummary \}, identity, audit, 1\)/);
+  assert.match(source, /REVISE_STATE=SOURCE_UNAVAILABLE[\s\S]*return 1/);
+});
+
+test("retryable complete-source failures release only the exact held same-head dispatch claim", () => {
+  const target = { repo: "M1Vj/example-repo", pr: 42, headSha: "a".repeat(40) };
+  const key = "b".repeat(64);
+  const events = [{ ...target, lane: "merge", kind: "dispatch", state: "DISPATCH_HELD", attempt: 1, artifactRefs: [`dispatch-key:${key}`] }];
+  const released = releaseHeldDispatch(target, key, {
+    stateRoot: "/tmp/fleet-source-retry-contract",
+    read: () => events,
+    append: (_file, event) => { events.push(event); return { event }; },
+    persist() {},
+  });
+  assert.equal(released.released, true);
+  assert.equal(events.at(-1).state, "DISPATCH_RELEASED");
+  assert.equal(events.at(-1).headSha, target.headSha);
+  assert.match(source, /complete-source-retryable/);
+  assert.match(source, /releaseRetryableClaim\(target, runtime, context, identity, audit\)/);
+});
+
+test("retryable source orchestration persists ERROR before releasing the exact held claim", () => {
+  const target = { repo: "M1Vj/example-repo", pr: 42, headSha: "a".repeat(40) };
+  const key = "c".repeat(64);
+  const events = [{ ...target, lane: "merge", kind: "dispatch", state: "DISPATCH_HELD", attempt: 2, artifactRefs: [`dispatch-key:${key}`] }];
+  const persisted = [];
+  const released = [];
+  const result = handleRetryableSourceFailure({
+    target,
+    runtime: { env: { FLEET_DISPATCH_ID: key } },
+    context: { runId: "source-retry", repo: target.repo, pr: target.pr, headSha: target.headSha },
+    details: { summary: "temporary exact-head source failure" },
+    identity: { login: "M1Vj" },
+    audit: { note() {}, incident() {} },
+    persist: (...args) => persisted.push(args),
+    release: (targetArg, runtimeArg, contextArg) => {
+      released.push({ target: targetArg, runtime: runtimeArg, context: contextArg });
+      return releaseHeldDispatch(targetArg, key, {
+        stateRoot: "/tmp/fleet-source-retry-orchestration",
+        read: () => events,
+        append: (_file, event) => { events.push(event); return { event }; },
+        persist() {},
+      });
+    },
+  });
+  assert.equal(result, 1);
+  assert.equal(persisted[0][2], "ERROR");
+  assert.equal(released.length, 1);
+  assert.equal(released[0].target.headSha, target.headSha);
+  assert.equal(events.at(-1).state, "DISPATCH_RELEASED");
+  assert.equal(events.at(-1).headSha, target.headSha);
+  assert.equal(hasOutstandingDispatch(events, target), false);
 });
 
 test("revision records retryable model failures, exits nonzero, and releases only the matching claim", () => {

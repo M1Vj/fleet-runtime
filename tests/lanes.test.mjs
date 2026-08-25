@@ -121,24 +121,53 @@ test("watchdog auto-enable opt-in accepts only the exact true value", async () =
   }
 });
 
-test("watchdog alert selector reuses one open issue and ignores closed or PR-like entries", async () => {
+test("watchdog alert selector reuses one canonical open issue and ignores near-matches", async () => {
   const { selectWatchdogAlertIssue } = await import("../scripts/lib/watchdog-decide.mjs");
   const existing = { number: 12, state: "open", title: "[WATCHDOG] patrol stale since 2026-08-25T00:00:00Z" };
   assert.equal(selectWatchdogAlertIssue([
     { number: 11, state: "closed", title: existing.title },
     { number: 13, state: "open", title: existing.title, pull_request: { url: "https://example.test/pr/13" } },
+    { number: 14, state: "open", title: "[WATCHDOG] patrol stale since 2026-08-25T00:00:00Z discussion" },
     existing,
   ]), existing);
   assert.equal(selectWatchdogAlertIssue([
     { number: 14, state: "open", title: "[WATCHDOG] unrelated" },
-    { number: 15, state: "open", title: "[WATCHDOG] patrol stale since old" , pull_request: {} },
+    { number: 15, state: "open", title: "[WATCHDOG] patrol stale since old" },
+    { number: 16, state: "open", title: existing.title, pull_request: {} },
   ]), null);
+});
+
+test("watchdog alert pagination searches beyond the first 100 and chooses the lowest canonical match", async () => {
+  const { findWatchdogAlertIssue } = await import("../scripts/lib/watchdog-decide.mjs");
+  const canonicalOld = { number: 9, state: "open", title: "[WATCHDOG] patrol stale since 2026-08-24T00:00:00Z" };
+  const canonicalNew = { number: 27, state: "open", title: "[WATCHDOG] patrol stale since 2026-08-25T00:00:00Z" };
+  const pages = [];
+  const found = findWatchdogAlertIssue((page) => {
+    pages.push(page);
+    if (page === 1) return [canonicalNew, ...Array.from({ length: 99 }, (_, index) => ({ number: 100 + index, state: "open", title: "[WATCHDOG] unrelated" }))];
+    if (page === 2) return [canonicalOld];
+    return [];
+  });
+  assert.deepEqual(pages, [1, 2]);
+  assert.equal(found, canonicalOld);
+});
+
+test("watchdog alert pagination stops after a short page when no canonical issue exists", async () => {
+  const { findWatchdogAlertIssue } = await import("../scripts/lib/watchdog-decide.mjs");
+  const pages = [];
+  const found = findWatchdogAlertIssue((page) => {
+    pages.push(page);
+    return [{ number: page, state: "open", title: "[WATCHDOG] patrol stale since now" }];
+  });
+  assert.equal(found, null);
+  assert.deepEqual(pages, [1]);
 });
 
 test("watchdog workflow exposes an unset-safe explicit opt-in", () => {
   assert.match(watchdogWorkflow, /FLEET_WATCHDOG_AUTO_ENABLE:\s*\$\{\{\s*vars\.FLEET_WATCHDOG_AUTO_ENABLE\s*\}\}/);
   assert.match(watchdogSource, /watchdogAutoEnableEnabled\(process\.env\.FLEET_WATCHDOG_AUTO_ENABLE\)/);
   assert.match(watchdogSource, /if \(plan\.autoEnable\)/);
+  assert.match(watchdogSource, /findWatchdogAlertIssue\(\(page\) =>/);
 });
 
 test("shouldCoalesce only for schedule trigger", async () => {

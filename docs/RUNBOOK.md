@@ -56,7 +56,9 @@ Watchdog recovery is fail-closed. A stale heartbeat reports through one open
 workflows by default. The trusted workflow may opt in with the exact repository variable
 `FLEET_WATCHDOG_AUTO_ENABLE=true`; blank, false, and other values leave manual workflow
 disables unchanged. The run result reports `stale-alerted` for a new issue and
-`stale-observed` when it reuses an existing issue.
+`stale-observed` when it reuses an existing issue. Production deployment should set this
+repository variable after canary proof; watchdog recovery then runs without a local operator
+session.
 
 ## 3. Emergency stop and re-arm
 

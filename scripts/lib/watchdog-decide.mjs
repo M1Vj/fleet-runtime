@@ -7,6 +7,8 @@ export function decideStale(lastRunUtc, nowMs = Date.now(), thresholdMs = 90 * 6
 }
 
 const WATCHDOG_WORKFLOWS = ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml"];
+const WATCHDOG_ALERT_TITLE = /^\[WATCHDOG\] patrol stale since (?:unknown|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z)$/;
+export const MAX_WATCHDOG_ALERT_PAGES = 10;
 
 /** Enable workflow recovery only when the trusted job supplies the exact opt-in value. */
 export function watchdogAutoEnableEnabled(value) {
@@ -14,12 +16,30 @@ export function watchdogAutoEnableEnabled(value) {
 }
 
 export function selectWatchdogAlertIssue(issues) {
-  return (Array.isArray(issues) ? issues : []).find((issue) => (
+  const matches = (Array.isArray(issues) ? issues : []).filter((issue) => (
     issue && issue.state === "open"
       && typeof issue.title === "string"
-      && issue.title.startsWith("[WATCHDOG] patrol stale")
+      && WATCHDOG_ALERT_TITLE.test(issue.title)
       && issue.pull_request == null
-  )) || null;
+  ));
+  return matches.sort((left, right) => {
+    const leftNumber = Number(left.number);
+    const rightNumber = Number(right.number);
+    if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber) && leftNumber !== rightNumber) return leftNumber - rightNumber;
+    return String(left.id || left.number || "").localeCompare(String(right.id || right.number || ""));
+  })[0] || null;
+}
+
+export function findWatchdogAlertIssue(fetchPage, { maxPages = MAX_WATCHDOG_ALERT_PAGES } = {}) {
+  if (typeof fetchPage !== "function") return null;
+  const pages = [];
+  for (let page = 1; page <= Math.max(1, Math.min(MAX_WATCHDOG_ALERT_PAGES, Number(maxPages) || MAX_WATCHDOG_ALERT_PAGES)); page += 1) {
+    const issues = fetchPage(page);
+    if (!Array.isArray(issues)) break;
+    pages.push(...issues);
+    if (issues.length < 100) break;
+  }
+  return selectWatchdogAlertIssue(pages);
 }
 
 export function planWatchdogActions(heartbeat, nowMs = Date.now(), thresholdMs = 90 * 60 * 1000, { autoEnable = false } = {}) {

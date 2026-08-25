@@ -6,7 +6,7 @@ import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
 import { verifyCommit, verifyIssueAuthor } from "./lib/verify.mjs";
-import { planWatchdogActions, selectWatchdogAlertIssue, watchdogAutoEnableEnabled } from "./lib/watchdog-decide.mjs";
+import { findWatchdogAlertIssue, planWatchdogActions, watchdogAutoEnableEnabled } from "./lib/watchdog-decide.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
@@ -98,8 +98,10 @@ export async function main() {
     const runsList = (recentRuns.workflow_runs || [])
       .map((r) => `- ${r.name} ${r.status}/${r.conclusion} ${r.html_url}`)
       .join("\n");
-    const openIssues = gh(["api", "/repos/M1Vj/fleet-control/issues?state=open&per_page=100"], process.env);
-    const existingIssue = selectWatchdogAlertIssue(openIssues);
+    const existingIssue = findWatchdogAlertIssue((page) => gh(
+      ["api", `/repos/M1Vj/fleet-control/issues?state=open&per_page=100&page=${page}`],
+      process.env,
+    ));
     const recoveryStatus = plan.autoEnable
       ? "Re-enable was attempted."
       : "Auto-enable opt-in is disabled; workflows remain in their current maintenance state.";

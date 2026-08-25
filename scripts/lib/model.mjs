@@ -362,7 +362,9 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
       try { markGatewayUp(healthRoot); } catch {}
       return { reply: r.reply, sessionId: sid, modelMode: `${model}${mode === "max" ? "@max" : ""}`, attempts, complete: true };
     }
-    const authState = classifyProviderAuthFailure(`${r.stderrTail || ""}\n${r.rawTail || ""}`);
+    // Classify CLI stderr only: rawTail includes model reply text, so a PR diff
+    // discussing "402"/"401" must never open the fleet-wide gateway circuit.
+    const authState = classifyProviderAuthFailure(r.stderrTail || "");
     if (authState) {
       return { reply: "", sessionId: sid, modelMode: mode, attempts, complete: false, authState };
     }

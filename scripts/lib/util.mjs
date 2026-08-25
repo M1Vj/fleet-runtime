@@ -19,10 +19,12 @@ export function dayPath(iso = utcNowISO()) {
 export function scrub(env) {
   const token = env.FLEET_GH_TOKEN || "";
   const auth = env.FLEET_OPENCODE_AUTH || "";
+  const providerKey = env.OPENCODE_API_KEY || "";
   return (str) => {
     let out = String(str ?? "");
     if (token) out = out.split(token).join("***");
     if (auth && auth.length > 16) out = out.split(auth).join("***");
+    if (providerKey && providerKey.length > 16) out = out.split(providerKey).join("***");
     return out;
   };
 }

@@ -56,6 +56,32 @@ test("credential rejection and exhaustion are classified for fail-closed handlin
   assert.equal(classifyProviderAuthFailure(""), null);
 });
 
+test("auth classification ignores reply-derived text and reads CLI stderr only", async () => {
+  const { repo, state } = tempPair("fleet-auth-stderr-only");
+  try {
+    const result = await askModel({
+      prompt: "judge",
+      timeoutMs: 1000,
+      env: { OPENCODE_API_KEY: "pk-fixture", FLEET_STATE_ROOT: state },
+      repoRoot: repo,
+      stateRoot: state,
+      skipCircuitCheck: true,
+      maxRounds: 1,
+      spawnImpl: () => spawnChild({
+        stdout: '{"text":"the PR diff literally says HTTP 402 payment required and 401 unauthorized"}\n',
+        code: 1,
+      }),
+    });
+    assert.equal(result.complete, false);
+    assert.equal(result.authState, undefined);
+    assert.match(result.attempts[0].rawTail || "", /402 payment required/);
+    assert.equal((result.attempts[0].errTail || "").trim(), "");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
 test("missing model credentials fail closed without spawning a model process", async () => {
   const { repo, state } = tempPair("fleet-auth-missing");
   let spawns = 0;

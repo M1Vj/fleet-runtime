@@ -7,6 +7,20 @@ import path from "node:path";
 import { markGatewayDown } from "../scripts/lib/gateway-health.mjs";
 import { redactText } from "../scripts/lib/pr-memory.mjs";
 import { normalizeAuditRunId } from "../scripts/lib/pr-memory.mjs";
+import { scrub } from "../scripts/lib/util.mjs";
+
+test("scrub redacts the durable provider key alongside token and legacy auth", () => {
+  const env = {
+    FLEET_GH_TOKEN: "gh-token-supersecret-value",
+    FLEET_OPENCODE_AUTH: "legacy-oauth-snapshot-supersecret",
+    OPENCODE_API_KEY: "provider-key-supersecret-1234",
+  };
+  const out = scrub(env)([env.FLEET_GH_TOKEN, env.FLEET_OPENCODE_AUTH, env.OPENCODE_API_KEY].join(" | "));
+  assert.equal(out.includes(env.FLEET_GH_TOKEN), false);
+  assert.equal(out.includes(env.FLEET_OPENCODE_AUTH), false);
+  assert.equal(out.includes(env.OPENCODE_API_KEY), false);
+  assert.match(out, /\*\*\*/);
+});
 
 test("shared redactor covers provider, basic-auth, and database credential forms", () => {
   for (const value of [

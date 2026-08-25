@@ -483,6 +483,43 @@ test("complete-source tree/blob API failures are retryable while incomplete resp
   assert.match(source, /REVISE_STATE=SOURCE_UNAVAILABLE[\s\S]*return 1/);
 });
 
+test("incomplete exact-source envelopes are retryable while explicit truncation stays blocked", () => {
+  const base = {
+    repo: "M1Vj/example-repo",
+    headSha: "a".repeat(40),
+    changedPaths: ["src/app.js"],
+    getBlob: () => { throw new Error("blob must not run"); },
+    getTree: () => ({ tree: [{ path: "src/app.js", type: "blob", sha: "blob-1" }] }),
+  };
+  const missingFlag = fetchCompleteRevisionSources({ ...base });
+  assert.equal(missingFlag.ok, false);
+  assert.equal(missingFlag.retryable, true);
+  assert.match(missingFlag.errors.join(" "), /truncation/i);
+
+  const blobShaMismatch = fetchCompleteRevisionSources({
+    ...base,
+    getTree: () => ({ truncated: false, tree: [{ path: "src/app.js", type: "blob", sha: "b".repeat(40) }] }),
+    getBlob: () => ({ sha: "e".repeat(40), encoding: "base64", content: Buffer.from("mismatched envelope", "utf8").toString("base64") }),
+  });
+  assert.equal(blobShaMismatch.disposition, "retryable");
+  assert.match(blobShaMismatch.errors.join(" "), /sha mismatch/i);
+
+  const blobMissingSha = fetchCompleteRevisionSources({
+    ...base,
+    getTree: () => ({ truncated: false, tree: [{ path: "src/app.js", type: "blob", sha: "blob-1" }] }),
+    getBlob: () => ({ encoding: "base64", content: Buffer.from("no sha field", "utf8").toString("base64") }),
+  });
+  assert.equal(blobMissingSha.disposition, "retryable");
+  assert.match(blobMissingSha.errors.join(" "), /sha mismatch|incomplete/i);
+
+  const exactMatch = fetchCompleteRevisionSources({
+    ...base,
+    getTree: () => ({ truncated: false, tree: [{ path: "src/app.js", type: "blob", sha: "BLOB-1" }] }),
+    getBlob: (_repo, sha) => ({ sha: sha.toLowerCase(), encoding: "base64", content: Buffer.from("ok\n", "utf8").toString("base64") }),
+  });
+  assert.equal(exactMatch.ok, true);
+});
+
 test("retryable complete-source failures release only the exact held same-head dispatch claim", () => {
   const target = { repo: "M1Vj/example-repo", pr: 42, headSha: "a".repeat(40) };
   const key = "b".repeat(64);

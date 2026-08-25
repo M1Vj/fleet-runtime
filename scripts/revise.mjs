@@ -142,6 +142,10 @@ export function fetchCompleteRevisionSources({
     errors.push("exact-head tree response incomplete");
     return completeSourceResult({ errors, retryable: true });
   }
+  if (tree.truncated !== false) {
+    errors.push("exact-head tree response missing truncation flag");
+    return completeSourceResult({ errors, retryable: true });
+  }
   const treeEntries = new Map(tree.tree.filter((entry) => entry && typeof entry.path === "string").map((entry) => [entry.path, entry]));
   const treePaths = new Set(treeEntries.keys());
   const files = [];
@@ -190,6 +194,12 @@ export function fetchCompleteRevisionSources({
       errors.push(`exact-head blob unavailable: ${filePath}`);
     }
     if (blobRetryable) {
+      retryableFailure = true;
+      continue;
+    }
+    const blobSha = typeof blob?.sha === "string" ? blob.sha.toLowerCase() : "";
+    if (!blobSha || blobSha !== String(entry.sha).toLowerCase()) {
+      errors.push(`exact-head blob sha mismatch: ${filePath}`);
       retryableFailure = true;
       continue;
     }

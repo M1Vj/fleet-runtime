@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 
 const workflow = readFileSync(new URL("../.github/workflows/merge.yml", import.meta.url), "utf8");
 const mergeSource = readFileSync(new URL("../scripts/merge.mjs", import.meta.url), "utf8");
@@ -169,4 +169,15 @@ test("the setup-failure finalizer runs even when the gate job failed", () => {
   assert.match(condition, /^\$\{\{\s*always\(\)/);
   assert.match(condition, /github\.event_name == 'workflow_dispatch'/);
   assert.match(condition, /needs\.gate\.result != 'success'/);
+});
+
+test("every model-credential wiring also exposes the durable provider key", () => {
+  const dir = new URL("../.github/workflows/", import.meta.url);
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith(".yml")) continue;
+    const text = readFileSync(new URL(name, dir), "utf8");
+    const legacy = text.match(/secrets\.FLEET_OPENCODE_AUTH/g) || [];
+    const provider = text.match(/OPENCODE_API_KEY: \$\{\{ secrets\.OPENCODE_API_KEY \}\}/g) || [];
+    assert.equal(provider.length, legacy.length, `${name}: each FLEET_OPENCODE_AUTH wiring needs a sibling OPENCODE_API_KEY wiring`);
+  }
 });

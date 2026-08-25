@@ -42,7 +42,7 @@ function readJson(p, fallback) {
   }
 }
 
-async function collectSignals(env, audit) {
+export async function collectSignals(env, audit) {
   const repos = gh(["api", "/user/repos?affiliation=owner&per_page=100&sort=pushed"], env);
   audit.note("enumerate", `owned repos=${repos.length}`);
   const signals = [];
@@ -60,7 +60,8 @@ async function collectSignals(env, audit) {
       signals.push({
         repo: full,
         pushedAt: repo.pushed_at,
-        openPulls: pulls.map((p) => ({ n: p.number, title: p.title, draft: p.draft, updated: p.updated_at })),
+        // PR comments change updated_at; the head SHA is the stable freshness key.
+        openPulls: pulls.map((p) => ({ n: p.number, title: p.title, draft: p.draft, headSha: String(p.head && p.head.sha || "").toLowerCase() })),
         activeIssues: issues.filter((i) => !i.pull_request).map((i) => ({ n: i.number, title: i.title, updated: i.updated_at })),
         failingRuns24h: runs.map((r) => ({ id: r.id, name: r.name, url: r.html_url, created: r.created_at })),
       });
@@ -72,12 +73,12 @@ async function collectSignals(env, audit) {
   return signals;
 }
 
-function buildDigest(signals, seen) {
+export function buildDigest(signals, seen) {
   const fresh = [];
   for (const s of signals) {
     const f = {
       repo: s.repo,
-      newPulls: s.openPulls.filter((p) => !has(seen, eventKey("sig-pr", s.repo, String(p.n), String(p.updated)))),
+      newPulls: s.openPulls.filter((p) => p.headSha && !has(seen, eventKey("sig-pr", s.repo, String(p.n), p.headSha))),
       newIssueActivity: s.activeIssues.filter((i) => !has(seen, eventKey("sig-issue", s.repo, String(i.n), String(i.updated)))),
       failingRuns: s.failingRuns24h.filter((r) => !has(seen, eventKey("sig-run", s.repo, String(r.id), String(r.created)))),
     };
@@ -91,11 +92,11 @@ function buildPrompt(digest) {
     "You are the fleet triage brain for GitHub user M1Vj. Analyze the digest of repository signals below.",
     "Your ENTIRE reply must be exactly one strict JSON array of directive objects and nothing else — no prose, no markdown fences, no code, no examples. Allowed kinds:",
     '{"kind":"report","section":"triage|security|standards|docs|testing|redteam","text":"..."}',
-    '{"kind":"comment","repo":"owner/name","target":"issue|pr","number":N,"body":"..."}',
     '{"kind":"label","repo":"owner/name","target":"issue|pr","number":N,"labels":["..."]}',
     '{"kind":"draft_pr","repo":"owner/name","title":"...","body":"...","branch":"fleet/<kebab>","files":[{"path":"docs/... or scripts/... etc","content":"..."}]}',
     '{"kind":"noop","reason":"..."}',
     "Rules: prioritize security > broken CI > stale PR review comments > standards/docs/testing findings.",
+    "Never emit a comment directive targeting an existing issue or pull request: all patrol public comments are downgraded to a private report with no mutation. Use draft_pr for actionable code/documentation fixes, or report/fleet_issue for findings and blockers.",
     "Never propose direct pushes to default branches; draft_pr files only under docs/, src/, scripts/, tests/, .github/workflows/<name>.yml.",
     "Keep total under 25 directives; prefer report entries summarizing minor items.",
     "Digest:",
@@ -142,10 +143,14 @@ function enqueueDeepTasks(signals) {
   return additions.length;
 }
 
-async function executeDirectives(env, identity, directives, targets, audit) {
+export async function executeDirectives(env, identity, directives, targets, audit) {
   let mutations = 0;
   const results = [];
-  for (const d of directives) {
+  for (const raw of directives) {
+    // Keep the executor fail-closed even if a caller bypasses main's sanitizer.
+    const d = raw && raw.kind === "comment"
+      ? patrolPublicCommentReport(raw)
+      : raw;
     try {
       if (d.kind === "report") {
         results.push({ kind: d.kind, ok: true, note: d.section });
@@ -209,6 +214,27 @@ async function executeDirectives(env, identity, directives, targets, audit) {
   const failedCount = results.filter((r) => r.ok === false).length;
   if (failedCount > 0) audit.note("executor-summary", `${failedCount} directive(s) failed but run continued`);
   return { mutations, results };
+}
+
+/** Downgrade every public comment suggestion to a private, non-mutating report. */
+export function patrolPublicCommentReport(directive = {}) {
+  return {
+    kind: "report",
+    section: "triage",
+    text: `suppressed public ${directive.target === "pr" ? "PR" : "issue"} comment directive for ${String(directive.repo || "target").slice(0, 120)}#${Number.isSafeInteger(directive.number) ? directive.number : "?"}; use draft_pr for an actionable fix`,
+    downgraded: "public-comment-disabled",
+  };
+}
+
+// Backwards-compatible export for callers that named the former PR-only guard.
+export const patrolPrCommentReport = patrolPublicCommentReport;
+
+export function sanitizePatrolDirectives(directives) {
+  return (Array.isArray(directives) ? directives : []).map((directive) => (
+    directive && directive.kind === "comment"
+      ? patrolPublicCommentReport(directive)
+      : directive
+  ));
 }
 
 export async function main() {
@@ -288,7 +314,9 @@ export async function main() {
         audit.incident("validator", "model output rejected", { errors: validation.errors.slice(0, 10) });
         throw Object.assign(new Error("DIRECTIVES_REJECTED"), { code: 5 });
       }
-      directives = validation.directives;
+      directives = sanitizePatrolDirectives(validation.directives);
+      const suppressedComments = validation.directives.length - directives.filter((directive) => directive.downgraded !== "public-comment-disabled").length;
+      if (suppressedComments > 0) audit.note("policy", `suppressed ${suppressedComments} public comment directive(s)`);
       audit.note("validator", `directives accepted=${directives.length}`);
     }
 
@@ -296,7 +324,9 @@ export async function main() {
     audit.note("executor", `mutations=${mutations}`);
 
     for (const group of signals) {
-      for (const p of group.openPulls || []) append(ledgerPath(), eventKey("sig-pr", group.repo, String(p.n), String(p.updated)), {});
+      for (const p of group.openPulls || []) {
+        if (p.headSha) append(ledgerPath(), eventKey("sig-pr", group.repo, String(p.n), p.headSha), {});
+      }
       for (const i of group.activeIssues || []) append(ledgerPath(), eventKey("sig-issue", group.repo, String(i.n), String(i.updated)), {});
       for (const r of group.failingRuns24h || []) append(ledgerPath(), eventKey("sig-run", group.repo, String(r.id), String(r.created)), {});
     }

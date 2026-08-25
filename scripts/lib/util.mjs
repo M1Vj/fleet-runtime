@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -19,10 +19,12 @@ export function dayPath(iso = utcNowISO()) {
 export function scrub(env) {
   const token = env.FLEET_GH_TOKEN || "";
   const auth = env.FLEET_OPENCODE_AUTH || "";
+  const providerKey = env.OPENCODE_API_KEY || "";
   return (str) => {
     let out = String(str ?? "");
     if (token) out = out.split(token).join("***");
     if (auth && auth.length > 16) out = out.split(auth).join("***");
+    if (providerKey && providerKey.length > 16) out = out.split(providerKey).join("***");
     return out;
   };
 }
@@ -105,12 +107,14 @@ export function ensureBranch(repo, branch, baseSha, env = process.env) {
 }
 
 export function ghInput(prefixArgs, bodyObj, env = process.env) {
-  const tmp = path.join(mkdtempSync(path.join(tmpdir(), "ghin-")), "body.json");
-  writeFileSync(tmp, JSON.stringify(bodyObj), "utf8");
+  const tempDir = mkdtempSync(path.join(tmpdir(), "ghin-"));
+  chmodSync(tempDir, 0o700);
   try {
+    const tmp = path.join(tempDir, "body.json");
+    writeFileSync(tmp, JSON.stringify(bodyObj), { encoding: "utf8", mode: 0o600, flag: "wx" });
     return gh([...prefixArgs, "--input", tmp], env);
   } finally {
-    rmSync(tmp, { force: true });
+    rmSync(tempDir, { recursive: true, force: true });
   }
 }
 

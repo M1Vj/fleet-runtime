@@ -1,19 +1,55 @@
 #!/usr/bin/env node
 import process from "node:process";
-import fsMod from "node:fs";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, ghInput, putFileContent, ensureBranch, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, sha256, configureIdentity } from "./lib/util.mjs";
-import { askModel, askModelResilient } from "./lib/model.mjs";
-import { verifyCommit, verifyPullAuthor, verifyCommentAuthor } from "./lib/verify.mjs";
+import { askModel, askModelResilient, createDisposableModelWorkspace, disposeModelWorkspace } from "./lib/model.mjs";
+import { verifyCommit, verifyPullAuthor } from "./lib/verify.mjs";
 import { makeTerminal } from "./lib/terminal.mjs";
 import { isSafeRepoPath, sanitizeControlChars, extractJsonObject } from "./lib/directives.mjs";
+import { isAllowedRepo, readTier1Repos } from "./lib/target-policy.mjs";
+import { redactText } from "./lib/pr-memory.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
 const STATE_PATH = path.join(REPO_ROOT, "state", "improve-state.json");
+
+function improveTargets() {
+  const targetsPath = path.join(REPO_ROOT, "state", "targets.json");
+  return existsSync(targetsPath) ? readJson(targetsPath, undefined) : undefined;
+}
+
+/** Improve may inspect only an explicitly public, allowlisted target. */
+export function validateImproveTarget({ repo, meta, stateRoot = REPO_ROOT, targets = improveTargets() } = {}) {
+  const normalizedRepo = String(repo || "").trim();
+  const errors = [];
+  if (!normalizedRepo || !meta || meta.full_name !== normalizedRepo) errors.push("target repository metadata mismatch");
+  if (!meta || meta.private !== false) errors.push("target repository must be explicitly public");
+  if (!meta || meta.visibility !== "public") errors.push("target repository visibility must be public");
+  const allowlist = readTier1Repos({ stateRoot, targets });
+  if (allowlist.size > 0 && !isAllowedRepo(normalizedRepo, { stateRoot, targets })) errors.push("target repository is not in the tier1 improve allowlist");
+  return { ok: errors.length === 0, repo: normalizedRepo, errors: errors.slice(0, 8) };
+}
+
+function createPublicImproveWorkspace(repo, meta) {
+  const workspace = createDisposableModelWorkspace({
+    repoRoot: CODE_ROOT,
+    stateRoot: process.env.FLEET_STATE_ROOT || REPO_ROOT,
+    prefix: "fleet-improve-public-",
+    profile: "public-read",
+    publicTarget: meta,
+  });
+  const sourceDir = path.join(workspace, "source");
+  try {
+    gh(["repo", "clone", repo0(repo), sourceDir, "--", "--depth", "1"], process.env);
+    return { workspace, sourceDir };
+  } catch (error) {
+    disposeModelWorkspace(workspace);
+    throw error;
+  }
+}
 
 function readJson(p, fallback) {
   if (!existsSync(p)) return fallback;
@@ -41,13 +77,17 @@ async function modePick(audit) {
   configureIdentity(REPO_ROOT, identity);
   const repos = gh(["api", "/user/repos?affiliation=owner&per_page=100&sort=pushed"], process.env) || [];
   const topK = Number(process.env.FLEET_TOP_K || 2);
-  const ranked = rankRepos(repos.filter((r) => !r.archived && r.full_name !== "M1Vj/fleet-control")).slice(0, topK);
+  const targets = improveTargets();
+  const ranked = rankRepos(repos.filter((r) => {
+    if (r.archived || r.full_name === "M1Vj/fleet-control") return false;
+    return validateImproveTarget({ repo: r.full_name, meta: r, stateRoot: REPO_ROOT, targets }).ok;
+  })).slice(0, topK);
   audit.note("pick", ranked.map((r) => `${r.full_name}(${r.score})`).join(", "));
   console.log(`IMPROVE_MATRIX=${JSON.stringify({ repo: ranked.map((r) => r.full_name) })}`);
   return 0;
 }
 
-function buildResearchPrompt(repo, workdir) {
+function buildResearchPrompt(repo, sourceDir) {
   const meta = gh(["api", `/repos/${repo}`], process.env);
   const commits = gh(["api", `/repos/${repo}/commits?per_page=15`], process.env) || [];
   const pulls = gh(["api", `/repos/${repo}/pulls?state=open&per_page=10`], process.env) || [];
@@ -60,7 +100,7 @@ function buildResearchPrompt(repo, workdir) {
     `Open issues: ${issuesRaw.filter((i) => !i.pull_request).map((i) => `#${i.number} ${i.title}`).join("; ") || "none"}`,
   ];
   return [
-    `You are the research sub-agent for repo ${repo}. A full shallow clone is mounted at your working directory ('.')${workdir ? "" : " (digest-only mode)"} — use read/grep/glob on real code before concluding. Decide what would MOST improve this project right now (correctness, security, DX, performance, docs, CI). You may use webfetch to consult authoritative sources.`,
+    `You are the research sub-agent for repo ${repo}. A full shallow clone is mounted at '${sourceDir ? "./source" : "(unavailable)"}'${sourceDir ? "" : " (digest-only mode)"} — use read/grep/glob on real code before concluding. Decide what would MOST improve this project right now (correctness, security, DX, performance, docs, CI). You may use webfetch to consult authoritative sources.`,
     "Return ONLY strict JSON: {\"ideas\":[{\"title\":\"...\",\"rationale\":\"...\",\"evidence\":\"what you saw\",\"impact\":\"high|medium|low\"}]} max 5 ideas.",
     "Context:",
     lines.join("\n").slice(0, 14000),
@@ -79,26 +119,31 @@ async function modeResearch(audit) {
       return 0;
     }
   }
-  let workdir;
-  try {
-    workdir = `/tmp/improve-${String(repo).replace("/", "__")}`;
-    gh(["repo", "clone", repo0(repo), workdir, "--", "--depth", "1"], process.env);
-  } catch {
-    workdir = undefined;
+  const meta = gh(["api", `/repos/${repo}`], process.env);
+  const target = validateImproveTarget({ repo, meta, stateRoot: REPO_ROOT });
+  if (!target.ok) {
+    audit.note("research", `${repo}: target rejected (${target.errors.join("; ")})`);
+    throw Object.assign(new Error("IMPROVE_TARGET_REJECTED"), { code: 4, reason: target.errors.join("; ") });
   }
-  const result = await askModelResilient({
-    prompt: buildResearchPrompt(repo),
-    timeoutMs: 480000,
-    env: process.env,
-    preferVariantMax: true,
-    maxRounds: 4,
-    workspace: workdir,
-  });
-  audit.note("research", `repo=${repo} complete=${result.complete} ladders=${result.ladders}`);
-  if (workdir) {
-    try {
-      fsRemove(workdir);
-    } catch {}
+  let prepared;
+  try {
+    prepared = createPublicImproveWorkspace(repo, meta);
+  } catch {
+    prepared = undefined;
+  }
+  let result;
+  try {
+    result = await askModelResilient({
+      prompt: buildResearchPrompt(repo, prepared && prepared.sourceDir),
+      timeoutMs: 480000,
+      env: process.env,
+      preferVariantMax: true,
+      maxRounds: 4,
+      ...(prepared ? { workspace: prepared.workspace, profile: "public-read", publicTarget: meta } : {}),
+    });
+    audit.note("research", `repo=${repo} complete=${result.complete} ladders=${result.ladders}`);
+  } finally {
+    if (prepared) disposeModelWorkspace(prepared.workspace);
   }
   if (!result.complete || !result.reply) {
     const { gatewayDown } = await import("./lib/gateway-health.mjs");
@@ -119,12 +164,29 @@ async function modeResearch(audit) {
 function repo0(name) {
   return name;
 }
-function fsRemove(target) {
-  fsMod.rmSync(target, { recursive: true, force: true });
-}
-
 export function extractJson(replyText) {
   return extractJsonObject(replyText);
+}
+
+function sanitizeReviewText(value, maxChars) {
+  return redactText(String(value ?? ""))
+    .replace(/https?:\/\/[^\s]+/gi, "[LINK]")
+    .replace(/(^|\s)@[A-Za-z0-9_.-]+/g, "$1[MENTION]")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "")
+    .replace(/[\r\n]+/g, " ")
+    .slice(0, maxChars);
+}
+
+/** Bound and redact review findings before the workflow uploads their JSON. */
+export function sanitizeReviewPayload(payload = {}) {
+  return {
+    verdict: sanitizeReviewText(payload.verdict || "fix", 16),
+    findings: (Array.isArray(payload.findings) ? payload.findings : []).slice(0, 8).map((finding) => ({
+      severity: sanitizeReviewText(finding?.severity || "low", 16),
+      title: sanitizeReviewText(finding?.title || "", 160),
+      detail: sanitizeReviewText(finding?.detail || "", 400),
+    })),
+  };
 }
 
 export function pickBestIdea(replyText) {
@@ -227,17 +289,22 @@ async function modePlan(audit) {
       audit.note("plan", `${data.repo}: ideas unparsable (${err.message})`);
       continue;
     }
-    let workdir;
+    const meta = gh(["api", `/repos/${data.repo}`], process.env);
+    const target = validateImproveTarget({ repo: data.repo, meta, stateRoot: REPO_ROOT });
+    if (!target.ok) {
+      audit.note("plan", `${data.repo}: target rejected (${target.errors.join("; ")})`);
+      continue;
+    }
+    let prepared;
     try {
-      workdir = `/tmp/improve-plan-${String(data.repo).replace("/", "__")}`;
-      gh(["repo", "clone", repo0(data.repo), workdir, "--", "--depth", "1"], process.env);
+      prepared = createPublicImproveWorkspace(data.repo, meta);
     } catch {
-      workdir = undefined;
+      prepared = undefined;
     }
     const planPrompt = [
       `You are the planning sub-agent for repo ${data.repo}. Turn this improvement idea into a concrete minimal implementation plan.`,
       `Idea: ${idea.title}. Rationale: ${idea.rationale}. Evidence: ${idea.evidence}.`,
-      workdir ? `A shallow clone of the repository is mounted at your working directory ('.') — inspect real code with read/grep/glob before planning.` : "",
+      prepared ? "A shallow clone of the explicitly public repository is mounted at './source' — inspect real code with read/grep/glob before planning." : "",
       "You may fetch authoritative docs via webfetch if needed.",
       "Respond in EXACTLY this plain-text format (no markdown headers, no extra prose):",
       "PLAN",
@@ -251,13 +318,20 @@ async function modePlan(audit) {
       "```",
       "Constraints: at most 6 files; each file under 15000 chars; no .env*, *.pem, *.key, state/, audit/ paths; no '..' in paths.",
     ].join("\n");
-    const plan = await askModel({ prompt: planPrompt, timeoutMs: 480000, env: process.env, preferVariantMax: true, maxRounds: 4, workspace: workdir });
-    audit.note("plan", `repo=${data.repo} complete=${plan.complete} attempts=${JSON.stringify(plan.attempts)}`);
-    if (workdir) {
-      try {
-        (await import("node:fs")).rmSync(workdir, { recursive: true, force: true });
-      } catch {}
+    let plan;
+    try {
+      plan = await askModel({
+        prompt: planPrompt,
+        timeoutMs: 480000,
+        env: process.env,
+        preferVariantMax: true,
+        maxRounds: 4,
+        ...(prepared ? { workspace: prepared.workspace, profile: "public-read", publicTarget: meta } : {}),
+      });
+    } finally {
+      if (prepared) disposeModelWorkspace(prepared.workspace);
     }
+    audit.note("plan", `repo=${data.repo} complete=${plan.complete} attempts=${JSON.stringify(plan.attempts)}`);
     if (plan.circuitOpen) {
       audit.note("plan", "gateway circuit open; skipping plan wave");
       continue;
@@ -313,6 +387,11 @@ async function modeImplement(audit) {
   }
   const { plan } = JSON.parse(readFileSync(planFile, "utf8"));
   const meta = gh(["api", `/repos/${repo}`], process.env);
+  const target = validateImproveTarget({ repo, meta, stateRoot: REPO_ROOT });
+  if (!target.ok) {
+    audit.note("implement", `${repo}: target rejected (${target.errors.join("; ")})`);
+    throw Object.assign(new Error("IMPROVE_TARGET_REJECTED"), { code: 4, reason: target.errors.join("; ") });
+  }
   const base = meta.default_branch;
   const hash = sha256(JSON.stringify([plan.title, plan.files.map((f) => f.path)])).slice(0, 8);
   const branch = `fleet/improve-${hash}`;
@@ -356,6 +435,11 @@ async function modeReview(audit) {
   const prmetas = existsSync(dir) ? readdirSync(dir).filter((f) => f.startsWith("prmeta-") && f.endsWith(".json")).map((f) => JSON.parse(readFileSync(path.join(dir, f), "utf8"))) : [];
   mkdirSync(path.join(dir, "..", "reviews"), { recursive: true });
   for (const meta of prmetas) {
+    const target = validateImproveTarget({ repo: meta.repo, meta: gh(["api", `/repos/${meta.repo}`], process.env), stateRoot: REPO_ROOT });
+    if (!target.ok) {
+      audit.note("review", `${meta.repo}: target rejected (${target.errors.join("; ")})`);
+      continue;
+    }
     const filesRaw = gh(["api", `/repos/${meta.repo}/pulls/${meta.prNumber}/files?per_page=20`], process.env) || [];
     const diff = filesRaw.map((f) => `--- ${f.filename}\n${String(f.patch || "(binary or large)").slice(0, 6000)}`).join("\n\n").slice(0, 30000);
     const prompt = [
@@ -374,7 +458,8 @@ async function modeReview(audit) {
         payload = { verdict: parsed.verdict === "approve" ? "approve" : "fix", findings: Array.isArray(parsed.findings) ? parsed.findings.slice(0, 8) : [] };
       } catch {}
     }
-    writeFileSync(path.join(dir, "..", "reviews", `review-${meta.repo.replace("/", "__")}__${lens}.json`), JSON.stringify({ repo: meta.repo, prNumber: meta.prNumber, lens, ...payload }, null, 2));
+    const safePayload = sanitizeReviewPayload(payload);
+    writeFileSync(path.join(dir, "..", "reviews", `review-${meta.repo.replace("/", "__")}__${lens}.json`), JSON.stringify({ repo: meta.repo, prNumber: meta.prNumber, lens, ...safePayload }, null, 2));
   }
   console.log(`IMPROVE_DONE=review:${lens}:${prmetas.length}`);
   return 0;
@@ -392,18 +477,22 @@ async function modeFinalize(audit) {
   const reviews = existsSync(revDir) ? readdirSync(revDir).filter((f) => f.endsWith(".json")).map((f) => JSON.parse(readFileSync(path.join(revDir, f), "utf8"))) : [];
   const state = readJson(STATE_PATH, { runs: [] });
   const byRepo = {};
-  for (const m of metas) byRepo[m.repo] = { ...m, verdicts: {}, commentsPosted: [] };
+  for (const m of metas) byRepo[m.repo] = { ...m, verdicts: {}, reviewFindings: {} };
   for (const r of reviews) {
     const entry = byRepo[r.repo];
     if (!entry) continue;
-    entry.verdicts[r.lens] = r.verdict;
-    const lines = [`### ${r.lens} review: **${r.verdict}**`];
-    for (const f of r.findings || []) lines.push(`- [${f.severity}] ${f.title} — ${f.detail}`);
-    const created = gh(["api", "-X", "POST", `/repos/${r.repo}/issues/${r.prNumber}/comments`, "-f", `body=${lines.join("\n")}`], process.env);
-    await verifyCommentAuthor(r.repo, created.id, identity, process.env.FLEET_GH_TOKEN);
-    entry.commentsPosted.push(created.id);
+    const safePayload = sanitizeReviewPayload(r);
+    entry.verdicts[r.lens] = safePayload.verdict;
+    entry.reviewFindings[r.lens] = safePayload.findings;
   }
-  const runRecord = { utc: new Date().toISOString(), repos: Object.fromEntries(Object.entries(byRepo).map(([k, v]) => [k, { pr: v.prUrl, verdicts: v.verdicts }])) };
+  const runRecord = {
+    utc: new Date().toISOString(),
+    repos: Object.fromEntries(Object.entries(byRepo).map(([k, v]) => [k, {
+      pr: v.prUrl,
+      verdicts: v.verdicts,
+      reviewFindings: v.reviewFindings,
+    }])),
+  };
   state.runs.unshift(runRecord);
   state.runs = state.runs.slice(0, 30);
   writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));

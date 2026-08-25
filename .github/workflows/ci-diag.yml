@@ -49,6 +49,7 @@ jobs:
         continue-on-error: true
         env:
           OPENCODE_AUTH_CONTENT: ${{ secrets.FLEET_OPENCODE_AUTH }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
         run: |
           timeout 90 opencode run --format json -m opencode/x-preview-f-free "Reply DIAG3" > o3.txt 2> e3.txt; echo "exit=$?"

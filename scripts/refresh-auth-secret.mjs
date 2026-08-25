@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+// Migration-only utility: refreshes the legacy OAuth snapshot secret
+// (FLEET_OPENCODE_AUTH) or FLEET_GH_TOKEN. Production model auth uses the
+// durable OPENCODE_API_KEY GitHub Environment secret instead.
 import process from "node:process";
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -6,9 +9,10 @@ import { spawnSync } from "node:child_process";
 const usage = "usage: node scripts/refresh-auth-secret.mjs [--token] <file>\n  default file is auth.json -> secret FLEET_OPENCODE_AUTH\n  --token file -> secret FLEET_GH_TOKEN";
 
 const REPOS = ["M1Vj/fleet-runtime", "M1Vj/fleet-control"];
+const GH_BIN = process.env.FLEET_GH_BIN || "gh";
 function setSecret(name, value) {
   for (const repo of REPOS) {
-    const res = spawnSync("gh", ["secret", "set", name, "-R", repo], {
+    const res = spawnSync(GH_BIN, ["secret", "set", name, "-R", repo], {
       input: value,
       encoding: "utf8",
       stdio: ["pipe", "inherit", "inherit"],
@@ -16,15 +20,6 @@ function setSecret(name, value) {
     if (res.status !== 0) process.exit(res.status || 1);
     process.stdout.write(`secret ${name} updated on ${repo}\n`);
   }
-}
-function setSecretLegacy(name, value) {
-  const res = spawnSync("gh", ["secret", "set", name, "-R", repo], {
-    input: value,
-    encoding: "utf8",
-    stdio: ["pipe", "inherit", "inherit"],
-  });
-  if (res.status !== 0) process.exit(res.status || 1);
-  process.stdout.write(`secret ${name} updated (value never displayed)\n`);
 }
 
 const args = process.argv.slice(2);

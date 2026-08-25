@@ -69,6 +69,7 @@ jobs:
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
       FLEET_REPO: ${{ matrix.repo }}
     steps:
       - name: checkout fleet repo
@@ -116,6 +117,7 @@ jobs:
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
     steps:
       - name: checkout fleet repo
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -231,6 +233,7 @@ jobs:
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
       FLEET_LENS: ${{ matrix.lens }}
     steps:
       - name: checkout fleet repo

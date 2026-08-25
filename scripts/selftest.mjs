@@ -113,14 +113,19 @@ export async function main() {
     }
 
     const now2 = Date.now();
-    const stalePlan = planWatchdogActions({ lastRunUtc: new Date(now2 - 4 * 3600 * 1000).toISOString() }, now2);
+    const staleHeartbeat = { lastRunUtc: new Date(now2 - 4 * 3600 * 1000).toISOString() };
+    const stalePlan = planWatchdogActions(staleHeartbeat, now2);
+    const falsePlan = planWatchdogActions(staleHeartbeat, now2, undefined, { autoEnable: false });
+    const optedInPlan = planWatchdogActions(staleHeartbeat, now2, undefined, { autoEnable: true });
     const freshPlan = planWatchdogActions({ lastRunUtc: new Date(now2 - 5 * 60000).toISOString() }, now2);
     const enables = stalePlan.actions.filter((a) => a.kind === "enable-workflow").length;
+    const falseEnables = falsePlan.actions.filter((a) => a.kind === "enable-workflow").length;
+    const optedInEnables = optedInPlan.actions.filter((a) => a.kind === "enable-workflow").length;
     const alerts = stalePlan.actions.filter((a) => a.kind === "file-alert-issue").length;
-    if (stalePlan.stale && enables >= 6 && alerts === 1 && !freshPlan.stale && freshPlan.actions.length === 0) {
-      audit.note("T9", `PASS watchdog canary: stale plans ${enables} re-enables + alert; fresh plans nothing`);
+    if (stalePlan.stale && enables === 0 && falseEnables === 0 && optedInEnables >= 6 && alerts === 1 && !freshPlan.stale && freshPlan.actions.length === 0) {
+      audit.note("T9", `PASS watchdog canary: default/false plans suppress re-enables; explicit opt-in plans ${optedInEnables}; fresh plans nothing`);
     } else {
-      audit.incident("T9", `watchdog canary wrong: ${JSON.stringify({ enables, alerts, freshStale: freshPlan.stale })}`);
+      audit.incident("T9", `watchdog canary wrong: ${JSON.stringify({ enables, falseEnables, optedInEnables, alerts, freshStale: freshPlan.stale })}`);
       failed = true;
     }
 

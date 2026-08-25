@@ -6,7 +6,7 @@ import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
 import { verifyCommit, verifyIssueAuthor } from "./lib/verify.mjs";
-import { planWatchdogActions } from "./lib/watchdog-decide.mjs";
+import { findWatchdogAlertIssue, planWatchdogActions, watchdogAutoEnableEnabled, WATCHDOG_WORKFLOWS } from "./lib/watchdog-decide.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
@@ -27,9 +27,10 @@ export async function main() {
 
     if (process.env.FLEET_WATCHDOG_DRY_RUN === "1") {
       const synthetic = { lastRunUtc: new Date(Date.now() - 4 * 3600 * 1000).toISOString() };
-      const plan = planWatchdogActions(synthetic, Date.now());
+      const autoEnable = watchdogAutoEnableEnabled(process.env.FLEET_WATCHDOG_AUTO_ENABLE);
+      const plan = planWatchdogActions(synthetic, Date.now(), undefined, { autoEnable });
       const enables = plan.actions.filter((a) => a.kind === "enable-workflow").length;
-      audit.note("dry-run", `stale=${plan.stale} enables=${enables} alert=${plan.alertIssue}`);
+      audit.note("dry-run", `stale=${plan.stale} autoEnable=${plan.autoEnable} enables=${enables} alert=${plan.alertIssue}`);
       for (const a of plan.actions) console.log(`WOULD ${a.kind} ${a.workflow || ""}`.trim());
       audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Watchdog dry-run", "ok");
       console.log(`WATCHDOG_DRY_RUN_OK stale=${plan.stale} enables=${enables}`);
@@ -44,7 +45,8 @@ export async function main() {
         heartbeat = null;
       }
     }
-    const plan = planWatchdogActions(heartbeat, Date.now());
+    const autoEnable = watchdogAutoEnableEnabled(process.env.FLEET_WATCHDOG_AUTO_ENABLE);
+    const plan = planWatchdogActions(heartbeat, Date.now(), undefined, { autoEnable });
     audit.note("heartbeat", `decision=${plan.reason} ageMinutes=${plan.ageMinutes}`);
 
     if (!plan.stale) {
@@ -54,17 +56,21 @@ export async function main() {
     }
 
     const enablePlan = {
-      "M1Vj/fleet-runtime": ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml"],
+      // Runtime recovery derives from the shared lib allowlist; fleet-control's
+      // four-lane entry stays explicit.
+      "M1Vj/fleet-runtime": [...WATCHDOG_WORKFLOWS],
       "M1Vj/fleet-control": ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml"],
     };
-    for (const [repoFullName, workflows] of Object.entries(enablePlan)) {
-      for (const wf of workflows) {
-        try {
-          gh(["api", "-X", "PUT", `/repos/${repoFullName}/actions/workflows/${wf}/enable`], process.env);
-          audit.note("re-enable", `${repoFullName}/${wf}`);
-        } catch (err) {
-          if (!/404|not found/i.test(String(err.message))) throw err;
-          audit.note("re-enable-skip", `${repoFullName}/${wf} absent`);
+    if (plan.autoEnable) {
+      for (const [repoFullName, workflows] of Object.entries(enablePlan)) {
+        for (const wf of workflows) {
+          try {
+            gh(["api", "-X", "PUT", `/repos/${repoFullName}/actions/workflows/${wf}/enable`], process.env);
+            audit.note("re-enable", `${repoFullName}/${wf}`);
+          } catch (err) {
+            if (!/404|not found/i.test(String(err.message))) throw err;
+            audit.note("re-enable-skip", `${repoFullName}/${wf} absent`);
+          }
         }
       }
     }
@@ -94,18 +100,26 @@ export async function main() {
     const runsList = (recentRuns.workflow_runs || [])
       .map((r) => `- ${r.name} ${r.status}/${r.conclusion} ${r.html_url}`)
       .join("\n");
-    const issue = gh(
+    const existingIssue = findWatchdogAlertIssue((page) => gh(
+      ["api", `/repos/M1Vj/fleet-control/issues?state=open&per_page=100&page=${page}`],
+      process.env,
+    ));
+    const recoveryStatus = plan.autoEnable
+      ? "Re-enable was attempted."
+      : "Auto-enable opt-in is disabled; workflows remain in their current maintenance state.";
+    const issue = existingIssue || gh(
       [
         "api", "-X", "POST", "/repos/M1Vj/fleet-control/issues",
         "-f", `title=${plan.actions.find((a) => a.kind === "file-alert-issue").title}`,
-        "-f", `body=Patrol heartbeat is stale (${plan.ageMinutes} minutes).\nRe-enable was attempted. Recent runs:\n${runsList}\n\nCheck model auth secret freshness and Actions quota.`,
+        "-f", `body=Patrol heartbeat is stale (${plan.ageMinutes} minutes).\n${recoveryStatus}\nRecent runs:\n${runsList}\n\nCheck model auth secret freshness and Actions quota.`,
       ],
       process.env,
     );
     await verifyIssueAuthor("M1Vj/fleet-control", issue.number, identity, process.env.FLEET_GH_TOKEN);
-    audit.note("alert-issue", `#${issue.number}`);
+    audit.note(existingIssue ? "alert-issue-reuse" : "alert-issue", `#${issue.number}`);
 
-    audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Watchdog", "ok-stale-recovered");
+    const terminalStatus = plan.autoEnable ? "ok-stale-recovered" : (existingIssue ? "ok-stale-observed" : "ok-stale-alerted");
+    audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Watchdog", terminalStatus);
     if (gitHasChanges(REPO_ROOT, ["state", "audit"])) {
       gitAdd(REPO_ROOT, ["state", "audit"]);
       gitCommit(REPO_ROOT, `[fleet] watchdog ${runId}`, identity);
@@ -114,7 +128,8 @@ export async function main() {
       await verifyCommit("M1Vj/fleet-control", sha, identity, process.env.FLEET_GH_TOKEN);
       audit.note("push-verify", `attribution verified sha=${sha.slice(0, 10)}`);
     }
-    console.log("FLEET_RUN_RESULT=" + JSON.stringify({ runId, status: "stale-recovered", issue: issue.number }));
+    const status = plan.autoEnable ? "stale-recovered" : (existingIssue ? "stale-observed" : "stale-alerted");
+    console.log("FLEET_RUN_RESULT=" + JSON.stringify({ runId, status, issue: issue.number }));
     return 0;
   } catch (err) {
     const code = err.code && Number.isInteger(err.code) ? err.code : 1;

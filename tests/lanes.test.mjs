@@ -109,8 +109,16 @@ test("planWatchdogActions: explicit opt-in enables the bounded workflow set", as
   const now = Date.now();
   const p = planWatchdogActions({ lastRunUtc: new Date(now - 5 * 3600000).toISOString() }, now, undefined, { autoEnable: true });
   assert.equal(p.stale, true);
-  assert.equal(p.actions.filter((a) => a.kind === "enable-workflow").length, 7);
+  assert.equal(p.actions.filter((a) => a.kind === "enable-workflow").length, 8);
   assert.equal(p.actions.filter((a) => a.kind === "file-alert-issue").length, 1);
+});
+
+test("watchdog recovery allowlist includes the merge gate", async () => {
+  const { planWatchdogActions } = await import("../scripts/lib/watchdog-decide.mjs");
+  const now = Date.now();
+  const p = planWatchdogActions({ lastRunUtc: new Date(now - 5 * 3600000).toISOString() }, now, undefined, { autoEnable: true });
+  const workflows = p.actions.filter((a) => a.kind === "enable-workflow").map((a) => a.workflow);
+  assert.ok(workflows.includes("merge.yml"), "merge gate must be restorable");
 });
 
 test("watchdog auto-enable opt-in accepts only the exact true value", async () => {
@@ -168,6 +176,10 @@ test("watchdog workflow exposes an unset-safe explicit opt-in", () => {
   assert.match(watchdogSource, /watchdogAutoEnableEnabled\(process\.env\.FLEET_WATCHDOG_AUTO_ENABLE\)/);
   assert.match(watchdogSource, /if \(plan\.autoEnable\)/);
   assert.match(watchdogSource, /findWatchdogAlertIssue\(\(page\) =>/);
+});
+
+test("the runtime enable plan can restore the merge gate workflow", () => {
+  assert.match(watchdogSource, /"M1Vj\/fleet-runtime":\s*\[[^\]]*"merge\.yml"/);
 });
 
 test("shouldCoalesce only for schedule trigger", async () => {

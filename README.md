@@ -84,7 +84,7 @@ Core lane terminal states written to `state/events.jsonl` are `SUCCESS`, `NO-OP`
 
 - `fleet-merge-gate` now reads `FLEET_KILL_SWITCH_PATH`; several other production lanes still do not. API-level workflow disabling remains the complete operational stop.
 - `fleet-emergency-stop` does not disable `fleet-merge-gate` or `ci-diag`; for a complete halt, disable them explicitly through the Actions API.
-- Watchdog stale recovery keeps workflow enablement off unless the trusted job receives the exact `FLEET_WATCHDOG_AUTO_ENABLE=true` opt-in. It reuses an open `[WATCHDOG] patrol stale...` issue instead of creating one on every run.
+- Watchdog stale recovery keeps workflow enablement off unless the trusted job receives the exact `FLEET_WATCHDOG_AUTO_ENABLE=true` opt-in. It reuses an open `[WATCHDOG] patrol stale...` issue instead of creating one on every run. The allowlist now includes `merge.yml`, so an opted-in watchdog can restore the merge gate. A watchdog cannot recover itself when it is the disabled or stale component; the paired fleet-control sentinel is the recovery path for that case, and if both sentinels stop, only an operator can restore them.
 - An unresolved `DISPATCH_UNKNOWN` intentionally suppresses blind retry until a correlated target run consumes it or an operator reconciles GitHub Actions and private state.
 - `queue: max` is supported by GitHub Actions (May 2026); actionlint 1.7.12 predates that schema addition and needs its single `concurrency.queue` diagnostic ignored until a supporting release ships.
 - Single free gateway model: 429-driven silent hangs are mitigated by hard timeouts, retry ladders, and the circuit breaker, not eliminated; VLM color naming on synthetic images is unreliable.

@@ -66,6 +66,14 @@ disables unchanged. The run result reports `stale-alerted` for a new issue and
 repository variable after canary proof; watchdog recovery then runs without a local operator
 session.
 
+The recovery allowlist covers `patrol.yml`, `selftest.yml`, `deep.yml`, `improve.yml`,
+`thesis.yml`, `kb.yml`, `retro.yml`, and `merge.yml` in fleet-runtime (plus the four
+fleet-control lanes). This watchdog cannot recover itself: if `fleet-watchdog` is the
+disabled or stale component, only the paired sentinel in private `M1Vj/fleet-control` can
+restore it, under that repository's own explicit opt-in variable and with the kill switch
+still absent. If both sentinels stop at once, recovery waits for an operator when service
+returns; GitHub cannot recover GitHub itself.
+
 ## 3. Emergency stop and re-arm
 
 Stop (requires exact confirmation string):

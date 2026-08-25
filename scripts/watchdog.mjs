@@ -56,7 +56,7 @@ export async function main() {
     }
 
     const enablePlan = {
-      "M1Vj/fleet-runtime": ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml"],
+      "M1Vj/fleet-runtime": ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml", "merge.yml"],
       "M1Vj/fleet-control": ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml"],
     };
     if (plan.autoEnable) {

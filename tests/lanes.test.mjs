@@ -177,6 +177,35 @@ test("shouldCoalesce only for schedule trigger", async () => {
   assert.equal(shouldCoalesce("schedule", new Date(now - 60000).toISOString(), now).coalesce, true);
 });
 
+test("malformed heartbeats collapse to one canonical unknown alert identity", async () => {
+  const { canonicalHeartbeatStamp, planWatchdogActions, selectWatchdogAlertIssue } = await import("../scripts/lib/watchdog-decide.mjs");
+  const now = Date.now();
+  const valid = new Date(now - 3600000).toISOString();
+  assert.equal(canonicalHeartbeatStamp(valid), valid);
+
+  for (const heartbeat of [null, {}, { lastRunUtc: "" }, { lastRunUtc: "not-a-timestamp" }, { lastRunUtc: "2026-13-45T99:00:00Z" }, { lastRunUtc: 12345 }, { lastRunUtc: "2026-08-25T00:00:00+02:00" }]) {
+    const plan = planWatchdogActions(heartbeat, now);
+    assert.equal(plan.stale, true, JSON.stringify(heartbeat));
+    const alert = plan.actions.find((a) => a.kind === "file-alert-issue");
+    assert.equal(alert.title, "[WATCHDOG] patrol stale since unknown");
+    assert.equal(selectWatchdogAlertIssue([{ number: 5, state: "open", title: alert.title }])?.number, 5);
+  }
+
+  const first = planWatchdogActions({ lastRunUtc: "garbage-one" }, now);
+  const second = planWatchdogActions({ lastRunUtc: "garbage-two" }, now + 60000);
+  const firstAlert = first.actions.find((a) => a.kind === "file-alert-issue");
+  const secondAlert = second.actions.find((a) => a.kind === "file-alert-issue");
+  assert.equal(firstAlert.title, secondAlert.title);
+  const existing = { number: 3, state: "open", title: firstAlert.title };
+  const found = selectWatchdogAlertIssue([
+    { number: 1, state: "closed", title: firstAlert.title },
+    { number: 2, state: "open", title: `${firstAlert.title} discussion` },
+    { number: 4, state: "open", title: firstAlert.title, pull_request: {} },
+    existing,
+  ]);
+  assert.equal(found, existing);
+});
+
 test("resolveModelChain parsing", async () => {
   const { resolveModelChain } = await import("../scripts/lib/model.mjs");
   assert.deepEqual(resolveModelChain({}), ["opencode/x-preview-f-free"]);

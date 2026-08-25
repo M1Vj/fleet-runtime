@@ -8,7 +8,16 @@ export function decideStale(lastRunUtc, nowMs = Date.now(), thresholdMs = 90 * 6
 
 const WATCHDOG_WORKFLOWS = ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml"];
 const WATCHDOG_ALERT_TITLE = /^\[WATCHDOG\] patrol stale since (?:unknown|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z)$/;
+const CANONICAL_STAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 export const MAX_WATCHDOG_ALERT_PAGES = 10;
+
+/** Malformed heartbeat timestamps collapse to one canonical alert identity. */
+export function canonicalHeartbeatStamp(value) {
+  if (typeof value !== "string") return "unknown";
+  const text = value.trim();
+  if (!CANONICAL_STAMP_RE.test(text) || Number.isNaN(Date.parse(text))) return "unknown";
+  return text;
+}
 
 /** Enable workflow recovery only when the trusted job supplies the exact opt-in value. */
 export function watchdogAutoEnableEnabled(value) {
@@ -53,7 +62,7 @@ export function planWatchdogActions(heartbeat, nowMs = Date.now(), thresholdMs =
   return {
     ...decision,
     autoEnable: autoEnable === true,
-    actions: [...actions, { kind: "file-alert-issue", title: `[WATCHDOG] patrol stale since ${heartbeat && heartbeat.lastRunUtc ? heartbeat.lastRunUtc : "unknown"}` }],
+    actions: [...actions, { kind: "file-alert-issue", title: `[WATCHDOG] patrol stale since ${canonicalHeartbeatStamp(heartbeat && heartbeat.lastRunUtc)}` }],
     alertIssue: true,
   };
 }

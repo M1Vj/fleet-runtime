@@ -25,7 +25,7 @@ test("GNU-format tar listings expose escape members to validation and pass norma
   assert.ok(members.some((member) => member.name === "/abs/escape.sh"), "absolute member must be surfaced");
   assert.equal(members.at(-1).name, "", "unparseable lines must fail closed");
   const linkMember = members.find((member) => member.type === "symlink");
-  assert.equal(linkMember.name, "/etc/passwd", "link lines parse their trailing target field");
+  assert.equal(linkMember.name, "", "link lines fail closed on their -> target shape");
   assert.equal(validateArchiveMembers([linkMember]).ok, false);
   assert.equal(validateArchiveMembers(members).ok, false);
   assert.equal(validateArchiveMembers(members.slice(0, 2)).ok, true);

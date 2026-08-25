@@ -187,6 +187,44 @@ test("model attachments never copy repository or private-state files", async () 
   }
 });
 
+test("provider-key mode keeps variant and session flags while credential-less runs drop them", async () => {
+  const captured = [];
+  const spawnImpl = (_command, args) => {
+    captured.push([...args]);
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => {};
+    queueMicrotask(() => {
+      child.stdout.emit("data", Buffer.from('{"text":"ok"}\n'));
+      child.emit("close", 0);
+    });
+    return child;
+  };
+  await runOnce({
+    prompt: "judge",
+    sessionId: "sess-42",
+    variant: "max",
+    timeoutMs: 1000,
+    env: { OPENCODE_API_KEY: "pk-fixture" },
+    spawnImpl,
+  });
+  assert.deepEqual(captured[0].slice(captured[0].indexOf("--variant"), captured[0].indexOf("--variant") + 2), ["--variant", "max"]);
+  assert.deepEqual(captured[0].slice(captured[0].indexOf("-s"), captured[0].indexOf("-s") + 2), ["-s", "sess-42"]);
+  await runOnce({
+    prompt: "judge",
+    sessionId: "sess-42",
+    variant: "max",
+    timeoutMs: 1000,
+    env: {},
+    spawnImpl,
+  });
+  assert.equal(captured[1].includes("--variant"), false);
+  assert.equal(captured[1].includes("max"), false);
+  assert.equal(captured[1].includes("-s"), false);
+  assert.equal(captured[1].includes("sess-42"), false);
+});
+
 test("selected primary, fallback, and explicit override models reach OpenCode and telemetry", async () => {
   const repo = mkdtempSync(path.join(tmpdir(), "fleet-model-chain-repo-"));
   const state = mkdtempSync(path.join(tmpdir(), "fleet-model-chain-state-"));

@@ -169,7 +169,7 @@ export function resolveModelChain(env = process.env) {
 
 export function runOnce({ prompt, sessionId, variant, timeoutMs, env, files = [], model = "opencode/x-preview-f-free", modelOverride, workspace, repoRoot = process.cwd(), stateRoot = env.FLEET_STATE_ROOT || "", spawnImpl = spawn }) {
   return new Promise((resolve) => {
-    const missing = !env.FLEET_OPENCODE_AUTH;
+    const missing = !resolveProviderAuth(env).ok;
     const args = ["run", "--format", "json", "-m", modelOverride || model];
     if (env.FLEET_OPENCODE_DEBUG === "1") args.push("--print-logs", "--log-level", "DEBUG");
     if (!missing && variant) args.push("--variant", variant);

@@ -166,10 +166,10 @@ export function resolveModelChain(env = process.env) {
   return chain.length > 0 ? chain : [primary];
 }
 
-export function runOnce({ prompt, sessionId, variant, timeoutMs, env, files = [], modelOverride, workspace, repoRoot = process.cwd(), stateRoot = env.FLEET_STATE_ROOT || "", spawnImpl = spawn }) {
+export function runOnce({ prompt, sessionId, variant, timeoutMs, env, files = [], model = "opencode/x-preview-f-free", modelOverride, workspace, repoRoot = process.cwd(), stateRoot = env.FLEET_STATE_ROOT || "", spawnImpl = spawn }) {
   return new Promise((resolve) => {
     const missing = !env.FLEET_OPENCODE_AUTH;
-    const args = ["run", "--format", "json", "-m", "opencode/x-preview-f-free"];
+    const args = ["run", "--format", "json", "-m", modelOverride || model];
     if (env.FLEET_OPENCODE_DEBUG === "1") args.push("--print-logs", "--log-level", "DEBUG");
     if (!missing && variant) args.push("--variant", variant);
     if (!missing && sessionId) args.push("-s", sessionId);
@@ -328,7 +328,7 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
       await sleep(backoff);
     }
     const roundEnv = useAuth ? env : stripAuth(env);
-    const r = await runOnce({ prompt: promptNow, sessionId: sid || undefined, variant: mode === "max" ? "max" : undefined, timeoutMs, env: roundEnv, files, workspace, repoRoot, stateRoot, spawnImpl });
+    const r = await runOnce({ prompt: promptNow, sessionId: sid || undefined, variant: mode === "max" ? "max" : undefined, timeoutMs, env: roundEnv, files, model, workspace, repoRoot, stateRoot: privateStateRoot, spawnImpl });
     attempts.push({
       round,
       model,

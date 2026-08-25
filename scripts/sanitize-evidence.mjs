@@ -4,19 +4,20 @@ import { lstatSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { redactText } from "./lib/pr-memory.mjs";
-import { writeEvidenceSafe } from "./pr-check.mjs";
+import { encodeEvidenceEnvelope, writeEvidenceSafe } from "./pr-check.mjs";
 
 export function sanitizeEvidenceArtifact(inputPath, outputPath, maxChars = 8000) {
   const input = path.resolve(String(inputPath || ""));
   const limit = Math.max(1, Math.min(8000, Number(maxChars) || 8000));
   let text = "target-check evidence unavailable\n";
+  let available = false;
   try {
     const stat = lstatSync(input);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > limit * 4) throw new Error("unsafe evidence artifact");
     text = readFileSync(input, "utf8");
+    available = !/^(?:target-check\s+)?evidence\s+unavailable\s*$/i.test(text.trim());
   } catch {}
-  const safe = redactText(text).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "").slice(-limit);
+  const safe = encodeEvidenceEnvelope(text, { available, maxChars: limit });
   writeEvidenceSafe(outputPath, safe);
   return safe;
 }

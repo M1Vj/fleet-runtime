@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import { redactText } from "./lib/pr-memory.mjs";
 
 export const MAX_EVIDENCE_CHARS = 8000;
+export const EVIDENCE_ENVELOPE_VERSION = "FLEET_EVIDENCE_V1";
 const SAFE_ENV_KEYS = ["CI", "HOME", "LANG", "LC_ALL", "NODE_ENV", "PATH", "TMPDIR"];
 
 export function buildTargetEnv(source = process.env) {
@@ -39,6 +40,29 @@ export function buildTargetEnv(source = process.env) {
 
 export function sanitizeEvidence(value) {
   return redactText(String(value || ""));
+}
+
+function unavailableEvidenceText(value) {
+  return /^(?:target-check\s+)?evidence\s+unavailable\s*$/i.test(String(value || "").trim());
+}
+
+/** Mark whether the sanitizer received a trusted raw artifact before upload. */
+export function encodeEvidenceEnvelope(value, { available = false, maxChars = MAX_EVIDENCE_CHARS } = {}) {
+  const limit = Math.max(1, Math.min(MAX_EVIDENCE_CHARS, Number(maxChars) || MAX_EVIDENCE_CHARS));
+  const text = sanitizeEvidence(String(value || ""))
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "")
+    .slice(-limit);
+  const trusted = available === true && !unavailableEvidenceText(text);
+  return `${EVIDENCE_ENVELOPE_VERSION}\navailable=${trusted ? "true" : "false"}\n\n${text}`;
+}
+
+/** Fail closed when a canonical artifact lacks a trusted availability marker. */
+export function decodeEvidenceEnvelope(value) {
+  const match = String(value || "").match(new RegExp(`^${EVIDENCE_ENVELOPE_VERSION}\\navailable=(true|false)\\n\\n([\\s\\S]*)$`));
+  if (!match) return { available: false, text: "", reason: "missing-marker" };
+  const text = match[2];
+  const available = match[1] === "true" && !unavailableEvidenceText(text);
+  return { available, text: available ? text : "", reason: available ? "ok" : "unavailable" };
 }
 
 function evidenceParent(output) {

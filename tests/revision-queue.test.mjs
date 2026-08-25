@@ -51,6 +51,15 @@ test("revision output allows changed files and at most two safe supporting files
   assert.deepEqual(result.supportingPaths, ["support/one.md", "support/two.md"]);
 });
 
+test("revision output rejects an out-of-diff supporting path that already exists at the exact head", () => {
+  const result = validateRevisionFiles([
+    { path: "src/app.js", content: "fixed" },
+    { path: "support/existing.md", content: "overwrite" },
+  ], ["src/app.js"], { existingPaths: ["src/app.js", "support/existing.md"] });
+  assert.equal(result.ok, false);
+  assert.match(result.errors.join(" "), /already exists|support/i);
+});
+
 test("revision output rejects a third supporting file and unknown unsafe paths", () => {
   const changedPaths = ["src/app.js"];
   const tooMany = validateRevisionFiles([

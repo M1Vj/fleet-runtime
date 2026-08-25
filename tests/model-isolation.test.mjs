@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSy
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { assertDisposableModelWorkspace, createDisposableModelWorkspace, PUBLIC_READ_MODEL_POLICY, runOnce } from "../scripts/lib/model.mjs";
+import { askModel, assertDisposableModelWorkspace, createDisposableModelWorkspace, PUBLIC_READ_MODEL_POLICY, runOnce } from "../scripts/lib/model.mjs";
 
 test("model workspace is disposable, outside private state, and deny-all", () => {
   const repo = mkdtempSync(path.join(tmpdir(), "fleet-model-repo-"));
@@ -184,5 +184,74 @@ test("model attachments never copy repository or private-state files", async () 
     rmSync(repo, { recursive: true, force: true });
     rmSync(state, { recursive: true, force: true });
     rmSync(safeRoot, { recursive: true, force: true });
+  }
+});
+
+test("selected primary, fallback, and explicit override models reach OpenCode and telemetry", async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), "fleet-model-chain-repo-"));
+  const state = mkdtempSync(path.join(tmpdir(), "fleet-model-chain-state-"));
+  const calls = [];
+  let invocation = 0;
+  const spawnImpl = (_command, args) => {
+    calls.push([...args]);
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => {};
+    queueMicrotask(() => {
+      invocation += 1;
+      if (invocation === 1) child.emit("close", 1);
+      else {
+        child.stdout.emit("data", Buffer.from('{"text":"ok"}\n'));
+        child.emit("close", 0);
+      }
+    });
+    return child;
+  };
+  try {
+    const result = await askModel({
+      prompt: "chain",
+      timeoutMs: 1000,
+      env: { FLEET_OPENCODE_AUTH: "auth-fixture", FLEET_MODEL_CHAIN: "model-A,model-B", FLEET_STATE_ROOT: state },
+      repoRoot: repo,
+      stateRoot: state,
+      skipCircuitCheck: true,
+      maxRounds: 1,
+      spawnImpl,
+    });
+    assert.equal(result.complete, true);
+    assert.equal(result.modelMode, "model-B");
+    assert.deepEqual(calls.map((args) => args.slice(args.indexOf("-m"), args.indexOf("-m") + 2)), [["-m", "model-A"], ["-m", "model-B"]]);
+
+    calls.length = 0;
+    invocation = 0;
+    const override = await askModel({
+      prompt: "override",
+      timeoutMs: 1000,
+      env: { FLEET_OPENCODE_AUTH: "auth-fixture", FLEET_MODEL_CHAIN: "model-A,model-B", FLEET_STATE_ROOT: state },
+      repoRoot: repo,
+      stateRoot: state,
+      modelOverride: "model-C",
+      skipCircuitCheck: true,
+      maxRounds: 1,
+      spawnImpl: (_command, args) => {
+        calls.push([...args]);
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = () => {};
+        queueMicrotask(() => {
+          child.stdout.emit("data", Buffer.from('{"text":"override"}\n'));
+          child.emit("close", 0);
+        });
+        return child;
+      },
+    });
+    assert.equal(override.complete, true);
+    assert.equal(override.modelMode, "model-C@max");
+    assert.deepEqual(calls.map((args) => args.slice(args.indexOf("-m"), args.indexOf("-m") + 2)), [["-m", "model-C"]]);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
   }
 });

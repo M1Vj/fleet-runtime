@@ -33,6 +33,7 @@ import {
 } from "./lib/target-policy.mjs";
 import { isFleetRef } from "./lib/target-policy.mjs";
 import { normalizeMaxRevisions } from "./lib/revision-queue.mjs";
+import { decodeEvidenceEnvelope } from "./pr-check.mjs";
 
 const STATE_ROOT = String(process.env.FLEET_STATE_ROOT || "");
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -571,7 +572,7 @@ function persistRevisionIntent(target, runId, attempt, blockerIds, identity) {
     runId,
     attempt,
     "REVISION_INTENT",
-    { summary: "bounded revision intent persisted before dispatch release", blockerIds },
+    { summary: "bounded revision intent persisted before revision dispatch output", blockerIds },
     identity,
   );
 }
@@ -623,6 +624,58 @@ function terminal(state, details, audit, runId, identity, repo, pr, exitCode = 0
   return exitCode;
 }
 
+/** Release a matching held scanner claim after a retryable revision failure. */
+export function releaseHeldDispatch(
+  target,
+  rawDispatchKey,
+  {
+    stateRoot = STATE_ROOT,
+    runId = process.env.FLEET_RUN_ID || "revision",
+    append = appendMemoryEvent,
+    read = readMemoryEvents,
+    persist,
+    identity,
+  } = {},
+) {
+  const dispatchKey = String(rawDispatchKey || "");
+  if (!dispatchKey) return { released: false, manualDispatch: true };
+  if (!/^[a-f0-9]{64}$/.test(dispatchKey)) throw new Error("DISPATCH_CORRELATION_INVALID");
+  const normalized = normalizeTargetInput(target);
+  if (!normalized.ok) throw new Error(`INVALID_DISPATCH_TARGET ${normalized.errors.join("; ")}`);
+  const root = String(stateRoot || "");
+  if (!root || !path.isAbsolute(root) || path.resolve(root) !== root) throw new Error("FLEET_STATE_ROOT is required for dispatch release");
+  const memoryFile = path.join(root, "state", "pr-memory.jsonl");
+  const reference = dispatchKeyReference(dispatchKey);
+  const matching = dispatchEventsForTarget(read(memoryFile), normalized)
+    .filter((event) => Array.isArray(event.artifactRefs) && event.artifactRefs.includes(reference));
+  const latest = matching.at(-1);
+  if (latest && latest.state === "DISPATCH_RELEASED") return { released: false, alreadyReleased: true, event: latest };
+  if (!latest || !new Set(["DISPATCH_HELD", "DISPATCH_CONSUMED"]).has(latest.state)) {
+    throw new Error("DISPATCH_CORRELATION_NOT_HELD");
+  }
+  const dispatchArtifact = latest.artifactRefs.find((item) => String(item).startsWith("dispatch-run:")) || "";
+  try {
+    const result = append(memoryFile, dispatchEvent(normalized, {
+      runId,
+      attempt: Number(latest.attempt) || 0,
+      dispatchKey,
+      state: "DISPATCH_RELEASED",
+      dispatchArtifact,
+    }));
+    if (persist || identity) {
+      const outcome = persist
+        ? persist("DISPATCH_RELEASED")
+        : safeCommitState(root, ["state"], `[fleet] dispatch ${normalized.repo}#${normalized.pr} DISPATCH_RELEASED`, identity, process.env);
+      if (outcome === "no-changes") throw new Error("dispatch release event was not committed");
+    }
+    return { released: true, event: result && result.event ? result.event : result };
+  } catch (error) {
+    const failure = new Error(`STATE_PERSISTENCE_FAILED ${bounded(error.message, 200)}`);
+    failure.code = 7;
+    throw failure;
+  }
+}
+
 async function postComment(repo, number, body, audit, identity) {
   const comment = gh([
     "api", "-X", "POST", `/repos/${repo}/issues/${number}/comments`, "-F", `body=${sanitizeCommentBody(body, MAX_COMMENT_CHARS)}`,
@@ -631,6 +684,17 @@ async function postComment(repo, number, body, audit, identity) {
   await verifyCommentAuthor(repo, comment.id, identity, process.env.FLEET_GH_TOKEN);
   audit.note("comment", `#${bounded(number, 20)} posted`);
   return comment;
+}
+
+/** Public judge comments mirror private state; failures remain bounded audit evidence. */
+export async function attemptJudgeMirror({ repo, number, body, audit, identity, post = postComment } = {}) {
+  try {
+    await post(repo, number, body, audit, identity);
+    return { ok: true };
+  } catch (error) {
+    audit?.incident?.("judge-mirror", `public mirror failed for ${bounded(repo, MAX_REPO_CHARS)}#${bounded(number, 20)}: ${bounded(error.message, 180)}`);
+    return { ok: false, reason: bounded(error.message, 180) };
+  }
 }
 
 export function readEvidence(rawPath = process.env.FLEET_EVIDENCE_PATH, { workspaceRoot = REPO_ROOT } = {}) {
@@ -663,7 +727,9 @@ export function readEvidence(rawPath = process.env.FLEET_EVIDENCE_PATH, { worksp
     if (!openedStat.isFile() || openedStat.size > MAX_EVIDENCE_BYTES) {
       return { available: false, text: "target-check evidence unavailable" };
     }
-    const text = readFileSync(descriptor, "utf8").slice(-MAX_EVIDENCE_CHARS);
+    const envelope = decodeEvidenceEnvelope(readFileSync(descriptor, "utf8"));
+    if (!envelope.available) return { available: false, text: "target-check evidence unavailable", digest: "unavailable" };
+    const text = envelope.text.slice(-MAX_EVIDENCE_CHARS);
     return { available: true, text: sanitizeCommentBody(text, MAX_EVIDENCE_CHARS), digest: sha256(text).slice(0, 16) };
   } catch {
     return { available: false, text: "target-check evidence unreadable", digest: "unavailable" };
@@ -885,7 +951,7 @@ export function recoverRejectedJudge({
 export function evidenceUnavailableDisposition() {
   return {
     revisionNeeded: false,
-    state: "BLOCKED",
+    state: "STALLED",
     why: "deterministic target evidence unavailable",
     publicComment: false,
   };
@@ -1151,23 +1217,29 @@ export async function main(env = process.env) {
         targetCheckSucceeded,
         extraBlockers: targetCheckSucceeded ? [] : ["deterministic target checks did not report exact success"],
       });
-      await postComment(target.repo, target.pr, verdictBody, audit, identity);
+      let disposition;
+      if (!approved) {
+        disposition = revisionDisposition({
+          fleetAuthored,
+          revisionAllowed: cls.revisionAllowed,
+          evidenceAvailable: true,
+          judgeResults: [correctness, standards],
+          revisionAttempts,
+          maxRevisions,
+        });
+        if (disposition.revisionNeeded) {
+          persistRevisionIntent(target, runId, revisionAttempts + 1, allBlockers.map(blockerIdentifier), identity);
+          writeRevisionOutput(env);
+        }
+      }
+      await attemptJudgeMirror({ repo: target.repo, number: target.pr, body: verdictBody, audit, identity });
+      if (!approved) {
+        if (disposition.revisionNeeded) return targetTerminal("REVISION_QUEUED", { why: targetCheckSucceeded ? "judges rejected" : "deterministic target checks did not report exact success" });
+        return targetTerminal(disposition.state, { why: disposition.why });
+      }
     }
     if (!approved) {
-      const disposition = revisionDisposition({
-        fleetAuthored,
-        revisionAllowed: cls.revisionAllowed,
-        evidenceAvailable: true,
-        judgeResults: [correctness, standards],
-        revisionAttempts,
-        maxRevisions,
-      });
-      if (disposition.revisionNeeded) {
-        persistRevisionIntent(target, runId, revisionAttempts + 1, allBlockers.map(blockerIdentifier), identity);
-        writeRevisionOutput(env);
-        return targetTerminal("REVISION_QUEUED", { why: targetCheckSucceeded ? "judges rejected" : "deterministic target checks did not report exact success" });
-      }
-      return targetTerminal(disposition.state, { why: disposition.why });
+      return targetTerminal("BLOCKED", { why: "judge disposition unavailable" });
     }
     if (String(env.FLEET_ALLOW_MERGE || "") !== "true") {
       return targetTerminal("APPROVED_NO_MERGE", { why: "live merge proof flag is not exactly true" });

@@ -21,8 +21,10 @@ import {
   isExactTargetCheckSuccess,
   buildJudgeComment,
   evidenceUnavailableDisposition,
+  attemptJudgeMirror,
   findCompletedJudgeEvent,
   recoverRejectedJudge,
+  releaseHeldDispatch,
   validateFilesResponse,
 } from "../scripts/merge.mjs";
 import { evaluateTargetPolicy, normalizeTargetInput, isAllowedRepo } from "../scripts/lib/target-policy.mjs";
@@ -557,7 +559,7 @@ test("deterministic evidence accepts only the canonical bounded regular artifact
   const artifactDir = path.join(workspace, "target-check");
   const artifact = path.join(artifactDir, "evidence.txt");
   mkdirSync(artifactDir, { recursive: true });
-  writeFileSync(artifact, "checks passed\n", "utf8");
+  writeFileSync(artifact, "FLEET_EVIDENCE_V1\navailable=true\n\nchecks passed\n", "utf8");
   try {
     assert.equal(readEvidence(artifact, { workspaceRoot: workspace }).available, true);
     assert.equal(readEvidence(path.join(workspace, "other.txt"), { workspaceRoot: workspace }).available, false);
@@ -601,6 +603,42 @@ test("infrastructure failures never queue revision while deterministic rejection
     state: "BLOCKED",
     why: "revision cap reached",
   });
+});
+
+test("missing evidence is private STALLED and releases a consumed scanner claim", () => {
+  assert.deepEqual(evidenceUnavailableDisposition(), {
+    revisionNeeded: false,
+    state: "STALLED",
+    why: "deterministic target evidence unavailable",
+    publicComment: false,
+  });
+  const target = { repo: "M1Vj/fleet-runtime", pr: 17, headSha: "a".repeat(40) };
+  const key = "b".repeat(64);
+  const events = [{ ...target, lane: "merge", kind: "dispatch", state: "DISPATCH_HELD", attempt: 1, artifactRefs: [`dispatch-key:${key}`] }];
+  const released = releaseHeldDispatch(target, key, {
+    stateRoot: "/tmp/fleet-dispatch-contract",
+    read: () => events,
+    append: (_file, event) => { events.push(event); return { event }; },
+    persist() {},
+  });
+  assert.equal(released.event.state, "DISPATCH_RELEASED");
+  assert.equal(hasOutstandingDispatch(events, target), false);
+});
+
+test("judge mirror failure is private and cannot suppress a queued revision", async () => {
+  const incidents = [];
+  const mirror = await attemptJudgeMirror({
+    repo: "M1Vj/fleet-runtime",
+    number: 17,
+    body: "controlled summary",
+    audit: { incident: (...args) => incidents.push(args), note() {} },
+    identity: { login: "M1Vj" },
+    post: async () => { throw new Error("comment API unavailable"); },
+  });
+  assert.equal(mirror.ok, false);
+  assert.equal(incidents.length, 1);
+  assert.equal(revisionDisposition({ fleetAuthored: true, revisionAllowed: true, evidenceAvailable: true, judgeResults: [{ infrastructureFailure: false }] }).revisionNeeded, true);
+  assert.ok(source.indexOf("persistRevisionIntent") < source.indexOf("attemptJudgeMirror"));
 });
 
 test("unavailable and unparsable judges are marked as infrastructure failures", async () => {
@@ -677,11 +715,11 @@ test("same-head rejected judge recovery reuses revision intent and queues withou
   assert.equal(result.publicComment, false);
 });
 
-test("evidence-unavailable exact heads are blocked privately without a public comment", () => {
+test("evidence-unavailable exact heads are stalled privately without a public comment", () => {
   const disposition = evidenceUnavailableDisposition();
   assert.deepEqual(disposition, {
     revisionNeeded: false,
-    state: "BLOCKED",
+    state: "STALLED",
     why: "deterministic target evidence unavailable",
     publicComment: false,
   });

@@ -123,6 +123,8 @@ test("fresh sanitizer owns the canonical redaction sink while exact target outco
   const gateJob = workflow.slice(workflow.indexOf("  gate:"));
   assert.match(gateJob, /needs:\s*\[authorize, target-check, sanitize-evidence\]/);
   assert.match(gateJob, /FLEET_TARGET_CHECK_RESULT:\s*\$\{\{\s*needs\.target-check\.outputs\.check_result\s*\}\}/);
+  assert.match(prCheckSource, /FLEET_EVIDENCE_V1|available=/i);
+  assert.match(gateJob, /FLEET_EVIDENCE_PATH:/);
 });
 
 test("trusted judge tooling installs before private state is present", () => {
@@ -143,5 +145,6 @@ test("revision is gated by manual dispatch, authorization, normalized outputs, a
   assert.match(revision, /needs\.authorize\.outputs\.repo\s*!=\s*['"]['"]/);
   assert.match(revision, /needs\.authorize\.outputs\.pr\s*!=\s*['"]['"]/);
   assert.match(revision, /needs\.authorize\.outputs\.head_sha\s*!=\s*['"]['"]/);
+  assert.match(revision, /FLEET_DISPATCH_ID:\s*\$\{\{\s*inputs\.dispatch_id\s*\}\}/);
   assert.match(revision, /steps\.gate\.outputs\.revision_needed\s*==\s*['"]true['"]/);
 });

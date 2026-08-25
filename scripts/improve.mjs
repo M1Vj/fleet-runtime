@@ -168,6 +168,27 @@ export function extractJson(replyText) {
   return extractJsonObject(replyText);
 }
 
+function sanitizeReviewText(value, maxChars) {
+  return redactText(String(value ?? ""))
+    .replace(/https?:\/\/[^\s]+/gi, "[LINK]")
+    .replace(/(^|\s)@[A-Za-z0-9_.-]+/g, "$1[MENTION]")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "")
+    .replace(/[\r\n]+/g, " ")
+    .slice(0, maxChars);
+}
+
+/** Bound and redact review findings before the workflow uploads their JSON. */
+export function sanitizeReviewPayload(payload = {}) {
+  return {
+    verdict: sanitizeReviewText(payload.verdict || "fix", 16),
+    findings: (Array.isArray(payload.findings) ? payload.findings : []).slice(0, 8).map((finding) => ({
+      severity: sanitizeReviewText(finding?.severity || "low", 16),
+      title: sanitizeReviewText(finding?.title || "", 160),
+      detail: sanitizeReviewText(finding?.detail || "", 400),
+    })),
+  };
+}
+
 export function pickBestIdea(replyText) {
   const obj = extractJson(replyText);
   if (!Array.isArray(obj.ideas) || obj.ideas.length === 0) throw new Error("no ideas");
@@ -437,7 +458,8 @@ async function modeReview(audit) {
         payload = { verdict: parsed.verdict === "approve" ? "approve" : "fix", findings: Array.isArray(parsed.findings) ? parsed.findings.slice(0, 8) : [] };
       } catch {}
     }
-    writeFileSync(path.join(dir, "..", "reviews", `review-${meta.repo.replace("/", "__")}__${lens}.json`), JSON.stringify({ repo: meta.repo, prNumber: meta.prNumber, lens, ...payload }, null, 2));
+    const safePayload = sanitizeReviewPayload(payload);
+    writeFileSync(path.join(dir, "..", "reviews", `review-${meta.repo.replace("/", "__")}__${lens}.json`), JSON.stringify({ repo: meta.repo, prNumber: meta.prNumber, lens, ...safePayload }, null, 2));
   }
   console.log(`IMPROVE_DONE=review:${lens}:${prmetas.length}`);
   return 0;
@@ -459,12 +481,9 @@ async function modeFinalize(audit) {
   for (const r of reviews) {
     const entry = byRepo[r.repo];
     if (!entry) continue;
-    entry.verdicts[r.lens] = r.verdict;
-    entry.reviewFindings[r.lens] = (Array.isArray(r.findings) ? r.findings : []).slice(0, 8).map((finding) => ({
-      severity: redactText(String(finding && finding.severity || "low")).slice(0, 16),
-      title: redactText(String(finding && finding.title || "")).replace(/[\r\n]+/g, " ").slice(0, 160),
-      detail: redactText(String(finding && finding.detail || "")).replace(/[\r\n]+/g, " ").slice(0, 400),
-    }));
+    const safePayload = sanitizeReviewPayload(r);
+    entry.verdicts[r.lens] = safePayload.verdict;
+    entry.reviewFindings[r.lens] = safePayload.findings;
   }
   const runRecord = {
     utc: new Date().toISOString(),

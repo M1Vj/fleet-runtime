@@ -123,7 +123,7 @@ export function isSafeSupportingPath(filePath, changedPaths = []) {
  * with at most two additional safe supporting files. No model output is written
  * until this pure validation returns ok.
  */
-export function validateRevisionFiles(files, changedPaths = []) {
+export function validateRevisionFiles(files, changedPaths = [], { existingPaths = [] } = {}) {
   const errors = [];
   const changed = new Set(
     (Array.isArray(changedPaths) ? changedPaths : [])
@@ -133,6 +133,7 @@ export function validateRevisionFiles(files, changedPaths = []) {
   const outputs = Array.isArray(files) ? files : [];
   const seen = new Set();
   const supportingPaths = [];
+  const existing = new Set((Array.isArray(existingPaths) ? existingPaths : []).filter((value) => typeof value === "string"));
 
   if (!Array.isArray(files) || files.length === 0) errors.push("revision must contain at least one file");
   for (const file of outputs) {
@@ -151,6 +152,7 @@ export function validateRevisionFiles(files, changedPaths = []) {
     if (workflowPath(filePath)) errors.push(`workflow path rejected: ${filePath}`);
     if (!alreadyChanged) {
       if (!isSafeSupportingPath(filePath, changedPaths)) errors.push(`unsafe supporting path: ${filePath}`);
+      else if (existing.has(filePath)) errors.push(`supporting path already exists at exact head: ${filePath}`);
       else supportingPaths.push(filePath);
     }
   }

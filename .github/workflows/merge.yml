@@ -347,5 +347,6 @@ jobs:
           FLEET_REPO: ${{ needs.authorize.outputs.repo }}
           FLEET_PR_NUMBER: ${{ needs.authorize.outputs.pr }}
           FLEET_HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
+          FLEET_DISPATCH_ID: ${{ inputs.dispatch_id }}
           FLEET_EVIDENCE_PATH: ${{ github.workspace }}/target-check/evidence.txt
         run: node scripts/revise.mjs

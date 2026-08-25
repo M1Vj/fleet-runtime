@@ -4,6 +4,8 @@
 merge-gate dispatches, judge blocker hashes, and autonomous revision attempts. PR comments are
 only bounded, controlled status mirrors. Never copy raw diffs, prompts, model replies, complete
 judge comments, raw target test output, credentials, or secret-like values into either surface.
+The sanitizer writes `FLEET_EVIDENCE_V1` with an explicit `available=true|false` marker. A
+missing marker or generated-unavailable text is unavailable evidence, not a successful check.
 
 ## Record contract
 
@@ -33,7 +35,7 @@ newline is preserved and separated before the next append.
 | `DISPATCH_UNKNOWN` | Acceptance is ambiguous, such as a network or server failure | Do not retry blindly; reconcile first |
 | `DISPATCH_FAILED` | A definite client rejection means no run was accepted | A later scan may make a new attempt after the cause is fixed |
 | `DISPATCH_CONSUMED` | Authorization matched the target and correlation key | Keep the same head claimed while the globally serialized target run proceeds |
-| `DISPATCH_RELEASED` | The gate completed or reached a retryable terminal state | A later scan may make a new same-head attempt if the PR remains eligible |
+| `DISPATCH_RELEASED` | The gate completed or reached a retryable terminal state, including missing evidence | A later scan may make a new same-head attempt if the PR remains eligible |
 | `DISPATCH_HELD` | The gate reached policy `BLOCKED`, `REVISION_QUEUED`, `APPROVED_NO_MERGE`, `READY_REQUIRED`, `MERGE_UNKNOWN`, or `MERGE_VERIFY_FAILED` | Suppress the same head; a changed head or explicit reconciliation is required |
 
 Scanner-generated runs carry a 64-hex `dispatch_id`. Authorization validates the live PR

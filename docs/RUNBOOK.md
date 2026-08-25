@@ -1,4 +1,4 @@
-# RUNBOOK — fleet-runtime operations
+# RUNBOOK - fleet-runtime operations
 
 All commands assume `gh` authenticated as M1Vj on the owner Mac. Workflows live in
 `M1Vj/fleet-runtime`; durable state lives in private `M1Vj/fleet-control`. Use
@@ -106,15 +106,17 @@ and prints `MERGE_TERMINAL_STATE=<STATE>`:
 | `MERGE_UNKNOWN` | the merge response was ambiguous and requires reconciliation |
 | `MERGE_VERIFY_FAILED` | GitHub reported a merge but post-verification failed |
 
-`STALLED` means skipped-by-design, such as a circuit-open or superseded/stale PR, rather
-than a generic infrastructure failure.
+`STALLED` means a private retryable or skipped-by-design result, such as unavailable model
+infrastructure, missing deterministic evidence, a circuit-open run, or a superseded/stale PR.
+Missing evidence produces no public comment and releases the matching scanner claim. Policy
+failures use `BLOCKED` and hold the claim instead.
 
 Dispatch lifecycle states live in `state/pr-memory.jsonl`: `DISPATCH_INTENT` is committed
 before the REST request, `DISPATCHED` confirms acceptance, `DISPATCH_UNKNOWN` preserves an
 ambiguous result without blind retry, `DISPATCH_FAILED` records a definite client rejection,
 `DISPATCH_CONSUMED` binds a target run to its scanner correlation key,
 `DISPATCH_RELEASED` permits a later same-head attempt after completion or a retryable stall,
-and `DISPATCH_HELD` requires a new head after policy `BLOCKED`, `REVISION_QUEUED`,
+including missing evidence or retryable revision output failures, and `DISPATCH_HELD` requires a new head after policy `BLOCKED`, `REVISION_QUEUED`,
 `APPROVED_NO_MERGE`, `READY_REQUIRED`, `MERGE_UNKNOWN`, or `MERGE_VERIFY_FAILED`. Judge and
 revision events also use `REVISION_INTENT`, `JUDGE_APPROVED`, `JUDGE_REJECTED`, `JUDGE_UNAVAILABLE`,
 and `ROTATED`. Every promised
@@ -140,7 +142,7 @@ Set repo variable `FLEET_MODEL_CHAIN` (comma-separated, priority order):
 Semantics (`scripts/lib/model.mjs`):
 
 - Each model gets variant `max`, plain, anonymous (auth stripped), then resume rounds. The
-  default is four rounds; thesis and KB drafts use five. Calls are spaced by 20–35 seconds.
+  default is four rounds; thesis and KB drafts use five. Calls are spaced by 20 to 35 seconds.
 - If the whole chain fails, a second ladder starts after a 90-second cooldown, or 120 seconds
   for long-form lanes. Per-call timeouts are 480 seconds by default, 540 for deep analysis,
   and 600 for thesis, KB, or revision work.

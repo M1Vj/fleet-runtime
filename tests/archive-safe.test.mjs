@@ -5,7 +5,47 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { safeExtractArchive, validateArchiveMembers } from "../scripts/lib/archive-safe.mjs";
+import { parseArchiveListing, safeExtractArchive, validateArchiveMembers } from "../scripts/lib/archive-safe.mjs";
+
+test("GNU-format tar listings expose escape members to validation and pass normal ones", () => {
+  const gnuListing = [
+    "drwxr-xr-x root/root         0 2026-05-01 10:00 src/",
+    "-rw-r--r-- root/root      1234 2026-05-01 10:00 src/app.js",
+    "-rw-r--r-- root/root        12 2026-05-01 10:00 ../escaped.sh",
+    "-rw-r--r-- root/root        12 2026-05-01 10:00 /abs/escape.sh",
+    "lrwxrwxrwx root/root         0 2026-05-01 10:00 src/link -> /etc/passwd",
+    "garbage line without a listing shape",
+  ].join("\n");
+  const members = parseArchiveListing(gnuListing);
+  assert.deepEqual(members.slice(0, 2), [
+    { name: "src/", type: "file" },
+    { name: "src/app.js", type: "file" },
+  ]);
+  assert.ok(members.some((member) => member.name === "../escaped.sh"), "traversal member must be surfaced");
+  assert.ok(members.some((member) => member.name === "/abs/escape.sh"), "absolute member must be surfaced");
+  assert.equal(members.at(-1).name, "", "unparseable lines must fail closed");
+  const linkMember = members.find((member) => member.type === "symlink");
+  assert.equal(linkMember.name, "/etc/passwd", "link lines parse their trailing target field");
+  assert.equal(validateArchiveMembers([linkMember]).ok, false);
+  assert.equal(validateArchiveMembers(members).ok, false);
+  assert.equal(validateArchiveMembers(members.slice(0, 2)).ok, true);
+});
+
+test("bsdtar-style listings parse while ambiguous or metadata-shaped names fail closed", () => {
+  const listing = [
+    "-rw-r--r--  0 owner staff       3 25 Aug 15:46 src/app.js",
+    "-rw-r--r-- root/root        5 2026-05-01 10:00 my file.txt",
+    "-rw-r--r-- root/root        5 2026-05-01 10:00 2026-05-01",
+    "-rw-r--r-- root/root        5 2026-05-01 10:00 10:00",
+  ].join("\n");
+  const members = parseArchiveListing(listing);
+  assert.equal(members[0].name, "src/app.js");
+  assert.equal(validateArchiveMembers([members[0]]).ok, true);
+  for (const member of members.slice(1)) {
+    assert.equal(member.name, "", JSON.stringify(member));
+    assert.equal(validateArchiveMembers([member]).ok, false);
+  }
+});
 
 test("archive member validation rejects absolute, traversal, and link entries", () => {
   assert.equal(validateArchiveMembers(["src/app.js", "src/"]).ok, true);

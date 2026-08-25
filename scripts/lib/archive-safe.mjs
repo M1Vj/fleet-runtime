@@ -34,14 +34,54 @@ export function validateArchiveMembers(members) {
   return { ok: errors.length === 0, errors: errors.slice(0, 8) };
 }
 
+const TAR_MODE_RE = /^[dlbcps-][-rwxstST]{9}[.@+]?$/;
+const TAR_ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const TAR_MONTH_RE = /^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/;
+const TAR_TIME_RE = /^\d{1,2}:\d{2}(?::\d{2})?$/;
+
+/**
+ * Strictly parse one verbose `tar -tvzf` listing line into its member name, or
+ * "" to fail closed. Listings place the path last, but paths containing spaces
+ * make the final split ambiguous, so only a strict header shape ending in
+ * "<date> <time> <single-token-name>" is accepted (ISO dates for GNU tar, or a
+ * month/day pair in either order for bsdtar). A parsed name that is itself a
+ * bare date/time/mode token means mis-parsing and fails closed too.
+ */
+function tarListingMemberName(line) {
+  const fields = String(line ?? "").trim().split(/\s+/);
+  const timeIndex = fields.length - 2;
+  if (timeIndex < 4 || !TAR_TIME_RE.test(fields[timeIndex] || "")) return "";
+  let headerEnd = -1;
+  if (TAR_ISO_DATE_RE.test(fields[timeIndex - 1] || "")) {
+    headerEnd = timeIndex - 1;
+  } else {
+    const left = fields[timeIndex - 2] || "";
+    const right = fields[timeIndex - 1] || "";
+    if ((TAR_MONTH_RE.test(left) && /^\d{1,2}$/.test(right)) || (/^\d{1,2}$/.test(left) && TAR_MONTH_RE.test(right))) {
+      headerEnd = timeIndex - 2;
+    }
+  }
+  if (headerEnd < 3 || !TAR_MODE_RE.test(fields[0] || "")) return "";
+  const meta = fields.slice(1, headerEnd);
+  if (meta.length < 2 || meta.length > 4 || !meta.some((field) => /^\d+$/.test(field))) return "";
+  const name = fields[fields.length - 1];
+  if (!name || name.includes("\0")) return "";
+  if (TAR_ISO_DATE_RE.test(name) || TAR_MONTH_RE.test(name) || TAR_TIME_RE.test(name)) return "";
+  return name;
+}
+
+/** Parse a full verbose tar listing; unparseable lines yield empty names that fail closed. */
+export function parseArchiveListing(text) {
+  return String(text ?? "").split(/\r?\n/).filter(Boolean).map((line) => {
+    const type = line[0] === "l" ? "symlink" : line[0] === "h" ? "hardlink" : line[0] === "p" ? "fifo" : line[0] === "c" ? "char" : line[0] === "b" ? "block" : "file";
+    return { name: tarListingMemberName(line), type };
+  });
+}
+
 function archiveMembers(archive) {
   const result = spawnSync("tar", ["-tvzf", archive], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
   if (result.status !== 0) throw new Error(`ARCHIVE_LIST_FAILED ${result.stderr || result.stdout || "tar failed"}`);
-  return String(result.stdout || "").split(/\r?\n/).filter(Boolean).map((line) => {
-    const type = line[0] === "l" ? "symlink" : line[0] === "h" ? "hardlink" : line[0] === "p" ? "fifo" : line[0] === "c" ? "char" : line[0] === "b" ? "block" : "file";
-    const match = line.match(/\s([^\s].*)$/);
-    return { name: match ? match[1].replace(/\s+->\s+.*$/, "") : "", type };
-  });
+  return parseArchiveListing(String(result.stdout || ""));
 }
 
 function supportedTarFlags(flags) {

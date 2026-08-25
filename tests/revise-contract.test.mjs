@@ -384,6 +384,16 @@ test("revision fails closed when exact-head blobs are missing or oversized", () 
   assert.equal(symlink.disposition, "blocked");
   assert.match(symlink.errors.join(" "), /symlink/i);
 
+  const symlinkWithoutSha = fetchCompleteRevisionSources({
+    ...base,
+    getTree: () => ({ truncated: false, tree: [{ path: "src/app.js", type: "symlink", mode: "120000" }] }),
+    getBlob: () => { throw new Error("blob must not run"); },
+  });
+  assert.equal(symlinkWithoutSha.ok, false);
+  assert.equal(symlinkWithoutSha.retryable, false);
+  assert.equal(symlinkWithoutSha.disposition, "blocked");
+  assert.match(symlinkWithoutSha.errors.join(" "), /symlink/i);
+
   const removed = fetchCompleteRevisionSources({
     ...base,
     getTree: () => ({ truncated: false, tree: [] }),

@@ -155,11 +155,6 @@ export function fetchCompleteRevisionSources({
       blockedFailure = true;
       continue;
     }
-    if (!entry.sha) {
-      errors.push(`complete exact-head source tree entry is incomplete: ${filePath}`);
-      retryableFailure = true;
-      continue;
-    }
     if (entry.mode === "120000" || entry.type === "symlink") {
       errors.push(`exact-head source is a symlink: ${filePath}`);
       blockedFailure = true;
@@ -168,6 +163,11 @@ export function fetchCompleteRevisionSources({
     if (entry.mode === "160000" || entry.type === "commit") {
       errors.push(`exact-head source is a submodule: ${filePath}`);
       blockedFailure = true;
+      continue;
+    }
+    if (typeof entry.sha !== "string" || entry.sha.length === 0) {
+      errors.push(`complete exact-head source tree entry is incomplete: ${filePath}`);
+      retryableFailure = true;
       continue;
     }
     if (!entry.type) {

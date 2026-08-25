@@ -625,6 +625,28 @@ test("missing evidence is private STALLED and releases a consumed scanner claim"
   assert.equal(hasOutstandingDispatch(events, target), false);
 });
 
+test("dispatch release requires the latest held state and exact correlation", () => {
+  const target = { repo: "M1Vj/fleet-runtime", pr: 17, headSha: "a".repeat(40) };
+  const key = "b".repeat(64);
+  const released = [{ ...target, kind: "dispatch", state: "DISPATCH_RELEASED", attempt: 1, artifactRefs: [`dispatch-key:${key}`] }];
+  assert.deepEqual(releaseHeldDispatch(target, key, {
+    stateRoot: "/tmp/fleet-dispatch-contract",
+    read: () => released,
+    append() { throw new Error("append should not run for an idempotent release"); },
+  }), { released: false, alreadyReleased: true, event: released[0] });
+
+  for (const events of [
+    [{ ...target, kind: "dispatch", state: "DISPATCH_CONSUMED", attempt: 1, artifactRefs: [`dispatch-key:${key}`] }],
+    [{ ...target, kind: "dispatch", state: "DISPATCH_HELD", attempt: 1, artifactRefs: [`dispatch-key:${"c".repeat(64)}`] }],
+  ]) {
+    assert.throws(() => releaseHeldDispatch(target, key, {
+      stateRoot: "/tmp/fleet-dispatch-contract",
+      read: () => events,
+      append() { throw new Error("append should not run for a mismatched claim"); },
+    }), /DISPATCH_CORRELATION_NOT_HELD/);
+  }
+});
+
 test("judge mirror failure is private and cannot suppress a queued revision", async () => {
   const incidents = [];
   const mirror = await attemptJudgeMirror({

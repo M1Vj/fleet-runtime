@@ -15,7 +15,7 @@ export function sanitizeEvidenceArtifact(inputPath, outputPath, maxChars = 8000)
     const stat = lstatSync(input);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > limit * 4) throw new Error("unsafe evidence artifact");
     text = readFileSync(input, "utf8");
-    available = !/^(?:target-check\s+)?evidence\s+unavailable\s*$/i.test(text.trim());
+    available = text.trim().length > 0 && !/^(?:target-check\s+)?evidence\s+unavailable\s*$/i.test(text.trim());
   } catch {}
   const safe = encodeEvidenceEnvelope(text, { available, maxChars: limit });
   writeEvidenceSafe(outputPath, safe);

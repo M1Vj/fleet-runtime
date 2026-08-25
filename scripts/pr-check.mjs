@@ -43,7 +43,8 @@ export function sanitizeEvidence(value) {
 }
 
 function unavailableEvidenceText(value) {
-  return /^(?:target-check\s+)?evidence\s+unavailable\s*$/i.test(String(value || "").trim());
+  const text = String(value || "").trim();
+  return text.length === 0 || /^(?:target-check\s+)?evidence\s+unavailable\s*$/i.test(text);
 }
 
 /** Mark whether the sanitizer received a trusted raw artifact before upload. */

@@ -309,6 +309,52 @@ function recordRetryableFailure(target, runtime, context, details, identity, aud
   return code;
 }
 
+/** Mirror a successful revision without allowing the public API to relabel it as failed. */
+export async function attemptRevisionMirror({ repo, number, body, audit, post, verify } = {}) {
+  try {
+    const comment = await post(repo, number, body);
+    if (!comment || !comment.id) throw new Error("revision comment response missing id");
+    if (typeof verify === "function") await verify(repo, comment.id);
+    return { ok: true, comment };
+  } catch (error) {
+    const reason = redactText(String(error && error.message || error)).slice(0, 180);
+    audit?.incident?.("revision-mirror", `public mirror failed for ${redactText(String(repo || "")).slice(0, 120)}#${String(number || "").slice(0, 20)}: ${reason}`);
+    return { ok: false, reason };
+  }
+}
+
+/** Validate model files and screen them before delegating to Git Data mutation. */
+export async function applyValidatedRevision({
+  files,
+  changedPaths = [],
+  existingPaths = [],
+  api,
+  repo,
+  branch,
+  expectedHead,
+  identity,
+  message,
+  apply = applyAtomicRevision,
+} = {}) {
+  const pathSafetyErrors = (Array.isArray(files) ? files : [])
+    .filter((file) => !isSafeRepoPath(file && file.path))
+    .map((file) => `unsafe path: ${String(file && file.path || "")}`);
+  const validation = validateRevisionFiles(files, changedPaths, { existingPaths });
+  if (pathSafetyErrors.length > 0 || !validation.ok) {
+    const failure = new Error(`REVISION_OUTPUT_POLICY ${[...pathSafetyErrors, ...(validation.errors || [])].slice(0, 3).join("; ")}`);
+    failure.code = "REVISION_OUTPUT_POLICY";
+    throw failure;
+  }
+  const confidentiality = screenRevisionOutput(validation.files);
+  if (!confidentiality.ok) {
+    const failure = new Error(`REVISION_OUTPUT_POLICY ${(confidentiality.errors || []).slice(0, 3).join("; ")}`);
+    failure.code = "REVISION_OUTPUT_POLICY";
+    throw failure;
+  }
+  const atomic = await apply({ api, repo, branch, expectedHead, identity, files: validation.files, message });
+  return { atomic, validation };
+}
+
 /** Commit the final audit only after the gate has verified identity. */
 export function persistRevisionAudit({ runtime, audit, runId, target, auditStatus, identity, persist = safeCommitState } = {}) {
   if (!identity) return { skipped: true, reason: "identity-unverified" };
@@ -539,23 +585,6 @@ async function reviseTarget(target, identity, audit, context, runtime) {
     return 5;
   }
 
-  // Keep the shared path validator in this script's import graph as an explicit
-  // defense-in-depth check; revision-queue applies the full changed-path policy.
-  const pathSafetyErrors = files.filter((file) => !isSafeRepoPath(file.path)).map((file) => `unsafe path: ${file.path}`);
-  const validation = validateRevisionFiles(files, changedPaths, { existingPaths: [...fetched.completeSource.treePaths] });
-  if (pathSafetyErrors.length > 0 || !validation.ok) {
-    const errors = [...pathSafetyErrors, ...(validation.errors || [])];
-    recordRetryableFailure(target, runtime, context, { summary: "model output path policy rejected", changedPaths, blockers }, identity, audit, 5);
-    console.log(`REVISE_STATE=REJECTED ${errors[0] || "invalid output"}`);
-    return 5;
-  }
-  const confidentiality = screenRevisionOutput(validation.files);
-  if (!confidentiality.ok) {
-    recordRetryableFailure(target, runtime, context, { summary: "model output confidentiality policy rejected", changedPaths, blockers }, identity, audit, 5);
-    console.log(`REVISE_STATE=REJECTED ${confidentiality.errors[0] || "private output"}`);
-    return 5;
-  }
-
   // Re-read the PR immediately before the first PUT to close the stale-head
   // race between model generation and branch mutation.
   const latestPr = gh(["api", `/repos/${target.repo}/pulls/${target.pr}`], runtime.env);
@@ -586,26 +615,46 @@ async function reviseTarget(target, identity, audit, context, runtime) {
     getRef: (repo, ref) => gh(["api", `/repos/${repo}/git/ref/heads/${encodeURIComponent(ref)}`], runtime.env),
     updateRef: (repo, ref, body) => ghInput(["api", "-X", "PATCH", `/repos/${repo}/git/refs/heads/${encodeURIComponent(ref)}`], body, runtime.env),
   };
-  const atomic = await applyAtomicRevision({
-    api: atomicApi,
-    repo: target.repo,
-    branch,
-    expectedHead,
-    identity,
-    files: validation.files,
-    message: `[fleet-revise] atomic update (round ${used + 1})`,
-  });
+  let atomic;
+  let validation;
+  try {
+    const applied = await applyValidatedRevision({
+      api: atomicApi,
+      repo: target.repo,
+      branch,
+      expectedHead,
+      identity,
+      files,
+      changedPaths,
+      existingPaths: [...fetched.completeSource.treePaths],
+      message: `[fleet-revise] atomic update (round ${used + 1})`,
+    });
+    atomic = applied.atomic;
+    validation = applied.validation;
+  } catch (error) {
+    if (error && error.code === "REVISION_OUTPUT_POLICY") {
+      recordRetryableFailure(target, runtime, context, { summary: "model output policy rejected", changedPaths, blockers }, identity, audit, 5);
+      console.log(`REVISE_STATE=REJECTED ${String(error.message).slice(0, 180)}`);
+      return 5;
+    }
+    throw error;
+  }
   await verifyCommit(target.repo, atomic.commitSha, identity, runtime.env.FLEET_GH_TOKEN);
   const controlledSummary = `updated ${validation.files.length} validated files`;
   persistEvent(runtime, context, "SUCCESS", { summary: controlledSummary, changedPaths: validation.files.map((file) => file.path), blockers }, identity, audit, { required: true });
   const safeCommentPaths = validation.files.map((file) => formatRevisionPath(file.path)).join(", ");
-  const comment = gh(
-    ["api", "-X", "POST", `/repos/${target.repo}/issues/${target.pr}/comments`, "-F", `body=<!-- fleet-pr-memory: revision -->\n🔧 **fleet revision agent** (round ${used + 1}/${max}): ${controlledSummary} (${safeCommentPaths}).\n\nMerge gate re-evaluates automatically.`],
-    runtime.env,
-  );
-  if (!comment || !comment.id) throw new Error("revision comment response missing id");
-  await verifyCommentAuthor(target.repo, comment.id, identity, runtime.env.FLEET_GH_TOKEN);
-  audit.note("attribution", `verified one commit ${atomic.commitSha.slice(0, 10)} and comment #${comment.id}`);
+  const mirror = await attemptRevisionMirror({
+    repo: target.repo,
+    number: target.pr,
+    body: `<!-- fleet-pr-memory: revision -->\n🔧 **fleet revision agent** (round ${used + 1}/${max}): ${controlledSummary} (${safeCommentPaths}).\n\nMerge gate re-evaluates automatically.`,
+    audit,
+    post: (repo, number, body) => gh(
+      ["api", "-X", "POST", `/repos/${repo}/issues/${number}/comments`, "-F", `body=${body}`],
+      runtime.env,
+    ),
+    verify: (repo, commentId) => verifyCommentAuthor(repo, commentId, identity, runtime.env.FLEET_GH_TOKEN),
+  });
+  if (mirror.ok) audit.note("attribution", `verified one commit ${atomic.commitSha.slice(0, 10)} and comment #${mirror.comment.id}`);
   console.log("REVISE_STATE=SUCCESS");
   return 0;
 }

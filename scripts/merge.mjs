@@ -650,7 +650,7 @@ export function releaseHeldDispatch(
     .filter((event) => Array.isArray(event.artifactRefs) && event.artifactRefs.includes(reference));
   const latest = matching.at(-1);
   if (latest && latest.state === "DISPATCH_RELEASED") return { released: false, alreadyReleased: true, event: latest };
-  if (!latest || !new Set(["DISPATCH_HELD", "DISPATCH_CONSUMED"]).has(latest.state)) {
+  if (!latest || latest.state !== "DISPATCH_HELD") {
     throw new Error("DISPATCH_CORRELATION_NOT_HELD");
   }
   const dispatchArtifact = latest.artifactRefs.find((item) => String(item).startsWith("dispatch-run:")) || "";

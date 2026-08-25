@@ -43,6 +43,13 @@ test("missing or generated-unavailable evidence never becomes available", () => 
     sanitizeEvidenceArtifact(fixture.input, fixture.output);
     assert.match(readFileSync(fixture.output, "utf8"), /^FLEET_EVIDENCE_V1\navailable=false\n\n/);
     assert.equal(readEvidence(fixture.output, { workspaceRoot: fixture.root }).available, false);
+
+    for (const raw of ["", " \t\n"]) {
+      writeFileSync(fixture.input, raw, "utf8");
+      sanitizeEvidenceArtifact(fixture.input, fixture.output);
+      assert.match(readFileSync(fixture.output, "utf8"), /^FLEET_EVIDENCE_V1\navailable=false\n\n/);
+      assert.equal(readEvidence(fixture.output, { workspaceRoot: fixture.root }).available, false);
+    }
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }

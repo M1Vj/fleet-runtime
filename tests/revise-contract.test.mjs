@@ -15,6 +15,8 @@ import {
   screenRevisionOutput,
   persistRevisionAudit,
   fetchCompleteRevisionSources,
+  attemptRevisionMirror,
+  applyValidatedRevision,
 } from "../scripts/revise.mjs";
 
 const source = readFileSync(new URL("../scripts/revise.mjs", import.meta.url), "utf8");
@@ -173,8 +175,8 @@ test("revision memory context reuses prior heads for the same repo and PR", () =
 
 test("revision requires PR-memory persistence before model or branch mutation", () => {
   const start = source.indexOf("persistEvent(runtime, context, \"REVISION_STARTED\"");
-  const model = source.indexOf("askModel(");
-  const put = source.indexOf("applyAtomicRevision({");
+  const model = source.indexOf("askModel({", start);
+  const put = source.indexOf("applyValidatedRevision({", start);
   assert.ok(start >= 0 && start < model && start < put);
   assert.match(source.slice(start, model), /required:\s*true/);
   assert.match(source, /STATE_PERSISTENCE_FAILED/);
@@ -185,7 +187,7 @@ test("revision treats SUCCESS state persistence failure as a failed run", () => 
   assert.ok(success >= 0);
   assert.match(source.slice(success, success + 360), /required:\s*true/);
   assert.doesNotMatch(source, /REVISE_MEMORY_WARNING=STATE_PERSIST_FAILED/);
-  const comment = source.indexOf("const comment = gh(");
+  const comment = source.indexOf("const mirror = await attemptRevisionMirror");
   assert.ok(success < comment);
 });
 
@@ -220,6 +222,40 @@ test("pre-identity revision failures do not attempt an audit commit with undefin
   assert.equal(commits, 0);
 });
 
+test("revision mirror failures remain private after SUCCESS persistence", async () => {
+  const incidents = [];
+  const mirror = await attemptRevisionMirror({
+    repo: "M1Vj/example-repo",
+    number: 42,
+    body: "controlled revision summary",
+    audit: { incident: (...args) => incidents.push(args) },
+    post: async () => { throw new Error("comment API unavailable"); },
+  });
+  assert.equal(mirror.ok, false);
+  assert.equal(incidents.length, 1);
+  const success = source.indexOf('persistEvent(runtime, context, "SUCCESS"');
+  const mirrorCall = source.indexOf("const mirror = await attemptRevisionMirror");
+  assert.ok(success >= 0 && mirrorCall > success);
+  assert.doesNotMatch(source.slice(success, mirrorCall), /persistEvent\(runtime, context, "ERROR"/);
+});
+
+test("production mutation helper makes zero Git API calls for an existing support path", async () => {
+  let apiCalls = 0;
+  const api = new Proxy({}, { get: () => async () => { apiCalls += 1; throw new Error("mutation API must not run"); } });
+  await assert.rejects(applyValidatedRevision({
+    api,
+    repo: "M1Vj/example-repo",
+    branch: "fleet/fix-one",
+    expectedHead: "a".repeat(40),
+    identity: { name: "M1Vj", noreply: "1+M1Vj@users.noreply.github.com" },
+    files: [{ path: "src/app.js", content: "fixed" }, { path: "support/existing.md", content: "overwrite" }],
+    changedPaths: ["src/app.js"],
+    existingPaths: ["src/app.js", "support/existing.md"],
+    message: "guarded update",
+  }), /REVISION_OUTPUT_POLICY|already exists/i);
+  assert.equal(apiCalls, 0);
+});
+
 test("revision records truthful audit failure status and rejects fork heads before PUT", () => {
   assert.match(source, /let\s+auditStatus\s*=\s*["']ok["']/);
   assert.match(source, /auditStatus\s*=\s*["']failed["']/);
@@ -242,7 +278,7 @@ test("revision uses untrusted delimiters, controlled summaries, and one Git Data
   assert.match(source, /updated \$\{validation\.files\.length\} validated files/);
   assert.match(source, /formatRevisionPath/);
   assert.match(source, /validation\.files\.map\(\(file\) => formatRevisionPath/);
-  assert.match(source, /applyAtomicRevision\(/);
+  assert.match(source, /applyValidatedRevision\(/);
   assert.doesNotMatch(source, /\/contents\//);
   assert.doesNotMatch(source, /"PUT"/);
 });
@@ -374,14 +410,17 @@ test("model revision content is screened before any Git object creation", () => 
   assert.equal(screenRevisionOutput([{ path: "src/app.js", content: "const token = 'ghp_abcdefghijklmnopqrstuvwxyz1234567890';" }]).ok, false);
   assert.equal(screenRevisionOutput([{ path: "src/app.js", content: "read state-control/state/pr-memory.jsonl" }]).ok, false);
   assert.equal(screenRevisionOutput([{ path: "src/app.js", content: "export const fixed = true;" }]).ok, true);
-  const applyIndex = source.indexOf("applyAtomicRevision({");
-  const screenIndex = source.indexOf("screenRevisionOutput");
+  const helperIndex = source.indexOf("export async function applyValidatedRevision");
+  const applyIndex = source.indexOf("const atomic = await apply(", helperIndex);
+  const screenIndex = source.indexOf("screenRevisionOutput", helperIndex);
   assert.ok(screenIndex >= 0 && screenIndex < applyIndex);
 });
 
 test("existing supporting paths are rejected before atomic Git mutation", () => {
-  const validation = source.indexOf("validateRevisionFiles(files, changedPaths, { existingPaths");
-  const apply = source.indexOf("applyAtomicRevision({");
+  const helperIndex = source.indexOf("export async function applyValidatedRevision");
+  const validation = source.indexOf("validateRevisionFiles(files, changedPaths, { existingPaths", helperIndex);
+  const apply = source.indexOf("const atomic = await apply(", helperIndex);
   assert.ok(validation >= 0 && apply >= 0 && validation < apply);
-  assert.match(source.slice(validation, apply), /fetched\.completeSource\.treePaths/);
+  assert.match(source.slice(validation, apply), /existingPaths/);
+  assert.match(source, /existingPaths:\s*\[\.\.\.fetched\.completeSource\.treePaths\]/);
 });

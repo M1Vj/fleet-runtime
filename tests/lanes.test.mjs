@@ -121,6 +121,13 @@ test("watchdog recovery allowlist includes the merge gate", async () => {
   assert.ok(workflows.includes("merge.yml"), "merge gate must be restorable");
 });
 
+test("watchdog runtime recovery derives from the shared lib allowlist", async () => {
+  const { WATCHDOG_WORKFLOWS } = await import("../scripts/lib/watchdog-decide.mjs");
+  assert.equal(WATCHDOG_WORKFLOWS.length, 8);
+  assert.deepEqual([...new Set(WATCHDOG_WORKFLOWS)], WATCHDOG_WORKFLOWS);
+  assert.match(watchdogSource, /"M1Vj\/fleet-runtime": \[\.\.\.WATCHDOG_WORKFLOWS\]/);
+});
+
 test("watchdog auto-enable opt-in accepts only the exact true value", async () => {
   const { watchdogAutoEnableEnabled } = await import("../scripts/lib/watchdog-decide.mjs");
   assert.equal(watchdogAutoEnableEnabled("true"), true);

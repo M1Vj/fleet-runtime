@@ -6,7 +6,7 @@ import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
 import { verifyCommit, verifyIssueAuthor } from "./lib/verify.mjs";
-import { findWatchdogAlertIssue, planWatchdogActions, watchdogAutoEnableEnabled } from "./lib/watchdog-decide.mjs";
+import { findWatchdogAlertIssue, planWatchdogActions, watchdogAutoEnableEnabled, WATCHDOG_WORKFLOWS } from "./lib/watchdog-decide.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
@@ -56,7 +56,9 @@ export async function main() {
     }
 
     const enablePlan = {
-      "M1Vj/fleet-runtime": ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml", "merge.yml"],
+      // Runtime recovery derives from the shared lib allowlist; fleet-control's
+      // four-lane entry stays explicit.
+      "M1Vj/fleet-runtime": [...WATCHDOG_WORKFLOWS],
       "M1Vj/fleet-control": ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml"],
     };
     if (plan.autoEnable) {

@@ -3,7 +3,7 @@ import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync,
 import path from "node:path";
 import os from "node:os";
 import { gatewayCircuitOpen, markGatewayDown, markGatewayUp } from "./gateway-health.mjs";
-import { classifyProviderAuthFailure, providerAuthStatus } from "./provider-auth.mjs";
+import { classifyProviderAuthFailure, providerAuthStatus, resolveProviderAuth } from "./provider-auth.mjs";
 
 export const DISPOSABLE_MODEL_POLICY = Object.freeze({
   permission: {

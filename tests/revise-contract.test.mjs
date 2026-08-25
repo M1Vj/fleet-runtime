@@ -354,6 +354,35 @@ test("revision fetches complete exact-head blobs and preserves unchanged regions
   assert.deepEqual([...result.treePaths], ["src/app.js"]);
 });
 
+test("a validly encoded empty head blob completes as an empty source, not retryable churn", () => {
+  const EMPTY_BLOB_SHA = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+  const base = {
+    repo: "M1Vj/example-repo",
+    headSha: "a".repeat(40),
+    changedPaths: ["docs/empty.md"],
+    getTree: () => ({ truncated: false, tree: [{ path: "docs/empty.md", type: "blob", sha: EMPTY_BLOB_SHA }] }),
+  };
+  const empty = fetchCompleteRevisionSources({
+    ...base,
+    getBlob: (_repo, sha) => ({ sha, encoding: "base64", content: "" }),
+  });
+  assert.equal(empty.ok, true);
+  assert.equal(empty.disposition, "complete");
+  assert.equal(empty.retryable, false);
+  assert.deepEqual(empty.files, [{ path: "docs/empty.md", content: "" }]);
+  for (const [label, getBlob] of [
+    ["null content", (_repo, sha) => ({ sha, encoding: "base64", content: null })],
+    ["wrong encoding", (_repo, sha) => ({ sha, encoding: "utf8", content: Buffer.from("x", "utf8").toString("base64") })],
+    ["malformed base64", (_repo, sha) => ({ sha, encoding: "base64", content: "!!!not-base64!!!" })],
+  ]) {
+    const shapeFailure = fetchCompleteRevisionSources({ ...base, getBlob });
+    assert.equal(shapeFailure.ok, false, label);
+    assert.equal(shapeFailure.retryable, true, label);
+    assert.equal(shapeFailure.disposition, "retryable", label);
+    assert.match(shapeFailure.errors.join(" "), /missing/i, label);
+  }
+});
+
 test("revision fails closed when exact-head blobs are missing or oversized", () => {
   const base = {
     repo: "M1Vj/example-repo",
@@ -361,7 +390,7 @@ test("revision fails closed when exact-head blobs are missing or oversized", () 
     changedPaths: ["src/app.js"],
     getTree: () => ({ truncated: false, tree: [{ path: "src/app.js", type: "blob", sha: "blob-1" }] }),
   };
-  const missing = fetchCompleteRevisionSources({ ...base, getBlob: () => ({ sha: "blob-1", encoding: "base64", content: "" }) });
+  const missing = fetchCompleteRevisionSources({ ...base, getBlob: () => ({ sha: "blob-1", encoding: "base64", content: null }) });
   assert.equal(missing.ok, false);
   assert.equal(missing.retryable, true);
   assert.equal(missing.disposition, "retryable");

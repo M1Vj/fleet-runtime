@@ -203,15 +203,24 @@ export function fetchCompleteRevisionSources({
       retryableFailure = true;
       continue;
     }
-    const encoded = String(blob?.content || "").replace(/\s+/g, "");
-    if (!blob || blob.encoding !== "base64" || !encoded || encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
+    // A string content field (including empty) with base64 encoding is present:
+    // git's empty blob decodes to "" and is a complete source. Null content,
+    // non-base64 encoding, and malformed base64 stay retryable transport/shape
+    // failures so a deterministic outcome cannot churn scan→gate→consume→release.
+    if (!blob || typeof blob.content !== "string" || blob.encoding !== "base64") {
+      errors.push(`exact-head blob content missing: ${filePath}`);
+      retryableFailure = true;
+      continue;
+    }
+    const encoded = blob.content.replace(/\s+/g, "");
+    if (encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) {
       errors.push(`exact-head blob content missing: ${filePath}`);
       retryableFailure = true;
       continue;
     }
     const bytes = Buffer.from(encoded, "base64");
     const content = bytes.toString("utf8");
-    if (!content || Buffer.from(content, "utf8").compare(bytes) !== 0
+    if (Buffer.from(content, "utf8").compare(bytes) !== 0
       || /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(content)) {
       errors.push(`exact-head blob is not complete text: ${filePath}`);
       blockedFailure = true;

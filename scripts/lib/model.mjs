@@ -3,6 +3,7 @@ import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync,
 import path from "node:path";
 import os from "node:os";
 import { gatewayCircuitOpen, markGatewayDown, markGatewayUp } from "./gateway-health.mjs";
+import { classifyProviderAuthFailure, providerAuthStatus } from "./provider-auth.mjs";
 
 export const DISPOSABLE_MODEL_POLICY = Object.freeze({
   permission: {
@@ -201,12 +202,14 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs, env, files = []
     let timedOut = false;
     const childEnv = { ...env };
     for (const key of Object.keys(childEnv)) {
-      if (/TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL/i.test(key) && key !== "OPENCODE_AUTH_CONTENT") delete childEnv[key];
+      if (/TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL/i.test(key) && key !== "OPENCODE_AUTH_CONTENT" && key !== "OPENCODE_API_KEY") delete childEnv[key];
     }
     delete childEnv.FLEET_GH_TOKEN;
     delete childEnv.GH_TOKEN;
     delete childEnv.GDRIVE_REFRESH_TOKEN;
     delete childEnv.GDRIVE_CLIENT_SECRET;
+    // Legacy migration path only: owner-Mac OAuth snapshots are never the
+    // production dependency; GitHub provisions OPENCODE_API_KEY instead.
     childEnv.OPENCODE_AUTH_CONTENT = env.FLEET_OPENCODE_AUTH || "";
     childEnv.OPENCODE_DISABLE_AUTOUPDATE = "1";
     const child = spawnImpl("opencode", args, { env: childEnv, stdio: ["ignore", "pipe", "pipe"], cwd: workspaceRoot });
@@ -262,25 +265,38 @@ function sleep(ms) {
 
 async function askModelInternal({ prompt, sessionId, timeoutMs = 480000, env = process.env, preferVariantMax = true, maxRounds = 4, files = [], modelOverride, workspace, repoRoot = process.cwd(), stateRoot: privateStateRoot = env.FLEET_STATE_ROOT || "", spawnImpl, skipCircuitCheck = false }) {
   const healthRoot = env.FLEET_STATE_ROOT || process.cwd();
-  if (!skipCircuitCheck && !sessionId && gatewayCircuitOpen(healthRoot)) {
-    return { reply: "", sessionId: "", modelMode: "circuit-open", attempts: [{ round: 0, skipped: "circuit-open" }], complete: false, circuitOpen: true };
+  const authStatus = providerAuthStatus(env, { circuitOpen: !skipCircuitCheck && !sessionId && gatewayCircuitOpen(healthRoot) });
+  if (!authStatus.ready) {
+    return authStatus.stage === "credentials"
+      ? { reply: "", sessionId: "", modelMode: "auth-missing", attempts: [{ round: 0, skipped: "model-auth-missing" }], complete: false, authMissing: true }
+      : { reply: "", sessionId: "", modelMode: "circuit-open", attempts: [{ round: 0, skipped: "circuit-open" }], complete: false, circuitOpen: true };
   }
   const chain = modelOverride ? [modelOverride] : resolveModelChain(env);
   const allAttempts = [];
   let lastSid = sessionId || "";
   let lastMode = "";
+  let lastAuthState = "";
   for (let ci = 0; ci < chain.length; ci++) {
     const r = await askOnModel({ model: chain[ci], isPrimary: ci === 0, prompt, sessionId: lastSid || undefined, timeoutMs, env, preferVariantMax, maxRounds, files, workspace, repoRoot, stateRoot: privateStateRoot, spawnImpl });
     allAttempts.push(...(r.attempts || []));
     if (r.sessionId) lastSid = r.sessionId;
     lastMode = r.modelMode || lastMode;
+    lastAuthState = r.authState || lastAuthState;
     if (r.complete) {
       try { markGatewayUp(healthRoot); } catch {}
       return { reply: r.reply, sessionId: lastSid, modelMode: lastMode, attempts: allAttempts, complete: true };
     }
+    if (lastAuthState) break;
   }
   try { markGatewayDown(healthRoot, allAttempts.map((x) => x.errTail || "").join(" ").slice(-200)); } catch {}
-  return { reply: "", sessionId: lastSid, modelMode: lastMode, attempts: allAttempts, complete: false };
+  return {
+    reply: "",
+    sessionId: lastSid,
+    modelMode: lastMode,
+    attempts: allAttempts,
+    complete: false,
+    ...(lastAuthState ? { authState: lastAuthState } : {}),
+  };
 }
 
 /** Every judge/revision call gets a fresh workspace and policy by default. */
@@ -346,6 +362,10 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
       try { markGatewayUp(healthRoot); } catch {}
       return { reply: r.reply, sessionId: sid, modelMode: `${model}${mode === "max" ? "@max" : ""}`, attempts, complete: true };
     }
+    const authState = classifyProviderAuthFailure(`${r.stderrTail || ""}\n${r.rawTail || ""}`);
+    if (authState) {
+      return { reply: "", sessionId: sid, modelMode: mode, attempts, complete: false, authState };
+    }
     if (mode === "max") {
       mode = "plain";
       continue;
@@ -364,7 +384,7 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
 
 export async function askModelResilient(opts) {
   const first = await askModel(opts);
-  if (first.complete) return { ...first, ladders: 1 };
+  if (first.complete || first.authState || first.authMissing) return { ...first, ladders: 1 };
   const cooldownMs = opts.cooldownMs ?? 90000;
   await new Promise((r) => setTimeout(r, cooldownMs));
   const second = await askModel({ ...opts, maxRounds: Math.max(2, (opts.maxRounds || 4) - 1) });

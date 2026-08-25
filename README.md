@@ -88,7 +88,7 @@ Core lane terminal states written to `state/events.jsonl` are `SUCCESS`, `NO-OP`
 - An unresolved `DISPATCH_UNKNOWN` intentionally suppresses blind retry until a correlated target run consumes it or an operator reconciles GitHub Actions and private state.
 - `queue: max` is supported by GitHub Actions (May 2026); actionlint 1.7.12 predates that schema addition and needs its single `concurrency.queue` diagnostic ignored until a supporting release ships.
 - Single free gateway model: 429-driven silent hangs are mitigated by hard timeouts, retry ladders, and the circuit breaker, not eliminated; VLM color naming on synthetic images is unreliable.
-- Model auth freshness depends on the owner Mac refreshing `FLEET_OPENCODE_AUTH` every ~30 minutes; the anonymous fallback round works but is degraded capacity.
+- Production model auth uses the durable `OPENCODE_API_KEY` provider secret (GitHub Environment) exposed only to the model process; missing, rejected, or exhausted credentials fail closed into retryable private errors without mutating targets. The owner-Mac OAuth snapshot refresh (`FLEET_OPENCODE_AUTH`, LaunchAgent keepalive) remains an explicit migration-only utility and is never the default production path.
 - Dispatch inputs `top_files` (fleet-thesis) and `gdrive` (fleet-kb) are accepted but not wired into script behavior.
 
 Operations, procedures, and troubleshooting: see [docs/RUNBOOK.md](docs/RUNBOOK.md).

@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+// Migration-only utility: refreshes the legacy OAuth snapshot secret
+// (FLEET_OPENCODE_AUTH) or FLEET_GH_TOKEN. Production model auth uses the
+// durable OPENCODE_API_KEY GitHub Environment secret instead.
 import process from "node:process";
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";

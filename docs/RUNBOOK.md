@@ -10,6 +10,12 @@ Required secrets on BOTH repos: `FLEET_GH_TOKEN` (PAT with `repo` + `workflow` s
 the gate exits 3 when it is missing or its identity is wrong, and exits 4 when scopes are
 insufficient) and `FLEET_OPENCODE_AUTH`.
 
+Production model access uses the durable `OPENCODE_API_KEY` provider key (a protected GitHub
+Environment secret exposed only to the model process). Missing, rejected, or exhausted values
+fail closed into retryable private errors without mutating a target. `FLEET_OPENCODE_AUTH` and
+the helper/keepalive below are migration-only utilities for moving off the owner Mac; they are
+not production dependencies.
+
 Refresh model auth (values never displayed; helper targets both `M1Vj/fleet-runtime` and
 `M1Vj/fleet-control`):
 
@@ -152,6 +158,8 @@ Semantics (`scripts/lib/model.mjs`):
 
 - Each model gets variant `max`, plain, anonymous (auth stripped), then resume rounds. The
   default is four rounds; thesis and KB drafts use five. Calls are spaced by 20 to 35 seconds.
+  With the production `OPENCODE_API_KEY`, detected credential rejection or exhaustion stops the
+  remaining rounds immediately instead of falling back to anonymous calls.
 - If the whole chain fails, a second ladder starts after a 90-second cooldown, or 120 seconds
   for long-form lanes. Per-call timeouts are 480 seconds by default, 540 for deep analysis,
   and 600 for thesis, KB, or revision work.

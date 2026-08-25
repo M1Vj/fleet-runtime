@@ -143,28 +143,33 @@ test("non-credential failures keep the existing ladder behavior", async () => {
 });
 
 test("the model process receives OPENCODE_API_KEY while other key-like variables stay stripped", async () => {
+  const workspace = mkdtempSync(path.join(tmpdir(), "fleet-auth-runonce-"));
   let capturedEnv;
-  const result = await runOnce({
-    prompt: "probe",
-    timeoutMs: 1000,
-    env: {
-      OPENCODE_API_KEY: "pk-fixture",
-      FLEET_GH_TOKEN: "gh-fixture",
-      MY_API_TOKEN: "token-fixture",
-      SERVICE_PASSWORD: "pw-fixture",
-    },
-    workspace: mkdtempSync(path.join(tmpdir(), "fleet-auth-runonce-")),
-    spawnImpl: (_command, _args, options) => {
-      capturedEnv = options.env;
-      return spawnChild({ stdout: '{"text":"ok"}\n', code: 0 });
-    },
-  });
-  assert.equal(result.exitCode, 0);
-  assert.equal(capturedEnv.OPENCODE_API_KEY, "pk-fixture");
-  assert.equal(capturedEnv.OPENCODE_AUTH_CONTENT, "");
-  assert.equal(capturedEnv.FLEET_GH_TOKEN, undefined);
-  assert.equal(capturedEnv.MY_API_TOKEN, undefined);
-  assert.equal(capturedEnv.SERVICE_PASSWORD, undefined);
+  try {
+    const result = await runOnce({
+      prompt: "probe",
+      timeoutMs: 1000,
+      env: {
+        OPENCODE_API_KEY: "pk-fixture",
+        FLEET_GH_TOKEN: "gh-fixture",
+        MY_API_TOKEN: "token-fixture",
+        SERVICE_PASSWORD: "pw-fixture",
+      },
+      workspace,
+      spawnImpl: (_command, _args, options) => {
+        capturedEnv = options.env;
+        return spawnChild({ stdout: '{"text":"ok"}\n', code: 0 });
+      },
+    });
+    assert.equal(result.exitCode, 0);
+    assert.equal(capturedEnv.OPENCODE_API_KEY, "pk-fixture");
+    assert.equal(capturedEnv.OPENCODE_AUTH_CONTENT, "");
+    assert.equal(capturedEnv.FLEET_GH_TOKEN, undefined);
+    assert.equal(capturedEnv.MY_API_TOKEN, undefined);
+    assert.equal(capturedEnv.SERVICE_PASSWORD, undefined);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
 });
 
 test("merge-gate workflows provision the provider key next to the legacy migration secret", () => {

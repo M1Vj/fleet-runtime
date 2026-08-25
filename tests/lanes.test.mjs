@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { validateDirectives } from "../scripts/lib/directives.mjs";
+
+const watchdogWorkflow = readFileSync(new URL("../.github/workflows/watchdog.yml", import.meta.url), "utf8");
+const watchdogSource = readFileSync(new URL("../scripts/watchdog.mjs", import.meta.url), "utf8");
 
 test("valid report directive passes", () => {
   const r = validateDirectives('[{"kind":"report","section":"triage","text":"all quiet"}]');
@@ -91,13 +95,50 @@ test("decideStale matrix", async () => {
   assert.equal(decideStale(null, now).stale, true);
 });
 
-test("planWatchdogActions: stale plans re-enables + alert", async () => {
+test("planWatchdogActions: stale defaults to reporting without re-enables", async () => {
   const { planWatchdogActions } = await import("../scripts/lib/watchdog-decide.mjs");
   const now = Date.now();
   const p = planWatchdogActions({ lastRunUtc: new Date(now - 5 * 3600000).toISOString() }, now);
   assert.equal(p.stale, true);
-  assert.ok(p.actions.filter((a) => a.kind === "enable-workflow").length >= 6);
+  assert.equal(p.actions.filter((a) => a.kind === "enable-workflow").length, 0);
   assert.equal(p.actions.filter((a) => a.kind === "file-alert-issue").length, 1);
+});
+
+test("planWatchdogActions: explicit opt-in enables the bounded workflow set", async () => {
+  const { planWatchdogActions } = await import("../scripts/lib/watchdog-decide.mjs");
+  const now = Date.now();
+  const p = planWatchdogActions({ lastRunUtc: new Date(now - 5 * 3600000).toISOString() }, now, undefined, { autoEnable: true });
+  assert.equal(p.stale, true);
+  assert.equal(p.actions.filter((a) => a.kind === "enable-workflow").length, 7);
+  assert.equal(p.actions.filter((a) => a.kind === "file-alert-issue").length, 1);
+});
+
+test("watchdog auto-enable opt-in accepts only the exact true value", async () => {
+  const { watchdogAutoEnableEnabled } = await import("../scripts/lib/watchdog-decide.mjs");
+  assert.equal(watchdogAutoEnableEnabled("true"), true);
+  for (const value of [undefined, "", "false", "TRUE", " true ", "1", "yes"]) {
+    assert.equal(watchdogAutoEnableEnabled(value), false, `unexpected opt-in for ${String(value)}`);
+  }
+});
+
+test("watchdog alert selector reuses one open issue and ignores closed or PR-like entries", async () => {
+  const { selectWatchdogAlertIssue } = await import("../scripts/lib/watchdog-decide.mjs");
+  const existing = { number: 12, state: "open", title: "[WATCHDOG] patrol stale since 2026-08-25T00:00:00Z" };
+  assert.equal(selectWatchdogAlertIssue([
+    { number: 11, state: "closed", title: existing.title },
+    { number: 13, state: "open", title: existing.title, pull_request: { url: "https://example.test/pr/13" } },
+    existing,
+  ]), existing);
+  assert.equal(selectWatchdogAlertIssue([
+    { number: 14, state: "open", title: "[WATCHDOG] unrelated" },
+    { number: 15, state: "open", title: "[WATCHDOG] patrol stale since old" , pull_request: {} },
+  ]), null);
+});
+
+test("watchdog workflow exposes an unset-safe explicit opt-in", () => {
+  assert.match(watchdogWorkflow, /FLEET_WATCHDOG_AUTO_ENABLE:\s*\$\{\{\s*vars\.FLEET_WATCHDOG_AUTO_ENABLE\s*\}\}/);
+  assert.match(watchdogSource, /watchdogAutoEnableEnabled\(process\.env\.FLEET_WATCHDOG_AUTO_ENABLE\)/);
+  assert.match(watchdogSource, /if \(plan\.autoEnable\)/);
 });
 
 test("shouldCoalesce only for schedule trigger", async () => {
@@ -129,4 +170,3 @@ test("harvestFencedFiles extracts path+content", async () => {
   const files = harvestFencedFiles("V2FILE path=v2/ch.md\n```md\n# Hello\n```");
   assert.equal(files[0].path, "v2/ch.md");
 });
-

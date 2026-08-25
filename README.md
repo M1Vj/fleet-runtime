@@ -32,7 +32,7 @@ Public GitHub Actions execution shell that autonomously patrols, audits, improve
 | Workflow | Trigger | Cadence (UTC) | Purpose | Model use |
 | --- | --- | --- | --- | --- |
 | fleet-patrol | cron, dispatch | 3x/hour :03 :23 :43 | triage repo signals; private reports, labels/draft PRs; enqueue deep tasks; heartbeat | 1 call + repair |
-| fleet-watchdog | cron | 4x/hour :09 :24 :39 :54 | heartbeat staleness (90 min): re-enable workflows, reclaim queue tasks, alert issue | none |
+| fleet-watchdog | cron | 4x/hour :09 :24 :39 :54 | heartbeat staleness (90 min): report once, reclaim queue tasks, optional workflow recovery | none |
 | fleet-deep | cron, dispatch | 3x/hour :11 :31 :51 | drain state/queue.jsonl, max 3 workers: security/redteam/code-review/docs reports on real clones | <=3 calls/wave |
 | fleet-improve | cron, dispatch | every 2 h at :25 | pick -> research -> plan -> implement draft PR -> 3-lens review persisted privately | ~5 calls/repo |
 | fleet-merge-gate | cron, dispatch | every 15 min | select at most one draft; isolated deterministic checks; 2 advisory judges; block or bounded autonomous revision; merge only on intentional manual dispatch | 2 judges + optional revision |
@@ -84,7 +84,7 @@ Core lane terminal states written to `state/events.jsonl` are `SUCCESS`, `NO-OP`
 
 - `fleet-merge-gate` now reads `FLEET_KILL_SWITCH_PATH`; several other production lanes still do not. API-level workflow disabling remains the complete operational stop.
 - `fleet-emergency-stop` does not disable `fleet-merge-gate` or `ci-diag`; for a complete halt, disable them explicitly through the Actions API.
-- The watchdog's stale-alert issue body references an undefined variable (`ageMs`), so stale-recovery runs apply the re-enables but then exit nonzero without filing the alert or committing that cycle's state.
+- Watchdog stale recovery keeps workflow enablement off unless the trusted job receives the exact `FLEET_WATCHDOG_AUTO_ENABLE=true` opt-in. It reuses an open `[WATCHDOG] patrol stale...` issue instead of creating one on every run.
 - An unresolved `DISPATCH_UNKNOWN` intentionally suppresses blind retry until a correlated target run consumes it or an operator reconciles GitHub Actions and private state.
 - `queue: max` is supported by GitHub Actions (May 2026); actionlint 1.7.12 predates that schema addition and needs its single `concurrency.queue` diagnostic ignored until a supporting release ships.
 - Single free gateway model: 429-driven silent hangs are mitigated by hard timeouts, retry ladders, and the circuit breaker, not eliminated; VLM color naming on synthetic images is unreliable.

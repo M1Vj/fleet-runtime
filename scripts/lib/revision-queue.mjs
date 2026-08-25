@@ -110,8 +110,8 @@ export function isRevisionPathPolicySafe(filePath) {
 
 /**
  * A path is a safe supporting path only when it is safe in the shared directive
- * validator and not a workflow path. Workflow files may be revised only when
- * they were already part of the PR's original changed-path set.
+ * validator and not a workflow path. Workflow files are never revisable: they are
+ * rejected unconditionally, even when already part of the PR's changed-path set.
  */
 export function isSafeSupportingPath(filePath, changedPaths = []) {
   if (!isRevisionPathPolicySafe(filePath)) return false;

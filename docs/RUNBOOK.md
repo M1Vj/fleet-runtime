@@ -6,15 +6,15 @@ All commands assume `gh` authenticated as M1Vj on the owner Mac. Workflows live 
 
 ## 1. Secrets setup and rotation
 
-Required secrets on BOTH repos: `FLEET_GH_TOKEN` (PAT with `repo` + `workflow` scopes;
+Required secret on BOTH repos: `FLEET_GH_TOKEN` (PAT with `repo` + `workflow` scopes;
 the gate exits 3 when it is missing or its identity is wrong, and exits 4 when scopes are
-insufficient) and `FLEET_OPENCODE_AUTH`.
+insufficient).
 
-Production model access uses the durable `OPENCODE_API_KEY` provider key (a protected GitHub
-Environment secret exposed only to the model process). Missing, rejected, or exhausted values
-fail closed into retryable private errors without mutating a target. `FLEET_OPENCODE_AUTH` and
-the helper/keepalive below are migration-only utilities for moving off the owner Mac; they are
-not production dependencies.
+Production model access requires the durable `OPENCODE_API_KEY` provider key (a protected GitHub
+Environment secret exposed only to the model process); provision it wherever model lanes run.
+Missing, rejected, or exhausted values fail closed into retryable private errors without mutating
+a target. `FLEET_OPENCODE_AUTH` is migration-only: it was required only while moving off the owner
+Mac and is not a production dependency, and the helper/keepalive below are migration-only too.
 
 Refresh model auth (values never displayed; helper targets both `M1Vj/fleet-runtime` and
 `M1Vj/fleet-control`):
@@ -82,9 +82,14 @@ Stop (requires exact confirmation string):
 
 Effects: commits `state/KILL_SWITCH` to fleet-control, disables patrol/watchdog/selftest/
 deep/improve/thesis/kb/retro on BOTH repos, opens an `[EMERGENCY STOP]` issue.
-Caveat: `fleet-merge-gate` and `ci-diag` are NOT disabled; for a full halt also run:
+Precedence: committing the `state/KILL_SWITCH` file is the only complete stop. API-level
+workflow disabling alone is reversible while `FLEET_WATCHDOG_AUTO_ENABLE=true` is set, because
+an opted-in watchdog may re-enable allowlisted workflows (including `merge.yml`).
+Caveat: `fleet-merge-gate` and `ci-diag` are NOT disabled; for a fuller halt also run:
 
     gh api -X PUT repos/M1Vj/fleet-runtime/actions/workflows/merge.yml/disable
+
+and remember the API-level disable remains reversible under the watchdog opt-in above.
 
 Re-arm (from a local clone of fleet-control):
 

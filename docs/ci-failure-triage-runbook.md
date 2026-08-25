@@ -2,6 +2,10 @@
 
 Scope: scheduled fleet workflows (patrol, watchdog, deep, improve).
 
+This file is a general triage procedure for recurring scheduled-workflow failures.
+It deliberately contains no incident facts; per-incident windows, run IDs, and root
+causes live only in the canonical log referenced below.
+
 ## 0. Related documents
 - Incident record for 2026-08-23: see `docs/runbooks/ci-failure-triage.md`. That runbook is
   the canonical log of observed failures (windows, run IDs, root cause). Do not restate or
@@ -20,8 +24,13 @@ merge gate: group `fleet-merge-gate` with `queue: max`). This is deliberate:
 
 - Fleet runs mutate shared private state (`state-control/`). Cancelling a run mid-flight
   can leave partial state behind and corrupt subsequent runs.
-- Overlapping cron triggers therefore queue rather than pre-empt; this is enforced by
-  `tests/workflow-contract.test.mjs`.
+- Overlapping cron triggers therefore queue rather than pre-empt.
+
+Enforcement note: this contract is asserted by `tests/workflow-contract.test.mjs` for the
+merge gate only (that test reads solely `merge.yml` and asserts the single fixed group
+`fleet-merge-gate` with `cancel-in-progress: false` and `queue: max`). The identical
+settings on patrol/watchdog/deep/improve are an intentional repo-wide convention guarded
+by review, not by an automated contract test.
 
 Do not propose dynamic groups (`${{ github.workflow }}-${{ github.ref }}`) or
 `cancel-in-progress: true` as remediation. To reduce overlap, adjust cron schedules via PR

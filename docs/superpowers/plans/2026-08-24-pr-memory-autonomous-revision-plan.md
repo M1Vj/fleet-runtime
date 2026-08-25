@@ -94,7 +94,7 @@
 - [ ] Enable only long enough to dispatch a controlled `allow_merge=false` canary, verify non-empty target inputs, isolated target checks, atomic revision behavior, and private memory, then reconcile the canary.
 - [ ] Re-enable scheduled operation only after the canary passes; otherwise leave it disabled and record the exact blocker.
 
-- [x] Run `node --test tests/*.test.mjs` (213/213) and actionlint on all workflows; ignore only actionlint 1.7.12's documented stale `concurrency.queue` diagnostic.
+- [x] Run `node --test tests/*.test.mjs` (216/216) and actionlint on all workflows; ignore only actionlint 1.7.12's documented stale `concurrency.queue` diagnostic.
 - [x] Run a read-only static secret-pattern scan; hits are confined to deliberate scanner/test fixtures, and the commit hook passed the documentation packet.
 - [ ] Dispatch one targeted merge-gate run against an existing fleet draft with no merge permission and inspect the workflow logs, private state event, and target inputs.
 - [ ] Re-fetch both remotes, inspect the complete diff, and verify attribution on any state commit/comment.

@@ -125,7 +125,6 @@ test("watchdog runtime recovery derives from the shared lib allowlist", async ()
   const { WATCHDOG_WORKFLOWS } = await import("../scripts/lib/watchdog-decide.mjs");
   assert.equal(WATCHDOG_WORKFLOWS.length, 8);
   assert.deepEqual([...new Set(WATCHDOG_WORKFLOWS)], WATCHDOG_WORKFLOWS);
-  assert.match(watchdogSource, /"M1Vj\/fleet-runtime": \[\.\.\.WATCHDOG_WORKFLOWS\]/);
 });
 
 test("watchdog auto-enable opt-in accepts only the exact true value", async () => {
@@ -185,8 +184,10 @@ test("watchdog workflow exposes an unset-safe explicit opt-in", () => {
   assert.match(watchdogSource, /findWatchdogAlertIssue\(\(page\) =>/);
 });
 
-test("the runtime enable plan can restore the merge gate workflow", () => {
-  assert.match(watchdogSource, /"M1Vj\/fleet-runtime":\s*\[[^\]]*"merge\.yml"/);
+test("the runtime enable plan can restore the merge gate workflow", async () => {
+  const { WATCHDOG_WORKFLOWS } = await import("../scripts/lib/watchdog-decide.mjs");
+  assert.match(watchdogSource, /"M1Vj\/fleet-runtime":\s*\[\.\.\.WATCHDOG_WORKFLOWS\]/);
+  assert.ok(WATCHDOG_WORKFLOWS.includes("merge.yml"), "merge gate must be restorable");
 });
 
 test("shouldCoalesce only for schedule trigger", async () => {

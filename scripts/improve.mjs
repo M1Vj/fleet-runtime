@@ -6,6 +6,7 @@ import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, ghInput, putFileContent, ensureBranch, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, sha256, configureIdentity } from "./lib/util.mjs";
 import { askModel, askModelResilient, createDisposableModelWorkspace, disposeModelWorkspace } from "./lib/model.mjs";
+import { createPublicSourceWorkspace } from "./lib/source-workspace.mjs";
 import { verifyCommit, verifyPullAuthor } from "./lib/verify.mjs";
 import { makeTerminal } from "./lib/terminal.mjs";
 import { isSafeRepoPath, sanitizeControlChars, extractJsonObject } from "./lib/directives.mjs";
@@ -34,21 +35,7 @@ export function validateImproveTarget({ repo, meta, stateRoot = REPO_ROOT, targe
 }
 
 function createPublicImproveWorkspace(repo, meta) {
-  const workspace = createDisposableModelWorkspace({
-    repoRoot: CODE_ROOT,
-    stateRoot: process.env.FLEET_STATE_ROOT || REPO_ROOT,
-    prefix: "fleet-improve-public-",
-    profile: "public-read",
-    publicTarget: meta,
-  });
-  const sourceDir = path.join(workspace, "source");
-  try {
-    gh(["repo", "clone", repo0(repo), sourceDir, "--", "--depth", "1"], process.env);
-    return { workspace, sourceDir };
-  } catch (error) {
-    disposeModelWorkspace(workspace);
-    throw error;
-  }
+  return createPublicSourceWorkspace(repo, meta, { repoRoot: CODE_ROOT, stateRoot: process.env.FLEET_STATE_ROOT || REPO_ROOT });
 }
 
 function readJson(p, fallback) {

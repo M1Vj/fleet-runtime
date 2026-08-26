@@ -5,7 +5,8 @@ import path from "node:path";
 import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, readmeExcerptWithFallback, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
-import { askModel } from "./lib/model.mjs";
+import { askModel, disposeModelWorkspace } from "./lib/model.mjs";
+import { createPublicSourceWorkspace } from "./lib/source-workspace.mjs";
 import { verifyCommit } from "./lib/verify.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
 import { makeTerminal } from "./lib/terminal.mjs";
@@ -71,7 +72,9 @@ function buildPrompt(task) {
     focus,
     "Return ONLY strict JSON: {\"findings\":[{\"severity\":\"critical|high|medium|low\",\"title\":\"...\",\"detail\":\"...\",\"recommendation\":\"...\"}],\"verdict\":\"one-paragraph summary\"}",
     "Max 12 findings; be specific and evidence-based; do not invent files you have not seen.",
-    "A full clone of the repository is mounted at '.' (your working directory). Use read/grep/glob freely to inspect real code before concluding.",
+    task.hasSource
+      ? "A shallow clone of the verified-public repository is mounted at './source' (inside your working directory). Use read/grep/glob freely to inspect that real code before concluding."
+      : "No repository files are mounted; base every finding on the repository context below and say so when evidence is insufficient.",
     "Repository context follows:",
     buildContext(task.repo),
   ].join("\n");
@@ -86,10 +89,10 @@ function parseFindings(reply) {
   };
 }
 
-export async function analyzeOne(repo, kind, workdir, audit) {
+export async function analyzeOne(repo, kind, prepared, audit) {
   const result = await askModel({
-    prompt: buildPromptFor({ repo, kind }, workdir),
-    workspace: workdir,
+    prompt: buildPromptFor({ repo, kind, hasSource: Boolean(prepared) }),
+    ...(prepared ? { workspace: prepared.workspace, profile: "public-read", publicTarget: prepared.meta } : {}),
     timeoutMs: 540000,
     env: process.env,
     preferVariantMax: true,
@@ -110,8 +113,8 @@ export async function analyzeOne(repo, kind, workdir, audit) {
   }
 }
 
-function buildPromptFor(task, workdir) {
-  return buildPrompt(task, workdir);
+function buildPromptFor(task) {
+  return buildPrompt(task);
 }
 
 async function mainWorker() {
@@ -136,11 +139,23 @@ async function mainWorker() {
     console.log(`DEEP_RESULT_FILE=${path.join(process.env.FLEET_ARTIFACT_DIR || ".", `report-${repo.replace("/", "__")}.json`)}`);
     return 0;
   }
-  const cloneDir = `/tmp/deep-${String(repo).replace("/", "__")}`;
-  gh(["repo", "clone", repo, cloneDir, "--", "--depth", "1"], process.env);
+  const meta = gh(["api", `/repos/${repo}`], process.env);
+  const publicVerified = Boolean(meta) && meta.private === false && meta.visibility === "public";
+  let prepared;
+  if (publicVerified) {
+    try {
+      prepared = { ...createPublicSourceWorkspace(repo, meta), meta };
+      audit.note("workspace", `public-read source mount for ${repo}`);
+    } catch (error) {
+      audit.note("workspace", `public mount unavailable for ${repo} (${String(error.message || error).slice(0, 80)}); falling back to prompt-only`);
+      prepared = undefined;
+    }
+  } else {
+    audit.note("workspace", `${repo} is not verified public; prompt-only deny-all analysis`);
+  }
   let analysis;
   try {
-    analysis = await analyzeOne(repo, kind, cloneDir, audit);
+    analysis = await analyzeOne(repo, kind, prepared, audit);
   } catch (err) {
     if (err.code === 6 || /MODEL_UNAVAILABLE/.test(err.message)) {
       const { gatewayDown } = await import("./lib/gateway-health.mjs");
@@ -152,6 +167,8 @@ async function mainWorker() {
       }
     }
     throw err;
+  } finally {
+    if (prepared) disposeModelWorkspace(prepared.workspace);
   }
   const outPath = path.join(process.env.FLEET_ARTIFACT_DIR || ".", `report-${repo.replace("/", "__")}.json`);
   writeFileSync(outPath, JSON.stringify({ repo, kind, ...analysis, finishedUtc: new Date().toISOString() }, null, 2));

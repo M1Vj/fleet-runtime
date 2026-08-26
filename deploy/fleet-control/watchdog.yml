@@ -1,0 +1,35 @@
+name: fleet-watchdog-sentinel
+run-name: "fleet watchdog sentinel ${{ github.run_id }}"
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-watchdog
+  cancel-in-progress: false
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      FLEET_WATCHDOG_AUTO_ENABLE: ${{ vars.FLEET_WATCHDOG_AUTO_ENABLE }}
+      FLEET_SENTINEL_TARGET: M1Vj/fleet-runtime
+    steps:
+      - name: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: setup node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+      - name: sentinel
+        run: node scripts/sentinel.mjs

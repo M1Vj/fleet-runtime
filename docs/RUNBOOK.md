@@ -46,7 +46,7 @@ owner's active user session is running. Uninstall:
 ## 2. Manual runs and monitoring
 
     gh workflow run fleet-patrol.yml        -R M1Vj/fleet-runtime
-    gh workflow run fleet-deep.yml          -R M1Vj/fleet-runtime -f workers=3
+    gh workflow run fleet-deep.yml          -R M1Vj/fleet-runtime -f workers=4
     gh workflow run fleet-selftest.yml      -R M1Vj/fleet-runtime
     gh run list -R M1Vj/fleet-runtime --limit 10
     gh run watch <run-id> -R M1Vj/fleet-runtime
@@ -68,11 +68,13 @@ session.
 
 The recovery allowlist covers `patrol.yml`, `selftest.yml`, `deep.yml`, `improve.yml`,
 `thesis.yml`, `kb.yml`, `retro.yml`, and `merge.yml` in fleet-runtime (plus the four
-fleet-control lanes). This watchdog cannot recover itself: if `fleet-watchdog` is the
-disabled or stale component, only the paired sentinel in private `M1Vj/fleet-control` can
-restore it, under that repository's own explicit opt-in variable and with the kill switch
-still absent. If both sentinels stop at once, recovery waits for an operator when service
-returns; GitHub cannot recover GitHub itself.
+fleet-control lanes). This watchdog cannot recover itself: the paired sentinel in private
+`M1Vj/fleet-control` (deploy/fleet-control/watchdog.yml, hourly at :23) checks the runtime
+watchdog's last run and, when stale for 60+ minutes, with fleet-control's
+`FLEET_WATCHDOG_AUTO_ENABLE=true` and no kill switch, re-enables exactly runtime
+`watchdog.yml` and `merge.yml`; the revived primary then self-heals every other lane. It
+fails closed on uncertain API errors and never disables anything. If both sentinels stop
+at once, recovery waits for an operator when service returns; GitHub cannot recover GitHub itself.
 
 ## 3. Emergency stop and re-arm
 

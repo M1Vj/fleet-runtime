@@ -248,3 +248,18 @@ test("harvestFencedFiles extracts path+content", async () => {
   const files = harvestFencedFiles("V2FILE path=v2/ch.md\n```md\n# Hello\n```");
   assert.equal(files[0].path, "v2/ch.md");
 });
+
+test("deep analyze tolerates a missing README without losing real failures", async () => {
+  const { readmeExcerptWithFallback } = await import("../scripts/lib/util.mjs");
+  assert.equal(readmeExcerptWithFallback(() => "# Title"), "# Title");
+  assert.equal(readmeExcerptWithFallback(() => ""), "(no README file)");
+  assert.equal(readmeExcerptWithFallback(() => null), "(no README file)");
+  assert.equal(
+    readmeExcerptWithFallback(() => { throw new Error("gh api /repos/X/readme failed: gh: Not Found (HTTP 404)"); }),
+    "(no README file)",
+  );
+  assert.throws(
+    () => readmeExcerptWithFallback(() => { throw new Error("gh api failed: network error"); }),
+    /network error/,
+  );
+});

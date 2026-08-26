@@ -352,8 +352,8 @@ export async function main() {
       await verifyCommit("M1Vj/fleet-control", sha, identity, process.env.FLEET_GH_TOKEN);
       audit.note("push-verify", `attribution verified sha=${sha.slice(0, 10)}`);
       try {
-        gh(["workflow", "run", "deep.yml", "-R", "M1Vj/fleet-control", "-f", "workers=3"], process.env);
-        audit.note("deep-dispatch", "deep.yml dispatched");
+        gh(["workflow", "run", "deep.yml", "-R", "M1Vj/fleet-runtime", "-f", "workers=3"], process.env);
+        audit.note("deep-dispatch", "deep.yml dispatched on fleet-runtime");
       } catch (err) {
         audit.note("deep-dispatch", `dispatch skipped: ${err.message.slice(0, 120)}`);
       }

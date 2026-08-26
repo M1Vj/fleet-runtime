@@ -7,6 +7,7 @@ import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, readmeExcerptWithFallback, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
 import { askModel, disposeModelWorkspace } from "./lib/model.mjs";
 import { createPublicSourceWorkspace } from "./lib/source-workspace.mjs";
+import { appendMemoryEntry, repoMemoryFilePath } from "./lib/fleet-memory.mjs";
 import { verifyCommit } from "./lib/verify.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
 import { makeTerminal } from "./lib/terminal.mjs";
@@ -176,6 +177,34 @@ async function mainWorker() {
   return 0;
 }
 
+/** Best-effort per-repo fleet-memory entry for one deep-audit report. */
+function appendDeepRepoMemoryEntry(stateRoot, repo, kind, findings, audit) {
+  try {
+    if (!stateRoot || !repo) return false;
+    const severityCounts = {};
+    for (const finding of Array.isArray(findings) ? findings : []) {
+      const severity = String(finding && finding.severity || "unknown").toLowerCase().replace(/[^a-z]/g, "").slice(0, 16) || "unknown";
+      severityCounts[severity] = (severityCounts[severity] || 0) + 1;
+    }
+    const detail = Object.keys(severityCounts).sort().map((key) => `${key}=${severityCounts[key]}`).join(",") || "none";
+    const file = repoMemoryFilePath(stateRoot, repo);
+    const existing = existsSync(file) ? readFileSync(file, "utf8") : "";
+    const next = appendMemoryEntry(existing, {
+      stampUtc: new Date().toISOString(),
+      lane: "deep",
+      repo,
+      summary: `${String(kind || "audit").slice(0, 40)} report: findings ${detail}`,
+    });
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, next, "utf8");
+    audit?.note?.("memory", `deep memory entry repo=${String(repo).slice(0, 100)} ${detail}`);
+    return true;
+  } catch (error) {
+    audit.note("memory", `deep memory entry skipped: ${String(error.message || error).slice(0, 160)}`);
+    return false;
+  }
+}
+
 async function mainCommit() {
   const runId = `deep-commit-${Date.now()}`;
   const audit = new AuditBuffer(scrub(process.env));
@@ -206,6 +235,7 @@ async function mainCommit() {
       ...(data.findings || []).map((x) => `### [${x.severity}] ${x.title}\n\n${x.detail}\n\n**Recommendation:** ${x.recommendation}\n`),
     ].join("\n");
     writeFileSync(file, md);
+    appendDeepRepoMemoryEntry(REPO_ROOT, data.repo, data.kind, data.findings, audit);
     for (const t of queue) {
       if (t.repo === data.repo && t.kind === data.kind && (t.status === "in_progress" || t.status === "pending")) {
         t.status = "done";
@@ -217,8 +247,10 @@ async function mainCommit() {
   saveQueue(queue);
   audit.note("reports", `written=${processed}`);
   makeTerminal(REPO_ROOT)("SUCCESS", { runId, reportsCommitted: processed });
-  if (gitHasChanges(REPO_ROOT, ["state/queue.jsonl", "docs/reports"])) {
-    gitAdd(REPO_ROOT, ["state/queue.jsonl", "docs/reports"]);
+  const commitPaths = ["state/queue.jsonl", "docs/reports"];
+  if (existsSync(path.join(REPO_ROOT, "state", "memory"))) commitPaths.push("state/memory");
+  if (gitHasChanges(REPO_ROOT, commitPaths)) {
+    gitAdd(REPO_ROOT, commitPaths);
     gitCommit(REPO_ROOT, `[fleet] deep reports ${runId}`, identity);
     gitPush(REPO_ROOT, "main", process.env);
     const sha = gitRevParse(REPO_ROOT, "HEAD");

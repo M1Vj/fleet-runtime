@@ -6,6 +6,9 @@ const workflow = readFileSync(new URL("../.github/workflows/merge.yml", import.m
 const mergeSource = readFileSync(new URL("../scripts/merge.mjs", import.meta.url), "utf8");
 const archiveSource = readFileSync(new URL("../scripts/lib/archive-safe.mjs", import.meta.url), "utf8");
 const prCheckSource = readFileSync(new URL("../scripts/pr-check.mjs", import.meta.url), "utf8");
+const fleetMemorySource = readFileSync(new URL("../scripts/lib/fleet-memory.mjs", import.meta.url), "utf8");
+const reviseSource = readFileSync(new URL("../scripts/revise.mjs", import.meta.url), "utf8");
+const improveSource = readFileSync(new URL("../scripts/improve.mjs", import.meta.url), "utf8");
 
 test("manual dispatch has an explicit, fail-closed target contract", () => {
   assert.match(workflow, /workflow_dispatch:\s*\n\s+inputs:/);
@@ -180,4 +183,37 @@ test("every model-credential wiring also exposes the durable provider key", () =
     const provider = text.match(/OPENCODE_API_KEY: \$\{\{ secrets\.OPENCODE_API_KEY \}\}/g) || [];
     assert.equal(provider.length, legacy.length, `${name}: each FLEET_OPENCODE_AUTH wiring needs a sibling OPENCODE_API_KEY wiring`);
   }
+});
+
+test("fleet memory is labeled untrusted and only wired into private model prompts", () => {
+  assert.match(fleetMemorySource, /FLEET MEMORY \(untrusted operational notes; verify against current evidence\):/);
+  for (const [name, source] of [["merge", mergeSource], ["revise", reviseSource], ["improve", improveSource]]) {
+    assert.match(source, /formatMemoryPromptBlock/, `${name} must render the bounded memory block`);
+    // the label literal lives once in the shared lib; lanes reference it via the helper
+    assert.doesNotMatch(source, /FLEET MEMORY \(untrusted operational notes/, `${name} must not duplicate the label literal`);
+  }
+});
+
+test("memory content never reaches public comment bodies or mirrors", () => {
+  // judge comment builder is a controlled summary; no memory rendering inside
+  const judgeBuilder = mergeSource.slice(
+    mergeSource.indexOf("export function buildJudgeComment("),
+    mergeSource.indexOf("export function revisionDisposition("),
+  );
+  assert.ok(judgeBuilder.length > 0);
+  assert.doesNotMatch(judgeBuilder, /formatMemoryPromptBlock|loadFleetMemoryPromptBlock|FleetMemoryBlock/i);
+  // postComment passes through sanitizeCommentBody only; no memory interpolation
+  const postComment = mergeSource.slice(
+    mergeSource.indexOf("async function postComment("),
+    mergeSource.indexOf("/** Public judge comments mirror private state"),
+  );
+  assert.match(postComment, /sanitizeCommentBody/);
+  assert.doesNotMatch(postComment, /formatMemoryPromptBlock|MemoryBlock/i);
+  // revision public mirror body is built from controlled summary + safe paths only
+  const revisionMirror = reviseSource.slice(
+    reviseSource.indexOf("const mirror = await attemptRevisionMirror({"),
+    reviseSource.indexOf('console.log("REVISE_STATE=SUCCESS")'),
+  );
+  assert.match(revisionMirror, /controlledSummary/);
+  assert.doesNotMatch(revisionMirror, /fleetMemoryBlock|formatMemoryPromptBlock/i);
 });

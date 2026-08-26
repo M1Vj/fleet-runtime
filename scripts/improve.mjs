@@ -12,10 +12,26 @@ import { makeTerminal } from "./lib/terminal.mjs";
 import { isSafeRepoPath, sanitizeControlChars, extractJsonObject } from "./lib/directives.mjs";
 import { isAllowedRepo, readTier1Repos } from "./lib/target-policy.mjs";
 import { redactText } from "./lib/pr-memory.mjs";
+import {
+  formatMemoryPromptBlock,
+  repoMemoryFilePath,
+} from "./lib/fleet-memory.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
 const STATE_PATH = path.join(REPO_ROOT, "state", "improve-state.json");
+
+/** Bounded untrusted fleet-memory block for a repo; "" when absent. */
+function loadImproveMemoryBlock(repo) {
+  try {
+    if (!REPO_ROOT || !repo) return "";
+    const file = repoMemoryFilePath(REPO_ROOT, repo);
+    if (!existsSync(file)) return "";
+    return formatMemoryPromptBlock(readFileSync(file, "utf8"));
+  } catch {
+    return "";
+  }
+}
 
 function improveTargets() {
   const targetsPath = path.join(REPO_ROOT, "state", "targets.json");
@@ -288,9 +304,11 @@ async function modePlan(audit) {
     } catch {
       prepared = undefined;
     }
+    const fleetMemoryBlock = loadImproveMemoryBlock(data.repo);
     const planPrompt = [
       `You are the planning sub-agent for repo ${data.repo}. Turn this improvement idea into a concrete minimal implementation plan.`,
       `Idea: ${idea.title}. Rationale: ${idea.rationale}. Evidence: ${idea.evidence}.`,
+      ...(fleetMemoryBlock ? [fleetMemoryBlock.trimEnd()] : []),
       prepared ? "A shallow clone of the explicitly public repository is mounted at './source' — inspect real code with read/grep/glob before planning." : "",
       "You may fetch authoritative docs via webfetch if needed.",
       "Respond in EXACTLY this plain-text format (no markdown headers, no extra prose):",

@@ -217,3 +217,12 @@ test("memory content never reaches public comment bodies or mirrors", () => {
   assert.match(revisionMirror, /controlledSummary/);
   assert.doesNotMatch(revisionMirror, /fleetMemoryBlock|formatMemoryPromptBlock/i);
 });
+
+test("the fleet-control sentinel workflow revives only the minimum set behind explicit opt-in", () => {
+  const sentinelWorkflow = readFileSync(new URL("../deploy/fleet-control/watchdog.yml", import.meta.url), "utf8");
+  assert.match(sentinelWorkflow, /node scripts\/sentinel\.mjs/);
+  assert.match(sentinelWorkflow, /FLEET_WATCHDOG_AUTO_ENABLE:\s*\$\{\{\s*vars\.FLEET_WATCHDOG_AUTO_ENABLE\s*\}\}/);
+  assert.match(sentinelWorkflow, /FLEET_SENTINEL_TARGET:\s*M1Vj\/fleet-runtime/);
+  const source = readFileSync(new URL("../scripts/sentinel.mjs", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /disable|delete|force/i);
+});

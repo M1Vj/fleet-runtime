@@ -9,7 +9,7 @@ on:
       workers:
         description: "max parallel sub-agents"
         type: string
-        default: "3"
+        default: "4"
 
 concurrency:
   group: fleet-deep
@@ -31,7 +31,7 @@ jobs:
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
     steps:
       - name: sanitize workers input
-        run: echo "FLEET_MAX_WORKERS=$(echo '${{ github.event.inputs.workers }}' | grep -E '^[0-9]+$' || echo 3)" >> "$GITHUB_ENV"
+        run: echo "FLEET_MAX_WORKERS=$(echo '${{ github.event.inputs.workers }}' | grep -E '^[0-9]+$' || echo 4)" >> "$GITHUB_ENV"
       - name: checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -136,7 +136,7 @@ jobs:
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
     steps:
       - name: sanitize workers input
-        run: echo "FLEET_MAX_WORKERS=$(echo '${{ github.event.inputs.workers }}' | grep -E '^[0-9]+$' || echo 3)" >> "$GITHUB_ENV"
+        run: echo "FLEET_MAX_WORKERS=$(echo '${{ github.event.inputs.workers }}' | grep -E '^[0-9]+$' || echo 4)" >> "$GITHUB_ENV"
       - name: checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:

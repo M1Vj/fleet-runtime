@@ -76,3 +76,36 @@ export function shouldCoalesce(trigger, lastRunUtc, nowMs = Date.now(), minGapMi
   const gapMinutes = Math.round(((nowMs - last) / 60000) * 10) / 10;
   return { coalesce: gapMinutes < minGapMinutes, gapMinutes };
 }
+
+/** The paired fleet-control sentinel may revive exactly this minimum set so the primary watchdog can self-heal everything else. */
+export const SENTINEL_REVIVE_WORKFLOWS = ["watchdog.yml", "merge.yml"];
+export const SENTINEL_TARGET_REPO = "M1Vj/fleet-runtime";
+
+/**
+ * Pure planner for the paired fleet-control sentinel: when the target repo's
+ * primary watchdog is stale, auto-enable is explicitly on, and no kill switch
+ * exists, revive exactly SENTINEL_REVIVE_WORKFLOWS on the target repo. Any
+ * uncertain input fails closed to zero actions.
+ */
+export function planSentinelActions({ lastRunUtc, nowMs = Date.now(), thresholdMs = 60 * 60 * 1000, autoEnable, killSwitchPresent } = {}) {
+  if (killSwitchPresent === true || autoEnable !== "true") {
+    return { stale: false, reason: killSwitchPresent === true ? "kill-switch-present" : "auto-enable-off", actions: [] };
+  }
+  const stamp = typeof lastRunUtc === "string" ? lastRunUtc.trim() : "";
+  let stale;
+  let reason;
+  if (!stamp) {
+    stale = true;
+    reason = "no-runs";
+  } else {
+    const decision = decideStale(stamp, nowMs, thresholdMs);
+    stale = decision.stale === true;
+    reason = decision.reason;
+  }
+  if (!stale) return { stale: false, reason, actions: [] };
+  return {
+    stale: true,
+    reason,
+    actions: SENTINEL_REVIVE_WORKFLOWS.map((workflow) => ({ kind: "enable-workflow", repo: SENTINEL_TARGET_REPO, workflow })),
+  };
+}

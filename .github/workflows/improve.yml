@@ -3,7 +3,7 @@ run-name: "fleet improve ${{ github.run_id }}"
 
 on:
   schedule:
-    - cron: "25 */2 * * *"
+    - cron: "25 * * * *"
   workflow_dispatch:
     inputs:
       top_k:
@@ -29,7 +29,7 @@ jobs:
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
-      FLEET_TOP_K: ${{ github.event.inputs.top_k || '2' }}
+      FLEET_TOP_K: ${{ github.event.inputs.top_k || '3' }}
     steps:
       - name: checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262

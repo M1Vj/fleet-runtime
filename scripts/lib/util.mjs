@@ -229,3 +229,14 @@ export function installCredentialHelper(repoDir, env = process.env) {
   void res;
   return helperPath;
 }
+
+/** Fetch a repo README via the given fetcher; a missing README (404) is normal repo state, not a failure. */
+export function readmeExcerptWithFallback(fetchReadme) {
+  try {
+    return String(fetchReadme() || "(no README file)");
+  } catch (error) {
+    const message = String((error && error.message) || error);
+    if (!/\b404\b|Not Found/i.test(message)) throw error;
+    return "(no README file)";
+  }
+}

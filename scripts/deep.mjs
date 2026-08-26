@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 
 import path from "node:path";
 import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
-import { scrub, gh, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
+import { scrub, gh, readmeExcerptWithFallback, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";
 import { verifyCommit } from "./lib/verify.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
@@ -46,7 +46,7 @@ export function claimTask(queue) {
 
 function buildContext(repo) {
   const meta = gh(["api", `/repos/${repo}`], process.env);
-  const readmeRaw = gh(["api", `-H=Accept: application/vnd.github.raw`, `/repos/${repo}/readme`], process.env);
+  const readmeRaw = readmeExcerptWithFallback(() => gh(["api", `-H=Accept: application/vnd.github.raw`, `/repos/${repo}/readme`], process.env));
   const commits = gh(["api", `/repos/${repo}/commits?per_page=10`], process.env) || [];
   const pulls = gh(["api", `/repos/${repo}/pulls?state=open&per_page=10`], process.env) || [];
   const lines = [];
@@ -55,7 +55,7 @@ function buildContext(repo) {
   lines.push(`Recent commit subjects:`);
   for (const c of commits.slice(0, 10)) lines.push(`- ${String(c.commit && c.commit.message ? c.commit.message.split("\n")[0] : "").slice(0, 120)}`);
   lines.push(`Open PRs: ${pulls.map((p) => `#${p.number} ${p.title}`).join("; ") || "none"}`);
-  lines.push(`README excerpt:\n${String(readmeRaw).slice(0, 4000)}`);
+  lines.push(`README excerpt:\n${readmeRaw.slice(0, 4000)}`);
   return lines.join("\n").slice(0, 14000);
 }
 

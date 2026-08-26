@@ -1,13 +1,17 @@
 #!/usr/bin/env node
 import process from "node:process";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
-import { scrub, gh } from "./lib/util.mjs";
+import { safeCommitState, scrub, gh } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";
 import { verifyIssueAuthor } from "./lib/verify.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
+import {
+  consolidatePatterns,
+  renderRepoMemoryPage,
+} from "./lib/fleet-memory.mjs";
 
 const REPO_ROOT = process.env.FLEET_STATE_ROOT || process.cwd();
 
@@ -28,8 +32,77 @@ function readEvents() {
     .slice(-200);
 }
 
+function readJsonlTolerant(fileName) {
+  const p = path.join(REPO_ROOT, "state", fileName);
+  if (!existsSync(p)) return [];
+  return String(readFileSync(p, "utf8"))
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => {
+      try {
+        const parsed = JSON.parse(l);
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+      } catch {
+        return null; // skip malformed lines
+      }
+    })
+    .filter(Boolean);
+}
+
+function toPatternEvents(laneEvents, prMemoryEvents) {
+  const mapped = [];
+  for (const e of laneEvents) {
+    mapped.push({
+      lane: String(e.mode || e.lane || "lane").slice(0, 32),
+      state: String(e.state || "").slice(0, 64),
+      reason: String(e.why || e.reason || e.summary || ""),
+      repo: String(e.repo || "").slice(0, 120),
+    });
+  }
+  for (const e of prMemoryEvents) {
+    mapped.push({
+      lane: String(e.lane || "lane").slice(0, 32),
+      state: String(e.state || "").slice(0, 64),
+      reason: String(e.summary || ""),
+      repo: String(e.repo || "").slice(0, 120),
+    });
+  }
+  return mapped;
+}
+
+/**
+ * Deterministic consolidation pass: rebuild the "## Patterns" section of
+ * UNIVERSAL.md from events.jsonl + pr-memory.jsonl. Best-effort — a memory
+ * failure is an audit note and never fails the retro lane.
+ */
+function consolidateUniversalMemory(audit, identity) {
+  try {
+    const memoryDir = path.join(REPO_ROOT, "state", "memory");
+    const universalPath = path.join(memoryDir, "UNIVERSAL.md");
+    const existing = existsSync(universalPath)
+      ? String(readFileSync(universalPath, "utf8"))
+      : renderRepoMemoryPage("fleet", {
+        title: "Universal Fleet Memory",
+        description: "Fleet-wide operational learnings shared across lanes and repositories.",
+      });
+    const headingIdx = existing.indexOf("## Patterns");
+    const head = headingIdx === -1 ? existing : existing.slice(0, headingIdx);
+    const patternEvents = toPatternEvents(readJsonlTolerant("events.jsonl"), readJsonlTolerant("pr-memory.jsonl"));
+    const rebuilt = `${head.replace(/\s*$/, "")}\n\n${consolidatePatterns(patternEvents)}`;
+    mkdirSync(memoryDir, { recursive: true });
+    writeFileSync(universalPath, rebuilt, "utf8");
+    const outcome = safeCommitState(REPO_ROOT, ["state"], "[fleet] retro consolidate universal memory patterns", identity, process.env);
+    audit.note("memory", `patterns rebuilt events=${patternEvents.length} commit=${outcome}`);
+    return true;
+  } catch (error) {
+    audit.note("memory", `universal patterns rebuild skipped: ${String(error.message || error).slice(0, 160)}`);
+    return false;
+  }
+}
+
 async function modePropose(audit) {
   const identity = await runGate(process.env);
+  consolidateUniversalMemory(audit, identity);
   const today = new Date().toISOString().slice(0, 10);
   const dedupeKey = `[RETRO] ${today}`;
   const recentIssues = gh(["api", `/repos/M1Vj/fleet-control/issues?since=${today}T00:00:00Z&state=all&per_page=50`], process.env) || [];

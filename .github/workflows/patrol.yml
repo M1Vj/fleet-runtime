@@ -30,6 +30,9 @@ jobs:
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      OPENCODE_API_KEY_2: ${{ secrets.OPENCODE_API_KEY_2 }}
+      FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN }}
+      FLEET_MODEL_BUCKET: ${{ vars.FLEET_MODEL_BUCKET }}
     steps:
       - name: checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262

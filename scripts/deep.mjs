@@ -93,7 +93,7 @@ function parseFindings(reply) {
 export async function analyzeOne(repo, kind, prepared, audit) {
   const result = await askModel({
     prompt: buildPromptFor({ repo, kind, hasSource: Boolean(prepared) }),
-    ...(prepared ? { workspace: prepared.workspace, profile: "public-read", publicTarget: prepared.meta } : {}),
+    ...(prepared ? { workspace: prepared.workspace, profile: "public-read", dataClass: "public", publicTarget: prepared.meta } : {}),
     timeoutMs: 540000,
     env: process.env,
     preferVariantMax: true,
@@ -127,19 +127,6 @@ async function mainWorker() {
   const repo = process.env.FLEET_REPO;
   const kind = process.env.FLEET_KIND;
   audit.note("task", `${repo} ${kind}`);
-  const { gatewayDown } = await import("./lib/gateway-health.mjs");
-  if (gatewayDown(process.env.FLEET_STATE_ROOT || process.cwd())) {
-    const stamp0 = new Date().toISOString();
-    writeFileSync(
-      path.join(process.env.FLEET_ARTIFACT_DIR || ".", `report-${repo.replace("/", "__")}.json`),
-      JSON.stringify({ repo, kind, findings: [{ severity: "low", title: "skipped", detail: "gateway circuit open" }], verdict: "Skipped during gateway outage.", modelMode: "skipped", sessionId: "", finishedUtc: stamp0 }, null, 2),
-    );
-    console.log(`DEEP_SKIPPED=circuit-open ${repo}`);
-    console.log(`DEEP_RESULT_FILE=${path.join(process.env.FLEET_ARTIFACT_DIR || ".", `report-${repo.replace("/", "__")}.json`)}`);
-    writeFileSync(path.join(process.env.FLEET_ARTIFACT_DIR || ".", `report-${repo.replace("/", "__")}.json`), JSON.stringify({ repo, kind, findings: [{ severity: "low", title: "skipped", detail: "gateway circuit open" }], verdict: "Skipped during gateway outage." }, null, 2));
-    console.log(`DEEP_RESULT_FILE=${path.join(process.env.FLEET_ARTIFACT_DIR || ".", `report-${repo.replace("/", "__")}.json`)}`);
-    return 0;
-  }
   const meta = gh(["api", `/repos/${repo}`], process.env);
   const publicVerified = Boolean(meta) && meta.private === false && meta.visibility === "public";
   let prepared;
@@ -224,7 +211,7 @@ async function mainCommit() {
       `# Deep ${data.kind} — ${data.repo}`,
       "",
       `- generatedUtc: ${data.finishedUtc}`,
-      `- model: opencode/x-preview-f-free (${data.modelMode})`,
+      `- model: ${data.modelMode || "unavailable"}`,
       "",
       `## Verdict`,
       "",

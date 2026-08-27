@@ -81,6 +81,12 @@ jobs:
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      OPENCODE_API_KEY_2: ${{ secrets.OPENCODE_API_KEY_2 }}
+      FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN }}
+      FLEET_MODEL_BUCKET: ${{ vars.FLEET_MODEL_BUCKET }}
+      FLEET_GEMINI_MODEL: ${{ vars.FLEET_GEMINI_MODEL }}
+      FLEET_PROVIDER_HEALTH_JSON: ${{ vars.FLEET_PROVIDER_HEALTH_JSON }}
+      FLEET_NVIDIA_ENABLE: ${{ vars.FLEET_NVIDIA_ENABLE }}
       FLEET_REPO: ${{ matrix.worker.repo || matrix.repo }}
       FLEET_KIND: ${{ matrix.worker.kind || matrix.kind }}
     steps:
@@ -109,8 +115,25 @@ jobs:
       - name: install pinned opencode cli
         if: ${{ env.FLEET_REPO != '' }}
         run: npm install -g opencode-ai@1.18.21
+      - name: verify public target for free-provider credentials
+        id: public
+        if: ${{ env.FLEET_REPO != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+        run: |
+          echo "verified=false" >> "$GITHUB_OUTPUT"
+          full_name=$(gh api "repos/$FLEET_REPO" --jq '.full_name')
+          visibility=$(gh api "repos/$FLEET_REPO" --jq 'if .private == false and .visibility == "public" then "public" else "restricted" end')
+          if [ "$full_name" = "$FLEET_REPO" ] && [ "$visibility" = "public" ]; then
+            echo "verified=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: analyze as sub-agent
         if: ${{ env.FLEET_REPO != '' }}
+        env:
+          GEMINI_API_KEY_1: ${{ steps.public.outputs.verified == 'true' && secrets.GEMINI_API_KEY_1 || '' }}
+          GEMINI_API_KEY_2: ${{ steps.public.outputs.verified == 'true' && secrets.GEMINI_API_KEY_2 || '' }}
+          OPENROUTER_API_KEY: ${{ steps.public.outputs.verified == 'true' && secrets.OPENROUTER_API_KEY || '' }}
+          NVIDIA_API_KEY: ${{ steps.public.outputs.verified == 'true' && secrets.NVIDIA_API_KEY || '' }}
         run: |
           mkdir -p artifacts
           FLEET_ARTIFACT_DIR=artifacts node scripts/deep.mjs

@@ -114,14 +114,6 @@ async function modeResearch(audit) {
   const identity = await runGate(process.env);
   configureIdentity(REPO_ROOT, identity);
   const repo = process.env.FLEET_REPO;
-  {
-    const { gatewayDown } = await import("./lib/gateway-health.mjs");
-    if (gatewayDown(process.env.FLEET_STATE_ROOT || process.cwd())) {
-      audit.note("research", "gateway circuit open; skipping wave");
-      console.log("IMPROVE_SKIPPED=circuit-open");
-      return 0;
-    }
-  }
   const meta = gh(["api", `/repos/${repo}`], process.env);
   const target = validateImproveTarget({ repo, meta, stateRoot: REPO_ROOT });
   if (!target.ok) {
@@ -142,7 +134,7 @@ async function modeResearch(audit) {
       env: process.env,
       preferVariantMax: true,
       maxRounds: 4,
-      ...(prepared ? { workspace: prepared.workspace, profile: "public-read", publicTarget: meta } : {}),
+      ...(prepared ? { workspace: prepared.workspace, profile: "public-read", dataClass: "public", publicTarget: meta } : {}),
     });
     audit.note("research", `repo=${repo} complete=${result.complete} ladders=${result.ladders}`);
   } finally {

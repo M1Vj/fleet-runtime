@@ -165,21 +165,34 @@ opencode installed:
 
 ## 7. Model fallback chain configuration
 
-Set repo variable `FLEET_MODEL_CHAIN` (comma-separated, priority order):
+Set repo variable `FLEET_MODEL_CHAIN` only to registry-backed references (comma-separated,
+priority order). The default `other` chain is:
 
-    opencode/x-preview-f-free, opencode/gemini-3-flash, opencode/minimax-m3-free
+    opencode/claude-opus-4-6, openrouter/meta-llama/llama-3.2-3b-instruct:free, nvidia-nim/meta/llama-3.1-8b-instruct
+
+Calls that explicitly prove `dataClass=public` and a public target use the default `public`
+chain instead:
+
+    antigravity/gemini-3.7-flash-high, gemini-api/gemini-3.7-flash, openrouter/meta-llama/llama-3.2-3b-instruct:free, nvidia-nim/meta/llama-3.1-8b-instruct, opencode/claude-opus-4-6
+
+GitHub skips the local-only Antigravity entry. Missing API keys are skipped. A direct public
+API with no fresh health record uses its first bounded task request as the live canary, avoiding
+a second quota-consuming preflight. Known rate-limit, quota, or outage states remain ineligible.
 
 Semantics (`scripts/lib/model.mjs`):
 
-- Each model gets variant `max`, plain, anonymous (auth stripped), then resume rounds. The
+- Zen gets variant `max`, plain, and bounded auth-recovery rounds. Direct free-provider adapters
+  use bounded requests without OpenCode sessions. The
   default is four rounds; thesis and KB drafts use five. Calls are spaced by 20 to 35 seconds.
-  With the production `OPENCODE_API_KEY`, detected credential rejection or exhaustion stops the
-  remaining rounds immediately instead of falling back to anonymous calls.
+  With the production `OPENCODE_API_KEY`, detected credential rejection stops that credential's
+  remaining rounds. A cold Zen backup may run only for missing, expired, or rejected auth. Rate
+  limits and quota exhaustion never rotate to another credential from the same provider; the
+  chain may continue to a different provider. Anonymous fallback is not used.
 - If the whole chain fails, a second ladder starts after a 90-second cooldown, or 120 seconds
   for long-form lanes. Per-call timeouts are 480 seconds by default, 540 for deep analysis,
   and 600 for thesis, KB, or revision work.
 - The breaker opens for 30 minutes only after the entire chain fails. Judges may use
-  `FLEET_JUDGE_MODEL`; the default remains Ox/Alpha-only.
+  `FLEET_JUDGE_MODEL`; the governed default is Zen `claude-opus-4-6`.
 - Merge/revise/patrol judges receive a fresh disposable workspace with a deny-all OpenCode
   policy; no repository or private-state checkout is attached. Improve research/plan may use
   the explicit `public-read` profile only after target metadata proves `private=false` and
@@ -191,6 +204,44 @@ Semantics (`scripts/lib/model.mjs`):
   #8203/#22243/#29134). Hard timeouts, failure-log tails, and `max-parallel` limits contain
   the failure. If hangs become chronic, pin another model ID in `scripts/lib/model.mjs`;
   deterministic gating and attribution do not depend on the model choice.
+
+### Provider registry and credential boundary
+
+`config/providers.json` is a secretless, reviewed policy registry. It records the requested
+bucket preferences (`gemini` prefers local Antigravity `gemini-3.7-flash-high`, followed by
+AI Studio `gemini-3.7-flash` backups; `other` prefers `opencode/claude-opus-4-6`) and the model-update digest/rollback
+contract. The registry does not activate a provider or change any workflow by itself.
+
+GitHub Actions uses the existing protected `OPENCODE_API_KEY` for the paid Zen Opus route and
+may use `OPENCODE_API_KEY_2` only as a cold auth-recovery credential. `FLEET_OPENCODE_AUTH`
+is migration-only. The optional `GEMINI_API_KEY_1`, `GEMINI_API_KEY_2`, `OPENROUTER_API_KEY`,
+and `NVIDIA_API_KEY` secrets are passed only to verified-public research jobs.
+They require either a fresh healthy snapshot or a first-request live canary. A second key is
+never selected for rate-limit or quota errors, so the fleet does not evade provider limits.
+
+Antigravity OAuth is local-only. With the explicit `FLEET_ANTIGRAVITY_LOCAL=true` gate on a
+non-GitHub host, `agy` runs from a disposable cwd, uses the existing secure local OAuth cache
+in place, pins `gemini-3.7-flash-high`, and forwards no API key. The CLI may refresh its own
+local OAuth state; the fleet neither copies nor exports that cache. GitHub jobs cannot import a
+browser profile, cookies, OAuth snapshot, or local session database. The documented Gemini API
+backup uses model ID `gemini-3.7-flash` with high thinking effort, not the Antigravity `-high`
+slug. Google free-tier prompts may be used to improve products, so the adapter is public-only.
+
+OpenRouter uses the explicit `meta-llama/llama-3.2-3b-instruct:free` route and sends ZDR plus
+`data_collection: "deny"`; its fleet key is bound to the `Fleet Free Public Only` guardrail.
+NVIDIA Hosted NIM is a gated prototype route (`FLEET_NVIDIA_ENABLE`) and is not a production
+SLA. Both providers are public-only and disabled when credentials are absent or a current
+health record says the provider is unavailable.
+
+A model-registry update must carry a `sha256:` digest, the previous active digest, and a
+rollback record. Automatic activation is disabled; a reviewed commit, deterministic checks,
+independent review, and an exact canary remain required before any production change.
+
+`model-refresh.yml` performs daily read-only discovery when
+`FLEET_MODEL_REFRESH_ENABLE=true`. It retains only bounded model identifiers from allowlisted
+Google and OpenRouter endpoints, compares them with the committed catalog, and uploads a
+redacted 14-day proposal artifact. Retrieved descriptions and instructions are discarded.
+The lane has no write token and cannot edit the registry, open a PR, or activate a model.
 
 ## 8. PR lifecycle hygiene rules
 

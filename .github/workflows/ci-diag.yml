@@ -29,10 +29,10 @@ jobs:
           node -v
           which opencode
           file "$(readlink -f "$(which opencode)")" || true
-      - name: v1 anonymous plain
+      - name: v1 unauthenticated fail-closed check
         continue-on-error: true
         run: |
-          timeout 90 opencode run --format json -m opencode/x-preview-f-free "Reply DIAG1" > o1.txt 2> e1.txt; echo "exit=$?"
+          timeout 90 opencode run --format json -m opencode/claude-opus-4-6 "Reply DIAG1" > o1.txt 2> e1.txt; echo "exit=$?"
           echo "--stdout--"; head -c 300 o1.txt
           echo "--stderr--"; tail -c 400 e1.txt
           echo "--logfile--"; tail -n 6 $HOME/.local/share/opencode/log/*.log 2>/dev/null | cut -c1-220
@@ -41,7 +41,7 @@ jobs:
         run: |
           export OPENCODE_MODELS_URL="file://$GITHUB_WORKSPACE/config/models.json"
           echo "URL=$OPENCODE_MODELS_URL"; ls -la config/models.json
-          timeout 90 env OPENCODE_MODELS_URL="$OPENCODE_MODELS_URL" opencode run --format json -m opencode/x-preview-f-free "Reply DIAG2" > o2.txt 2> e2.txt; echo "exit=$?"
+          timeout 90 env OPENCODE_MODELS_URL="$OPENCODE_MODELS_URL" opencode run --format json -m opencode/claude-opus-4-6 "Reply DIAG2" > o2.txt 2> e2.txt; echo "exit=$?"
           echo "--stdout--"; head -c 300 o2.txt
           echo "--stderr--"; tail -c 400 e2.txt
           echo "--logfile--"; tail -n 6 $HOME/.local/share/opencode/log/*.log 2>/dev/null | cut -c1-220
@@ -52,7 +52,7 @@ jobs:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
         run: |
-          timeout 90 opencode run --format json -m opencode/x-preview-f-free "Reply DIAG3" > o3.txt 2> e3.txt; echo "exit=$?"
+          timeout 90 opencode run --format json -m opencode/claude-opus-4-6 "Reply DIAG3" > o3.txt 2> e3.txt; echo "exit=$?"
           echo "--stdout--"; head -c 300 o3.txt
           echo "--stderr--"; tail -c 400 e3.txt
           echo "--logfile--"; tail -n 6 $HOME/.local/share/opencode/log/*.log 2>/dev/null | cut -c1-220

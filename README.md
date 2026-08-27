@@ -1,6 +1,6 @@
 # fleet-runtime
 
-Public GitHub Actions execution shell that autonomously patrols, audits, improves, and revises the owner's M1Vj repositories using the Ox/Alpha model (`opencode/x-preview-f-free`). Mutations are identity-gated and post-verified; merging requires an intentional manual dispatch.
+Public GitHub Actions execution shell that autonomously patrols, audits, improves, and revises the owner's M1Vj repositories. Private judging and revision use governed Zen `claude-opus-4-6`; verified-public research can use the local Antigravity Gemini route or configured public-only API fallbacks. Mutations are identity-gated and post-verified; merging requires an intentional manual dispatch.
 
 ## Architecture
 

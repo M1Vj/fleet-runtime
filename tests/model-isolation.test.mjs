@@ -225,7 +225,7 @@ test("provider-key mode keeps variant and session flags while credential-less ru
   assert.equal(captured[1].includes("sess-42"), false);
 });
 
-test("selected primary, fallback, and explicit override models reach OpenCode and telemetry", async () => {
+test("selected Zen and direct fallback routes use provider-specific execution", async () => {
   const repo = mkdtempSync(path.join(tmpdir(), "fleet-model-chain-repo-"));
   const state = mkdtempSync(path.join(tmpdir(), "fleet-model-chain-state-"));
   const calls = [];
@@ -239,10 +239,7 @@ test("selected primary, fallback, and explicit override models reach OpenCode an
     queueMicrotask(() => {
       invocation += 1;
       if (invocation === 1) child.emit("close", 1);
-      else {
-        child.stdout.emit("data", Buffer.from('{"text":"ok"}\n'));
-        child.emit("close", 0);
-      }
+      else child.emit("close", 1);
     });
     return child;
   };
@@ -250,26 +247,36 @@ test("selected primary, fallback, and explicit override models reach OpenCode an
     const result = await askModel({
       prompt: "chain",
       timeoutMs: 1000,
-      env: { FLEET_OPENCODE_AUTH: "auth-fixture", FLEET_MODEL_CHAIN: "model-A,model-B", FLEET_STATE_ROOT: state },
+      env: {
+        FLEET_OPENCODE_AUTH: "auth-fixture",
+        OPENCODE_API_KEY: "pk-fixture",
+        FLEET_MODEL_CHAIN: "opencode/claude-opus-4-6,openrouter/meta-llama/llama-3.2-3b-instruct:free",
+        OPENROUTER_API_KEY: "or-fixture",
+        FLEET_STATE_ROOT: state,
+      },
       repoRoot: repo,
       stateRoot: state,
       skipCircuitCheck: true,
       maxRounds: 1,
       spawnImpl,
+      dataClass: "public",
+      publicTarget: { private: false, visibility: "public" },
+      providerHealth: { openrouter: { status: "healthy", checkedAt: new Date().toISOString() } },
+      fetchImpl: async () => ({ ok: true, text: async () => JSON.stringify({ choices: [{ message: { content: "ok" } }] }) }),
     });
     assert.equal(result.complete, true);
-    assert.equal(result.modelMode, "model-B");
-    assert.deepEqual(calls.map((args) => args.slice(args.indexOf("-m"), args.indexOf("-m") + 2)), [["-m", "model-A"], ["-m", "model-B"]]);
+    assert.equal(result.modelMode, "openrouter/meta-llama/llama-3.2-3b-instruct:free");
+    assert.deepEqual(calls.map((args) => args.slice(args.indexOf("-m"), args.indexOf("-m") + 2)), [["-m", "opencode/claude-opus-4-6"]]);
 
     calls.length = 0;
     invocation = 0;
     const override = await askModel({
       prompt: "override",
       timeoutMs: 1000,
-      env: { FLEET_OPENCODE_AUTH: "auth-fixture", FLEET_MODEL_CHAIN: "model-A,model-B", FLEET_STATE_ROOT: state },
+      env: { FLEET_OPENCODE_AUTH: "auth-fixture", OPENCODE_API_KEY: "pk-fixture", FLEET_MODEL_CHAIN: "opencode/claude-opus-4-6", FLEET_STATE_ROOT: state },
       repoRoot: repo,
       stateRoot: state,
-      modelOverride: "model-C",
+      modelOverride: "opencode/claude-opus-4-6",
       skipCircuitCheck: true,
       maxRounds: 1,
       spawnImpl: (_command, args) => {
@@ -286,8 +293,140 @@ test("selected primary, fallback, and explicit override models reach OpenCode an
       },
     });
     assert.equal(override.complete, true);
-    assert.equal(override.modelMode, "model-C@max");
-    assert.deepEqual(calls.map((args) => args.slice(args.indexOf("-m"), args.indexOf("-m") + 2)), [["-m", "model-C"]]);
+    assert.equal(override.modelMode, "opencode/claude-opus-4-6@max");
+    assert.deepEqual(calls.map((args) => args.slice(args.indexOf("-m"), args.indexOf("-m") + 2)), [["-m", "opencode/claude-opus-4-6"]]);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("a public direct route uses its first bounded request as the live health canary", async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), "fleet-model-live-canary-repo-"));
+  const state = mkdtempSync(path.join(tmpdir(), "fleet-model-live-canary-state-"));
+  let fetches = 0;
+  try {
+    const result = await askModel({
+      prompt: "inspect this public repository",
+      timeoutMs: 1000,
+      env: {
+        FLEET_MODEL_CHAIN: "openrouter/meta-llama/llama-3.2-3b-instruct:free",
+        OPENROUTER_API_KEY: "or-fixture",
+        FLEET_STATE_ROOT: state,
+      },
+      repoRoot: repo,
+      stateRoot: state,
+      skipCircuitCheck: true,
+      dataClass: "public",
+      publicTarget: { private: false, visibility: "public" },
+      fetchImpl: async () => {
+        fetches += 1;
+        return { ok: true, text: async () => JSON.stringify({ choices: [{ message: { content: "ok" } }] }) };
+      },
+    });
+    assert.equal(result.complete, true);
+    assert.equal(result.modelMode, "openrouter/meta-llama/llama-3.2-3b-instruct:free");
+    assert.equal(fetches, 1, "the task request is the canary; no quota-wasting preflight call");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("Zen backup key is used only after an auth rejection and is remapped in-process", async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), "fleet-model-zen-backup-repo-"));
+  const state = mkdtempSync(path.join(tmpdir(), "fleet-model-zen-backup-state-"));
+  const captured = [];
+  let invocation = 0;
+  const spawnImpl = (_command, args, options) => {
+    captured.push({ args: [...args], env: { ...options.env } });
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => {};
+    queueMicrotask(() => {
+      invocation += 1;
+      if (invocation === 1) {
+        child.stdout.emit("data", Buffer.from('{"sessionID":"sess-primary"}\n'));
+        child.stderr.emit("data", Buffer.from("401 unauthorized\n"));
+      }
+      else child.stdout.emit("data", Buffer.from('{"text":"ok"}\n'));
+      child.emit("close", invocation === 1 ? 1 : 0);
+    });
+    return child;
+  };
+  try {
+    const result = await askModel({
+      prompt: "backup",
+      timeoutMs: 1000,
+      env: {
+        OPENCODE_API_KEY: "primary-fixture",
+        OPENCODE_API_KEY_2: "backup-fixture",
+        FLEET_MODEL_CHAIN: "opencode/claude-opus-4-6",
+        FLEET_STATE_ROOT: state,
+      },
+      repoRoot: repo,
+      stateRoot: state,
+      skipCircuitCheck: true,
+      maxRounds: 1,
+      spawnImpl,
+    });
+    assert.equal(result.complete, true);
+    assert.equal(captured.length, 2);
+    assert.equal(captured[0].env.OPENCODE_API_KEY, "primary-fixture");
+    assert.equal(captured[0].env.OPENCODE_API_KEY_2, undefined);
+    assert.equal(captured[1].env.OPENCODE_API_KEY, "backup-fixture");
+    assert.equal(captured[1].env.OPENCODE_API_KEY_2, undefined);
+    assert.equal(captured[1].args.includes("-s"), false);
+    assert.equal(captured[1].args.includes("sess-primary"), false);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("local Gemini override invokes the gated Antigravity adapter without an API key", async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), "fleet-model-agy-repo-"));
+  const state = mkdtempSync(path.join(tmpdir(), "fleet-model-agy-state-"));
+  const captured = [];
+  const spawnImpl = (_command, args, options) => {
+    captured.push({ args: [...args], env: { ...options.env }, cwd: options.cwd });
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => {};
+    queueMicrotask(() => {
+      child.stdout.emit("data", Buffer.from('{"status":"SUCCESS","response":"ok"}\n'));
+      child.emit("close", 0);
+    });
+    return child;
+  };
+  try {
+    const result = await askModel({
+      prompt: "local Gemini",
+      timeoutMs: 1000,
+      env: {
+        HOME: "/tmp/fleet-home-fixture",
+        FLEET_GEMINI_MODEL: "gemini-3.7-flash-high",
+        FLEET_ANTIGRAVITY_LOCAL: "1",
+        FLEET_STATE_ROOT: state,
+        GITHUB_ACTIONS: "false",
+      },
+      repoRoot: repo,
+      stateRoot: state,
+      skipCircuitCheck: true,
+      maxRounds: 1,
+      spawnImpl,
+      dataClass: "public",
+      publicTarget: { private: false, visibility: "public" },
+    });
+    assert.equal(result.complete, true);
+    assert.equal(result.modelMode, "antigravity/gemini-3.7-flash-high");
+    assert.equal(result.sessionId, "");
+    assert.equal(captured.length, 1);
+    assert.equal(captured[0].env.HOME, "/tmp/fleet-home-fixture");
+    assert.equal(captured[0].env.GEMINI_API_KEY, undefined);
+    assert.equal(captured[0].args.at(-1), "--sandbox");
   } finally {
     rmSync(repo, { recursive: true, force: true });
     rmSync(state, { recursive: true, force: true });

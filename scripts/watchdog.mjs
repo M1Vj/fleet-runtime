@@ -6,7 +6,7 @@ import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
 import { verifyCommit, verifyIssueAuthor } from "./lib/verify.mjs";
-import { findWatchdogAlertIssue, planWatchdogActions, watchdogAutoEnableEnabled, WATCHDOG_WORKFLOWS } from "./lib/watchdog-decide.mjs";
+import { findWatchdogAlertIssue, planWatchdogActions, recoverStaleQueue, watchdogAutoEnableEnabled, WATCHDOG_WORKFLOWS } from "./lib/watchdog-decide.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
@@ -79,17 +79,10 @@ export async function main() {
       try {
         const queue = readFileSync(queuePath, "utf8").split("\n").filter(Boolean)
           .map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-        const now = Date.now();
-        let changed = false;
-        for (const t of queue) {
-          if (t.status === "in_progress" && t.updatedUtc && now - new Date(t.updatedUtc).getTime() > 40 * 60 * 1000) {
-            t.updatedUtc = new Date().toISOString();
-            changed = true;
-          }
-        }
-        if (changed) {
-          writeFileSync(queuePath, queue.map((t) => JSON.stringify(t)).join("\n") + "\n");
-          audit.note("queue-recheck", "stale in_progress timestamps refreshed");
+        const recovery = recoverStaleQueue(queue);
+        if (recovery.changed) {
+          writeFileSync(queuePath, recovery.queue.map((t) => JSON.stringify(t)).join("\n") + "\n");
+          audit.note("queue-recheck", `requeued=${recovery.requeued.length} exhausted=${recovery.exhausted.length}`);
         }
       } catch (err) {
         audit.note("queue-recheck", `skipped: ${err.message.slice(0, 120)}`);

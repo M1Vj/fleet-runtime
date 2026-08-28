@@ -71,8 +71,33 @@ export function sanitizeDiscoveredModelIds(providerId, payload) {
 }
 
 async function boundedJson(response) {
-  const text = await response.text();
-  if (typeof text !== "string" || text.length > MAX_DISCOVERY_BYTES) throw new Error("MODEL_DISCOVERY_RESPONSE_INVALID");
+  const contentLength = Number(response?.headers?.get?.("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > MAX_DISCOVERY_BYTES) throw new Error("MODEL_DISCOVERY_RESPONSE_INVALID");
+  let text = "";
+  if (response?.body?.getReader) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let bytes = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value?.byteLength || 0;
+        if (bytes > MAX_DISCOVERY_BYTES) {
+          await reader.cancel?.();
+          throw new Error("MODEL_DISCOVERY_RESPONSE_INVALID");
+        }
+        text += decoder.decode(value, { stream: true });
+      }
+      text += decoder.decode();
+    } catch (error) {
+      try { await reader.cancel?.(); } catch {}
+      throw error;
+    }
+  } else {
+    text = await response.text();
+  }
+  if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > MAX_DISCOVERY_BYTES) throw new Error("MODEL_DISCOVERY_RESPONSE_INVALID");
   return JSON.parse(text);
 }
 

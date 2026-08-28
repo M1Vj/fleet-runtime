@@ -30,6 +30,7 @@ const MAX_ARTIFACTS = 32;
 const MAX_REVIEW_NOTES = 8;
 const MAX_REVIEW_NOTE_CHARS = 240;
 const REVISION_COUNT_KEY_RE = /^([^\n:]{1,120})#(\d+)$/;
+const COMMENT_FINGERPRINT_RE = /^comment-[a-f0-9]{64}$/i;
 
 // These patterns deliberately cover provider tokens and common credential forms,
 // while leaving ordinary prose intact. The replacement happens before hashing or
@@ -145,6 +146,11 @@ function safeJudgeScores(value) {
   return { correctness, standards, threshold, targetChecksPassed: value.targetChecksPassed };
 }
 
+function safeCommentFingerprint(value) {
+  const candidate = String(value ?? "").trim().toLowerCase();
+  return COMMENT_FINGERPRINT_RE.test(candidate) ? candidate : undefined;
+}
+
 /**
  * Normalize an event to the bounded, redacted schema used by fleet-control.
  * This helper is intentionally permissive; target authorization belongs to the
@@ -174,6 +180,8 @@ export function normalizeMemoryEvent(input = {}) {
   if (["completed", "infrastructure"].includes(String(redacted.judgeStatus || ""))) event.judgeStatus = String(redacted.judgeStatus);
   const revisionCounts = safeRevisionCounts(redacted.revisionCounts);
   if (revisionCounts) event.revisionCounts = revisionCounts;
+  const commentFingerprint = safeCommentFingerprint(redacted.commentFingerprint);
+  if (commentFingerprint) event.commentFingerprint = commentFingerprint;
   event.eventId = deterministicEventId(event);
   return event;
 }
@@ -193,6 +201,7 @@ export function deterministicEventId(input = {}) {
     reviewNotes: event.reviewNotes || [],
     judgeScores: event.judgeScores || {},
     judgeStatus: event.judgeStatus || "",
+    commentFingerprint: event.commentFingerprint || "",
     artifactRefs: event.artifactRefs || [],
     revisionCounts: event.revisionCounts || {},
   };
@@ -470,6 +479,20 @@ export function revisionCountForTarget(eventsOrPath, { repo, pr } = {}) {
   }, 0);
 }
 
+/** Return the newest completed judge event from a different exact PR head. */
+export function findLatestPriorJudgeEvent(eventsOrPath, { repo, pr, headSha } = {}) {
+  const source = Array.isArray(eventsOrPath) ? eventsOrPath : readMemoryEvents(eventsOrPath);
+  const currentHead = String(headSha ?? "").toLowerCase();
+  return source
+    .map((entry) => normalizeMemoryEvent(entry))
+    .filter((entry) => entry.kind === "judge"
+      && ["JUDGE_APPROVED", "JUDGE_REJECTED"].includes(entry.state)
+      && entry.repo === repo
+      && Number(entry.pr) === Number(pr)
+      && (!currentHead || String(entry.headSha || "").toLowerCase() !== currentHead))
+    .at(-1) || null;
+}
+
 /**
  * Append one redacted event. Existing event ids make retries idempotent; a
  * successful duplicate append never changes the file's mtime or line count.
@@ -477,6 +500,27 @@ export function revisionCountForTarget(eventsOrPath, { repo, pr } = {}) {
 export function appendMemoryEvent(filePath, input, options = {}) {
   const target = memoryPath(filePath);
   return withWriteLock(target, () => appendMemoryEventLocked(target, input, options));
+}
+
+/**
+ * Atomically claim one exact public-comment fingerprint before any POST.
+ * Fixed logical fields make competing workflow retries resolve to one event.
+ */
+export function claimCommentFingerprint(filePath, input, options = {}) {
+  const fingerprint = safeCommentFingerprint(input?.commentFingerprint);
+  if (!fingerprint) throw new Error("comment fingerprint is invalid");
+  const target = memoryPath(filePath);
+  return withWriteLock(target, () => {
+    const result = appendMemoryEventLocked(target, {
+      ...input,
+      attempt: 0,
+      kind: "comment",
+      state: "COMMENT_INTENT",
+      summary: "public comment fingerprint claimed",
+      commentFingerprint: fingerprint,
+    }, options);
+    return { ...result, claimed: result.appended === true };
+  });
 }
 
 function appendMemoryEventLocked(target, input, options = {}) {

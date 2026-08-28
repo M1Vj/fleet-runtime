@@ -233,7 +233,7 @@ test("resolveModelChain parsing", async () => {
   assert.deepEqual(resolveModelChain({}), [
     "opencode/claude-opus-4-6",
     "openrouter/meta-llama/llama-3.2-3b-instruct:free",
-    "nvidia-nim/meta/llama-3.1-8b-instruct",
+    "nvidia-nim/moonshotai/kimi-k3",
   ]);
   assert.equal(resolveModelChain({ FLEET_MODEL_CHAIN: "opencode/claude-opus-4-6,openrouter/meta-llama/llama-3.2-3b-instruct:free" }).length, 2);
   assert.throws(() => resolveModelChain({ FLEET_MODEL_CHAIN: "a/b,c/d" }), /MODEL_REFERENCE_UNVERIFIED/);

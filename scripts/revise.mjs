@@ -7,9 +7,10 @@ import { fileURLToPath } from "node:url";
 
 import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
-import { applyAtomicRevision } from "./lib/atomic-revision.mjs";
+import { applyAtomicRevision, revisionHasByteChanges } from "./lib/atomic-revision.mjs";
 import {
   appendMemoryEvent,
+  claimCommentFingerprint,
   buildMemoryContext,
   memoryPath,
   readMemoryEvents,
@@ -46,7 +47,19 @@ import {
 } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";
 import { decodeEvidenceEnvelope } from "./pr-check.mjs";
-import { releaseHeldDispatch } from "./merge.mjs";
+import { dispatchTarget, releaseHeldDispatch } from "./merge.mjs";
+import {
+  dispatchResearchWorkflow,
+  normalizeResearchEvent,
+  readResearchEvents,
+  requestResearchEscalation,
+} from "./lib/research-state.mjs";
+import {
+  findPublicCommentFingerprint,
+  listPublicComments,
+  publicCommentFingerprint,
+  withPublicCommentFingerprint,
+} from "./lib/public-comment.mjs";
 import {
   verifyCommentAuthor,
   verifyCommit,
@@ -58,6 +71,11 @@ const REVISION_EVIDENCE_MAX_CHARS = 8000;
 export const MAX_REVISION_SOURCE_FILE_CHARS = 60000;
 export const MAX_REVISION_SOURCE_TOTAL_CHARS = 120000;
 export const MAX_REVISION_PROMPT_CHARS = 200000;
+
+const RESEARCH_CORRELATION_RE = /^research-[a-f0-9]{32}$/;
+const MAX_REVISION_RESEARCH_SUMMARIES = 8;
+const MAX_REVISION_RESEARCH_CITATIONS = 8;
+const MAX_REVISION_RESEARCH_PROMPT_CHARS = 12000;
 
 export { screenRevisionOutput };
 
@@ -335,6 +353,7 @@ function recordMemory(memoryFile, context, state, details = {}) {
     summary,
     changedPaths: details.changedPaths || [],
     blockerIds: blockerIds(details.blockers || details.blockerIds),
+    commentFingerprint: details.commentFingerprint,
     artifactRefs: [],
   });
 }
@@ -411,6 +430,108 @@ function persistEvent(runtime, context, state, details, identity, audit, { requi
   return { eventResult, stateOutcome };
 }
 
+function claimRevisionComment(runtime, context, headSha, fingerprint, identity, audit) {
+  let claim;
+  try {
+    claim = claimCommentFingerprint(runtime.memoryFile, {
+      runId: context.runId,
+      lane: "revise",
+      repo: context.repo,
+      pr: context.pr,
+      headSha,
+      commentFingerprint: fingerprint,
+    });
+    if (!claim.claimed) return false;
+    const outcome = persistState(runtime, identity, audit, `[fleet] revise comment claim ${context.repo}#${context.pr}`, { required: true });
+    if (outcome === "no-changes") throw new Error("comment claim was not committed");
+    return true;
+  } catch (error) {
+    const failure = new Error(`STATE_PERSISTENCE_FAILED ${String(error.message || error).slice(0, 200)}`);
+    failure.code = 7;
+    throw failure;
+  }
+}
+
+/** Request one correlated private research run for a byte-identical revision. */
+export async function requestRevisionNoProgressResearch({
+  target,
+  runtime,
+  context,
+  identity,
+  audit,
+  changedPaths,
+  blockers,
+  request = requestResearchEscalation,
+  persist,
+  dispatch,
+  appendMemory = appendMemoryEvent,
+} = {}) {
+  const failure = {
+    errorClass: "revision-no-progress",
+    check: "exact-head-byte-change",
+    runtime: "fleet-revision",
+    message: `revision output matched exact-head blobs; changed paths=${(Array.isArray(changedPaths) ? changedPaths : []).slice(0, 8).join(",")}`,
+    hard: true,
+    diagnosisConfidence: "low",
+  };
+  try {
+    const result = await request({
+      stateRoot: runtime.stateRoot,
+      runId: `${context.runId}-research`,
+      repo: target.repo,
+      pr: target.pr,
+      headSha: target.headSha,
+      failure,
+      persist: persist || (({ event }) => {
+        const outcome = safeCommitState(
+          runtime.stateRoot,
+          ["state"],
+          `[fleet] research ${event.state} ${target.repo}#${target.pr}`,
+          identity,
+          runtime.env,
+        );
+        if (outcome === "no-changes") throw new Error("research state event was not committed");
+        return outcome;
+      }),
+      dispatch: dispatch || ((payload) => dispatchResearchWorkflow(payload, { env: runtime.env })),
+    });
+    const requestEvent = [result?.event, result?.dispatchEvent]
+      .find((event) => RESEARCH_CORRELATION_RE.test(String(event?.correlationId || "").trim().toLowerCase()));
+    const correlationMemoryFile = runtime.memoryFile || (runtime.stateRoot ? path.join(runtime.stateRoot, "state", "pr-memory.jsonl") : "");
+    if (requestEvent && correlationMemoryFile) {
+      const correlationId = String(requestEvent.correlationId).trim().toLowerCase();
+      const existing = readMemoryEvents(correlationMemoryFile).find((event) => (
+        event.state === "RESEARCH_REQUESTED"
+        && researchTargetMatches(event, target)
+        && (Array.isArray(event.artifactRefs) ? event.artifactRefs : []).includes(`research-correlation:${correlationId}`)
+      ));
+      const memoryResult = existing
+        ? { event: existing, appended: false }
+        : appendMemory(correlationMemoryFile, {
+          runId: context.runId,
+          lane: "revise",
+          repo: target.repo,
+          pr: target.pr,
+          headSha: target.headSha,
+          attempt: context.attempt,
+          kind: "research",
+          state: "RESEARCH_REQUESTED",
+          summary: "bounded research requested after byte-identical revision output",
+          blockerIds: blockers,
+          artifactRefs: [`research-correlation:${correlationId}`],
+        });
+      if (memoryResult.appended !== false && runtime.memoryFile) {
+        persistState(runtime, identity, audit, `[fleet] revise research request ${target.repo}#${target.pr}`, { required: true });
+      }
+    }
+    audit?.note?.("research", `byte-identical no-progress research ${result.dispatched ? "dispatched" : "requested"}`);
+    return result;
+  } catch (error) {
+    audit?.incident?.("research", `byte-identical no-progress research skipped: ${redactText(String(error?.message || error)).slice(0, 180)}`);
+    return { requested: false, reason: "persistence-failed" };
+  }
+}
+
 function releaseRetryableClaim(target, runtime, context, identity, audit) {
   const dispatchKey = String(runtime.env.FLEET_DISPATCH_ID || "");
   if (!dispatchKey) return { released: false, manualDispatch: true };
@@ -444,12 +565,47 @@ function recordRetryableFailure(target, runtime, context, details, identity, aud
 }
 
 /** Mirror a successful revision without allowing the public API to relabel it as failed. */
-export async function attemptRevisionMirror({ repo, number, body, audit, post, verify } = {}) {
+export async function attemptRevisionMirror({
+  repo,
+  number,
+  headSha = "",
+  body,
+  audit,
+  post,
+  verify,
+  listComments,
+  existingComments,
+  identity,
+  claimFingerprint,
+  kind = "revision",
+} = {}) {
+  const fingerprint = publicCommentFingerprint({ kind, repo, pr: number, headSha, body });
   try {
-    const comment = await post(repo, number, body);
+    let comments = existingComments;
+    if (comments === undefined && typeof listComments === "function") comments = await listComments(repo, number);
+    const existingMatch = findPublicCommentFingerprint(comments, {
+      kind,
+      repo,
+      pr: number,
+      headSha,
+      body,
+      fingerprint,
+      authorLogin: identity?.login,
+    });
+    if (existingMatch) {
+      audit?.note?.("revision-mirror", `public mirror deduped ${fingerprint.slice(0, 20)}`);
+      if (existingMatch.id && typeof verify === "function") await verify(repo, existingMatch.id);
+      return { ok: true, deduped: true, fingerprint, comment: existingMatch };
+    }
+    if (typeof claimFingerprint === "function" && await claimFingerprint(fingerprint) !== true) {
+      audit?.note?.("revision-mirror", `durable claim deduped ${fingerprint.slice(0, 20)}`);
+      return { ok: true, deduped: true, durableClaim: true, fingerprint };
+    }
+    const markedBody = withPublicCommentFingerprint(body, { kind, fingerprint });
+    const comment = await post(repo, number, markedBody);
     if (!comment || !comment.id) throw new Error("revision comment response missing id");
     if (typeof verify === "function") await verify(repo, comment.id);
-    return { ok: true, comment };
+    return { ok: true, comment, fingerprint };
   } catch (error) {
     const reason = redactText(String(error && error.message || error)).slice(0, 180);
     audit?.incident?.("revision-mirror", `public mirror failed for ${redactText(String(repo || "")).slice(0, 120)}#${String(number || "").slice(0, 20)}: ${reason}`);
@@ -457,11 +613,54 @@ export async function attemptRevisionMirror({ repo, number, body, audit, post, v
   }
 }
 
+/** Dispatch exactly one new merge-gate run for the attributed revised head. */
+export async function dispatchFreshJudgeAfterRevision({
+  target,
+  commitSha,
+  runtime,
+  identity,
+  audit,
+  dispatch = dispatchTarget,
+} = {}) {
+  const nextHead = String(commitSha || "").trim().toLowerCase();
+  if (!/^[a-f0-9]{40}$/.test(nextHead)) return { dispatched: false, reason: "invalid-commit-sha" };
+  if (!target || nextHead === String(target.headSha || "").trim().toLowerCase()) {
+    return { dispatched: false, reason: "same-head" };
+  }
+  const nextTarget = { repo: target.repo, pr: target.pr, headSha: nextHead };
+  try {
+    const result = await dispatch(nextTarget, {
+      stateRoot: runtime?.stateRoot,
+      runId: `${String(runtime?.env?.FLEET_RUN_ID || "revision").slice(0, 60)}-rejudge`,
+      identity,
+      allowMerge: false,
+    });
+    audit?.note?.("dispatch", `fresh exact-head judge queued ${nextTarget.repo}#${nextTarget.pr}@${nextHead.slice(0, 10)}`);
+    return { dispatched: true, target: nextTarget, result };
+  } catch (error) {
+    const reason = redactText(String(error?.message || error)).slice(0, 180);
+    audit?.incident?.("dispatch", `fresh exact-head judge dispatch failed: ${reason}`);
+    return { dispatched: false, target: nextTarget, reason };
+  }
+}
+
+/** A committed revision is not operationally complete until its new head has a judge dispatch. */
+export function freshJudgeDispatchDisposition(result) {
+  if (result?.dispatched === true) return { ok: true, state: "SUCCESS", exitCode: 0 };
+  return {
+    ok: false,
+    state: "ERROR",
+    exitCode: 1,
+    summary: `fresh exact-head judge dispatch failed: ${redactText(String(result?.reason || "unknown failure")).slice(0, 160)}`,
+  };
+}
+
 /** Validate model files and screen them before delegating to Git Data mutation. */
 export async function applyValidatedRevision({
   files,
   changedPaths = [],
   existingPaths = [],
+  baseFiles,
   api,
   repo,
   branch,
@@ -485,7 +684,12 @@ export async function applyValidatedRevision({
     failure.code = "REVISION_OUTPUT_POLICY";
     throw failure;
   }
-  const atomic = await apply({ api, repo, branch, expectedHead, identity, files: validation.files, message });
+  if (Array.isArray(baseFiles) && !revisionHasByteChanges(validation.files, baseFiles)) {
+    const failure = new Error("REVISION_NO_PROGRESS byte-identical output");
+    failure.code = "REVISION_NO_PROGRESS";
+    throw failure;
+  }
+  const atomic = await apply({ api, repo, branch, expectedHead, identity, files: validation.files, baseFiles, message });
   return { atomic, validation };
 }
 
@@ -507,6 +711,101 @@ export function revisionMemoryContext(memoryFile, repo, pr) {
     maxEvents: 200,
     maxChars: 24000,
   });
+}
+
+function researchTargetMatches(event, target) {
+  return Boolean(event
+    && String(event.repo || "").toLowerCase() === String(target?.repo || "").toLowerCase()
+    && Number(event.pr) === Number(target?.pr)
+    && String(event.headSha || "").toLowerCase() === String(target?.headSha || "").toLowerCase());
+}
+
+function researchCorrelationFromMemoryEvent(event) {
+  if (!event || event.state !== "RESEARCH_CONTINUATION_CONSUMED") return "";
+  return (Array.isArray(event.artifactRefs) ? event.artifactRefs : [])
+    .map((value) => String(value || "").trim().toLowerCase())
+    .map((value) => value.match(/^research-correlation:(research-[a-f0-9]{32})$/)?.[1] || "")
+    .find(Boolean) || "";
+}
+
+function emptyResearchPromptContext() {
+  return { correlationId: "", claimSummaries: [], citations: [] };
+}
+
+/**
+ * Select only a consumed, exact-target research completion for the next
+ * revision. The research ledger is untrusted evidence: normalize it again and
+ * project only citation-bound summaries and citation metadata into the prompt.
+ */
+export function selectResearchCompletionContext({ memoryEvents = [], researchEvents = [], target } = {}) {
+  if (!target || !target.repo || !target.pr || !target.headSha) return emptyResearchPromptContext();
+  const consumed = (Array.isArray(memoryEvents) ? memoryEvents : [])
+    .filter((event) => researchTargetMatches(event, target))
+    .map((event) => ({ event, correlationId: researchCorrelationFromMemoryEvent(event) }))
+    .filter(({ correlationId }) => correlationId)
+    .at(-1);
+  if (!consumed) return emptyResearchPromptContext();
+
+  const completed = (Array.isArray(researchEvents) ? researchEvents : [])
+    .map((event) => {
+      try { return normalizeResearchEvent(event); } catch { return null; }
+    })
+    .filter((event) => event
+      && event.state === "RESEARCH_COMPLETED"
+      && event.correlationId === consumed.correlationId
+      && researchTargetMatches(event, target))
+    .at(-1);
+  if (!completed) return { correlationId: consumed.correlationId, claimSummaries: [], citations: [] };
+
+  const citations = (Array.isArray(completed.citations) ? completed.citations : [])
+    .slice(0, MAX_REVISION_RESEARCH_CITATIONS)
+    .map((citation) => ({
+      url: String(citation?.url || "").slice(0, 320),
+      title: String(citation?.title || "").slice(0, 160),
+      digest: String(citation?.digest || "").slice(0, 80),
+      evidenceType: String(citation?.evidenceType || "public-source-text").slice(0, 64),
+      confidence: String(citation?.confidence || "unknown").slice(0, 16),
+      factStatus: String(citation?.factStatus || "unknown").slice(0, 16),
+    }))
+    .filter((citation) => /^https:\/\//i.test(citation.url) && /^sha256:[a-f0-9]{64}$/i.test(citation.digest));
+  const citationDigests = new Set(citations.map((citation) => citation.digest));
+  const claimSummaries = (Array.isArray(completed.claimSummaries) ? completed.claimSummaries : [])
+    .slice(0, MAX_REVISION_RESEARCH_SUMMARIES)
+    .map((claim) => ({
+      summary: String(claim?.summary || "").slice(0, 600),
+      citationDigest: String(claim?.citationDigest || "").slice(0, 80),
+      confidence: String(claim?.confidence || "unknown").slice(0, 16),
+      factStatus: String(claim?.factStatus || "unknown").slice(0, 16),
+    }))
+    .filter((claim) => claim.summary
+      && /^sha256:[a-f0-9]{64}$/i.test(claim.citationDigest)
+      && citationDigests.has(claim.citationDigest));
+  return { correlationId: consumed.correlationId, claimSummaries, citations };
+}
+
+/** Build a bounded, explicitly untrusted research block with no page text. */
+export function buildResearchPromptBlock(options = {}) {
+  let memoryEvents = options.memoryEvents;
+  let researchEvents = options.researchEvents;
+  if (!Array.isArray(researchEvents) && options.stateRoot) {
+    try { researchEvents = readResearchEvents(path.join(String(options.stateRoot), "state", "research.jsonl")); } catch { researchEvents = []; }
+  }
+  if (!Array.isArray(memoryEvents) && (options.memoryFile || options.stateRoot)) {
+    try { memoryEvents = readMemoryEvents(options.memoryFile || memoryPath(String(options.stateRoot))); } catch { memoryEvents = []; }
+  }
+  const context = selectResearchCompletionContext({
+    ...options,
+    memoryEvents: Array.isArray(memoryEvents) ? memoryEvents : [],
+    researchEvents: Array.isArray(researchEvents) ? researchEvents : [],
+  });
+  if (!context.correlationId || (context.claimSummaries.length === 0 && context.citations.length === 0)) return "";
+  const payload = JSON.stringify({
+    correlationId: context.correlationId,
+    claimSummaries: context.claimSummaries,
+    citations: context.citations,
+  });
+  if (payload.length > MAX_REVISION_RESEARCH_PROMPT_CHARS) return "";
+  return untrustedData("RESEARCH", payload);
 }
 
 function resolveRuntime(env) {
@@ -657,6 +956,11 @@ async function reviseTarget(target, identity, audit, context, runtime) {
     .join("\n\n");
   const priorMemory = revisionMemoryContext(runtime.memoryFile, target.repo, target.pr);
   const reviewFeedback = selectRevisionFeedback(priorEvents, { repo: target.repo, pr: target.pr });
+  const researchPromptBlock = buildResearchPromptBlock({
+    memoryEvents: priorEvents,
+    researchEvents: (() => { try { return readResearchEvents(path.join(runtime.stateRoot, "state", "research.jsonl")); } catch { return []; } })(),
+    target,
+  });
   const fleetMemoryBlock = loadFleetMemoryPromptBlock(runtime.stateRoot, target.repo);
   const evidence = readRevisionEvidence(runtime.env.FLEET_EVIDENCE_PATH, { workspaceRoot: REPO_ROOT });
   persistEvent(runtime, context, "REVISION_STARTED", { summary: "revision model run started", changedPaths, blockers }, identity, audit, { required: true });
@@ -679,6 +983,7 @@ async function reviseTarget(target, identity, audit, context, runtime) {
     ...(fleetMemoryBlock ? [fleetMemoryBlock.trimEnd()] : []),
     untrustedData("MEMORY", JSON.stringify(priorMemory)),
     untrustedData("REVIEW_FEEDBACK", JSON.stringify(reviewFeedback)),
+    ...(researchPromptBlock ? [researchPromptBlock] : []),
     untrustedData("BLOCKERS", blockers.join("\n")),
     untrustedData("DIFF", diffText),
     untrustedData("COMPLETE_EXACT_HEAD_FILES", completeSourceText),
@@ -779,11 +1084,22 @@ async function reviseTarget(target, identity, audit, context, runtime) {
       files,
       changedPaths,
       existingPaths: [...fetched.completeSource.treePaths],
+      baseFiles: fetched.completeSource.files,
       message: `[fleet-revise] atomic update (round ${used + 1})`,
     });
     atomic = applied.atomic;
     validation = applied.validation;
   } catch (error) {
+    if (error && error.code === "REVISION_NO_PROGRESS") {
+      persistEvent(runtime, context, "NO_PROGRESS", {
+        summary: "revision output was byte-identical to the exact head; no Git mutation attempted",
+        changedPaths,
+        blockers,
+      }, identity, audit, { required: true });
+      await requestRevisionNoProgressResearch({ target, runtime, context, identity, audit, changedPaths, blockers });
+      console.log("REVISE_STATE=NO_PROGRESS");
+      return 0;
+    }
     if (error && error.code === "REVISION_OUTPUT_POLICY") {
       recordRetryableFailure(target, runtime, context, { summary: "model output policy rejected", changedPaths, blockers }, identity, audit, 5);
       console.log(`REVISE_STATE=REJECTED ${String(error.message).slice(0, 180)}`);
@@ -793,6 +1109,15 @@ async function reviseTarget(target, identity, audit, context, runtime) {
   }
   await verifyCommit(target.repo, atomic.commitSha, identity, runtime.env.FLEET_GH_TOKEN);
   const controlledSummary = `updated ${validation.files.length} validated files`;
+  const safeCommentPaths = validation.files.map((file) => formatRevisionPath(file.path)).join(", ");
+  const revisionCommentBody = `🔧 **fleet revision agent** (round ${used + 1}/${max}): ${controlledSummary} (${safeCommentPaths}).\n\nMerge gate re-evaluates automatically.`;
+  const revisionCommentFingerprint = publicCommentFingerprint({
+    kind: "revision",
+    repo: target.repo,
+    pr: target.pr,
+    headSha: atomic.commitSha,
+    body: revisionCommentBody,
+  });
   // Best-effort repo memory entry for the successful revision round; written
   // before persistEvent so it rides the same durable state commit.
   appendRepoMemoryEntry(runtime, {
@@ -800,20 +1125,59 @@ async function reviseTarget(target, identity, audit, context, runtime) {
     lane: "revise",
     summary: `revision round ${used + 1}: ${controlledSummary}`,
   }, audit);
-  persistEvent(runtime, context, "SUCCESS", { summary: controlledSummary, changedPaths: validation.files.map((file) => file.path), blockers }, identity, audit, { required: true });
-  const safeCommentPaths = validation.files.map((file) => formatRevisionPath(file.path)).join(", ");
+  persistEvent(runtime, context, "SUCCESS", {
+    summary: controlledSummary,
+    changedPaths: validation.files.map((file) => file.path),
+    blockers,
+    commentFingerprint: revisionCommentFingerprint,
+  }, identity, audit, { required: true });
+  const rejudge = await dispatchFreshJudgeAfterRevision({
+    target,
+    commitSha: atomic.commitSha,
+    runtime,
+    identity,
+    audit,
+  });
+  const rejudgeDisposition = freshJudgeDispatchDisposition(rejudge);
+  if (!rejudgeDisposition.ok) {
+    persistEvent(runtime, context, rejudgeDisposition.state, {
+      summary: rejudgeDisposition.summary,
+      changedPaths: validation.files.map((file) => file.path),
+      blockers,
+      artifactRefs: [`commit:${atomic.commitSha}`],
+    }, identity, audit, { required: true });
+    console.log(`REVISE_STATE=${rejudgeDisposition.state}`);
+    return rejudgeDisposition.exitCode;
+  }
   const mirror = await attemptRevisionMirror({
     repo: target.repo,
     number: target.pr,
-    body: `<!-- fleet-pr-memory: revision -->\n🔧 **fleet revision agent** (round ${used + 1}/${max}): ${controlledSummary} (${safeCommentPaths}).\n\nMerge gate re-evaluates automatically.`,
+    headSha: atomic.commitSha,
+    // The mirror body is derived only from controlledSummary and validated safe paths.
+    body: revisionCommentBody,
     audit,
     post: (repo, number, body) => gh(
       ["api", "-X", "POST", `/repos/${repo}/issues/${number}/comments`, "-F", `body=${body}`],
       runtime.env,
     ),
+    listComments: (repo, number) => listPublicComments({
+      repo,
+      pr: number,
+      listPage: (targetRepo, targetPr, page, pageSize) => gh(
+        ["api", `/repos/${targetRepo}/issues/${targetPr}/comments?per_page=${pageSize}&page=${page}`],
+        runtime.env,
+      ),
+    }),
     verify: (repo, commentId) => verifyCommentAuthor(repo, commentId, identity, runtime.env.FLEET_GH_TOKEN),
+    identity,
+    claimFingerprint: (fingerprint) => claimRevisionComment(runtime, context, atomic.commitSha, fingerprint, identity, audit),
   });
-  if (mirror.ok) audit.note("attribution", `verified one commit ${atomic.commitSha.slice(0, 10)} and comment #${mirror.comment.id}`);
+  if (mirror.ok) {
+    const commentEvidence = mirror.comment?.id
+      ? `comment #${mirror.comment.id}`
+      : mirror.deduped ? "comment mirror deduped" : "comment mirror verified";
+    audit.note("attribution", `verified one commit ${atomic.commitSha.slice(0, 10)} and ${commentEvidence}`);
+  }
   console.log("REVISE_STATE=SUCCESS");
   return 0;
 }

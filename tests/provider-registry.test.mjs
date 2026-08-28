@@ -12,6 +12,7 @@ import {
   loadProviderRegistry,
   providerSecretMappings,
   resolveProviderCredentials,
+  resolveProviderQuotaGroup,
   selectProviderRoute,
   validateModelUpdateMetadata,
   validateProviderRegistry,
@@ -73,6 +74,15 @@ test("mixed public-private jobs inject free-provider secrets only after public v
   assert.doesNotMatch(improveResearch.slice(0, improveResearch.indexOf("    steps:")), freeSecrets);
   assert.match(improveResearch, /id:\s*public/);
   assert.match(improveResearch, /OPENROUTER_API_KEY:\s*\$\{\{\s*steps\.public\.outputs\.verified\s*==\s*'true'/);
+  const quotaGroups = /GEMINI_API_KEY_[12]_QUOTA_GROUP:/;
+  assert.doesNotMatch(deepAnalyze.slice(0, deepAnalyze.indexOf("    steps:")), quotaGroups);
+  assert.match(deepAnalyze, quotaGroups);
+  assert.match(deepAnalyze, /GEMINI_API_KEY_1_QUOTA_GROUP:\s*\$\{\{\s*steps\.public\.outputs\.verified\s*==\s*'true'\s*&&\s*vars\.GEMINI_API_KEY_1_QUOTA_GROUP\s*\|\|\s*''\s*\}\}/);
+  assert.match(deepAnalyze, /GEMINI_API_KEY_2_QUOTA_GROUP:\s*\$\{\{\s*steps\.public\.outputs\.verified\s*==\s*'true'\s*&&\s*vars\.GEMINI_API_KEY_2_QUOTA_GROUP\s*\|\|\s*''\s*\}\}/);
+  assert.match(improveResearch, quotaGroups);
+  assert.doesNotMatch(improveResearch.slice(0, improveResearch.indexOf("    steps:")), quotaGroups);
+  assert.match(improveResearch, /GEMINI_API_KEY_1_QUOTA_GROUP:\s*\$\{\{\s*steps\.public\.outputs\.verified\s*==\s*'true'\s*&&\s*vars\.GEMINI_API_KEY_1_QUOTA_GROUP\s*\|\|\s*''\s*\}\}/);
+  assert.match(improveResearch, /GEMINI_API_KEY_2_QUOTA_GROUP:\s*\$\{\{\s*steps\.public\.outputs\.verified\s*==\s*'true'\s*&&\s*vars\.GEMINI_API_KEY_2_QUOTA_GROUP\s*\|\|\s*''\s*\}\}/);
 });
 
 test("OAuth is local-only and Gemini API keys are a separate durable backup provider", () => {
@@ -88,10 +98,19 @@ test("OAuth is local-only and Gemini API keys are a separate durable backup prov
 
   assert.ok(geminiApi);
   assert.equal(geminiApi.auth?.mode, "api-key");
-  assert.equal(geminiApi.auth?.sameProviderRotation, "auth-only");
+  assert.equal(geminiApi.auth?.sameProviderRotation, "healthy-round-robin");
+  assert.equal(geminiApi.auth?.quotaScope, "credential-group");
   assert.deepEqual(geminiApi.credentials.map((item) => item.id), ["account-1", "account-2"]);
   assert.ok(geminiApi.credentials.every((item) => item.targetEnv === "GEMINI_API_KEY"));
+  assert.deepEqual(geminiApi.credentials.map((item) => item.quotaGroupEnv), [
+    "GEMINI_API_KEY_1_QUOTA_GROUP",
+    "GEMINI_API_KEY_2_QUOTA_GROUP",
+  ]);
   assert.equal(geminiApi.models["gemini-3.7-flash"].free, true);
+  const zen = registry.providers.find((item) => item.id === "opencode-zen");
+  assert.equal(zen.auth?.mode, "api-key");
+  assert.equal(zen.auth?.sameProviderRotation, "healthy-round-robin");
+  assert.equal(zen.auth?.quotaScope, "account-wide");
 });
 
 test("verified free fallbacks expose documented OpenRouter and NVIDIA routes", () => {
@@ -103,7 +122,12 @@ test("verified free fallbacks expose documented OpenRouter and NVIDIA routes", (
   assert.equal(openrouter.models["meta-llama/llama-3.2-3b-instruct:free"].free, true);
   assert.ok(nvidia);
   assert.equal(nvidia.verification.status, "verified");
-  assert.equal(nvidia.models["meta/llama-3.1-8b-instruct"].free, true);
+  assert.equal(nvidia.models["moonshotai/kimi-k3"].free, true);
+  assert.equal(nvidia.models["moonshotai/kimi-k3"].availability, "free-endpoint");
+  assert.equal(nvidia.models["moonshotai/kimi-k3"].contextTokens, 1_048_576);
+  assert.equal(nvidia.models["moonshotai/kimi-k3"].maxOutputTokens, 65_536);
+  assert.ok(nvidia.verification.docs.includes("https://build.nvidia.com/moonshotai/kimi-k3/modelcard"));
+  assert.ok(nvidia.verification.docs.includes("https://docs.api.nvidia.com/nim/reference/moonshotai-kimi-k3-infer"));
   assert.equal(nvidia.production?.requiresEnv, "FLEET_NVIDIA_ENABLE");
   assert.deepEqual(
     registry.buckets.other.map((item) => `${item.provider}/${item.model}`),
@@ -111,7 +135,7 @@ test("verified free fallbacks expose documented OpenRouter and NVIDIA routes", (
       "opencode-zen/claude-opus-4-6",
       "opencode-zen/claude-opus-4-6",
       "openrouter/meta-llama/llama-3.2-3b-instruct:free",
-      "nvidia-nim/meta/llama-3.1-8b-instruct",
+      "nvidia-nim/moonshotai/kimi-k3",
     ],
   );
 });
@@ -297,11 +321,200 @@ test("same-provider Gemini keys do not rotate on an account-level rate limit", (
   assert.match(route.skipped.join(","), /gemini-api:rate-limited/);
 });
 
+test("healthy configured accounts rotate deterministically across run seeds", () => {
+  const env = {
+    GEMINI_API_KEY_1: "key-one",
+    GEMINI_API_KEY_2: "key-two",
+    GEMINI_API_KEY_1_QUOTA_GROUP: "project-one",
+    GEMINI_API_KEY_2_QUOTA_GROUP: "project-two",
+  };
+  const args = {
+    registry,
+    bucket: "gemini",
+    model: "gemini-api/gemini-3.7-flash",
+    env,
+    health: { "gemini-api": { status: "healthy", checkedAt: "2026-08-27T00:00:00Z" } },
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+    now: Date.parse("2026-08-27T00:10:00Z"),
+  };
+  const selected = new Set();
+  for (let index = 0; index < 32; index += 1) {
+    const route = selectProviderRoute({ ...args, rotationSeed: `run-${index}` });
+    assert.equal(route.ok, true);
+    selected.add(route.credential);
+    const repeated = selectProviderRoute({ ...args, rotationSeed: `run-${index}` });
+    assert.equal(repeated.credential, route.credential);
+  }
+  assert.deepEqual([...selected].sort(), ["account-1", "account-2"]);
+  const fromRunId = selectProviderRoute({ ...args, env: { ...env, GITHUB_RUN_ID: "1" } });
+  assert.equal(fromRunId.credential, "account-2");
+});
+
+test("a rate-limited quota group can fail over only to a separately declared project", () => {
+  const env = {
+    GEMINI_API_KEY_1: "key-one",
+    GEMINI_API_KEY_2: "key-two",
+    GEMINI_API_KEY_1_QUOTA_GROUP: "project-one",
+    GEMINI_API_KEY_2_QUOTA_GROUP: "project-two",
+  };
+  const route = selectProviderRoute({
+    registry,
+    bucket: "gemini",
+    model: "gemini-api/gemini-3.7-flash",
+    env,
+    health: {
+      "gemini-api": {
+        status: "healthy",
+        checkedAt: "2026-08-27T00:00:00Z",
+        quotaGroups: {
+          "project-one": { status: "rate-limited", checkedAt: "2026-08-27T00:00:00Z" },
+        },
+      },
+    },
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+    now: Date.parse("2026-08-27T00:10:00Z"),
+    allowLiveCanary: true,
+    rotationSeed: "stable-run",
+  });
+  assert.equal(route.ok, true);
+  assert.equal(route.credential, "account-2");
+  assert.equal(route.quotaGroup, "project-two");
+});
+
+test("missing quota-group declarations keep rate limits provider-wide", () => {
+  const route = selectProviderRoute({
+    registry,
+    bucket: "gemini",
+    model: "gemini-api/gemini-3.7-flash",
+    env: { GEMINI_API_KEY_1: "key-one", GEMINI_API_KEY_2: "key-two" },
+    health: {
+      "gemini-api": {
+        status: "healthy",
+        checkedAt: "2026-08-27T00:00:00Z",
+        credentials: {
+          "account-1": { status: "rate-limited", checkedAt: "2026-08-27T00:00:00Z" },
+        },
+      },
+    },
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+    now: Date.parse("2026-08-27T00:10:00Z"),
+    allowLiveCanary: true,
+    rotationSeed: "stable-run",
+  });
+  assert.equal(route.ok, false);
+  assert.match(route.skipped.join(","), /gemini-api:rate-limited/);
+});
+
+test("duplicate quota-group values fail closed instead of rotating a shared project", () => {
+  const route = selectProviderRoute({
+    registry,
+    bucket: "gemini",
+    model: "gemini-api/gemini-3.7-flash",
+    env: {
+      GEMINI_API_KEY_1: "key-one",
+      GEMINI_API_KEY_2: "key-two",
+      GEMINI_API_KEY_1_QUOTA_GROUP: "same-project",
+      GEMINI_API_KEY_2_QUOTA_GROUP: "same-project",
+    },
+    health: {
+      "gemini-api": {
+        status: "healthy",
+        checkedAt: "2026-08-27T00:00:00Z",
+        credentials: {
+          "account-1": { status: "rate-limited", checkedAt: "2026-08-27T00:00:00Z" },
+        },
+      },
+    },
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+    now: Date.parse("2026-08-27T00:10:00Z"),
+    allowLiveCanary: true,
+    rotationSeed: "stable-run",
+  });
+  assert.equal(route.ok, false);
+  assert.match(route.skipped.join(","), /gemini-api:rate-limited/);
+});
+
+test("auth rejection skips one named credential and keeps the other eligible", () => {
+  const route = selectProviderRoute({
+    registry,
+    bucket: "gemini",
+    model: "gemini-api/gemini-3.7-flash",
+    env: {
+      GEMINI_API_KEY_1: "key-one",
+      GEMINI_API_KEY_2: "key-two",
+      GEMINI_API_KEY_1_QUOTA_GROUP: "project-one",
+      GEMINI_API_KEY_2_QUOTA_GROUP: "project-two",
+    },
+    health: {
+      "gemini-api": {
+        status: "healthy",
+        checkedAt: "2026-08-27T00:00:00Z",
+        credentials: {
+          "account-1": { status: "rejected", checkedAt: "2026-08-27T00:00:00Z" },
+        },
+      },
+    },
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+    now: Date.parse("2026-08-27T00:10:00Z"),
+    rotationSeed: "stable-run",
+  });
+  assert.equal(route.ok, true);
+  assert.equal(route.credential, "account-2");
+});
+
+test("quota groups accept Google project ids or numbers and reject opaque labels", () => {
+  const provider = registry.providers.find((item) => item.id === "gemini-api");
+  const credential = provider.credentials[0];
+  for (const value of ["project-one", "123456789012"]) {
+    assert.equal(resolveProviderQuotaGroup(provider, credential, { GEMINI_API_KEY_1_QUOTA_GROUP: value }).ok, true, value);
+  }
+  for (const value of ["a", "UPPERCASE", "project.one", "project_one", "project:one", "-project", "project-"]) {
+    assert.equal(resolveProviderQuotaGroup(provider, credential, { GEMINI_API_KEY_1_QUOTA_GROUP: value }).ok, false, value);
+  }
+});
+
+test("untrusted health status never reaches route diagnostics", () => {
+  const secretStatus = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+  const route = selectProviderRoute({
+    registry,
+    bucket: "gemini",
+    model: "gemini-api/gemini-3.7-flash",
+    env: { GEMINI_API_KEY_1: "key-one", GEMINI_API_KEY_1_QUOTA_GROUP: "project-one" },
+    health: { "gemini-api": { status: secretStatus, checkedAt: "2026-08-27T00:00:00Z" } },
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+    now: Date.parse("2026-08-27T00:10:00Z"),
+  });
+  assert.equal(JSON.stringify(route).includes(secretStatus), false);
+});
+
+test("healthy Zen credentials rotate deterministically while retaining account-wide quota scope", () => {
+  const args = {
+    registry,
+    bucket: "other",
+    model: "opencode/claude-opus-4-6",
+    env: { OPENCODE_API_KEY: "key-one", OPENCODE_API_KEY_2: "key-two" },
+    health: { "opencode-zen": { status: "healthy", checkedAt: "2026-08-27T00:00:00Z" } },
+    now: Date.parse("2026-08-27T00:10:00Z"),
+    freeOnly: false,
+    allowPaid: true,
+  };
+  assert.equal(selectProviderRoute({ ...args, rotationSeed: "0" }).credential, "default");
+  assert.equal(selectProviderRoute({ ...args, rotationSeed: "1" }).credential, "backup");
+  assert.equal(selectProviderRoute({ ...args, rotationSeed: "1" }).credential, "backup");
+  assert.equal(selectProviderRoute({ ...args, env: { ...args.env, GITHUB_RUN_ID: "1" } }).credential, "backup");
+});
+
 test("model selection is registry-backed and Gemini override is exact", () => {
   assert.deepEqual(resolveModelChain({}), [
     "opencode/claude-opus-4-6",
     "openrouter/meta-llama/llama-3.2-3b-instruct:free",
-    "nvidia-nim/meta/llama-3.1-8b-instruct",
+    "nvidia-nim/moonshotai/kimi-k3",
   ]);
   assert.deepEqual(resolveModelChain({ FLEET_GEMINI_MODEL: "gemini-3.7-flash-high" }), ["antigravity/gemini-3.7-flash-high"]);
   assert.deepEqual(resolveModelChain({ FLEET_GEMINI_MODEL: "gemini-3.7-flash" }), ["gemini-api/gemini-3.7-flash"]);
@@ -310,7 +523,7 @@ test("model selection is registry-backed and Gemini override is exact", () => {
     "antigravity/gemini-3.7-flash-high",
     "gemini-api/gemini-3.7-flash",
     "openrouter/meta-llama/llama-3.2-3b-instruct:free",
-    "nvidia-nim/meta/llama-3.1-8b-instruct",
+    "nvidia-nim/moonshotai/kimi-k3",
     "opencode/claude-opus-4-6",
   ]);
 });
@@ -459,6 +672,33 @@ test("Gemini API adapter uses the documented model id and high reasoning level",
   assert.equal(result.response, "ok");
   assert.equal(request.model, "gemini-3.7-flash");
   assert.equal(request.reasoning_effort, "high");
+});
+
+test("NVIDIA Kimi K3 uses the documented free chat endpoint and exact model id", async () => {
+  const provider = fixtureProvider("nvidia-nim");
+  let request;
+  let endpoint;
+  const result = await createFreeProviderAdapter({
+    provider,
+    env: { NVIDIA_API_KEY: "nv-fixture", FLEET_NVIDIA_ENABLE: "true" },
+    fetchImpl: async (url, options) => {
+      endpoint = url;
+      request = JSON.parse(options.body);
+      assert.equal(options.headers.authorization, "Bearer nv-fixture");
+      return { ok: true, text: async () => JSON.stringify({ choices: [{ message: { content: "ok" } }] }) };
+    },
+  }).invoke({
+    prompt: "public",
+    model: "moonshotai/kimi-k3",
+    account: "default",
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+  });
+  assert.equal(result.response, "ok");
+  assert.equal(endpoint, "https://integrate.api.nvidia.com/v1/chat/completions");
+  assert.equal(request.model, "moonshotai/kimi-k3");
+  assert.equal(request.stream, false);
+  assert.equal(request.reasoning_effort, undefined, "NVIDIA defaults Kimi K3 reasoning effort to max");
 });
 
 test("model update metadata is digest-bound and rollback records are bounded and secretless", () => {

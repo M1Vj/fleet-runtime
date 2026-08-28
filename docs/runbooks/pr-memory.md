@@ -36,7 +36,7 @@ newline is preserved and separated before the next append.
 | `DISPATCH_FAILED` | A definite client rejection means no run was accepted | A later scan may make a new attempt after the cause is fixed |
 | `DISPATCH_CONSUMED` | Authorization matched the target and correlation key | Keep the same head claimed while the globally serialized target run proceeds |
 | `DISPATCH_RELEASED` | The gate completed or reached a retryable terminal state, including missing evidence | A later scan may make a new same-head attempt if the PR remains eligible |
-| `DISPATCH_HELD` | The gate reached policy `BLOCKED`, `REVISION_QUEUED`, `APPROVED_NO_MERGE`, `READY_REQUIRED`, `MERGE_UNKNOWN`, or `MERGE_VERIFY_FAILED` | Suppress the same head; a changed head or explicit reconciliation is required |
+| `DISPATCH_HELD` | The gate reached policy `BLOCKED`, `NO_PROGRESS`, `REVISION_QUEUED`, `APPROVED_NO_MERGE`, `READY_REQUIRED`, `MERGE_UNKNOWN`, or `MERGE_VERIFY_FAILED` | Suppress the same head; a changed head or explicit reconciliation is required |
 
 Scanner-generated runs carry a 64-hex `dispatch_id`. Authorization validates the live PR
 policy first, then consumes only the matching active event before any target checkout.
@@ -54,12 +54,22 @@ redacted private `reviewNotes` and normalized score metadata for the revision pr
 pushed before the model call or branch mutation. `ROTATED` is the bounded summary emitted
 when old events are compacted. Every promised terminal event and identity-verified audit must
 persist or the run exits with code 7 (`STATE_PERSISTENCE_FAILED`).
+`NO_PROGRESS` is a private terminal state for byte-identical revision output or a repeated/
+regressed judge result. It holds the exact dispatch claim and may create one correlated,
+bounded research request; it never queues another same-head revision or posts another judge
+mirror.
 `SUCCESS` is appended and pushed immediately after the single attributed commit and
 non-forced ref update, before the public status comment. `ERROR`, `BLOCKED`, `STALLED`, and
 `EXHAUSTED` explain bounded terminal outcomes. The default cap is two
 `REVISION_STARTED` events per repo and PR, so a successful revision's new head does not reset
 the allowance. Rotation preserves a summary count, so age or unrelated events cannot reset the
 allowance either.
+
+Public gate, judge, and revision mirrors carry a deterministic fingerprint over the controlled
+body and exact PR head. Before posting, the workflow reads at most five pages of issue comments,
+verifies any matching fingerprint, normalized body, and author, then commits one durable private
+claim for that fingerprint. Competing runs cannot both claim the same mirror. Private memory
+remains canonical when a comment lookup or post fails.
 
 A pre-mutation persistence failure exits without changing the target branch. If the target
 commit succeeds but the required `SUCCESS` push fails, the workflow exits nonzero and does

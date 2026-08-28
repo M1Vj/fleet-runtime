@@ -8,6 +8,7 @@ import {
   createAntigravityAdapter,
   createFreeProviderAdapter,
   loadProviderRegistry,
+  normalizeProviderHealthStatus,
   parseProviderModelReference,
   providerModelReference,
   selectProviderRoute,
@@ -43,7 +44,9 @@ export const PUBLIC_READ_MODEL_POLICY = Object.freeze({
     list: "allow",
     glob: "allow",
     grep: "allow",
-    webfetch: "allow",
+    // Public source retrieval is performed by the SSRF-safe fetch boundary;
+    // the model must not open arbitrary URLs from hostile prompt content.
+    webfetch: "deny",
     bash: "deny",
     edit: "deny",
     external_directory: "deny",
@@ -228,7 +231,8 @@ export function resolveModelChain(env = process.env, { dataClass = "private", pu
 
 export function runOnce({ prompt, sessionId, variant, timeoutMs, env, files = [], model = "opencode/claude-opus-4-6", workspace, repoRoot = process.cwd(), stateRoot = env.FLEET_STATE_ROOT || "", spawnImpl = spawn }) {
   return new Promise((resolve) => {
-    const missing = !resolveProviderAuth(env).ok;
+    const auth = resolveProviderAuth(env);
+    const missing = !auth.ok;
     const args = ["run", "--format", "json", "-m", model];
     if (env.FLEET_OPENCODE_DEBUG === "1") args.push("--print-logs", "--log-level", "DEBUG");
     if (!missing && variant) args.push("--variant", variant);
@@ -269,7 +273,7 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs, env, files = []
     delete childEnv.GDRIVE_CLIENT_SECRET;
     // Legacy migration path only: owner-Mac OAuth snapshots are never the
     // production dependency; GitHub provisions OPENCODE_API_KEY instead.
-    childEnv.OPENCODE_AUTH_CONTENT = env.FLEET_OPENCODE_AUTH || "";
+    childEnv.OPENCODE_AUTH_CONTENT = auth.mode === "legacy-oauth-migration" ? env.FLEET_OPENCODE_AUTH || "" : "";
     childEnv.OPENCODE_DISABLE_AUTOUPDATE = "1";
     const child = spawnImpl("opencode", args, { env: childEnv, stdio: ["ignore", "pipe", "pipe"], cwd: workspaceRoot });
     const timer = setTimeout(() => {
@@ -393,7 +397,7 @@ function routeFailureState(error) {
   return "";
 }
 
-function recordRouteFailure(health, route, state, now) {
+export function recordRouteFailure(health, route, state, now) {
   if (!route?.provider || !state) return;
   const normalizedState = state === "exhausted" ? "quota-exhausted" : state;
   const current = health[route.provider] && typeof health[route.provider] === "object" ? health[route.provider] : {};
@@ -403,15 +407,31 @@ function recordRouteFailure(health, route, state, now) {
     status: normalizedState,
     checkedAt: new Date(now).toISOString(),
   };
+  const quotaGroups = current.quotaGroups && typeof current.quotaGroups === "object" ? { ...current.quotaGroups } : {};
+  if (["rate-limited", "quota-exhausted"].includes(normalizedState)
+    && route.quotaGroupRotation === true
+    && typeof route.quotaGroup === "string"
+    && route.quotaGroup.length > 0) {
+    quotaGroups[route.quotaGroup] = {
+      ...(quotaGroups[route.quotaGroup] || {}),
+      status: normalizedState,
+      checkedAt: new Date(now).toISOString(),
+    };
+  }
   health[route.provider] = {
     ...current,
     checkedAt: current.checkedAt || new Date(now).toISOString(),
-    // Keep the provider-wide status healthy so an auth failure can fall back
-    // to a cold credential. Rate/quota failures remain provider-wide.
+    // Keep a credential-group provider healthy when the selected project is
+    // limited. Without an explicit, validated group map, the failure remains
+    // provider-wide and prevents quota-evasion retries.
     ...(normalizedState === "rejected" || normalizedState === "missing" || normalizedState === "expired"
-      ? { status: current.status || "healthy" }
-      : { status: normalizedState }),
+      ? { status: normalizeProviderHealthStatus(current.status, "healthy") }
+      : ["rate-limited", "quota-exhausted"].includes(normalizedState)
+        && route.quotaGroupRotation === true && typeof route.quotaGroup === "string"
+        ? { status: normalizeProviderHealthStatus(current.status, "healthy") }
+        : { status: normalizedState }),
     credentials,
+    ...(Object.keys(quotaGroups).length > 0 ? { quotaGroups } : {}),
   };
 }
 
@@ -475,7 +495,7 @@ async function askDirectRoute({ route, prompt, timeoutMs, env, dataClass, public
   }
 }
 
-async function askModelInternal({ prompt, sessionId, timeoutMs = 480000, env = process.env, preferVariantMax = true, maxRounds = 4, files = [], modelOverride, workspace, repoRoot = process.cwd(), stateRoot: privateStateRoot = env.FLEET_STATE_ROOT || "", spawnImpl, skipCircuitCheck = false, dataClass = "private", publicTarget, providerHealth, effort = "high", fetchImpl = globalThis.fetch, now = Date.now() }) {
+async function askModelInternal({ prompt, sessionId, timeoutMs = 480000, env = process.env, preferVariantMax = true, maxRounds = 4, files = [], modelOverride, workspace, repoRoot = process.cwd(), stateRoot: privateStateRoot = env.FLEET_STATE_ROOT || "", spawnImpl, skipCircuitCheck = false, dataClass = "private", publicTarget, providerHealth, effort = "high", fetchImpl = globalThis.fetch, now = Date.now(), rotationSeed }) {
   const registry = loadProviderRegistry();
   const chain = modelOverride
     ? [canonicalModelReference(modelOverride, registry)]
@@ -485,6 +505,7 @@ async function askModelInternal({ prompt, sessionId, timeoutMs = 480000, env = p
   const authStatus = providerAuthStatus(env, { circuitOpen });
   const explicitHealth = parseHealthSnapshot(providerHealth ?? env.FLEET_PROVIDER_HEALTH_JSON);
   const runtimeHealth = explicitHealth;
+  const effectiveRotationSeed = rotationSeed ?? env.FLEET_ACCOUNT_ROTATION_SEED ?? env.GITHUB_RUN_ID ?? "";
   const entries = chain.map((reference) => routeEntryForReference(reference, registry));
   const hasDirectEligible = entries.some((entry) => directRouteEligible(entry, dataClass, publicTarget));
   const allowLocal = entries.some((entry) => localRouteEligible(entry, env));
@@ -525,6 +546,7 @@ async function askModelInternal({ prompt, sessionId, timeoutMs = 480000, env = p
       allowLiveCanary: !isZen,
       dataClass,
       publicTarget,
+      rotationSeed: effectiveRotationSeed,
     });
     if (!route.ok) {
       allAttempts.push({ round: 0, model: reference, provider: entry.provider.id, skipped: route.reason || "route-unavailable", skippedRoutes: route.skipped || [] });
@@ -556,16 +578,18 @@ async function askModelInternal({ prompt, sessionId, timeoutMs = 480000, env = p
       return { reply: result.reply, sessionId: isZen ? lastSid : "", modelMode: lastMode, attempts: allAttempts, complete: true };
     }
     recordRouteFailure(runtimeHealth, selected, lastAuthState, now);
-    if (lastAuthState === "rejected" && !replayedReferences.has(reference)) {
+    const canRotateCredential = lastAuthState === "rejected"
+      || ((lastAuthState === "rate-limited" || lastAuthState === "quota-exhausted") && selected.quotaGroupRotation === true);
+    if (canRotateCredential && !replayedReferences.has(reference)) {
       // Re-run the same model reference once so selectProviderRoute can pick a
-      // cold credential from the same provider. Rate/quota failures are never
-      // replayed onto another key owned by that provider.
+      // cold credential from the same provider. Rate/quota failures are replayed
+      // only when the selected route proved a distinct credential-group map.
       replayedReferences.add(reference);
       chain.splice(ci + 1, 0, reference);
     }
-    // Auth failures are eligible for a cold credential or another provider;
-    // rate/quota failures never rotate a same-owner credential, but may try a
-    // distinct provider later in the configured chain.
+    // Auth failures are eligible for a cold credential or another provider.
+    // Account-group rate/quota failures may use the next declared project;
+    // provider-wide limits continue to the next provider only.
   }
   if (attemptedZen) {
     try { markGatewayDown(healthRoot, allAttempts.map((x) => x.errTail || x.error || "").join(" ").slice(-200)); } catch {}

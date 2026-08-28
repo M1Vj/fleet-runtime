@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "registryVersion": "2026-08-27.2",
-  "generatedAt": "2026-08-27T00:00:00.000Z",
+  "registryVersion": "2026-08-28.2",
+  "generatedAt": "2026-08-28T00:00:00.000Z",
   "updatePolicy": {
     "source": "committed-provider-registry",
     "autoActivate": false,
@@ -63,7 +63,8 @@
       },
       "auth": {
         "mode": "api-key",
-        "sameProviderRotation": "auth-only"
+        "sameProviderRotation": "healthy-round-robin",
+        "quotaScope": "credential-group"
       },
       "fallbackPolicy": {
         "credentialFallbackOn": ["missing", "expired", "rejected"],
@@ -76,6 +77,7 @@
           "env": "GEMINI_API_KEY_1",
           "targetEnv": "GEMINI_API_KEY",
           "expiresEnv": "GEMINI_API_KEY_1_EXPIRES_AT",
+          "quotaGroupEnv": "GEMINI_API_KEY_1_QUOTA_GROUP",
           "required": false
         },
         {
@@ -84,6 +86,7 @@
           "env": "GEMINI_API_KEY_2",
           "targetEnv": "GEMINI_API_KEY",
           "expiresEnv": "GEMINI_API_KEY_2_EXPIRES_AT",
+          "quotaGroupEnv": "GEMINI_API_KEY_2_QUOTA_GROUP",
           "required": false
         }
       ],
@@ -119,6 +122,11 @@
       "localOnly": false,
       "production": {
         "enabled": true
+      },
+      "auth": {
+        "mode": "api-key",
+        "sameProviderRotation": "healthy-round-robin",
+        "quotaScope": "account-wide"
       },
       "fallbackPolicy": {
         "credentialFallbackOn": ["missing", "expired", "rejected"],
@@ -168,7 +176,8 @@
         "enabled": true
       },
       "auth": {
-        "mode": "api-key"
+        "mode": "api-key",
+        "quotaScope": "account-wide"
       },
       "privacy": {
         "requireZdr": true,
@@ -224,7 +233,8 @@
         "requiresEnv": "FLEET_NVIDIA_ENABLE"
       },
       "auth": {
-        "mode": "api-key"
+        "mode": "api-key",
+        "quotaScope": "account-wide"
       },
       "fallbackPolicy": {
         "credentialFallbackOn": ["missing", "expired", "rejected"],
@@ -245,11 +255,22 @@
         "docs": [
           "https://docs.api.nvidia.com/nim/re/docs/api-quickstart",
           "https://docs.api.nvidia.com/nim/reference/llm-apis",
-          "https://docs.api.nvidia.com/nim/docs/run-anywhere"
+          "https://docs.api.nvidia.com/nim/docs/run-anywhere",
+          "https://build.nvidia.com/moonshotai/kimi-k3/modelcard",
+          "https://docs.api.nvidia.com/nim/reference/moonshotai-kimi-k3-infer"
         ],
-        "terms": "NVIDIA documents free hosted API access for Developer Program prototyping; production use requires the applicable NVIDIA license. The explicit FLEET_NVIDIA_ENABLE gate remains off by default."
+        "terms": "NVIDIA lists moonshotai/kimi-k3 as an available free endpoint governed by its API Trial Terms for prototyping; production use requires the applicable NVIDIA license. Limits remain account-wide and the explicit FLEET_NVIDIA_ENABLE gate stays off by default."
       },
       "models": {
+        "moonshotai/kimi-k3": {
+          "free": true,
+          "family": "kimi-k3",
+          "availability": "free-endpoint",
+          "contextTokens": 1048576,
+          "maxOutputTokens": 65536,
+          "modalities": ["text", "image"],
+          "reasoningEffort": ["low", "high", "max"]
+        },
         "meta/llama-3.1-8b-instruct": {
           "free": true,
           "family": "llama",
@@ -319,7 +340,7 @@
       },
       {
         "provider": "nvidia-nim",
-        "model": "meta/llama-3.1-8b-instruct",
+        "model": "moonshotai/kimi-k3",
         "credential": "default",
         "priority": 4,
         "free": true,
@@ -364,7 +385,7 @@
       },
       {
         "provider": "nvidia-nim",
-        "model": "meta/llama-3.1-8b-instruct",
+        "model": "moonshotai/kimi-k3",
         "credential": "default",
         "priority": 5,
         "free": true,

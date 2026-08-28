@@ -5,6 +5,7 @@ import process from "node:process";
 import { existsSync } from "node:fs";
 import { planSentinelActions } from "./lib/watchdog-decide.mjs";
 import { gh } from "./lib/util.mjs";
+import { runGate } from "./lib/gate.mjs";
 
 const THRESHOLD_MS = 60 * 60 * 1000;
 
@@ -17,8 +18,10 @@ export function sentinelEnvDefaults(env = process.env) {
   };
 }
 
-export async function main(env = process.env, { ghFn = gh, nowMs = Date.now() } = {}) {
+export async function main(env = process.env, { ghFn = gh, gateFn = runGate, nowMs = Date.now() } = {}) {
   const { target, autoEnable, killSwitchPath, thresholdMs } = sentinelEnvDefaults(env);
+  const identity = await gateFn(env);
+  if (!identity || identity.login !== "M1Vj") throw new Error("IDENTITY_MISMATCH");
   let lastRunUtc = null;
   try {
     const data = ghFn(["api", `/repos/${target}/actions/workflows/watchdog.yml/runs?per_page=1`], env);

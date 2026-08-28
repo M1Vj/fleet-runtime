@@ -21,6 +21,7 @@ jobs:
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       FLEET_WATCHDOG_AUTO_ENABLE: ${{ vars.FLEET_WATCHDOG_AUTO_ENABLE }}
       FLEET_SENTINEL_TARGET: M1Vj/fleet-runtime
+      FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state/KILL_SWITCH
     steps:
       - name: checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -31,5 +32,12 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
+      - name: checkout trusted runtime sentinel
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: M1Vj/fleet-runtime
+          persist-credentials: false
+          fetch-depth: 1
+          path: runtime
       - name: sentinel
-        run: node scripts/sentinel.mjs
+        run: node runtime/scripts/sentinel.mjs

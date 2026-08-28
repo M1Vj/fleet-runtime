@@ -27,6 +27,8 @@ import {
   releaseHeldDispatch,
   releaseSetupFailedDispatch,
   validateFilesResponse,
+  researchContinuationDisposition,
+  queueResearchContinuationRevision,
 } from "../scripts/merge.mjs";
 import { evaluateTargetPolicy, normalizeTargetInput, isAllowedRepo } from "../scripts/lib/target-policy.mjs";
 import { normalizeMemoryEvent, redactText } from "../scripts/lib/pr-memory.mjs";
@@ -736,6 +738,134 @@ test("judge mirror failure is private and cannot suppress a queued revision", as
   assert.equal(incidents.length, 1);
   assert.equal(revisionDisposition({ fleetAuthored: true, revisionAllowed: true, evidenceAvailable: true, judgeResults: [{ infrastructureFailure: false }] }).revisionNeeded, true);
   assert.ok(source.indexOf("persistRevisionIntent") < source.indexOf("attemptJudgeMirror"));
+});
+
+test("judge mirror suppresses POST when another run owns the durable fingerprint claim", async () => {
+  let posted = false;
+  const mirror = await attemptJudgeMirror({
+    repo: "M1Vj/fleet-runtime",
+    number: 17,
+    headSha: "a".repeat(40),
+    body: "controlled summary",
+    audit: { incident() {}, note() {} },
+    identity: { login: "M1Vj" },
+    existingComments: [],
+    claimFingerprint: async () => false,
+    post: async () => { posted = true; return { id: 1 }; },
+  });
+  assert.equal(mirror.ok, true);
+  assert.equal(mirror.deduped, true);
+  assert.equal(mirror.durableClaim, true);
+  assert.equal(posted, false);
+});
+
+test("same-head byte-identical revision is held after durable no-progress evidence", () => {
+  const target = { repo: "M1Vj/fleet-runtime", pr: 17, headSha: "a".repeat(40) };
+  const result = recoverRejectedJudge({
+    target,
+    existingJudge: {
+      ...target,
+      kind: "judge",
+      state: "JUDGE_REJECTED",
+      judgeScores: { correctness: 70, standards: 70 },
+      blockerIds: ["blocker-1111111111111111"],
+    },
+    memoryEvents: [{ ...target, state: "NO_PROGRESS", kind: "terminal" }],
+    fleetAuthored: true,
+    revisionAllowed: true,
+    evidenceAvailable: true,
+    revisionAttempts: 1,
+    maxRevisions: 2,
+  });
+  assert.deepEqual(result, {
+    revisionNeeded: false,
+    state: "NO_PROGRESS",
+    why: "same-head revision already recorded no progress",
+    publicComment: false,
+  });
+});
+
+test("research continuation correlates a hold to the newest exact-target request and newer completion", () => {
+  const target = { repo: "M1Vj/fleet-runtime", pr: 17, headSha: "a".repeat(40) };
+  const correlationId = "research-0123456789abcdef0123456789abcdef";
+  const memoryEvents = [
+    { ...target, state: "NO_PROGRESS", kind: "terminal", createdAt: "2026-08-28T00:00:00.000Z", artifactRefs: [] },
+    { ...target, state: "RESEARCH_REQUESTED", kind: "research", createdAt: "2026-08-28T00:01:00.000Z", artifactRefs: [`research-correlation:${correlationId}`] },
+  ];
+  const result = researchContinuationDisposition({
+    memoryEvents,
+    researchEvents: [{
+      ...target,
+      state: "RESEARCH_COMPLETED",
+      correlationId,
+      createdAt: "2026-08-28T00:02:00.000Z",
+      claimSummaries: [{ summary: "safe", citationDigest: "sha256:" + "1".repeat(64) }],
+    }],
+    target,
+    latestJudge: { state: "JUDGE_REJECTED" },
+    revisionAttempts: 1,
+    maxRevisions: 2,
+  });
+  assert.equal(result.ready, true);
+  assert.equal(result.correlationId, correlationId);
+});
+
+test("research continuation prefers the newest request over a stale hold artifact reference", () => {
+  const target = { repo: "M1Vj/fleet-runtime", pr: 17, headSha: "a".repeat(40) };
+  const oldCorrelation = "research-11111111111111111111111111111111";
+  const newestCorrelation = "research-22222222222222222222222222222222";
+  const memoryEvents = [
+    { ...target, state: "NO_PROGRESS", kind: "terminal", createdAt: "2026-08-28T00:00:00.000Z", artifactRefs: [`research-correlation:${oldCorrelation}`] },
+    { ...target, state: "RESEARCH_REQUESTED", kind: "research", createdAt: "2026-08-28T00:01:00.000Z", artifactRefs: [`research-correlation:${oldCorrelation}`] },
+    { ...target, state: "RESEARCH_REQUESTED", kind: "research", createdAt: "2026-08-28T00:02:00.000Z", artifactRefs: [`research-correlation:${newestCorrelation}`] },
+  ];
+  const result = researchContinuationDisposition({
+    memoryEvents,
+    researchEvents: [{
+      ...target,
+      state: "RESEARCH_COMPLETED",
+      correlationId: newestCorrelation,
+      createdAt: "2026-08-28T00:03:00.000Z",
+      claimSummaries: [{ summary: "safe", citationDigest: "sha256:" + "1".repeat(64) }],
+    }],
+    target,
+    latestJudge: { state: "JUDGE_REJECTED" },
+    revisionAttempts: 1,
+    maxRevisions: 2,
+  });
+  assert.equal(result.ready, true);
+  assert.equal(result.correlationId, newestCorrelation);
+});
+
+test("research continuation queues consumed state before one revision intent and fails closed before output", () => {
+  const target = { repo: "M1Vj/fleet-runtime", pr: 17, headSha: "a".repeat(40) };
+  const calls = [];
+  const continuation = {
+    ready: true,
+    correlationId: "research-0123456789abcdef0123456789abcdef",
+    noProgress: { blockerIds: ["blocker-1111111111111111"] },
+  };
+  const queued = queueResearchContinuationRevision({
+    target,
+    continuation,
+    revisionAttempts: 1,
+    persistMemory: () => calls.push("consumed"),
+    persistIntent: () => calls.push("intent"),
+    writeOutput: () => calls.push("output"),
+  });
+  assert.equal(queued.queued, true);
+  assert.deepEqual(calls, ["consumed", "intent", "output"]);
+
+  const failedCalls = [];
+  assert.throws(() => queueResearchContinuationRevision({
+    target,
+    continuation,
+    revisionAttempts: 1,
+    persistMemory: () => failedCalls.push("consumed"),
+    persistIntent: () => { failedCalls.push("intent"); throw new Error("intent persistence failed"); },
+    writeOutput: () => failedCalls.push("output"),
+  }), /intent persistence failed/);
+  assert.deepEqual(failedCalls, ["consumed", "intent"]);
 });
 
 test("unavailable and unparsable judges are marked as infrastructure failures", async () => {

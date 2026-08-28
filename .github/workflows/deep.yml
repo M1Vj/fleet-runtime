@@ -31,7 +31,14 @@ jobs:
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
     steps:
       - name: sanitize workers input
-        run: echo "FLEET_MAX_WORKERS=$(echo '${{ github.event.inputs.workers }}' | grep -E '^[0-9]+$' || echo 4)" >> "$GITHUB_ENV"
+        env:
+          WORKERS_INPUT: ${{ github.event.inputs.workers }}
+        run: |
+          case "$WORKERS_INPUT" in
+            ''|*[!0-9]*) workers=4 ;;
+            *) workers="$WORKERS_INPUT" ;;
+          esac
+          printf 'FLEET_MAX_WORKERS=%s\n' "$workers" >> "$GITHUB_ENV"
       - name: checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -79,7 +86,6 @@ jobs:
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
-      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
       OPENCODE_API_KEY_2: ${{ secrets.OPENCODE_API_KEY_2 }}
       FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN }}
@@ -132,6 +138,8 @@ jobs:
         env:
           GEMINI_API_KEY_1: ${{ steps.public.outputs.verified == 'true' && secrets.GEMINI_API_KEY_1 || '' }}
           GEMINI_API_KEY_2: ${{ steps.public.outputs.verified == 'true' && secrets.GEMINI_API_KEY_2 || '' }}
+          GEMINI_API_KEY_1_QUOTA_GROUP: ${{ steps.public.outputs.verified == 'true' && vars.GEMINI_API_KEY_1_QUOTA_GROUP || '' }}
+          GEMINI_API_KEY_2_QUOTA_GROUP: ${{ steps.public.outputs.verified == 'true' && vars.GEMINI_API_KEY_2_QUOTA_GROUP || '' }}
           OPENROUTER_API_KEY: ${{ steps.public.outputs.verified == 'true' && secrets.OPENROUTER_API_KEY || '' }}
           NVIDIA_API_KEY: ${{ steps.public.outputs.verified == 'true' && secrets.NVIDIA_API_KEY || '' }}
         run: |
@@ -159,7 +167,14 @@ jobs:
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
     steps:
       - name: sanitize workers input
-        run: echo "FLEET_MAX_WORKERS=$(echo '${{ github.event.inputs.workers }}' | grep -E '^[0-9]+$' || echo 4)" >> "$GITHUB_ENV"
+        env:
+          WORKERS_INPUT: ${{ github.event.inputs.workers }}
+        run: |
+          case "$WORKERS_INPUT" in
+            ''|*[!0-9]*) workers=4 ;;
+            *) workers="$WORKERS_INPUT" ;;
+          esac
+          printf 'FLEET_MAX_WORKERS=%s\n' "$workers" >> "$GITHUB_ENV"
       - name: checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:

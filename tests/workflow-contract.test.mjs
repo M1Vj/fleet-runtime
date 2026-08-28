@@ -9,6 +9,7 @@ const prCheckSource = readFileSync(new URL("../scripts/pr-check.mjs", import.met
 const fleetMemorySource = readFileSync(new URL("../scripts/lib/fleet-memory.mjs", import.meta.url), "utf8");
 const reviseSource = readFileSync(new URL("../scripts/revise.mjs", import.meta.url), "utf8");
 const improveSource = readFileSync(new URL("../scripts/improve.mjs", import.meta.url), "utf8");
+const deepWorkflow = readFileSync(new URL("../.github/workflows/deep.yml", import.meta.url), "utf8");
 
 test("manual dispatch has an explicit, fail-closed target contract", () => {
   assert.match(workflow, /workflow_dispatch:\s*\n\s+inputs:/);
@@ -67,7 +68,16 @@ test("the workflow uses one global non-canceling concurrency group", () => {
   const groups = [...workflow.matchAll(/^\s+group:\s*(.+)$/gm)].map((match) => match[1].trim());
   assert.deepEqual(groups, ["fleet-merge-gate"]);
   assert.match(workflow, /cancel-in-progress:\s*false/);
-  assert.match(workflow, /queue:\s*max/);
+  assert.doesNotMatch(workflow, /^\s+queue:/m);
+});
+
+test("deep worker input crosses into shell only through a validated environment value", () => {
+  assert.doesNotMatch(deepWorkflow, /['"]\$\{\{\s*github\.event\.inputs\.workers/);
+  assert.equal((deepWorkflow.match(/WORKERS_INPUT:\s*\$\{\{\s*github\.event\.inputs\.workers\s*\}\}/g) || []).length, 2);
+  assert.equal((deepWorkflow.match(/case "\$WORKERS_INPUT" in/g) || []).length, 2);
+  assert.equal((deepWorkflow.match(/''\|\*\[!0-9\]\*\) workers=4/g) || []).length, 2);
+  assert.equal((deepWorkflow.match(/printf 'FLEET_MAX_WORKERS=%s\\n' "\$workers"/g) || []).length, 2);
+  assert.doesNotMatch(deepWorkflow, /grep -E/);
 });
 
 test("target code has no state checkout or secret-bearing job environment", () => {
@@ -85,7 +95,8 @@ test("trusted credentials are step-local and state root is explicit", () => {
   const gateJob = workflow.slice(workflow.indexOf("  gate:"));
   assert.doesNotMatch(gateJob.slice(0, gateJob.indexOf("steps:")), /FLEET_GH_TOKEN|FLEET_OPENCODE_AUTH/);
   assert.match(gateJob, /FLEET_GH_TOKEN:\s*\$\{\{\s*secrets\.FLEET_GH_TOKEN\s*\}\}/);
-  assert.match(gateJob, /FLEET_OPENCODE_AUTH:\s*\$\{\{\s*secrets\.FLEET_OPENCODE_AUTH\s*\}\}/);
+  assert.match(gateJob, /OPENCODE_API_KEY:\s*\$\{\{\s*secrets\.OPENCODE_API_KEY\s*\}\}/);
+  assert.doesNotMatch(gateJob, /FLEET_OPENCODE_AUTH|OPENCODE_AUTH_CONTENT/);
   assert.match(gateJob, /FLEET_ALLOW_MERGE:\s*\$\{\{\s*inputs\.allow_merge\s*\}\}/);
   assert.match(gateJob, /FLEET_DISPATCH_ID:\s*\$\{\{\s*inputs\.dispatch_id\s*\}\}/);
   assert.match(gateJob, /FLEET_STATE_ROOT:/);
@@ -174,14 +185,15 @@ test("the setup-failure finalizer runs even when the gate job failed", () => {
   assert.match(condition, /needs\.gate\.result != 'success'/);
 });
 
-test("every model-credential wiring also exposes the durable provider key", () => {
+test("production model workflows use provider keys without legacy OAuth snapshots", () => {
   const dir = new URL("../.github/workflows/", import.meta.url);
+  const production = new Set(["deep.yml", "improve.yml", "kb.yml", "merge.yml", "patrol.yml", "retro.yml", "selftest.yml", "thesis.yml"]);
   for (const name of readdirSync(dir)) {
-    if (!name.endsWith(".yml")) continue;
+    if (!production.has(name)) continue;
     const text = readFileSync(new URL(name, dir), "utf8");
-    const legacy = text.match(/secrets\.FLEET_OPENCODE_AUTH/g) || [];
     const provider = text.match(/OPENCODE_API_KEY: \$\{\{ secrets\.OPENCODE_API_KEY \}\}/g) || [];
-    assert.equal(provider.length, legacy.length, `${name}: each FLEET_OPENCODE_AUTH wiring needs a sibling OPENCODE_API_KEY wiring`);
+    assert.ok(provider.length > 0, `${name}: durable provider key is required`);
+    assert.doesNotMatch(text, /FLEET_OPENCODE_AUTH|OPENCODE_AUTH_CONTENT/, `${name}: legacy OAuth is local migration only`);
   }
 });
 
@@ -220,7 +232,10 @@ test("memory content never reaches public comment bodies or mirrors", () => {
 
 test("the fleet-control sentinel workflow revives only the minimum set behind explicit opt-in", () => {
   const sentinelWorkflow = readFileSync(new URL("../deploy/fleet-control/watchdog.yml", import.meta.url), "utf8");
-  assert.match(sentinelWorkflow, /node scripts\/sentinel\.mjs/);
+  assert.match(sentinelWorkflow, /repository:\s*M1Vj\/fleet-runtime/);
+  assert.match(sentinelWorkflow, /path:\s*runtime/);
+  assert.match(sentinelWorkflow, /node runtime\/scripts\/sentinel\.mjs/);
+  assert.match(sentinelWorkflow, /FLEET_KILL_SWITCH_PATH:\s*\$\{\{\s*github\.workspace\s*\}\}\/state\/KILL_SWITCH/);
   assert.match(sentinelWorkflow, /FLEET_WATCHDOG_AUTO_ENABLE:\s*\$\{\{\s*vars\.FLEET_WATCHDOG_AUTO_ENABLE\s*\}\}/);
   assert.match(sentinelWorkflow, /FLEET_SENTINEL_TARGET:\s*M1Vj\/fleet-runtime/);
   const source = readFileSync(new URL("../scripts/sentinel.mjs", import.meta.url), "utf8");

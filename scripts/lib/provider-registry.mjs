@@ -103,7 +103,8 @@ export function validateProviderRegistry(value) {
     if (provider.production?.requiresEnv !== undefined && !ENV_RE.test(String(provider.production.requiresEnv))) errors.push(`${provider.id}.production.requiresEnv invalid`);
     if (provider.auth !== undefined && (!provider.auth || typeof provider.auth !== "object" || Array.isArray(provider.auth))) errors.push(`${provider.id}.auth must be an object`);
     if (provider.auth?.mode !== undefined && !["api-key", "oauth"].includes(provider.auth.mode)) errors.push(`${provider.id}.auth.mode invalid`);
-    if (provider.auth?.sameProviderRotation !== undefined && provider.auth.sameProviderRotation !== "auth-only") errors.push(`${provider.id}.auth.sameProviderRotation invalid`);
+    if (provider.auth?.sameProviderRotation !== undefined && !["auth-only", "healthy-round-robin"].includes(provider.auth.sameProviderRotation)) errors.push(`${provider.id}.auth.sameProviderRotation invalid`);
+    if (provider.auth?.quotaScope !== undefined && !["account-wide", "credential-group"].includes(provider.auth.quotaScope)) errors.push(`${provider.id}.auth.quotaScope invalid`);
     if (provider.localOnly && provider.auth?.mode !== "oauth") errors.push(`${provider.id}.localOnly providers must use oauth auth metadata`);
     if (!Array.isArray(provider.credentials) || provider.credentials.length === 0) errors.push(`${provider.id}.credentials must be non-empty`);
     for (const credential of Array.isArray(provider.credentials) ? provider.credentials : []) {
@@ -123,6 +124,10 @@ export function validateProviderRegistry(value) {
         }
         for (const field of ["githubSecret", "env", "targetEnv", "expiresEnv"]) {
           if (credential[field] !== undefined && !ENV_RE.test(String(credential[field]))) errors.push(`${provider.id}.credential.${field} invalid`);
+        }
+        if (credential.quotaGroupEnv !== undefined && !ENV_RE.test(String(credential.quotaGroupEnv))) errors.push(`${provider.id}.credential.quotaGroupEnv invalid`);
+        if (provider.auth?.quotaScope === "credential-group" && (!credential.quotaGroupEnv || !ENV_RE.test(String(credential.quotaGroupEnv)))) {
+          errors.push(`${provider.id}.credential.quotaGroupEnv is required for credential-group quota scope`);
         }
       }
       if (credential.localOnly !== undefined && typeof credential.localOnly !== "boolean") errors.push(`${provider.id}.credential.localOnly must be boolean`);
@@ -236,6 +241,17 @@ export function resolveProviderCredentials(provider, env = process.env, { accoun
 }
 
 /** Evaluate a provider snapshot without trusting stale or malformed health. */
+const PROVIDER_HEALTH_STATES = new Set([
+  "healthy", "rejected", "missing", "expired", "rate-limited", "quota-exhausted",
+  "timeout", "unavailable", "disabled", "unknown", "stale",
+]);
+
+/** Map untrusted health snapshots to a fixed, log-safe vocabulary. */
+export function normalizeProviderHealthStatus(value, fallback = "") {
+  const status = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return PROVIDER_HEALTH_STATES.has(status) ? status : fallback;
+}
+
 export function assessProviderHealth(provider, env = process.env, { snapshot, now = Date.now(), maxAgeMs = DEFAULT_HEALTH_MAX_AGE_MS, account } = {}) {
   const credentials = resolveProviderCredentials(provider, env, { account, now });
   if (!credentials.ok) {
@@ -253,8 +269,68 @@ export function assessProviderHealth(provider, env = process.env, { snapshot, no
   const checkedAt = dateMs(selectedSnapshot.checkedAt);
   if (!Number.isFinite(checkedAt) || checkedAt > Number(now)) return { provider: provider.id, status: "unknown", credential: credentials.credential };
   if (Number(now) - checkedAt > Number(maxAgeMs)) return { provider: provider.id, status: "stale", checkedAt: new Date(checkedAt).toISOString(), credential: credentials.credential };
-  if (selectedSnapshot.status !== "healthy") return { provider: provider.id, status: String(selectedSnapshot.status || "unavailable"), checkedAt: new Date(checkedAt).toISOString(), credential: credentials.credential };
+  const status = normalizeProviderHealthStatus(selectedSnapshot.status, "unknown");
+  if (status !== "healthy") return { provider: provider.id, status, checkedAt: new Date(checkedAt).toISOString(), credential: credentials.credential };
   return { provider: provider.id, status: "healthy", checkedAt: new Date(checkedAt).toISOString(), credential: credentials.credential };
+}
+
+const QUOTA_GROUP_VALUE_RE = /^(?:[a-z][a-z0-9-]{4,28}[a-z0-9]|[0-9]{6,20})$/;
+
+function validQuotaGroupValue(value) {
+  return typeof value === "string"
+    && QUOTA_GROUP_VALUE_RE.test(value)
+    && !SECRET_VALUE_RE.test(value);
+}
+
+/**
+ * Resolve a non-secret quota-group label for one credential. Group labels are
+ * configuration identifiers (for example, a Google Cloud project id), never
+ * credential values. The result deliberately omits the label on failure.
+ */
+export function resolveProviderQuotaGroup(provider, credential, env = process.env) {
+  if (provider?.auth?.quotaScope !== "credential-group") return { ok: false, state: "account-wide" };
+  const envName = credential?.quotaGroupEnv;
+  if (typeof envName !== "string" || !ENV_RE.test(envName)) return { ok: false, state: "missing-declaration" };
+  const value = credentialValue(env, envName);
+  if (!value) return { ok: false, state: "missing" };
+  if (!validQuotaGroupValue(value)) return { ok: false, state: "invalid" };
+  return { ok: true, env: envName, quotaGroup: value };
+}
+
+function freshSnapshotStatus(snapshot, now, maxAgeMs = DEFAULT_HEALTH_MAX_AGE_MS) {
+  if (!snapshot || typeof snapshot !== "object") return "";
+  const checkedAt = dateMs(snapshot.checkedAt);
+  if (!Number.isFinite(checkedAt) || checkedAt > Number(now) || Number(now) - checkedAt > Number(maxAgeMs)) return "";
+  return normalizeProviderHealthStatus(snapshot.status, "");
+}
+
+function quotaGroupValidation(provider, candidates, env) {
+  if (provider?.auth?.quotaScope !== "credential-group") return { ok: false, state: "account-wide", groups: new Map() };
+  const groups = new Map();
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const credentialId = candidate.ref?.credential || candidate.credentials?.credential;
+    if (!credentialId || seen.has(credentialId)) continue;
+    seen.add(credentialId);
+    const resolved = resolveProviderQuotaGroup(provider, candidate.credentialObject, env);
+    if (!resolved.ok) return { ok: false, state: resolved.state, groups };
+    groups.set(credentialId, resolved.quotaGroup);
+  }
+  const values = [...groups.values()];
+  if (values.length !== new Set(values).size) return { ok: false, state: "duplicate", groups };
+  return { ok: true, state: "valid", groups };
+}
+
+function rotationStart(seed, provider, model, count) {
+  if (!seed || count <= 1) return 0;
+  const text = String(seed).trim();
+  const numericSuffix = text.match(/(?:^|\D)(\d+)$/)?.[1];
+  if (numericSuffix) return Number(BigInt(numericSuffix) % BigInt(count));
+  const material = `${text}\u0000${provider}\u0000${model}`;
+  const hash = createHash("sha256").update(material).digest();
+  let value = 0n;
+  for (const byte of hash.subarray(0, 8)) value = (value << 8n) | BigInt(byte);
+  return Number(value % BigInt(count));
 }
 
 /** Return the model reference accepted by the OpenCode child or direct adapter. */
@@ -281,7 +357,7 @@ export function parseProviderModelReference(reference, registry = loadProviderRe
 }
 
 /** Select a route by policy; no route is returned for unverified providers. */
-export function selectProviderRoute({ registry = loadProviderRegistry(), bucket, model, env = process.env, health = {}, now = Date.now(), freeOnly = true, allowPaid = false, allowLocal = false, allowPreview = false, allowLiveCanary = false, dataClass = "private", publicTarget } = {}) {
+export function selectProviderRoute({ registry = loadProviderRegistry(), bucket, model, env = process.env, health = {}, now = Date.now(), freeOnly = true, allowPaid = false, allowLocal = false, allowPreview = false, allowLiveCanary = false, dataClass = "private", publicTarget, rotationSeed } = {}) {
   const validation = validateProviderRegistry(registry);
   if (!validation.ok) return { ok: false, reason: "PROVIDER_REGISTRY_INVALID" };
   const refs = Array.isArray(registry.buckets?.[bucket]) ? registry.buckets[bucket].slice().sort((a, b) => a.priority - b.priority) : [];
@@ -289,79 +365,144 @@ export function selectProviderRoute({ registry = loadProviderRegistry(), bucket,
   const localAccess = allowLocal === true
     && /^(?:1|true)$/i.test(String(env?.FLEET_ANTIGRAVITY_LOCAL || ""))
     && !/^(?:1|true)$/i.test(String(env?.GITHUB_ACTIONS || ""));
+  const effectiveRotationSeed = rotationSeed ?? env?.FLEET_ACCOUNT_ROTATION_SEED ?? env?.GITHUB_RUN_ID ?? "";
+  const groups = [];
+  const seenGroups = new Set();
   for (const ref of refs) {
-    if (model && ref.model !== model && providerModelReference(ref.provider === "opencode" ? "opencode-zen" : ref.provider, ref.model) !== model) {
-      continue;
-    }
-    const provider = registry.providers.find((item) => item.id === ref.provider);
+    if (model && ref.model !== model && providerModelReference(ref.provider === "opencode" ? "opencode-zen" : ref.provider, ref.model) !== model) continue;
+    const groupKey = `${ref.provider}\u0000${ref.model}`;
+    if (seenGroups.has(groupKey)) continue;
+    seenGroups.add(groupKey);
+    groups.push({
+      key: groupKey,
+      refs: refs.filter((item) => item.provider === ref.provider && item.model === ref.model),
+    });
+  }
+
+  for (const group of groups) {
+    const firstRef = group.refs[0];
+    const provider = registry.providers.find((item) => item.id === firstRef.provider);
     if (!provider) { skipped.push("provider-missing"); continue; }
-    if (provider.enabled !== true && !(localAccess && provider.localOnly === true)) { skipped.push(`${provider.id}:disabled`); continue; }
-    if (provider.localOnly && !localAccess) { skipped.push(`${provider.id}:local-only`); continue; }
-    if (provider.production?.enabled !== true && !localAccess && !allowPreview) { skipped.push(`${provider.id}:production-disabled`); continue; }
-    if (provider.production?.requiresEnv && !/^(?:1|true)$/i.test(String(env[provider.production.requiresEnv] || "")) && !localAccess) { skipped.push(`${provider.id}:gate-disabled`); continue; }
-    if (freeOnly && ref.free !== true) { skipped.push(`${provider.id}:paid`); continue; }
-    if (!freeOnly && ref.free !== true && !allowPaid) { skipped.push(`${provider.id}:paid`); continue; }
-    if (provider.kind === "free-api" && provider.verification?.status !== "verified") { skipped.push(`${provider.id}:unverified`); continue; }
-    if (provider.kind === "cli" && provider.id === "antigravity"
-      && provider.verification?.status !== "documented-local-api-key"
-      && !(localAccess && provider.auth?.mode === "oauth" && provider.verification?.status === "documented-local-oauth")) {
-      skipped.push(`${provider.id}:unverified`);
-      continue;
-    }
-    if ((ref.publicOnly === true || provider.free === true && provider.kind === "free-api") && (dataClass !== "public" || publicTarget?.private !== false || publicTarget?.visibility !== "public")) {
-      skipped.push(`${provider.id}:public-target-required`);
-      continue;
-    }
-    if (!modelIsKnown(provider, ref.model)) { skipped.push(`${provider.id}:model-unverified`); continue; }
     const providerSnapshot = health[provider.id];
-    const noRotationStates = new Set(provider.fallbackPolicy?.noCredentialRotationOn || []);
-    const blockedCredentialState = Object.values(providerSnapshot?.credentials || {})
-      .map((item) => item?.status)
-      .find((status) => noRotationStates.has(status));
-    if (blockedCredentialState) {
-      skipped.push(`${provider.id}:${blockedCredentialState}`);
+    const noRotationStates = new Set(["rate-limited", "quota-exhausted", ...(provider.fallbackPolicy?.noCredentialRotationOn || [])]);
+    const providerStatus = freshSnapshotStatus(providerSnapshot, now);
+    if (noRotationStates.has(providerStatus)) {
+      skipped.push(`${provider.id}:${providerStatus}`);
       continue;
     }
-    const snapshotStatus = providerSnapshot?.credentials?.[ref.credential]?.status || providerSnapshot?.status;
-    if (provider.fallbackPolicy?.noCredentialRotationOn?.includes(snapshotStatus)) {
-      skipped.push(`${provider.id}:${snapshotStatus}`);
+
+    const candidates = [];
+    for (const ref of group.refs) {
+      if (provider.enabled !== true && !(localAccess && provider.localOnly === true)) { skipped.push(`${provider.id}:disabled`); continue; }
+      if (provider.localOnly && !localAccess) { skipped.push(`${provider.id}:local-only`); continue; }
+      if (provider.production?.enabled !== true && !localAccess && !allowPreview) { skipped.push(`${provider.id}:production-disabled`); continue; }
+      if (provider.production?.requiresEnv && !/^(?:1|true)$/i.test(String(env[provider.production.requiresEnv] || "")) && !localAccess) { skipped.push(`${provider.id}:gate-disabled`); continue; }
+      if (freeOnly && ref.free !== true) { skipped.push(`${provider.id}:paid`); continue; }
+      if (!freeOnly && ref.free !== true && !allowPaid) { skipped.push(`${provider.id}:paid`); continue; }
+      if (provider.kind === "free-api" && provider.verification?.status !== "verified") { skipped.push(`${provider.id}:unverified`); continue; }
+      if (provider.kind === "cli" && provider.id === "antigravity"
+        && provider.verification?.status !== "documented-local-api-key"
+        && !(localAccess && provider.auth?.mode === "oauth" && provider.verification?.status === "documented-local-oauth")) {
+        skipped.push(`${provider.id}:unverified`);
+        continue;
+      }
+      if ((ref.publicOnly === true || provider.free === true && provider.kind === "free-api") && (dataClass !== "public" || publicTarget?.private !== false || publicTarget?.visibility !== "public")) {
+        skipped.push(`${provider.id}:public-target-required`);
+        continue;
+      }
+      if (!modelIsKnown(provider, ref.model)) { skipped.push(`${provider.id}:model-unverified`); continue; }
+      const credentials = resolveProviderCredentials(provider, env, { account: ref.credential, now });
+      const localCredential = localAccess && provider.localOnly === true && credentials.state === "local-only";
+      if (!credentials.ok && !localCredential) { skipped.push(`${provider.id}:${credentials.state}`); continue; }
+      const credentialObject = provider.credentials?.find((item) => item.id === ref.credential) || null;
+      candidates.push({ ref, provider, credentials, credentialObject, localCredential });
+    }
+    if (candidates.length === 0) continue;
+
+    const quotaInfo = quotaGroupValidation(provider, candidates.filter((candidate) => !candidate.localCredential), env);
+    const accountStates = new Map();
+    for (const candidate of candidates) {
+      const accountSnapshot = providerSnapshot?.credentials?.[candidate.ref.credential];
+      accountStates.set(candidate.ref.credential, freshSnapshotStatus(accountSnapshot, now));
+    }
+    const failedCredentials = new Set();
+    const failedGroups = new Set();
+    let unsafeQuotaSignal = false;
+    for (const [credential, status] of accountStates) {
+      if (!noRotationStates.has(status)) continue;
+      if (!quotaInfo.ok) unsafeQuotaSignal = true;
+      else {
+        const groupName = quotaInfo.groups.get(credential);
+        if (groupName) failedGroups.add(groupName);
+        else failedCredentials.add(credential);
+      }
+    }
+    const quotaGroups = providerSnapshot?.quotaGroups;
+    if (quotaGroups && typeof quotaGroups === "object" && !Array.isArray(quotaGroups)) {
+      if (!quotaInfo.ok) {
+        for (const snapshot of Object.values(quotaGroups)) {
+          if (noRotationStates.has(freshSnapshotStatus(snapshot, now))) unsafeQuotaSignal = true;
+        }
+      } else {
+        for (const [groupName, snapshot] of Object.entries(quotaGroups)) {
+          const status = freshSnapshotStatus(snapshot, now);
+          if (!noRotationStates.has(status)) continue;
+          if (![...quotaInfo.groups.values()].includes(groupName)) unsafeQuotaSignal = true;
+          else failedGroups.add(groupName);
+        }
+      }
+    }
+    if (unsafeQuotaSignal) {
+      const status = [...accountStates.values()].find((item) => noRotationStates.has(item)) || providerStatus || "rate-limited";
+      skipped.push(`${provider.id}:${status}`);
       continue;
     }
-    const credentials = resolveProviderCredentials(provider, env, { account: ref.credential, now });
-    const localCredential = localAccess && provider.localOnly === true && credentials.state === "local-only";
-    if (!credentials.ok && !localCredential) { skipped.push(`${provider.id}:${credentials.state}`); continue; }
-    if (localCredential) {
-      return {
-        ok: true,
-        bucket,
-        provider: provider.id,
-        model: ref.model,
-        credential: credentials.credential || ref.credential,
-        sourceEnv: "",
-        targetEnv: "",
-        free: ref.free,
-        publicOnly: ref.publicOnly === true || provider.free === true && provider.kind === "free-api",
-        modelReference: providerModelReference(provider, ref.model),
-      };
+
+    const eligible = [];
+    for (const candidate of candidates) {
+      if (failedCredentials.has(candidate.ref.credential)) {
+        skipped.push(`${provider.id}:${accountStates.get(candidate.ref.credential)}`);
+        continue;
+      }
+      const groupName = quotaInfo.groups.get(candidate.ref.credential);
+      if (groupName && failedGroups.has(groupName)) {
+        skipped.push(`${provider.id}:${accountStates.get(candidate.ref.credential) || "rate-limited"}`);
+        continue;
+      }
+      if (candidate.localCredential) {
+        eligible.push(candidate);
+        continue;
+      }
+      const healthStatus = assessProviderHealth(provider, env, { snapshot: providerSnapshot, now, account: candidate.ref.credential });
+      const liveCanary = allowLiveCanary === true
+        && provider.kind === "free-api"
+        && ["unknown", "stale"].includes(healthStatus.status);
+      if (healthStatus.status !== "healthy" && !liveCanary) {
+        skipped.push(`${provider.id}:${healthStatus.status}`);
+        continue;
+      }
+      eligible.push({ ...candidate, liveCanary });
     }
-    const healthStatus = assessProviderHealth(provider, env, { snapshot: providerSnapshot, now, account: ref.credential });
-    const liveCanary = allowLiveCanary === true
-      && provider.kind === "free-api"
-      && ["unknown", "stale"].includes(healthStatus.status);
-    if (healthStatus.status !== "healthy" && !liveCanary) { skipped.push(`${provider.id}:${healthStatus.status}`); continue; }
-    return {
+    if (eligible.length === 0) continue;
+    const ordered = eligible.slice().sort((left, right) => left.ref.priority - right.ref.priority);
+    const canRotateHealthy = provider.auth?.sameProviderRotation === "healthy-round-robin";
+    const selected = ordered[canRotateHealthy ? rotationStart(effectiveRotationSeed, provider.id, firstRef.model, ordered.length) : 0];
+    const route = {
       ok: true,
       bucket,
       provider: provider.id,
-      model: ref.model,
-      credential: credentials.credential,
-      sourceEnv: credentials.sourceEnv,
-      targetEnv: credentials.targetEnv,
-      free: ref.free,
-      publicOnly: ref.publicOnly === true || provider.free === true && provider.kind === "free-api",
-      modelReference: providerModelReference(provider, ref.model),
-      health: liveCanary ? "live-canary" : "fresh",
+      model: selected.ref.model,
+      credential: selected.credentials.credential || selected.ref.credential,
+      sourceEnv: selected.localCredential ? "" : selected.credentials.sourceEnv,
+      targetEnv: selected.localCredential ? "" : selected.credentials.targetEnv,
+      free: selected.ref.free,
+      publicOnly: selected.ref.publicOnly === true || provider.free === true && provider.kind === "free-api",
+      modelReference: providerModelReference(provider, selected.ref.model),
+      ...(selected.liveCanary ? { health: "live-canary" } : selected.localCredential ? {} : { health: "fresh" }),
+      ...(quotaInfo.groups.has(selected.credentials.credential) ? { quotaGroup: quotaInfo.groups.get(selected.credentials.credential) } : {}),
+      ...(quotaInfo.ok && candidates.length > 1 ? { quotaGroupRotation: true } : {}),
     };
+    return route;
   }
   return { ok: false, reason: freeOnly ? "NO_HEALTHY_FREE_PROVIDER" : "NO_HEALTHY_PROVIDER", skipped: skipped.slice(0, 20) };
 }

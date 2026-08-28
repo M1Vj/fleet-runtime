@@ -46,6 +46,26 @@ Public GitHub Actions execution shell that autonomously patrols, audits, improve
 
 CLI is pinned to `opencode-ai@1.18.21`; model registry served from committed snapshot `config/models.json`.
 
+## Provider accounts
+
+Healthy API-key slots may use deterministic round-robin selection. Set
+`FLEET_ACCOUNT_ROTATION_SEED` (or rely on `GITHUB_RUN_ID`) to keep one credential assignment
+stable within a run while balancing different runs. Authentication rejection can move to another
+named slot. Rate or quota errors remain provider-wide unless the provider registry declares
+`quotaScope: "credential-group"` and every involved slot supplies validated, distinct group
+variables. Gemini groups represent separately declared Google Cloud projects; missing or duplicate
+groups fail closed. Use a standard lowercase 6-30 character Google project ID or a 6-20 digit
+project number. OpenRouter free limits are account-wide and never trigger same-provider
+rotation. No account, project, or API key is created automatically.
+
+Antigravity OAuth remains one owner-Mac OS-keyring session through the official `agy` CLI. It is
+not portable to GitHub Actions and does not support concurrent HOME-based profiles. On an owner
+TTY, `node scripts/provider-accounts.mjs login antigravity` launches the official `agy --sandbox`
+login flow; use the CLI's documented `/logout` before switching accounts. The command refuses
+GitHub and non-TTY hosts. `node scripts/provider-accounts.mjs status` gives a secretless view of
+configured slot names and health; the helper never reads or copies OAuth caches or keychain data.
+Direct Gemini API-key slots may rotate only under the same quota-group policy.
+
 ## Safety model
 
 - **Attribution fail-closed**: every run verifies the token identity equals `M1Vj` (type User) and holds `repo` + `workflow` scopes before acting; any mismatch aborts (exit 3/4). Commits are made as the M1Vj noreply identity and re-verified against the API post-push; `[bot]` attribution aborts.
@@ -87,9 +107,8 @@ Core lane terminal states written to `state/events.jsonl` are `SUCCESS`, `NO-OP`
 - `fleet-emergency-stop` does not disable `fleet-merge-gate` or `ci-diag`; for a fuller halt, disable them explicitly through the Actions API, but that API-level stop is still reversible under the watchdog opt-in (previous bullet).
 - Watchdog stale recovery keeps workflow enablement off unless the trusted job receives the exact `FLEET_WATCHDOG_AUTO_ENABLE=true` opt-in. It reuses an open `[WATCHDOG] patrol stale...` issue instead of creating one on every run. The allowlist now includes `merge.yml`, so an opted-in watchdog can restore the merge gate. A watchdog cannot recover itself when it is the disabled or stale component; the paired fleet-control sentinel (hourly, `scripts/sentinel.mjs`) revives exactly runtime `watchdog.yml` + `merge.yml` when control's `FLEET_WATCHDOG_AUTO_ENABLE=true` and no kill switch exists, and if both sentinels stop, only an operator can restore them.
 - An unresolved `DISPATCH_UNKNOWN` intentionally suppresses blind retry until a correlated target run consumes it or an operator reconciles GitHub Actions and private state.
-- `queue: max` is supported by GitHub Actions (May 2026); actionlint 1.7.12 predates that schema addition and needs its single `concurrency.queue` diagnostic ignored until a supporting release ships.
-- Single free gateway model: 429-driven silent hangs are mitigated by hard timeouts, retry ladders, and the circuit breaker, not eliminated; VLM color naming on synthetic images is unreliable.
-- Production model auth uses the durable `OPENCODE_API_KEY` provider secret (GitHub Environment) exposed only to the model process; missing, rejected, or exhausted credentials fail closed into retryable private errors without mutating targets. The owner-Mac OAuth snapshot refresh (`FLEET_OPENCODE_AUTH`, LaunchAgent keepalive) remains an explicit migration-only utility and is never the default production path.
+- Free hosted fallbacks can still hit 429s or queue delays; hard timeouts, retry ladders, and the circuit breaker contain those failures. VLM color naming on synthetic images remains unreliable.
+- Production model auth uses only durable `OPENCODE_API_KEY` provider secrets exposed to model steps; GitHub-hosted workflows do not receive the owner-Mac OAuth snapshot. Missing, rejected, or exhausted credentials fail closed into retryable private errors without mutating targets. The owner-Mac OAuth snapshot refresh (`FLEET_OPENCODE_AUTH`, LaunchAgent keepalive) remains a local migration utility.
 - Dispatch inputs `top_files` (fleet-thesis) and `gdrive` (fleet-kb) are accepted but not wired into script behavior.
 
 Operations, procedures, and troubleshooting: see [docs/RUNBOOK.md](docs/RUNBOOK.md).

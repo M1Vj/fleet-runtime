@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSy
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { askModel, assertDisposableModelWorkspace, createDisposableModelWorkspace, PUBLIC_READ_MODEL_POLICY, runOnce } from "../scripts/lib/model.mjs";
+import { askModel, assertDisposableModelWorkspace, createDisposableModelWorkspace, PUBLIC_READ_MODEL_POLICY, recordRouteFailure, runOnce } from "../scripts/lib/model.mjs";
 
 test("model workspace is disposable, outside private state, and deny-all", () => {
   const repo = mkdtempSync(path.join(tmpdir(), "fleet-model-repo-"));
@@ -68,7 +68,7 @@ test("model workspace creation rejects a temp base that resolves into private st
   }
 });
 
-test("public-read requires an explicitly public target and keeps mutation tools denied", () => {
+test("public-read requires an explicitly public target and denies model network tools", () => {
   const repo = mkdtempSync(path.join(tmpdir(), "fleet-model-public-repo-"));
   const state = mkdtempSync(path.join(tmpdir(), "fleet-model-public-state-"));
   const publicTarget = { private: false, visibility: "public" };
@@ -80,8 +80,7 @@ test("public-read requires an explicitly public target and keeps mutation tools 
     assert.equal(policy.permission.list, "allow");
     assert.equal(policy.permission.glob, "allow");
     assert.equal(policy.permission.grep, "allow");
-    assert.equal(policy.permission.webfetch, "allow");
-    for (const key of ["edit", "bash", "task", "skill", "external_directory", "websearch"]) {
+    for (const key of ["edit", "bash", "task", "skill", "external_directory", "websearch", "webfetch"]) {
       assert.equal(policy.permission[key], "deny", key);
     }
     assertDisposableModelWorkspace(workspace, { repoRoot: repo, stateRoot: state, profile: "public-read", publicTarget });
@@ -331,6 +330,99 @@ test("a public direct route uses its first bounded request as the live health ca
     rmSync(repo, { recursive: true, force: true });
     rmSync(state, { recursive: true, force: true });
   }
+});
+
+test("a Gemini 429 retries once on a separately declared project account", async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), "fleet-model-account-rotation-repo-"));
+  const state = mkdtempSync(path.join(tmpdir(), "fleet-model-account-rotation-state-"));
+  const authorization = [];
+  try {
+    const result = await askModel({
+      prompt: "inspect this public repository",
+      timeoutMs: 1000,
+      env: {
+        FLEET_MODEL_CHAIN: "gemini-api/gemini-3.7-flash",
+        GEMINI_API_KEY_1: "key-one",
+        GEMINI_API_KEY_2: "key-two",
+        GEMINI_API_KEY_1_QUOTA_GROUP: "project-one",
+        GEMINI_API_KEY_2_QUOTA_GROUP: "project-two",
+        FLEET_ACCOUNT_ROTATION_SEED: "rotation-run",
+        FLEET_STATE_ROOT: state,
+      },
+      repoRoot: repo,
+      stateRoot: state,
+      skipCircuitCheck: true,
+      dataClass: "public",
+      publicTarget: { private: false, visibility: "public" },
+      fetchImpl: async (_url, options) => {
+        authorization.push(options.headers.authorization);
+        if (authorization.length === 1) return { ok: false, status: 429, text: async () => "rate limited" };
+        return { ok: true, status: 200, text: async () => JSON.stringify({ choices: [{ message: { content: "ok" } }] }) };
+      },
+    });
+    assert.equal(result.complete, true);
+    assert.deepEqual(new Set(authorization), new Set(["Bearer key-one", "Bearer key-two"]));
+    assert.equal(authorization.length, 2);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("a Zen account-wide 429 never retries with another credential", async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), "fleet-model-zen-account-wide-repo-"));
+  const state = mkdtempSync(path.join(tmpdir(), "fleet-model-zen-account-wide-state-"));
+  const captured = [];
+  const spawnImpl = (_command, args, options) => {
+    captured.push({ args: [...args], env: { ...options.env } });
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => {};
+    queueMicrotask(() => {
+      child.stderr.emit("data", Buffer.from("429 rate limited\n"));
+      child.emit("close", 1);
+    });
+    return child;
+  };
+  try {
+    const result = await askModel({
+      prompt: "account-wide limit",
+      timeoutMs: 1000,
+      env: {
+        FLEET_MODEL_CHAIN: "opencode/claude-opus-4-6",
+        OPENCODE_API_KEY: "key-one",
+        OPENCODE_API_KEY_2: "key-two",
+        FLEET_ACCOUNT_ROTATION_SEED: "0",
+        FLEET_STATE_ROOT: state,
+      },
+      repoRoot: repo,
+      stateRoot: state,
+      skipCircuitCheck: true,
+      maxRounds: 1,
+      spawnImpl,
+    });
+    assert.equal(result.complete, false);
+    assert.equal(result.authState, "rate-limited");
+    assert.equal(captured.length, 1);
+    assert.equal(captured[0].env.OPENCODE_API_KEY, "key-one");
+    assert.equal(captured[0].env.OPENCODE_API_KEY_2, undefined);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("a timeout on a quota-group route marks the provider unavailable instead of healthy", () => {
+  const health = { "gemini-api": { status: "healthy", checkedAt: "2026-08-27T00:00:00.000Z" } };
+  recordRouteFailure(health, {
+    provider: "gemini-api",
+    credential: "account-1",
+    quotaGroup: "project-one",
+    quotaGroupRotation: true,
+  }, "timeout", Date.parse("2026-08-27T00:10:00.000Z"));
+  assert.equal(health["gemini-api"].status, "timeout");
+  assert.equal(health["gemini-api"].credentials["account-1"].status, "timeout");
 });
 
 test("Zen backup key is used only after an auth rejection and is remapped in-process", async () => {

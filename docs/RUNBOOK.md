@@ -14,7 +14,8 @@ Production model access requires the durable `OPENCODE_API_KEY` provider key (a 
 Environment secret exposed only to the model process); provision it wherever model lanes run.
 Missing, rejected, or exhausted values fail closed into retryable private errors without mutating
 a target. `FLEET_OPENCODE_AUTH` is migration-only: it was required only while moving off the owner
-Mac and is not a production dependency, and the helper/keepalive below are migration-only too.
+Mac and is not passed to GitHub-hosted production workflows. The helper/keepalive below are local
+migration utilities only.
 
 Refresh model auth (values never displayed; helper targets both `M1Vj/fleet-runtime` and
 `M1Vj/fleet-control`):
@@ -168,12 +169,12 @@ opencode installed:
 Set repo variable `FLEET_MODEL_CHAIN` only to registry-backed references (comma-separated,
 priority order). The default `other` chain is:
 
-    opencode/claude-opus-4-6, openrouter/meta-llama/llama-3.2-3b-instruct:free, nvidia-nim/meta/llama-3.1-8b-instruct
+    opencode/claude-opus-4-6, openrouter/meta-llama/llama-3.2-3b-instruct:free, nvidia-nim/moonshotai/kimi-k3
 
 Calls that explicitly prove `dataClass=public` and a public target use the default `public`
 chain instead:
 
-    antigravity/gemini-3.7-flash-high, gemini-api/gemini-3.7-flash, openrouter/meta-llama/llama-3.2-3b-instruct:free, nvidia-nim/meta/llama-3.1-8b-instruct, opencode/claude-opus-4-6
+    antigravity/gemini-3.7-flash-high, gemini-api/gemini-3.7-flash, openrouter/meta-llama/llama-3.2-3b-instruct:free, nvidia-nim/moonshotai/kimi-k3, opencode/claude-opus-4-6
 
 GitHub skips the local-only Antigravity entry. Missing API keys are skipped. A direct public
 API with no fresh health record uses its first bounded task request as the live canary, avoiding
@@ -185,9 +186,14 @@ Semantics (`scripts/lib/model.mjs`):
   use bounded requests without OpenCode sessions. The
   default is four rounds; thesis and KB drafts use five. Calls are spaced by 20 to 35 seconds.
   With the production `OPENCODE_API_KEY`, detected credential rejection stops that credential's
-  remaining rounds. A cold Zen backup may run only for missing, expired, or rejected auth. Rate
-  limits and quota exhaustion never rotate to another credential from the same provider; the
-  chain may continue to a different provider. Anonymous fallback is not used.
+  remaining rounds. Healthy Zen slots balance deterministically; an authentication rejection may
+  move to the other slot, while Zen rate and quota signals remain account-wide. Named credentials
+  in a provider that declares `healthy-round-robin` use a deterministic seed (or
+  `GITHUB_RUN_ID`) so one run keeps session/credential affinity while healthy runs balance across
+  slots. Authentication rejection may move to another named credential. Rate limits and quota
+  exhaustion stay provider-wide unless every involved credential has validated, distinct quota
+  groups and the provider declares `quotaScope: "credential-group"`; no account, project, or key
+  is created automatically. Anonymous fallback is not used.
 - If the whole chain fails, a second ladder starts after a 90-second cooldown, or 120 seconds
   for long-form lanes. Per-call timeouts are 480 seconds by default, 540 for deep analysis,
   and 600 for thesis, KB, or revision work.
@@ -212,26 +218,41 @@ bucket preferences (`gemini` prefers local Antigravity `gemini-3.7-flash-high`, 
 AI Studio `gemini-3.7-flash` backups; `other` prefers `opencode/claude-opus-4-6`) and the model-update digest/rollback
 contract. The registry does not activate a provider or change any workflow by itself.
 
-GitHub Actions uses the existing protected `OPENCODE_API_KEY` for the paid Zen Opus route and
-may use `OPENCODE_API_KEY_2` only as a cold auth-recovery credential. `FLEET_OPENCODE_AUTH`
-is migration-only. The optional `GEMINI_API_KEY_1`, `GEMINI_API_KEY_2`, `OPENROUTER_API_KEY`,
+GitHub Actions uses the protected `OPENCODE_API_KEY` and optional `OPENCODE_API_KEY_2` for
+deterministic healthy Zen balancing and auth recovery. Zen rate/quota failures remain account-wide.
+`FLEET_OPENCODE_AUTH` is local migration-only. The optional `GEMINI_API_KEY_1`,
+`GEMINI_API_KEY_2`, `OPENROUTER_API_KEY`,
 and `NVIDIA_API_KEY` secrets are passed only to verified-public research jobs.
-They require either a fresh healthy snapshot or a first-request live canary. A second key is
-never selected for rate-limit or quota errors, so the fleet does not evade provider limits.
+They require either a fresh healthy snapshot or a first-request live canary. Gemini API slots
+must declare `GEMINI_API_KEY_1_QUOTA_GROUP` and `GEMINI_API_KEY_2_QUOTA_GROUP` with distinct
+Google Cloud project identifiers before a rate/quota retry can move to the other slot. Valid
+declarations are lowercase 6-30 character project IDs or 6-20 digit project numbers. Google
+documents Gemini quotas at the project level, so this is an explicit project-group declaration,
+not account fabrication or quota evasion. Missing, malformed, or duplicate group declarations
+keep the limit provider-wide. OpenRouter free limits are account-wide and never trigger
+same-provider rotation.
 
 Antigravity OAuth is local-only. With the explicit `FLEET_ANTIGRAVITY_LOCAL=true` gate on a
 non-GitHub host, `agy` runs from a disposable cwd, uses the existing secure local OAuth cache
-in place, pins `gemini-3.7-flash-high`, and forwards no API key. The CLI may refresh its own
-local OAuth state; the fleet neither copies nor exports that cache. GitHub jobs cannot import a
-browser profile, cookies, OAuth snapshot, or local session database. The documented Gemini API
-backup uses model ID `gemini-3.7-flash` with high thinking effort, not the Antigravity `-high`
-slug. Google free-tier prompts may be used to improve products, so the adapter is public-only.
+in place, pins `gemini-3.7-flash-high`, and forwards no API key. The official public CLI surface
+owns one OS-keyring OAuth session. On an owner TTY, `node scripts/provider-accounts.mjs login
+antigravity` launches the official `agy --sandbox` login flow; use the CLI's documented `/logout`
+before switching accounts. It refuses GitHub and non-TTY hosts. `node scripts/provider-accounts.mjs
+status` provides a secretless slot/health view. The helper never copies or exports the cache and
+does not pretend that HOME paths provide concurrent OAuth profiles. GitHub jobs cannot import a browser profile,
+  cookies, OAuth snapshot, or local session database. Direct Gemini API-key slots may rotate only
+  under the same credential-group rules. The documented Gemini API backup uses model
+ID `gemini-3.7-flash` with high thinking effort, not the Antigravity `-high` slug. Google
+free-tier prompts may be used to improve products, so the adapter is public-only.
 
 OpenRouter uses the explicit `meta-llama/llama-3.2-3b-instruct:free` route and sends ZDR plus
 `data_collection: "deny"`; its fleet key is bound to the `Fleet Free Public Only` guardrail.
-NVIDIA Hosted NIM is a gated prototype route (`FLEET_NVIDIA_ENABLE`) and is not a production
-SLA. Both providers are public-only and disabled when credentials are absent or a current
-health record says the provider is unavailable.
+NVIDIA Hosted NIM uses the official `moonshotai/kimi-k3` free endpoint through the existing
+OpenAI-compatible chat API. NVIDIA documents a 1,048,576-token input context, up to 65,536
+output tokens, and low/high/max reasoning effort for this model. The fleet leaves NVIDIA behind
+the `FLEET_NVIDIA_ENABLE` prototype gate, treats its rate and quota state as account-wide, and
+sends only verified-public research prompts. OpenRouter and NVIDIA stay disabled when credentials
+are absent or a current health record says the provider is unavailable.
 
 A model-registry update must carry a `sha256:` digest, the previous active digest, and a
 rollback record. Automatic activation is disabled; a reviewed commit, deterministic checks,

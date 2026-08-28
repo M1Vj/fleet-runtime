@@ -77,6 +77,38 @@ export function shouldCoalesce(trigger, lastRunUtc, nowMs = Date.now(), minGapMi
   return { coalesce: gapMinutes < minGapMinutes, gapMinutes };
 }
 
+/**
+ * Recover expired queue leases without hiding them behind a refreshed
+ * in-progress timestamp. The next worker owns the attempt increment. Work that
+ * already reached the cap becomes an explicit terminal failure.
+ */
+export function recoverStaleQueue(queue, {
+  nowMs = Date.now(),
+  staleMs = 40 * 60 * 1000,
+  maxAttempts = 3,
+} = {}) {
+  const now = Number(nowMs);
+  const staleAfter = Math.max(1, Number(staleMs) || 40 * 60 * 1000);
+  const cap = Math.max(1, Number(maxAttempts) || 3);
+  const nowUtc = new Date(now).toISOString();
+  const requeued = [];
+  const exhausted = [];
+  const next = (Array.isArray(queue) ? queue : []).map((raw) => {
+    const task = raw && typeof raw === "object" && !Array.isArray(raw) ? { ...raw } : raw;
+    if (!task || task.status !== "in_progress") return task;
+    const updated = Date.parse(String(task.updatedUtc || ""));
+    if (!Number.isFinite(updated) || updated > now || now - updated <= staleAfter) return task;
+    const attempts = Math.max(0, Number(task.attempts) || 0);
+    if (attempts >= cap) {
+      exhausted.push(String(task.id || "unknown").slice(0, 120));
+      return { ...task, status: "failed", updatedUtc: nowUtc, failureReason: "stale-attempt-limit" };
+    }
+    requeued.push(String(task.id || "unknown").slice(0, 120));
+    return { ...task, status: "pending", updatedUtc: nowUtc, recoveryReason: "stale-lease" };
+  });
+  return { queue: next, changed: requeued.length + exhausted.length > 0, requeued, exhausted };
+}
+
 /** The paired fleet-control sentinel may revive exactly this minimum set so the primary watchdog can self-heal everything else. */
 export const SENTINEL_REVIVE_WORKFLOWS = ["watchdog.yml", "merge.yml"];
 export const SENTINEL_TARGET_REPO = "M1Vj/fleet-runtime";

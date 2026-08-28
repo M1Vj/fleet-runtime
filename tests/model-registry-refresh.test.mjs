@@ -53,6 +53,32 @@ test("failed discovery stays bounded and produces no candidate", async () => {
   assert.equal(JSON.stringify(result).includes("hostile network body"), false);
 });
 
+test("discovery aborts an oversized streamed body before response.text can allocate it", async () => {
+  let textCalled = false;
+  let cancelled = false;
+  const chunk = new Uint8Array(256 * 1024).fill(97);
+  let reads = 0;
+  const result = await discoverProviderModels({
+    providerId: "openrouter",
+    env: {},
+    fetchImpl: async () => ({
+      ok: true,
+      headers: { get: () => null },
+      text: async () => { textCalled = true; return "{}"; },
+      body: {
+        getReader: () => ({
+          read: async () => (++reads <= 5 ? { done: false, value: chunk } : { done: true }),
+          cancel: async () => { cancelled = true; },
+        }),
+      },
+    }),
+  });
+  assert.equal(result.status, "unavailable");
+  assert.equal(textCalled, false);
+  assert.equal(cancelled, true);
+  assert.ok(reads <= 5);
+});
+
 test("Gemini discovery sends its key only as a header to the allowlisted endpoint", async () => {
   const calls = [];
   const result = await discoverProviderModels({

@@ -76,6 +76,27 @@ test("two validated files produce one blob tree commit and one non-force ref upd
   assert.deepEqual(commit[2].committer, { name: identity.name, email: identity.noreply });
 });
 
+test("byte-identical revision output is rejected before creating Git objects", async () => {
+  const api = fakeApi({ treeEntries: [{ path: "src/a.js", mode: "100644", type: "blob", sha: "2" }] });
+  await assert.rejects(
+    applyAtomicRevision({
+      api,
+      repo: "M1Vj/example-repo",
+      branch: "fleet/fix-one",
+      expectedHead,
+      identity,
+      files: [{ path: "src/a.js", content: "unchanged" }],
+      baseFiles: [{ path: "src/a.js", content: "unchanged" }],
+      message: "no-op",
+    }),
+    (error) => error && error.code === "REVISION_NO_PROGRESS",
+  );
+  assert.equal(api.calls.some(([kind]) => kind === "createBlob"), false);
+  assert.equal(api.calls.some(([kind]) => kind === "createTree"), false);
+  assert.equal(api.calls.some(([kind]) => kind === "createCommit"), false);
+  assert.equal(api.calls.some(([kind]) => kind === "updateRef"), false);
+});
+
 test("stale ref is rejected before creating any Git objects or updating the ref", async () => {
   const api = fakeApi({ race: true });
   await assert.rejects(

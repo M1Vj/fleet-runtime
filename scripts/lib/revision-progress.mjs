@@ -1,4 +1,5 @@
 import { buildFailureFingerprint, planResearchEscalation } from "./research-escalation.mjs";
+import { createHash } from "node:crypto";
 
 function scoresOf(value) {
   const scores = value && typeof value === "object" && value.judgeScores && typeof value.judgeScores === "object"
@@ -69,6 +70,72 @@ export function compareJudgeProgress(previous, current) {
     eliminatedBlockers,
     addedBlockers,
   };
+}
+
+function telemetryRunId(value) {
+  return String(value || "merge-judge").replace(/[^A-Za-z0-9._:-]/g, "-").slice(0, 120) || "merge-judge";
+}
+
+function telemetryTarget(target = {}) {
+  const repo = String(target.repo || "").trim();
+  const pr = Number(target.pr);
+  const headSha = String(target.headSha || "").trim().toLowerCase();
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) return {};
+  if (!Number.isSafeInteger(pr) || pr < 0) return { repo };
+  if (!/^[a-f0-9]{40,64}$/.test(headSha)) return { repo, pr };
+  return { repo, pr, headSha };
+}
+
+function judgeVerdict(value) {
+  if (value?.infrastructureFailure === true || value?.state === "JUDGE_UNAVAILABLE" || value?.verdict === "infrastructure") return "infrastructure";
+  if (value?.verdict === "approve" || value?.verdict === "approved" || value?.state === "JUDGE_APPROVED") return "approved";
+  return "rejected";
+}
+
+function progressKind(comparison) {
+  if (!comparison?.hasBaseline) return "baseline";
+  if (comparison.progress) return "improved";
+  if (comparison.exactRepeat) return "repeat";
+  if (comparison.regressed) return "regressed";
+  return "unknown";
+}
+
+/** Build a strict, redacted judge-progress telemetry envelope. */
+export function buildJudgeProgressTelemetry({
+  runId,
+  target,
+  previous,
+  current,
+  lens = "unknown",
+  hold = false,
+} = {}) {
+  const comparison = compareJudgeProgress(previous, current);
+  const targetFields = telemetryTarget(target);
+  const currentScore = comparison.currentMinimum;
+  const previousScore = comparison.previousMinimum;
+  const progress = progressKind(comparison);
+  const key = `${telemetryRunId(runId)}|${targetFields.repo || ""}|${targetFields.pr || 0}|${targetFields.headSha || ""}`;
+  const event = {
+    runId: telemetryRunId(runId),
+    correlationId: `corr-${createHash("sha256").update(key, "utf8").digest("hex").slice(0, 32)}`,
+    lane: "merge",
+    event: "judge",
+    phase: hold ? "hold" : "progress",
+    outcome: hold ? "held" : comparison.progress ? "succeeded" : "held",
+    ...targetFields,
+    judge: {
+      lens: ["correctness", "standards", "unknown"].includes(lens) ? lens : "unknown",
+      verdict: judgeVerdict(current),
+      score: currentScore === null ? 0 : currentScore,
+      blockerCount: comparison.currentBlockers.length,
+      progress,
+      ...(previousScore === null ? {} : { previousScore }),
+      ...(previousScore === null || currentScore === null ? {} : { scoreDelta: currentScore - previousScore }),
+      ...(comparison.hasBaseline ? { previousBlockerCount: comparison.previousBlockers.length } : {}),
+    },
+  };
+  if (hold) event.terminal = { state: "NO_PROGRESS" };
+  return event;
 }
 
 /** Build one bounded private research request for a repeated/regressed cycle. */

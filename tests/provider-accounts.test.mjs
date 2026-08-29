@@ -31,10 +31,34 @@ test("provider account status reports named slots without credential values", ()
   const text = JSON.stringify(status);
   assert.doesNotMatch(text, /secret-key-one|secret-key-two|secret-zen-key|project-one|project-two/);
   const gemini = status.providers.find((provider) => provider.provider === "gemini-api");
-  assert.deepEqual(gemini.credentials.map((credential) => credential.credential), ["account-1", "account-2"]);
+  assert.deepEqual(gemini.credentials.map((credential) => credential.credential), ["account-1", "account-2", "account-3", "account-4", "account-5", "account-6"]);
   assert.equal(gemini.credentials[0].state, "present");
   assert.equal(gemini.credentials[0].health, "rejected");
   assert.equal(gemini.credentials[0].quotaGroupState, "configured");
+});
+
+test("NVIDIA account status reports both protected slots without values or quota-group claims", () => {
+  const status = collectProviderAccountStatus({
+    registry,
+    env: { NVIDIA_API_KEY_1: "nvidia-key-one", NVIDIA_API_KEY_2: "nvidia-key-two" },
+    health: {
+      "nvidia-nim": {
+        status: "healthy",
+        checkedAt: "2026-08-27T00:00:00Z",
+        credentials: { "account-1": { status: "rejected", checkedAt: "2026-08-27T00:00:00Z" } },
+      },
+    },
+    now,
+  });
+  const text = JSON.stringify(status);
+  assert.doesNotMatch(text, /nvidia-key-one|nvidia-key-two/);
+  const nvidia = status.providers.find((provider) => provider.provider === "nvidia-nim");
+  assert.deepEqual(nvidia.credentials.map((credential) => credential.credential), ["account-1", "account-2"]);
+  assert.equal(nvidia.credentials[0].state, "present");
+  assert.equal(nvidia.credentials[0].health, "rejected");
+  assert.equal(nvidia.credentials[0].quotaGroupState, "account-wide");
+  assert.equal(nvidia.credentials[1].state, "present");
+  assert.equal(nvidia.credentials[1].health, "healthy");
 });
 
 test("owner login helper status remains secretless for the local Antigravity OAuth slot", () => {

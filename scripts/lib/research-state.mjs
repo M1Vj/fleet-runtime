@@ -21,6 +21,7 @@ import {
   redactResearchText,
   validateResearchUrl,
 } from "./research-escalation.mjs";
+import { recordTelemetryEvent } from "./telemetry.mjs";
 
 export const RESEARCH_SCHEMA_VERSION = 1;
 export const MAX_RESEARCH_EVENTS = 2000;
@@ -485,8 +486,43 @@ export function appendResearchEvent(stateRootOrFile, input, options = {}) {
     const retained = next.length > maxEvents ? next.slice(-maxEvents) : next;
     const payload = `${retained.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
     replaceDurable(target, payload);
+    emitResearchTelemetry(target, event);
     return { event, appended: true, rotated: retained.length !== next.length, count: retained.length };
   });
+}
+
+function researchTelemetryOutcome(state) {
+  if (state === "RESEARCH_COMPLETED") return "succeeded";
+  if (state === "RESEARCH_BLOCKED" || state === "RESEARCH_UNAVAILABLE" || /FAILED|UNKNOWN/.test(state)) return "failed";
+  if (/DISPATCHED|REQUESTED|INTENT|DISPATCHING/.test(state)) return "started";
+  return "unknown";
+}
+
+/** Best-effort shared telemetry mirror for durable research lifecycle events. */
+function emitResearchTelemetry(stateFile, event) {
+  try {
+    recordTelemetryEvent(stateFile.replace(`${path.sep}research.jsonl`, `${path.sep}telemetry.jsonl`), {
+      runId: event.runId,
+      correlationId: event.correlationId || undefined,
+      lane: "research",
+      event: "research",
+      phase: /CONTINUATION/.test(event.state) ? "continuation" : /DISPATCH/.test(event.state) ? "dispatch" : /COMPLETED|BLOCKED|UNAVAILABLE/.test(event.state) ? "finalize" : "request",
+      outcome: researchTelemetryOutcome(event.state),
+      repo: event.repo || undefined,
+      pr: event.pr || undefined,
+      headSha: event.headSha || undefined,
+      research: {
+        phase: /CONTINUATION/.test(event.state) ? "continuation" : /DISPATCH/.test(event.state) ? "dispatch" : /COMPLETED|BLOCKED|UNAVAILABLE/.test(event.state) ? "finalize" : "request",
+        reasonCode: ["low_confidence", "no_progress", "unavailable", "dispatch_failed", "dispatch_unknown", "none"].includes(event.reasonCode) ? event.reasonCode : "none",
+        sourceCount: Array.isArray(event.sourceDigests) ? event.sourceDigests.length : 0,
+        citationCount: Array.isArray(event.citations) ? event.citations.length : 0,
+        dispatchStatus: ["accepted", "failed", "unknown", "consumed", "none"].includes(event.dispatchStatus) ? event.dispatchStatus : "none",
+      },
+    });
+  } catch (error) {
+    // Telemetry is diagnostic; the canonical research ledger remains authoritative.
+    if (error?.code?.startsWith?.("TELEMETRY_")) throw error;
+  }
 }
 
 function matchingRequest(events, correlationId) {

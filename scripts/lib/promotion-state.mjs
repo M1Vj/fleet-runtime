@@ -15,6 +15,7 @@ import {
 } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
+import { recordTelemetryEvent, isTelemetryValidationError, telemetryPath } from "./telemetry.mjs";
 
 export const PROMOTION_SCHEMA_VERSION = 1;
 export const DEFAULT_PROMOTION_MAX_LINES = 2000;
@@ -496,8 +497,76 @@ export function appendPromotionEvent(stateRootOrFile, input, options = {}) {
     const next = [...current, event];
     atomicReplace(target, `${next.map((entry) => JSON.stringify(entry)).join("\n")}\n`, { backup: true });
     const rotation = rotateLocked(target, options);
+    emitPromotionTelemetry(target, event);
     return { event, appended: true, rotated: rotation.rotated, count: parseContents(readContents(target)).length };
   });
+}
+
+function telemetryRunId(value) {
+  return String(value || "promotion").replace(/[^A-Za-z0-9._:-]/g, "-").slice(0, 100) || "promotion";
+}
+
+function promotionPhase(state) {
+  const normalized = String(state || "").toUpperCase();
+  if (/CANARY/.test(normalized)) return "canary";
+  if (/ROLLBACK/.test(normalized)) return "rollback";
+  if (/COMMIT/.test(normalized)) return "committed";
+  if (/PUSH/.test(normalized)) return "pushed";
+  if (/PR_OPENED|COMPLETED|FAILED|REJECTED/.test(normalized)) return "completed";
+  if (/VERIF|READY/.test(normalized)) return "verified";
+  return "planned";
+}
+
+function promotionOutcome(state, healthStatus = "") {
+  const normalized = String(state || "").toUpperCase();
+  const health = String(healthStatus || "").toLowerCase();
+  if (/CANARY/.test(normalized) && ["passed", "pass", "healthy", "success"].includes(health)) return "succeeded";
+  if (/CANARY/.test(normalized) && ["failed", "fail", "unhealthy", "error"].includes(health)) return "failed";
+  if (/FAILED|REJECTED/.test(normalized)) return "failed";
+  if (/BLOCKED|HOLD|OWNER_REVIEW/.test(normalized)) return "held";
+  if (/OPENED|COMPLETED|APPLIED|COMMITTED|PUSHED/.test(normalized)) return "succeeded";
+  return "started";
+}
+
+/** Best-effort shared telemetry mirror for the private promotion ledger. */
+function emitPromotionTelemetry(stateFile, event) {
+  const root = path.dirname(path.dirname(stateFile));
+  try {
+    const healthStatus = String(event.health?.status || "").toLowerCase();
+    const outcome = promotionOutcome(event.state, healthStatus);
+    const operation = String(event.state || "").toUpperCase().includes("ROLLBACK") ? "rollback" : "activate";
+    const canaryState = String(event.state || "").toUpperCase();
+    const canaryStatus = /CANARY/.test(canaryState)
+      ? (outcome === "succeeded" ? "passed" : outcome === "failed" ? "failed" : "not_run")
+      : healthStatus
+        ? (["passed", "pass", "healthy", "success"].includes(healthStatus) ? "passed" : ["failed", "fail", "unhealthy", "error"].includes(healthStatus) ? "failed" : "not_run")
+        : "not_run";
+    const rawDisposition = String(event.disposition || "").toLowerCase();
+    const disposition = ["accepted", "auto-activate", "auto-rollback"].includes(rawDisposition)
+      ? "accepted"
+      : ["held", "owner-review", "owner_review"].includes(rawDisposition)
+        ? "held"
+        : ["failed", "blocked"].includes(rawDisposition) || outcome === "failed" ? "failed" : "held";
+    const correlationId = `corr-${sha256(`promotion|${event.capabilityId || ""}|${event.candidateDigest || ""}|${event.rollbackDigest || ""}`).slice(0, 32)}`;
+    recordTelemetryEvent(telemetryPath(root), {
+      runId: telemetryRunId(event.runId),
+      correlationId,
+      lane: "promotion",
+      event: "promotion",
+      phase: promotionPhase(event.state),
+      outcome,
+      promotion: {
+        operation,
+        phase: promotionPhase(event.state),
+        disposition,
+        canaryStatus,
+        ...(event.candidateDigest ? { candidateDigest: event.candidateDigest } : {}),
+        ...(event.rollbackDigest ? { rollbackDigest: event.rollbackDigest } : {}),
+      },
+    });
+  } catch (error) {
+    if (isTelemetryValidationError(error)) throw error;
+  }
 }
 
 /** Rotate the bounded promotion log while retaining active candidate claims. */

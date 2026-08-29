@@ -17,6 +17,17 @@ const DEFAULT_HEALTH_MAX_AGE_MS = 15 * 60 * 1000;
 const DEFAULT_AGY_TIMEOUT_MS = 120 * 1000;
 const MAX_PROCESS_OUTPUT = 128 * 1024;
 const MAX_PROVIDER_TIMEOUT_MS = 120 * 1000;
+const VERCEL_ENDPOINT = "https://ai-gateway.vercel.sh/v1/chat/completions";
+const OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
+const CLOUDFLARE_ACCOUNT_ID_RE = /^[a-f0-9]{32}$/i;
+const CLOUDFLARE_ENDPOINT_TEMPLATE = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions";
+// Groq documents an 8K TPM Free Plan cap for qwen/qwen3.8-27b. Tokenization
+// is model-owned and unavailable at this boundary, so UTF-8 bytes provide a
+// conservative deterministic input ceiling. Reserve 1,024 tokens for request
+// framing/rounding and cap completion with Groq's documented field.
+const GROQ_TPM_LIMIT = 8_000;
+const GROQ_COMPLETION_TOKEN_RESERVE = 1_024;
+const GROQ_INPUT_SAFETY_RESERVE = 1_024;
 
 const DEFAULT_REGISTRY_PATH = new URL("../../config/providers.json", import.meta.url);
 
@@ -80,6 +91,28 @@ function validHttpsEndpoint(endpoint) {
   }
 }
 
+/** Cloudflare account identifiers are exactly 32 hexadecimal characters. */
+export function validCloudflareAccountId(value) {
+  return typeof value === "string" && value.length === 32 && CLOUDFLARE_ACCOUNT_ID_RE.test(value);
+}
+
+/** Resolve only the fixed public endpoint for a provider. */
+export function buildProviderEndpoint(provider, env = process.env) {
+  if (!provider || typeof provider !== "object") throw providerError("FREE_PROVIDER_ENDPOINT_UNVERIFIED");
+  if (provider.id === "vercel-ai-gateway" && provider.endpoint !== VERCEL_ENDPOINT) {
+    throw providerError("FREE_PROVIDER_ENDPOINT_UNVERIFIED");
+  }
+  if (provider.id === "openrouter" && provider.endpoint !== OPENROUTER_ENDPOINT) {
+    throw providerError("FREE_PROVIDER_ENDPOINT_UNVERIFIED");
+  }
+  if (provider.id !== "cloudflare-workers-ai") return provider.endpoint;
+  if (provider.endpoint !== CLOUDFLARE_ENDPOINT_TEMPLATE) throw providerError("FREE_PROVIDER_ENDPOINT_UNVERIFIED");
+  const accountIdEnv = provider.accountIdEnv || "CLOUDFLARE_ACCOUNT_ID";
+  const accountId = typeof env?.[accountIdEnv] === "string" ? env[accountIdEnv] : "";
+  if (!validCloudflareAccountId(accountId)) throw providerError("FREE_PROVIDER_ACCOUNT_ID_INVALID");
+  return `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/v1/chat/completions`;
+}
+
 /** Validate the committed provider policy before it can affect routing. */
 export function validateProviderRegistry(value) {
   const errors = [];
@@ -101,6 +134,13 @@ export function validateProviderRegistry(value) {
     }
     if (!provider.production || typeof provider.production.enabled !== "boolean") errors.push(`${provider.id}.production.enabled must be boolean`);
     if (provider.production?.requiresEnv !== undefined && !ENV_RE.test(String(provider.production.requiresEnv))) errors.push(`${provider.id}.production.requiresEnv invalid`);
+    if (provider.accountIdEnv !== undefined && !ENV_RE.test(String(provider.accountIdEnv))) errors.push(`${provider.id}.accountIdEnv invalid`);
+    if (provider.id === "cloudflare-workers-ai") {
+      if (provider.endpoint !== CLOUDFLARE_ENDPOINT_TEMPLATE) errors.push(`${provider.id}.endpoint must use the fixed account endpoint template`);
+      if (provider.accountIdEnv !== "CLOUDFLARE_ACCOUNT_ID") errors.push(`${provider.id}.accountIdEnv must be CLOUDFLARE_ACCOUNT_ID`);
+    }
+    if (provider.id === "vercel-ai-gateway" && provider.endpoint !== VERCEL_ENDPOINT) errors.push(`${provider.id}.endpoint must use the fixed gateway endpoint`);
+    if (provider.id === "openrouter" && provider.endpoint !== OPENROUTER_ENDPOINT) errors.push(`${provider.id}.endpoint must use the fixed chat endpoint`);
     if (provider.auth !== undefined && (!provider.auth || typeof provider.auth !== "object" || Array.isArray(provider.auth))) errors.push(`${provider.id}.auth must be an object`);
     if (provider.auth?.mode !== undefined && !["api-key", "oauth"].includes(provider.auth.mode)) errors.push(`${provider.id}.auth.mode invalid`);
     if (provider.auth?.sameProviderRotation !== undefined && !["auth-only", "healthy-round-robin"].includes(provider.auth.sameProviderRotation)) errors.push(`${provider.id}.auth.sameProviderRotation invalid`);
@@ -151,6 +191,20 @@ export function validateProviderRegistry(value) {
     if (provider.privacy !== undefined) {
       if (provider.privacy.requireZdr !== true) errors.push(`${provider.id}.privacy.requireZdr must be true`);
       if (provider.privacy.dataCollection !== "deny") errors.push(`${provider.id}.privacy.dataCollection must be deny`);
+    }
+    if (provider.requestBudget !== undefined) {
+      if (!provider.requestBudget || typeof provider.requestBudget !== "object" || Array.isArray(provider.requestBudget)) {
+        errors.push(`${provider.id}.requestBudget must be an object`);
+      } else {
+        for (const field of ["maxPromptBytes", "maxCompletionTokens", "maxResponseBytes", "maxTimeoutMs"]) {
+          if (!Number.isInteger(provider.requestBudget[field]) || provider.requestBudget[field] < 1) {
+            errors.push(`${provider.id}.requestBudget.${field} must be a positive integer`);
+          }
+        }
+        if (provider.requestBudget.maxPromptBytes > 120000 * 4) errors.push(`${provider.id}.requestBudget.maxPromptBytes is too large`);
+        if (provider.requestBudget.maxResponseBytes > MAX_PROCESS_OUTPUT) errors.push(`${provider.id}.requestBudget.maxResponseBytes is too large`);
+        if (provider.requestBudget.maxTimeoutMs > MAX_PROVIDER_TIMEOUT_MS) errors.push(`${provider.id}.requestBudget.maxTimeoutMs is too large`);
+      }
     }
     if (SECRET_VALUE_RE.test(JSON.stringify(provider))) errors.push(`${provider.id} contains secret-like content`);
   }
@@ -383,6 +437,13 @@ export function selectProviderRoute({ registry = loadProviderRegistry(), bucket,
     const firstRef = group.refs[0];
     const provider = registry.providers.find((item) => item.id === firstRef.provider);
     if (!provider) { skipped.push("provider-missing"); continue; }
+    if (provider.id === "cloudflare-workers-ai") {
+      const accountIdEnv = provider.accountIdEnv || "CLOUDFLARE_ACCOUNT_ID";
+      if (!validCloudflareAccountId(env?.[accountIdEnv])) {
+        skipped.push(`${provider.id}:account-id-invalid`);
+        continue;
+      }
+    }
     const providerSnapshot = health[provider.id];
     const noRotationStates = new Set(["rate-limited", "quota-exhausted", ...(provider.fallbackPolicy?.noCredentialRotationOn || [])]);
     const providerStatus = freshSnapshotStatus(providerSnapshot, now);
@@ -498,6 +559,7 @@ export function selectProviderRoute({ registry = loadProviderRegistry(), bucket,
       free: selected.ref.free,
       publicOnly: selected.ref.publicOnly === true || provider.free === true && provider.kind === "free-api",
       modelReference: providerModelReference(provider, selected.ref.model),
+      routeClass: selected.localCredential ? "local" : selected.ref.free === true ? "public-free" : "private-paid",
       ...(selected.liveCanary ? { health: "live-canary" } : selected.localCredential ? {} : { health: "fresh" }),
       ...(quotaInfo.groups.has(selected.credentials.credential) ? { quotaGroup: quotaInfo.groups.get(selected.credentials.credential) } : {}),
       ...(quotaInfo.ok && candidates.length > 1 ? { quotaGroupRotation: true } : {}),
@@ -549,6 +611,22 @@ function providerError(code) {
   return error;
 }
 
+function groqRequestBudget(prompt) {
+  const estimatedInputTokens = Buffer.byteLength(prompt, "utf8");
+  if (estimatedInputTokens + GROQ_COMPLETION_TOKEN_RESERVE + GROQ_INPUT_SAFETY_RESERVE > GROQ_TPM_LIMIT) {
+    throw providerError("FREE_PROVIDER_PROMPT_BUDGET_EXCEEDED");
+  }
+  return { maxCompletionTokens: GROQ_COMPLETION_TOKEN_RESERVE };
+}
+
+function providerRequestBudget(provider, prompt) {
+  const budget = provider?.requestBudget;
+  if (!budget) return null;
+  const promptBytes = Buffer.byteLength(prompt, "utf8");
+  if (promptBytes > budget.maxPromptBytes) throw providerError("FREE_PROVIDER_PROMPT_BUDGET_EXCEEDED");
+  return budget;
+}
+
 function classifyProviderHttpStatus(status) {
   if (status === 401 || status === 403) return "FREE_PROVIDER_AUTH_REJECTED";
   if (status === 402) return "FREE_PROVIDER_QUOTA_EXHAUSTED";
@@ -567,17 +645,23 @@ async function readBoundedResponseText(response, maxLength = MAX_PROCESS_OUTPUT)
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let output = "";
+    let outputBytes = 0;
     try {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        output += decoder.decode(value, { stream: true });
-        if (output.length > maxLength) {
+        const decoded = decoder.decode(value, { stream: true });
+        output += decoded;
+        outputBytes += Buffer.byteLength(decoded, "utf8");
+        if (outputBytes > maxLength) {
           try { await reader.cancel(); } catch {}
           throw providerError("FREE_PROVIDER_OUTPUT_TOO_LARGE");
         }
       }
-      output += decoder.decode();
+      const tail = decoder.decode();
+      output += tail;
+      outputBytes += Buffer.byteLength(tail, "utf8");
+      if (outputBytes > maxLength) throw providerError("FREE_PROVIDER_OUTPUT_TOO_LARGE");
       return output;
     } finally {
       try { reader.releaseLock(); } catch {}
@@ -585,12 +669,12 @@ async function readBoundedResponseText(response, maxLength = MAX_PROCESS_OUTPUT)
   }
   if (typeof response?.text === "function") {
     const output = await response.text();
-    if (typeof output !== "string" || output.length > maxLength) throw providerError("FREE_PROVIDER_OUTPUT_TOO_LARGE");
+    if (typeof output !== "string" || Buffer.byteLength(output, "utf8") > maxLength) throw providerError("FREE_PROVIDER_OUTPUT_TOO_LARGE");
     return output;
   }
   if (typeof response?.json === "function") {
     const output = JSON.stringify(await response.json());
-    if (output.length > maxLength) throw providerError("FREE_PROVIDER_OUTPUT_TOO_LARGE");
+    if (Buffer.byteLength(output, "utf8") > maxLength) throw providerError("FREE_PROVIDER_OUTPUT_TOO_LARGE");
     return output;
   }
   throw providerError("FREE_PROVIDER_OUTPUT_INVALID");
@@ -683,9 +767,12 @@ export function createFreeProviderAdapter({ provider, env = process.env, fetchIm
       if (!modelIsKnown(provider, model)) throw new Error("FREE_PROVIDER_MODEL_UNVERIFIED");
       if (typeof fetchImpl !== "function") throw providerError("FREE_PROVIDER_FETCH_UNAVAILABLE");
       if (typeof prompt !== "string" || prompt.length === 0 || prompt.length > 120000) throw providerError("FREE_PROVIDER_PROMPT_INVALID");
+      const groqBudget = provider.id === "groq" ? groqRequestBudget(prompt) : null;
+      const budget = groqBudget || providerRequestBudget(provider, prompt);
+      const endpoint = buildProviderEndpoint(provider, env);
       const boundedTimeoutMs = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
-        ? Math.min(Number(timeoutMs), MAX_PROVIDER_TIMEOUT_MS)
-        : 60 * 1000;
+        ? Math.min(Number(timeoutMs), budget?.maxTimeoutMs || MAX_PROVIDER_TIMEOUT_MS)
+        : Math.min(60 * 1000, budget?.maxTimeoutMs || MAX_PROVIDER_TIMEOUT_MS);
       const credentials = resolveProviderCredentials(provider, env, { account });
       if (!credentials.ok) throw providerError(`FREE_PROVIDER_CREDENTIAL_${credentials.state.toUpperCase()}`);
       const secret = credentialValue(env, credentials.sourceEnv);
@@ -696,7 +783,11 @@ export function createFreeProviderAdapter({ provider, env = process.env, fetchIm
           model,
           messages: [{ role: "user", content: prompt }],
           stream: false,
+          ...(budget ? { max_completion_tokens: budget.maxCompletionTokens } : {}),
           ...(provider.id === "gemini-api" ? { reasoning_effort: effort || "high" } : {}),
+          ...(provider.id === "vercel-ai-gateway" ? {
+            providerOptions: { gateway: { disallowPromptTraining: true } },
+          } : {}),
           ...(provider.privacy?.requireZdr === true ? {
             provider: {
               zdr: true,
@@ -704,7 +795,7 @@ export function createFreeProviderAdapter({ provider, env = process.env, fetchIm
             },
           } : {}),
         };
-        const response = await fetchImpl(provider.endpoint, {
+        const response = await fetchImpl(endpoint, {
           method: "POST",
           headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
           body: JSON.stringify(requestBody),
@@ -714,7 +805,7 @@ export function createFreeProviderAdapter({ provider, env = process.env, fetchIm
         if (!response?.ok) throw providerError(classifyProviderHttpStatus(Number(response?.status || 0)));
         let parsed;
         try {
-          const raw = await readBoundedResponseText(response);
+          const raw = await readBoundedResponseText(response, budget?.maxResponseBytes || MAX_PROCESS_OUTPUT);
           parsed = JSON.parse(raw);
         } catch (error) {
           if (/^FREE_PROVIDER_/.test(String(error?.message || ""))) throw error;

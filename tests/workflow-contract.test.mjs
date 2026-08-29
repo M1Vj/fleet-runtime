@@ -10,6 +10,7 @@ const fleetMemorySource = readFileSync(new URL("../scripts/lib/fleet-memory.mjs"
 const reviseSource = readFileSync(new URL("../scripts/revise.mjs", import.meta.url), "utf8");
 const improveSource = readFileSync(new URL("../scripts/improve.mjs", import.meta.url), "utf8");
 const deepWorkflow = readFileSync(new URL("../.github/workflows/deep.yml", import.meta.url), "utf8");
+const improveWorkflow = readFileSync(new URL("../.github/workflows/improve.yml", import.meta.url), "utf8");
 
 test("manual dispatch has an explicit, fail-closed target contract", () => {
   assert.match(workflow, /workflow_dispatch:\s*\n\s+inputs:/);
@@ -78,6 +79,17 @@ test("deep worker input crosses into shell only through a validated environment 
   assert.equal((deepWorkflow.match(/''\|\*\[!0-9\]\*\) workers=4/g) || []).length, 2);
   assert.equal((deepWorkflow.match(/printf 'FLEET_MAX_WORKERS=%s\\n' "\$workers"/g) || []).length, 2);
   assert.doesNotMatch(deepWorkflow, /grep -E/);
+});
+
+test("matrix model jobs preserve bounded cooldown state through private finalizers", () => {
+  for (const [name, source] of [["deep", deepWorkflow], ["improve", improveWorkflow]]) {
+    assert.match(source, /node scripts\/provider-health-artifact\.mjs export/, `${name}: workers must export cooldown state`);
+    assert.match(source, /node scripts\/provider-health-artifact\.mjs import/, `${name}: finalizers must import cooldown state`);
+    assert.match(source, /retention-days:\s*1/, `${name}: transient bridge artifacts must expire quickly`);
+    assert.match(source, /path:\s*provider-health-artifacts/, `${name}: cooldown data must use a dedicated bounded artifact path`);
+  }
+  assert.match(deepWorkflow, /provider-health-deep-\*/);
+  assert.match(improveWorkflow, /provider-health-improve-\*/);
 });
 
 test("target code has no state checkout or secret-bearing job environment", () => {
@@ -199,11 +211,12 @@ test("production model workflows use provider keys without legacy OAuth snapshot
 
 test("fleet memory is labeled untrusted and only wired into private model prompts", () => {
   assert.match(fleetMemorySource, /FLEET MEMORY \(untrusted operational notes; verify against current evidence\):/);
-  for (const [name, source] of [["merge", mergeSource], ["revise", reviseSource], ["improve", improveSource]]) {
+  for (const [name, source] of [["merge", mergeSource], ["revise", reviseSource]]) {
     assert.match(source, /formatMemoryPromptBlock/, `${name} must render the bounded memory block`);
     // the label literal lives once in the shared lib; lanes reference it via the helper
     assert.doesNotMatch(source, /FLEET MEMORY \(untrusted operational notes/, `${name} must not duplicate the label literal`);
   }
+  assert.doesNotMatch(improveSource, /formatMemoryPromptBlock|loadImproveMemoryBlock/, "public Improve prompts must not receive private fleet memory");
 });
 
 test("memory content never reaches public comment bodies or mirrors", () => {

@@ -231,15 +231,21 @@ test("malformed heartbeats collapse to one canonical unknown alert identity", as
 test("resolveModelChain parsing", async () => {
   const { resolveModelChain } = await import("../scripts/lib/model.mjs");
   assert.deepEqual(resolveModelChain({}), [
-    "opencode/claude-opus-4-6",
-    "openrouter/meta-llama/llama-3.2-3b-instruct:free",
+    "antigravity/claude-opus-4-6-thinking",
+    "gemini-api/gemini-3.7-flash",
+    "vercel-ai-gateway/poolside/laguna-s-2.1-free",
+    "cloudflare-workers-ai/@cf/openai/gpt-oss-120b",
+    "cloudflare-workers-ai/@cf/zai-org/glm-4.7-flash",
+    "groq/qwen/qwen3.8-27b",
     "nvidia-nim/moonshotai/kimi-k3",
+    "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+    "opencode/claude-opus-4-6",
   ]);
-  assert.equal(resolveModelChain({ FLEET_MODEL_CHAIN: "opencode/claude-opus-4-6,openrouter/meta-llama/llama-3.2-3b-instruct:free" }).length, 2);
+  assert.equal(resolveModelChain({ FLEET_MODEL_CHAIN: "opencode/claude-opus-4-6,openrouter/nvidia/nemotron-3-ultra-550b-a55b:free" }).length, 2);
   assert.throws(() => resolveModelChain({ FLEET_MODEL_CHAIN: "a/b,c/d" }), /MODEL_REFERENCE_UNVERIFIED/);
 });
 
-test("public repository research explicitly opts into public-only provider routing", () => {
+test("public repository research explicitly opts into verified-public data routing", () => {
   assert.match(deepSource, /dataClass:\s*"public"/);
   assert.match(improveSource, /dataClass:\s*"public"/);
 });

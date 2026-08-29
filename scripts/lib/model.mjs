@@ -2,6 +2,9 @@ import { spawn } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { createHash, randomUUID } from "node:crypto";
+import { recordTelemetryEvent, isTelemetryValidationError } from "./telemetry.mjs";
+import { mergeProviderHealthSnapshots, persistProviderHealthState, readProviderHealthState } from "./provider-health-state.mjs";
 import { gatewayCircuitOpen, markGatewayDown, markGatewayUp } from "./gateway-health.mjs";
 import { classifyProviderAuthFailure, providerAuthStatus, resolveProviderAuth } from "./provider-auth.mjs";
 import {
@@ -13,6 +16,64 @@ import {
   providerModelReference,
   selectProviderRoute,
 } from "./provider-registry.mjs";
+
+function telemetryStateFile(env = process.env) {
+  const root = String(env?.FLEET_STATE_ROOT || "");
+  if (!root || !path.isAbsolute(root) || path.resolve(root) !== root || root.endsWith(path.sep)) return "";
+  return path.join(root, "state", "telemetry.jsonl");
+}
+
+function telemetryCorrelation(env, route = {}, invocationId = "") {
+  const runId = telemetryRunId(env);
+  const target = `${route.provider || "provider"}|${route.model || "model"}|${route.repo || ""}|${route.pr || 0}|${route.headSha || ""}`;
+  return `corr-${createHash("sha256").update(`${runId}|${invocationId}|${target}`).digest("hex").slice(0, 32)}`;
+}
+
+function telemetryRunId(env) {
+  return String(env?.FLEET_RUN_ID || env?.GITHUB_RUN_ID || "local-model").replace(/[^A-Za-z0-9._:-]/g, "-").slice(0, 100) || "local-model";
+}
+
+function telemetryDurationBucket(value) {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms < 1000) return "lt1s";
+  if (ms < 5000) return "1to5s";
+  if (ms < 15000) return "5to15s";
+  if (ms < 30000) return "15to30s";
+  return "gt30s";
+}
+
+function telemetryLane(env) {
+  const value = String(env?.FLEET_LANE || "unknown").trim().toLowerCase();
+  return new Set(["merge", "revise", "research", "deep", "improve", "patrol", "watchdog", "promotion", "sentinel", "selftest", "kb", "retro", "thesis", "terminal", "unknown"]).has(value) ? value : "unknown";
+}
+
+function telemetryAccountScope(selected, isZen) {
+  if (selected?.quotaGroup) return "project";
+  const scope = String(selected?.providerObject?.auth?.quotaScope || "").toLowerCase();
+  if (scope === "account" || scope === "account-wide" || isZen) return "account";
+  return "provider";
+}
+
+function telemetryErrorCode(value) {
+  const state = String(value || "").toLowerCase();
+  if (state.includes("rate")) return "rate_limited";
+  if (state.includes("quota") || state.includes("exhaust")) return "quota_exhausted";
+  if (state.includes("auth") || state.includes("reject") || state.includes("credential")) return "auth_rejected";
+  if (state.includes("timeout")) return "timeout";
+  if (state.includes("network") || state.includes("spawn") || state.includes("unavailable")) return "network";
+  return state ? "unknown" : "none";
+}
+
+function emitModelTelemetry(env, input) {
+  const file = telemetryStateFile(env);
+  if (!file) return null;
+  try {
+    return recordTelemetryEvent(file, input);
+  } catch (error) {
+    if (isTelemetryValidationError(error)) throw error;
+    return null;
+  }
+}
 
 export const DISPOSABLE_MODEL_POLICY = Object.freeze({
   permission: {
@@ -205,11 +266,27 @@ function uniqueReferences(references) {
 /** Resolve only registry-backed provider/model references in priority order. */
 export function resolveModelChain(env = process.env, { dataClass = "private", publicTarget } = {}) {
   const registry = loadProviderRegistry();
+  if (dataClass === "public" && (publicTarget?.private !== false || publicTarget?.visibility !== "public")) {
+    throw new Error("MODEL_PUBLIC_TARGET_REQUIRED");
+  }
+  const publicRequest = dataClass === "public"
+    && publicTarget?.private === false
+    && publicTarget?.visibility === "public";
+  const publicFallbacks = () => uniqueReferences(
+    (registry.buckets?.public || [])
+      .slice()
+      .sort((a, b) => a.priority - b.priority)
+      .map((ref) => providerModelReference(ref.provider, ref.model)),
+  );
   const raw = String(env.FLEET_MODEL_CHAIN || "").trim();
   if (raw) {
     const chain = raw.split(",").map((m) => m.trim()).filter(Boolean);
     if (chain.length === 0) throw new Error("MODEL_CHAIN_EMPTY");
-    return uniqueReferences(chain.map((reference) => canonicalModelReference(reference, registry)));
+    const preferred = chain.map((reference) => canonicalModelReference(reference, registry));
+    // Repository variables may narrow private lanes, but they cannot reorder a
+    // verified-public lane around its governed free-first policy. Call sites
+    // that intentionally require one exact model use modelOverride instead.
+    return publicRequest ? publicFallbacks() : uniqueReferences(preferred);
   }
   const requestedGemini = String(env.FLEET_GEMINI_MODEL || "").trim();
   if (requestedGemini) {
@@ -218,12 +295,11 @@ export function resolveModelChain(env = process.env, { dataClass = "private", pu
       : [];
     const references = uniqueReferences(refs.map((ref) => providerModelReference(ref.provider, ref.model)));
     if (references.length !== 1) throw new Error("MODEL_GEMINI_MODEL_UNVERIFIED");
-    return references;
+    return uniqueReferences(publicRequest ? [...references, ...publicFallbacks()] : references);
   }
-  const publicRequest = dataClass === "public"
-    && publicTarget?.private === false
-    && publicTarget?.visibility === "public";
-  const bucket = String(env.FLEET_MODEL_BUCKET || (publicRequest ? "public" : DEFAULT_MODEL_BUCKET)).trim() || DEFAULT_MODEL_BUCKET;
+  const bucket = publicRequest
+    ? "public"
+    : (String(env.FLEET_MODEL_BUCKET || DEFAULT_MODEL_BUCKET).trim() || DEFAULT_MODEL_BUCKET);
   const refs = registry.buckets?.[bucket];
   if (!Array.isArray(refs) || refs.length === 0) throw new Error("MODEL_BUCKET_UNVERIFIED");
   return uniqueReferences(refs.slice().sort((a, b) => a.priority - b.priority).map((ref) => providerModelReference(ref.provider, ref.model)));
@@ -420,7 +496,7 @@ export function recordRouteFailure(health, route, state, now) {
   }
   health[route.provider] = {
     ...current,
-    checkedAt: current.checkedAt || new Date(now).toISOString(),
+    checkedAt: new Date(now).toISOString(),
     // Keep a credential-group provider healthy when the selected project is
     // limited. Without an explicit, validated group map, the failure remains
     // provider-wide and prevents quota-evasion retries.
@@ -495,8 +571,11 @@ async function askDirectRoute({ route, prompt, timeoutMs, env, dataClass, public
   }
 }
 
-async function askModelInternal({ prompt, sessionId, timeoutMs = 480000, env = process.env, preferVariantMax = true, maxRounds = 4, files = [], modelOverride, workspace, repoRoot = process.cwd(), stateRoot: privateStateRoot = env.FLEET_STATE_ROOT || "", spawnImpl, skipCircuitCheck = false, dataClass = "private", publicTarget, providerHealth, effort = "high", fetchImpl = globalThis.fetch, now = Date.now(), rotationSeed }) {
+async function askModelInternal({ prompt, sessionId, timeoutMs = 480000, env = process.env, preferVariantMax = true, maxRounds = 4, files = [], modelOverride, workspace, repoRoot = process.cwd(), stateRoot: privateStateRoot = env.FLEET_STATE_ROOT || "", spawnImpl, skipCircuitCheck = false, dataClass = "private", publicTarget, providerHealth, effort = "high", fetchImpl = globalThis.fetch, now = Date.now(), rotationSeed, invocationId = `call-${randomUUID()}` }) {
   const registry = loadProviderRegistry();
+  if (dataClass === "public" && (publicTarget?.private !== false || publicTarget?.visibility !== "public")) {
+    throw new Error("MODEL_PUBLIC_TARGET_REQUIRED");
+  }
   const chain = modelOverride
     ? [canonicalModelReference(modelOverride, registry)]
     : resolveModelChain(env, { dataClass, publicTarget });
@@ -504,7 +583,8 @@ async function askModelInternal({ prompt, sessionId, timeoutMs = 480000, env = p
   const circuitOpen = !skipCircuitCheck && !sessionId && gatewayCircuitOpen(healthRoot);
   const authStatus = providerAuthStatus(env, { circuitOpen });
   const explicitHealth = parseHealthSnapshot(providerHealth ?? env.FLEET_PROVIDER_HEALTH_JSON);
-  const runtimeHealth = explicitHealth;
+  const persistedHealth = privateStateRoot ? readProviderHealthState(privateStateRoot, { now }) : {};
+  const runtimeHealth = mergeProviderHealthSnapshots(explicitHealth, persistedHealth, now);
   const effectiveRotationSeed = rotationSeed ?? env.FLEET_ACCOUNT_ROTATION_SEED ?? env.GITHUB_RUN_ID ?? "";
   const entries = chain.map((reference) => routeEntryForReference(reference, registry));
   const hasDirectEligible = entries.some((entry) => directRouteEligible(entry, dataClass, publicTarget));
@@ -554,6 +634,24 @@ async function askModelInternal({ prompt, sessionId, timeoutMs = 480000, env = p
       continue;
     }
     const selected = { ...route, providerObject: entry.provider };
+    const correlationId = telemetryCorrelation(env, selected, invocationId);
+    emitModelTelemetry(env, {
+      runId: telemetryRunId(env),
+      correlationId,
+      invocationId,
+      lane: telemetryLane(env),
+      event: "provider",
+      phase: "selected",
+      outcome: "started",
+      provider: {
+        name: selected.provider,
+        model: selected.model,
+        routeClass: selected.routeClass || (isZen ? "private-paid" : "public-free"),
+        accountScope: telemetryAccountScope(selected, isZen),
+        chainIndex: ci,
+        cooldownBucket: "none",
+      },
+    });
     if (isZen) attemptedZen = true;
     const routeEnv = materializeRouteEnv(selected, env);
     const routeSession = isZen
@@ -565,6 +663,28 @@ async function askModelInternal({ prompt, sessionId, timeoutMs = 480000, env = p
       ? await askOnModel({ model: selected.modelReference, isPrimary: ci === 0, prompt, sessionId: routeSession || undefined, timeoutMs, env: routeEnv, preferVariantMax, maxRounds, files, workspace, repoRoot, stateRoot: privateStateRoot, spawnImpl })
       : await askDirectRoute({ route: selected, prompt, timeoutMs, env, dataClass, publicTarget, effort, fetchImpl, allowLocal, spawnImpl });
     allAttempts.push(...(result.attempts || []));
+    const lastAttempt = Array.isArray(result.attempts) && result.attempts.length > 0 ? result.attempts.at(-1) : {};
+    emitModelTelemetry(env, {
+      runId: telemetryRunId(env),
+      correlationId,
+      invocationId,
+      lane: telemetryLane(env),
+      event: "provider",
+      phase: "attempt",
+      outcome: result.complete ? "succeeded" : "failed",
+      provider: {
+        name: selected.provider,
+        model: selected.model,
+        routeClass: selected.routeClass || (isZen ? "private-paid" : "public-free"),
+        accountScope: telemetryAccountScope(selected, isZen),
+        attempt: Number(lastAttempt.round) || 1,
+        chainIndex: ci,
+        durationBucket: telemetryDurationBucket(lastAttempt.elapsedMs),
+        errorCode: telemetryErrorCode(result.authState || lastAttempt.error),
+        httpClass: "none",
+        cooldownBucket: "none",
+      },
+    });
     if (isZen && result.sessionId) lastSid = result.sessionId;
     if (!isZen) lastSid = "";
     lastProvider = selected.provider;
@@ -578,6 +698,35 @@ async function askModelInternal({ prompt, sessionId, timeoutMs = 480000, env = p
       return { reply: result.reply, sessionId: isZen ? lastSid : "", modelMode: lastMode, attempts: allAttempts, complete: true };
     }
     recordRouteFailure(runtimeHealth, selected, lastAuthState, now);
+    if (privateStateRoot && ["rejected", "rate-limited", "quota-exhausted", "timeout", "unavailable"].includes(lastAuthState)) {
+      try {
+        persistProviderHealthState(privateStateRoot, runtimeHealth, { now });
+      } catch (error) {
+        // Another process owns the short atomic-write lock. Its write will be
+        // reloaded by the next call; do not sacrifice this call's fallback.
+        // Malformed/symlinked state and every other persistence error remain
+        // fail-closed.
+        if (error?.code !== "PROVIDER_HEALTH_STATE_BUSY") throw error;
+      }
+    }
+    emitModelTelemetry(env, {
+      runId: telemetryRunId(env),
+      correlationId,
+      invocationId,
+      lane: telemetryLane(env),
+      event: "provider",
+      phase: "fallback",
+      outcome: "started",
+      provider: {
+        name: selected.provider,
+        model: selected.model,
+        routeClass: selected.routeClass || (isZen ? "private-paid" : "public-free"),
+        accountScope: telemetryAccountScope(selected, isZen),
+        chainIndex: ci + 1,
+        errorCode: telemetryErrorCode(lastAuthState),
+        cooldownBucket: "none",
+      },
+    });
     const canRotateCredential = lastAuthState === "rejected"
       || ((lastAuthState === "rate-limited" || lastAuthState === "quota-exhausted") && selected.quotaGroupRotation === true);
     if (canRotateCredential && !replayedReferences.has(reference)) {
@@ -688,6 +837,22 @@ export async function askModelResilient(opts) {
   const first = await askModel(opts);
   if (first.complete || first.authState || first.authMissing) return { ...first, ladders: 1 };
   const cooldownMs = opts.cooldownMs ?? 90000;
+  emitModelTelemetry(opts.env || process.env, {
+    runId: telemetryRunId(opts.env || process.env),
+    correlationId: telemetryCorrelation(opts.env || process.env, { provider: "model-ladder", model: "fallback" }),
+    lane: telemetryLane(opts.env || process.env),
+    event: "provider",
+    phase: "cooldown",
+    outcome: "started",
+    provider: {
+      name: "model-ladder",
+      model: "fallback",
+      routeClass: "unknown",
+      accountScope: "provider",
+      cooldownBucket: cooldownMs < 60000 ? "lt1m" : cooldownMs <= 300000 ? "1to5m" : "gt5m",
+      errorCode: telemetryErrorCode(first.authState || "unavailable"),
+    },
+  });
   await new Promise((r) => setTimeout(r, cooldownMs));
   const second = await askModel({ ...opts, maxRounds: Math.max(2, (opts.maxRounds || 4) - 1) });
   return { ...second, ladders: 2 };

@@ -169,12 +169,18 @@ opencode installed:
 Set repo variable `FLEET_MODEL_CHAIN` only to registry-backed references (comma-separated,
 priority order). The default `other` chain is:
 
-    opencode/claude-opus-4-6, openrouter/meta-llama/llama-3.2-3b-instruct:free, nvidia-nim/moonshotai/kimi-k3
+    antigravity/claude-opus-4-6-thinking, gemini-api/gemini-3.7-flash, vercel-ai-gateway/poolside/laguna-s-2.1-free, cloudflare-workers-ai/@cf/openai/gpt-oss-120b, cloudflare-workers-ai/@cf/zai-org/glm-4.7-flash, groq/qwen/qwen3.8-27b, nvidia-nim/moonshotai/kimi-k3, openrouter/nvidia/nemotron-3-ultra-550b-a55b:free, opencode/claude-opus-4-6
 
 Calls that explicitly prove `dataClass=public` and a public target use the default `public`
 chain instead:
 
-    antigravity/gemini-3.7-flash-high, gemini-api/gemini-3.7-flash, openrouter/meta-llama/llama-3.2-3b-instruct:free, nvidia-nim/moonshotai/kimi-k3, opencode/claude-opus-4-6
+    antigravity/gemini-3.7-flash-high, gemini-api/gemini-3.7-flash, vercel-ai-gateway/poolside/laguna-s-2.1-free, cloudflare-workers-ai/@cf/openai/gpt-oss-120b, cloudflare-workers-ai/@cf/zai-org/glm-4.7-flash, groq/qwen/qwen3.8-27b, nvidia-nim/moonshotai/kimi-k3, openrouter/nvidia/nemotron-3-ultra-550b-a55b:free, opencode/claude-opus-4-6
+
+Here `public` classifies the input data: every source target must be freshly verified as a
+public repository before any model runs. Hosted free APIs are tried first. Paid Zen is the
+intentional final availability fallback for that non-sensitive public data, and an explicit
+call-site `modelOverride` may select it for a quality-critical phase. Repository-level
+`FLEET_MODEL_CHAIN` and bucket variables cannot reorder the governed public ladder.
 
 GitHub skips the local-only Antigravity entry. Missing API keys are skipped. A direct public
 API with no fresh health record uses its first bounded task request as the live canary, avoiding
@@ -194,6 +200,19 @@ Semantics (`scripts/lib/model.mjs`):
   exhaustion stay provider-wide unless every involved credential has validated, distinct quota
   groups and the provider declares `quotaScope: "credential-group"`; no account, project, or key
   is created automatically. Anonymous fallback is not used.
+- Authentication rejection, 429, quota, timeout, and unavailable state is written atomically to the private
+  `state/provider-health.json` ledger. Later model calls and fresh processes load it before route
+  selection. A provider, credential, or declared project group cannot be retried until the
+  15-minute health cooldown expires. The file stores only allowlisted provider/slot/group IDs,
+  status, and timestamps; it rejects prompts, responses, errors, credentials, and unknown fields.
+- A concurrent provider-health writer never cancels an otherwise eligible fallback. Only the
+  short lock-busy condition is tolerated; malformed or symlinked state still fails closed.
+- Provider-health state and bridge artifacts reject symlinked directory components and open
+  files with no-follow semantics. Bridge artifacts contain only the same allowlisted IDs,
+  status, and timestamps and expire after one day.
+- Provider telemetry assigns every model invocation a fresh bounded call ID. Replaying one event
+  remains idempotent, while two separate same-shaped calls remain visible. Local Antigravity OAuth
+  is recorded as `local`, hosted free APIs as `public-free`, and Zen as `private-paid`.
 - If the whole chain fails, a second ladder starts after a 90-second cooldown, or 120 seconds
   for long-form lanes. Per-call timeouts are 480 seconds by default, 540 for deep analysis,
   and 600 for thesis, KB, or revision work.
@@ -203,9 +222,9 @@ Semantics (`scripts/lib/model.mjs`):
   policy; no repository or private-state checkout is attached. Improve research/plan may use
   the explicit `public-read` profile only after target metadata proves `private=false` and
   `visibility=public` (plus any available tier-1 allowlist), using a fresh shallow clone under
-  `./source`. That profile permits read/list/glob/grep (and webfetch) but still denies edit,
-  shell, task, skill, external-directory, and web-search tools. Private/internal targets fail
-  before clone or model execution.
+  `./source`. That profile permits only read/list/glob/grep against the isolated clone. It denies
+  edit, shell, task, skill, external-directory, webfetch, and web-search tools. Private/internal
+  targets fail before clone or model execution.
 - On upstream errors such as 429, `opencode run` may hang silently (issues
   #8203/#22243/#29134). Hard timeouts, failure-log tails, and `max-parallel` limits contain
   the failure. If hangs become chronic, pin another model ID in `scripts/lib/model.mjs`;
@@ -214,45 +233,114 @@ Semantics (`scripts/lib/model.mjs`):
 ### Provider registry and credential boundary
 
 `config/providers.json` is a secretless, reviewed policy registry. It records the requested
-bucket preferences (`gemini` prefers local Antigravity `gemini-3.7-flash-high`, followed by
-AI Studio `gemini-3.7-flash` backups; `other` prefers `opencode/claude-opus-4-6`) and the model-update digest/rollback
-contract. The registry does not activate a provider or change any workflow by itself.
+bucket preferences (`gemini` prefers local Antigravity `gemini-3.7-flash-high`, followed by six
+AI Studio `gemini-3.7-flash` slots; `other` starts with local Antigravity
+`claude-opus-4-6-thinking`, then recurring public pools and paid Zen last) and the model-update
+digest/rollback contract. The registry does not activate a provider or change any workflow by itself.
 
 GitHub Actions uses the protected `OPENCODE_API_KEY` and optional `OPENCODE_API_KEY_2` for
 deterministic healthy Zen balancing and auth recovery. Zen rate/quota failures remain account-wide.
-`FLEET_OPENCODE_AUTH` is local migration-only. The optional `GEMINI_API_KEY_1`,
-`GEMINI_API_KEY_2`, `OPENROUTER_API_KEY`,
-and `NVIDIA_API_KEY` secrets are passed only to verified-public research jobs.
-They require either a fresh healthy snapshot or a first-request live canary. Gemini API slots
-must declare `GEMINI_API_KEY_1_QUOTA_GROUP` and `GEMINI_API_KEY_2_QUOTA_GROUP` with distinct
-Google Cloud project identifiers before a rate/quota retry can move to the other slot. Valid
-declarations are lowercase 6-30 character project IDs or 6-20 digit project numbers. Google
-documents Gemini quotas at the project level, so this is an explicit project-group declaration,
-not account fabrication or quota evasion. Missing, malformed, or duplicate group declarations
-keep the limit provider-wide. OpenRouter free limits are account-wide and never trigger
-same-provider rotation.
+`FLEET_OPENCODE_AUTH` is local migration-only. The optional `GEMINI_API_KEY_1` through
+`GEMINI_API_KEY_6`, `OPENROUTER_API_KEY`, `NVIDIA_API_KEY_1`, `NVIDIA_API_KEY_2`, `GROQ_API_KEY`,
+`VERCEL_AI_GATEWAY_API_KEY`, and `CLOUDFLARE_API_TOKEN` secrets are step-scoped: model steps
+receive them only after verified-public target checks; the model-refresh step receives them only
+for its fixed, allowlisted provider-discovery endpoints. They require either a fresh healthy
+snapshot or a first-request live canary. Every Gemini slot must declare its matching
+`GEMINI_API_KEY_1_QUOTA_GROUP` through `GEMINI_API_KEY_6_QUOTA_GROUP` with a distinct Google
+Cloud project identifier before a rate/quota retry can move to another slot. Valid declarations
+are lowercase 6-30 character project IDs or 6-20 digit project numbers. Google documents Gemini
+quotas at the project level, so this is an explicit project-group declaration, not account
+fabrication or quota evasion. Missing, malformed, or duplicate group declarations keep the limit
+provider-wide. OpenRouter, Vercel, Cloudflare, Groq, and NVIDIA limits are account/organization-
+wide and never trigger same-provider credential rotation. NVIDIA's two named slots use
+deterministic healthy selection and fall back in slot order when a key is missing, expired, or
+rejected; a 429 or quota signal stops the provider rather than rotating keys.
 
 Antigravity OAuth is local-only. With the explicit `FLEET_ANTIGRAVITY_LOCAL=true` gate on a
 non-GitHub host, `agy` runs from a disposable cwd, uses the existing secure local OAuth cache
-in place, pins `gemini-3.7-flash-high`, and forwards no API key. The official public CLI surface
+in place, pins `gemini-3.7-flash-high` for `gemini` and `claude-opus-4-6-thinking` first for
+`other`, and forwards no API key. The official public CLI surface
 owns one OS-keyring OAuth session. On an owner TTY, `node scripts/provider-accounts.mjs login
 antigravity` launches the official `agy --sandbox` login flow; use the CLI's documented `/logout`
 before switching accounts. It refuses GitHub and non-TTY hosts. `node scripts/provider-accounts.mjs
 status` provides a secretless slot/health view. The helper never copies or exports the cache and
-does not pretend that HOME paths provide concurrent OAuth profiles. GitHub jobs cannot import a browser profile,
-  cookies, OAuth snapshot, or local session database. Direct Gemini API-key slots may rotate only
-  under the same credential-group rules. The documented Gemini API backup uses model
-ID `gemini-3.7-flash` with high thinking effort, not the Antigravity `-high` slug. Google
-free-tier prompts may be used to improve products, so the adapter is public-only.
+does not pretend that HOME paths provide concurrent OAuth profiles. GitHub jobs cannot import a
+browser profile, cookies, OAuth snapshot, or local session database; the local OAuth profile has
+no supported multi-profile/export path for ephemeral runners. Direct Gemini API-key slots may
+rotate only under the same credential-group rules. The documented Gemini API backup uses model
+ID `gemini-3.7-flash` with high thinking effort, not the Antigravity `-high` slug. Gemini's
+actual project-scoped quota is visible in AI Studio; free-tier prompts may be used to improve
+Google products, so the adapter is public-only.
 
-OpenRouter uses the explicit `meta-llama/llama-3.2-3b-instruct:free` route and sends ZDR plus
-`data_collection: "deny"`; its fleet key is bound to the `Fleet Free Public Only` guardrail.
-NVIDIA Hosted NIM uses the official `moonshotai/kimi-k3` free endpoint through the existing
-OpenAI-compatible chat API. NVIDIA documents a 1,048,576-token input context, up to 65,536
-output tokens, and low/high/max reasoning effort for this model. The fleet leaves NVIDIA behind
-the `FLEET_NVIDIA_ENABLE` prototype gate, treats its rate and quota state as account-wide, and
-sends only verified-public research prompts. OpenRouter and NVIDIA stay disabled when credentials
-are absent or a current health record says the provider is unavailable.
+Vercel AI Gateway uses the fixed OpenAI-compatible endpoint
+`https://ai-gateway.vercel.sh/v1/chat/completions`, with the GitHub secret
+`VERCEL_AI_GATEWAY_API_KEY` mapped only at model-step scope to `AI_GATEWAY_API_KEY` and gated by
+`FLEET_VERCEL_AI_ENABLE`. The exact zero-price model is
+`poolside/laguna-s-2.1-free` (256K context, 32,768 maximum output); the recurring free tier
+includes $5/month. API keys do not expire unless revoked. Upstream privacy varies, so the
+adapter sends the documented request-level `providerOptions.gateway.disallowPromptTraining`
+control without claiming ZDR for this free model. Discovery is unauthenticated at
+`https://ai-gateway.vercel.sh/v1/models` and never activates a model.
+The adapter bounds each request to a conservative 32 KiB UTF-8 prompt, 1,024 completion tokens,
+128 KiB response, and 60-second timeout; these are safety ceilings, not claims about tokenization.
+
+Cloudflare Workers AI uses the fixed OpenAI-compatible template
+`https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions`, with
+`CLOUDFLARE_API_TOKEN` and non-secret `CLOUDFLARE_ACCOUNT_ID` injected only at model-step scope
+under `FLEET_CLOUDFLARE_AI_ENABLE`. The account ID must be exactly 32 hexadecimal characters
+before URL construction. The ordered free models are `@cf/openai/gpt-oss-120b` then
+`@cf/zai-org/glm-4.7-flash`; neither is in Cloudflare's current paid-required list. Workers Free
+allocates 10,000 neurons per account per day and resets at 00:00 UTC. Cloudflare does not use
+Customer Content to train or improve services without explicit consent. Authenticated discovery
+uses the fixed bounded URL
+`https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/models/search?format=openrouter&hide_experimental=true&per_page=100`
+with the bearer token. Missing or invalid account IDs produce zero fetches, and no free model
+silently falls through to a paid model.
+Each Cloudflare request is bounded to an 8 KiB UTF-8 prompt, 512 completion tokens, 128 KiB
+response, and 45-second timeout, keeping one request well below the daily neuron allocation.
+
+Groq remains the verified Qwen preview route documented above. NVIDIA Hosted NIM uses the
+official `moonshotai/kimi-k3` free endpoint through the existing OpenAI-compatible chat API.
+NVIDIA documents a 1,048,576-token input context, up to 65,536 output tokens, and low/high/max
+reasoning effort for this model. The fleet leaves NVIDIA behind the `FLEET_NVIDIA_ENABLE`
+prototype gate, treats its trial capacity as account-wide, and sends only verified-public
+research prompts. `NVIDIA_API_KEY_1` and `NVIDIA_API_KEY_2` are separate protected slots for
+auth recovery and deterministic healthy balancing; neither slot is used to evade a provider-wide
+429 or quota exhaustion. The read-only model refresh may query NVIDIA's fixed
+`https://integrate.api.nvidia.com/v1/models` endpoint with the first available slot and uses the
+second only after a missing or rejected first slot.
+
+OpenRouter uses the exact current `nvidia/nemotron-3-ultra-550b-a55b:free` route and the
+authenticated fixed discovery endpoint `https://openrouter.ai/api/v1/models`. Without purchased
+credits, the current official free limit is 50 requests/day total. The route requires
+`FLEET_OPENROUTER_ENABLE`, sends ZDR plus `data_collection: "deny"`, and never rotates or falls
+through to a paid model on a 429 or quota signal. All free API routes stay disabled when their
+credentials, explicit gates, public target proof, account ID, or fresh health/canary evidence are
+missing.
+
+Cerebras is intentionally deferred. Its current official rate-limit page describes a verified-
+payment-method free trial (5 RPM, 30K TPM, 1M TPH, 1M TPD) and states that it has no permanently
+renewing free tier, which conflicts with the earlier free-tier claim. Do not add a Cerebras key,
+gate, route, or discovery step until the owner re-verifies a durable public allocation.
+
+Explicitly rejected or deferred alternatives: GitHub Models is retired; SambaNova requires a
+payment method or credits; Cohere's trial is non-production; Hugging Face's $0.10 monthly credit
+is too small for this fleet; Scaleway's 1M-token offer can auto-bill and requires payment/KYC;
+IBM watsonx.ai Lite needs IAM/project/runtime plumbing and deletes idle Lite instances after 30
+days. These providers must not enter the active public ladder without a new verified review.
+
+Groq uses the official preview model `qwen/qwen3.8-27b` through
+`https://api.groq.com/openai/v1/chat/completions`. Groq documents 131,042 input-context tokens,
+16,384 maximum output tokens, and Free Plan limits of 30 RPM, 1K RPD, 8K TPM, and 2M TPD for
+this model. Groq applies limits at the organization level, so a 429 or quota exhaustion never
+rotates to another Groq credential. The route requires `GROQ_API_KEY`,
+`FLEET_GROQ_ENABLE=true`, and verified-public targets. A missing key or an explicit unavailable
+health state skips the route; when no fresh health record exists, the first bounded public request
+is the canary. The repository variable remains absent or false until an exact public canary is
+approved. The adapter reserves a bounded completion budget with Groq's `max_completion_tokens`
+field and rejects oversized prompts before network activity; it uses a conservative UTF-8-byte
+ceiling rather than pretending to know Groq's tokenizer. Preview availability can change or be
+deprecated.
 
 A model-registry update must carry a `sha256:` digest, the previous active digest, and a
 rollback record. Automatic activation is disabled; a reviewed commit, deterministic checks,
@@ -260,8 +348,10 @@ independent review, and an exact canary remain required before any production ch
 
 `model-refresh.yml` performs daily read-only discovery when
 `FLEET_MODEL_REFRESH_ENABLE=true`. It retains only bounded model identifiers from allowlisted
-Google and OpenRouter endpoints, compares them with the committed catalog, and uploads a
-redacted 14-day proposal artifact. Retrieved descriptions and instructions are discarded.
+Google, OpenRouter, Groq, Vercel, Cloudflare, and NVIDIA endpoints, compares them with the committed catalog, and uploads a
+redacted 14-day proposal artifact. Groq discovery can list models with `GROQ_API_KEY` while
+`FLEET_GROQ_ENABLE` remains unset; discovery never activates inference. Retrieved descriptions and
+instructions are discarded.
 The lane has no write token and cannot edit the registry, open a PR, or activate a model.
 
 ## 8. PR lifecycle hygiene rules

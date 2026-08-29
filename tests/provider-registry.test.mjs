@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 
 import {
   assessProviderHealth,
+  buildProviderEndpoint,
   buildModelUpdateMetadata,
   createAntigravityAdapter,
   createFreeProviderAdapter,
@@ -14,6 +15,7 @@ import {
   resolveProviderCredentials,
   resolveProviderQuotaGroup,
   selectProviderRoute,
+  validCloudflareAccountId,
   validateModelUpdateMetadata,
   validateProviderRegistry,
 } from "../scripts/lib/provider-registry.mjs";
@@ -50,11 +52,66 @@ test("the provider registry carries the requested bucket preferences without ena
   assert.equal(registry.buckets.gemini[0].provider, "antigravity");
   assert.equal(registry.buckets.gemini[0].model, "gemini-3.7-flash-high");
   assert.equal(registry.buckets.gemini[2].credential, "account-2");
-  assert.equal(registry.buckets.other[0].provider, "opencode-zen");
-  assert.equal(registry.buckets.other[0].model, "claude-opus-4-6");
+  assert.equal(registry.buckets.other[0].provider, "antigravity");
+  assert.equal(registry.buckets.other[0].model, "claude-opus-4-6-thinking");
   assert.equal(registry.providers.find((item) => item.id === "antigravity").enabled, false);
   assert.equal(registry.providers.find((item) => item.id === "antigravity").production.enabled, false);
   assert.equal(validateProviderRegistry(registry).ok, true);
+});
+
+test("every provider bucket has unique strictly increasing priorities", () => {
+  for (const [bucket, refs] of Object.entries(registry.buckets)) {
+    const priorities = refs.map((ref) => ref.priority);
+    assert.deepEqual(priorities, [...priorities].sort((left, right) => left - right), bucket);
+    for (let index = 1; index < priorities.length; index += 1) {
+      assert.ok(priorities[index] > priorities[index - 1], `${bucket} priority ${priorities[index]} is not strictly increasing`);
+    }
+  }
+});
+
+test("the expanded public ladder records exact providers, models, gates, and quotas", () => {
+  const antigravity = registry.providers.find((item) => item.id === "antigravity");
+  assert.equal(antigravity.models["claude-opus-4-6-thinking"].availability, "antigravity-local-only");
+  assert.deepEqual(registry.buckets.other.slice(0, 2).map((item) => `${item.provider}/${item.model}`), [
+    "antigravity/claude-opus-4-6-thinking",
+    "gemini-api/gemini-3.7-flash",
+  ]);
+
+  const vercel = registry.providers.find((item) => item.id === "vercel-ai-gateway");
+  assert.ok(vercel);
+  assert.equal(vercel.endpoint, "https://ai-gateway.vercel.sh/v1/chat/completions");
+  assert.equal(vercel.production.requiresEnv, "FLEET_VERCEL_AI_ENABLE");
+  assert.equal(vercel.credentials[0].githubSecret, "VERCEL_AI_GATEWAY_API_KEY");
+  assert.equal(vercel.credentials[0].env, "AI_GATEWAY_API_KEY");
+  assert.equal(vercel.models["poolside/laguna-s-2.1-free"].free, true);
+  assert.equal(vercel.models["poolside/laguna-s-2.1-free"].contextTokens, 262144);
+  assert.equal(vercel.models["poolside/laguna-s-2.1-free"].maxOutputTokens, 32768);
+
+  const cloudflare = registry.providers.find((item) => item.id === "cloudflare-workers-ai");
+  assert.ok(cloudflare);
+  assert.equal(cloudflare.endpoint, "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions");
+  assert.equal(cloudflare.accountIdEnv, "CLOUDFLARE_ACCOUNT_ID");
+  assert.equal(cloudflare.production.requiresEnv, "FLEET_CLOUDFLARE_AI_ENABLE");
+  assert.deepEqual(Object.keys(cloudflare.models), ["@cf/openai/gpt-oss-120b", "@cf/zai-org/glm-4.7-flash"]);
+  assert.equal(cloudflare.rateLimits.freePlan.neuronsPerDay, 10000);
+
+  const openrouter = registry.providers.find((item) => item.id === "openrouter");
+  assert.equal(openrouter.production.requiresEnv, "FLEET_OPENROUTER_ENABLE");
+  assert.equal(openrouter.models["nvidia/nemotron-3-ultra-550b-a55b:free"].free, true);
+  assert.equal(openrouter.rateLimits.freePlan.requestsPerDay, 50);
+  assert.equal(registry.buckets.other.at(-1).provider, "opencode-zen");
+});
+
+test("Cloudflare account IDs are strict and never permit an unsafe endpoint", () => {
+  assert.equal(validCloudflareAccountId("0123456789abcdef0123456789abcdef"), true);
+  for (const value of ["", "short", "0123456789abcdef0123456789abcdeg", "0123456789abcdef0123456789abcdef/extra", "\n0123456789abcdef0123456789abcdef"]) {
+    assert.equal(validCloudflareAccountId(value), false, value);
+  }
+  const provider = registry.providers.find((item) => item.id === "cloudflare-workers-ai");
+  assert.equal(buildProviderEndpoint(provider, { CLOUDFLARE_ACCOUNT_ID: "0123456789abcdef0123456789abcdef" }), "https://api.cloudflare.com/client/v4/accounts/0123456789abcdef0123456789abcdef/ai/v1/chat/completions");
+  assert.throws(() => buildProviderEndpoint(provider, { CLOUDFLARE_ACCOUNT_ID: "bad" }), /FREE_PROVIDER_ACCOUNT_ID_INVALID/);
+  assert.throws(() => buildProviderEndpoint(fixtureProvider("vercel-ai-gateway", { endpoint: "https://evil.example/chat" })), /FREE_PROVIDER_ENDPOINT_UNVERIFIED/);
+  assert.throws(() => buildProviderEndpoint(fixtureProvider("openrouter", { endpoint: "https://evil.example/chat" })), /FREE_PROVIDER_ENDPOINT_UNVERIFIED/);
 });
 
 test("the retired 0x Alpha model cannot be selected by config or diagnostics", () => {
@@ -65,24 +122,64 @@ test("the retired 0x Alpha model cannot be selected by config or diagnostics", (
 });
 
 test("mixed public-private jobs inject free-provider secrets only after public verification", () => {
-  const freeSecrets = /GEMINI_API_KEY_[12]:|OPENROUTER_API_KEY:|NVIDIA_API_KEY:/;
+  const freeSecrets = /GEMINI_API_KEY_[1-6]:|OPENROUTER_API_KEY:|NVIDIA_API_KEY_[12]:|GROQ_API_KEY:|AI_GATEWAY_API_KEY:|CLOUDFLARE_API_TOKEN:|CLOUDFLARE_ACCOUNT_ID:/;
   const deepAnalyze = deepWorkflow.slice(deepWorkflow.indexOf("  analyze:"));
   assert.doesNotMatch(deepAnalyze.slice(0, deepAnalyze.indexOf("    steps:")), freeSecrets);
   assert.match(deepAnalyze, /id:\s*public/);
-  assert.match(deepAnalyze, /GEMINI_API_KEY_1:\s*\$\{\{\s*steps\.public\.outputs\.verified\s*==\s*'true'/);
+  for (const slot of [1, 2, 3, 4, 5, 6]) {
+    assert.match(deepAnalyze, new RegExp(`GEMINI_API_KEY_${slot}:\\s*\\$\\{\\{\\s*steps\\.public\\.outputs\\.verified\\s*==\\s*'true'`));
+  }
+  for (const slot of [1, 2]) {
+    assert.match(deepAnalyze, new RegExp(`NVIDIA_API_KEY_${slot}:\\s*\\$\\{\\{\\s*steps\\.public\\.outputs\\.verified\\s*==\\s*'true'`));
+  }
+  assert.match(deepAnalyze, /FLEET_GROQ_ENABLE:\s*\$\{\{\s*vars\.FLEET_GROQ_ENABLE\s*\}\}/);
+  assert.match(deepAnalyze, /AI_GATEWAY_API_KEY:\s*\$\{\{\s*steps\.public\.outputs\.verified\s*==\s*'true'/);
+  assert.match(deepAnalyze, /CLOUDFLARE_API_TOKEN:\s*\$\{\{\s*steps\.public\.outputs\.verified\s*==\s*'true'/);
+  assert.match(deepAnalyze, /CLOUDFLARE_ACCOUNT_ID:\s*\$\{\{\s*steps\.public\.outputs\.verified\s*==\s*'true'/);
+  assert.match(deepAnalyze, /FLEET_VERCEL_AI_ENABLE:\s*\$\{\{\s*vars\.FLEET_VERCEL_AI_ENABLE\s*\}\}/);
+  assert.match(deepAnalyze, /FLEET_CLOUDFLARE_AI_ENABLE:\s*\$\{\{\s*vars\.FLEET_CLOUDFLARE_AI_ENABLE\s*\}\}/);
+  assert.match(deepAnalyze, /FLEET_OPENROUTER_ENABLE:\s*\$\{\{\s*vars\.FLEET_OPENROUTER_ENABLE\s*\}\}/);
   const improveResearch = improveWorkflow.slice(improveWorkflow.indexOf("  research:"), improveWorkflow.indexOf("  plan:"));
   assert.doesNotMatch(improveResearch.slice(0, improveResearch.indexOf("    steps:")), freeSecrets);
   assert.match(improveResearch, /id:\s*public/);
   assert.match(improveResearch, /OPENROUTER_API_KEY:\s*\$\{\{\s*steps\.public\.outputs\.verified\s*==\s*'true'/);
-  const quotaGroups = /GEMINI_API_KEY_[12]_QUOTA_GROUP:/;
+  for (const slot of [1, 2]) {
+    assert.match(improveResearch, new RegExp(`NVIDIA_API_KEY_${slot}:\\s*\\$\\{\\{\\s*steps\\.public\\.outputs\\.verified\\s*==\\s*'true'`));
+  }
+  assert.match(improveResearch, /FLEET_GROQ_ENABLE:\s*\$\{\{\s*vars\.FLEET_GROQ_ENABLE\s*\}\}/);
+  assert.match(improveResearch, /AI_GATEWAY_API_KEY:\s*\$\{\{\s*steps\.public\.outputs\.verified\s*==\s*'true'/);
+  assert.match(improveResearch, /CLOUDFLARE_API_TOKEN:\s*\$\{\{\s*steps\.public\.outputs\.verified\s*==\s*'true'/);
+  assert.match(improveResearch, /CLOUDFLARE_ACCOUNT_ID:\s*\$\{\{\s*steps\.public\.outputs\.verified\s*==\s*'true'/);
+  assert.match(improveResearch, /FLEET_VERCEL_AI_ENABLE:\s*\$\{\{\s*vars\.FLEET_VERCEL_AI_ENABLE\s*\}\}/);
+  assert.match(improveResearch, /FLEET_CLOUDFLARE_AI_ENABLE:\s*\$\{\{\s*vars\.FLEET_CLOUDFLARE_AI_ENABLE\s*\}\}/);
+  assert.match(improveResearch, /FLEET_OPENROUTER_ENABLE:\s*\$\{\{\s*vars\.FLEET_OPENROUTER_ENABLE\s*\}\}/);
+  const quotaGroups = /GEMINI_API_KEY_[1-6]_QUOTA_GROUP:/;
   assert.doesNotMatch(deepAnalyze.slice(0, deepAnalyze.indexOf("    steps:")), quotaGroups);
   assert.match(deepAnalyze, quotaGroups);
-  assert.match(deepAnalyze, /GEMINI_API_KEY_1_QUOTA_GROUP:\s*\$\{\{\s*steps\.public\.outputs\.verified\s*==\s*'true'\s*&&\s*vars\.GEMINI_API_KEY_1_QUOTA_GROUP\s*\|\|\s*''\s*\}\}/);
-  assert.match(deepAnalyze, /GEMINI_API_KEY_2_QUOTA_GROUP:\s*\$\{\{\s*steps\.public\.outputs\.verified\s*==\s*'true'\s*&&\s*vars\.GEMINI_API_KEY_2_QUOTA_GROUP\s*\|\|\s*''\s*\}\}/);
+  for (const slot of [1, 2, 3, 4, 5, 6]) {
+    assert.match(deepAnalyze, new RegExp(`GEMINI_API_KEY_${slot}_QUOTA_GROUP:\\s*\\$\\{\\{\\s*steps\\.public\\.outputs\\.verified\\s*==\\s*'true'\\s*&&\\s*vars\\.GEMINI_API_KEY_${slot}_QUOTA_GROUP\\s*\\|\\|\\s*''\\s*\\}\\}`));
+  }
   assert.match(improveResearch, quotaGroups);
   assert.doesNotMatch(improveResearch.slice(0, improveResearch.indexOf("    steps:")), quotaGroups);
-  assert.match(improveResearch, /GEMINI_API_KEY_1_QUOTA_GROUP:\s*\$\{\{\s*steps\.public\.outputs\.verified\s*==\s*'true'\s*&&\s*vars\.GEMINI_API_KEY_1_QUOTA_GROUP\s*\|\|\s*''\s*\}\}/);
-  assert.match(improveResearch, /GEMINI_API_KEY_2_QUOTA_GROUP:\s*\$\{\{\s*steps\.public\.outputs\.verified\s*==\s*'true'\s*&&\s*vars\.GEMINI_API_KEY_2_QUOTA_GROUP\s*\|\|\s*''\s*\}\}/);
+  for (const slot of [1, 2, 3, 4, 5, 6]) {
+    assert.match(improveResearch, new RegExp(`GEMINI_API_KEY_${slot}_QUOTA_GROUP:\\s*\\$\\{\\{\\s*steps\\.public\\.outputs\\.verified\\s*==\\s*'true'\\s*&&\\s*vars\\.GEMINI_API_KEY_${slot}_QUOTA_GROUP\\s*\\|\\|\\s*''\\s*\\}\\}`));
+  }
+
+  for (const [name, section] of [
+    ["plan", improveWorkflow.slice(improveWorkflow.indexOf("  plan:"), improveWorkflow.indexOf("  implement:"))],
+    ["review", improveWorkflow.slice(improveWorkflow.indexOf("  review:"), improveWorkflow.indexOf("  finalize:"))],
+  ]) {
+    assert.doesNotMatch(section.slice(0, section.indexOf("    steps:")), freeSecrets, `${name} job scope`);
+    assert.match(section, /id:\s*public/);
+    assert.match(section, /\[\s+-s\s+public-targets\.txt\s*\]\s*\|\|\s*exit\s+0/);
+    assert.match(section, /FLEET_GROQ_ENABLE:\s*\$\{\{\s*vars\.FLEET_GROQ_ENABLE\s*\}\}/, `${name} Groq gate`);
+    for (const key of ["GEMINI_API_KEY_1", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3", "GEMINI_API_KEY_4", "GEMINI_API_KEY_5", "GEMINI_API_KEY_6", "OPENROUTER_API_KEY", "NVIDIA_API_KEY_1", "NVIDIA_API_KEY_2", "GROQ_API_KEY", "AI_GATEWAY_API_KEY", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"]) {
+      assert.match(section, new RegExp(`${key}:\\s*\\$\\{\\{\\s*steps\\.public\\.outputs\\.verified\\s*==\\s*'true'`));
+    }
+    assert.match(section, /FLEET_VERCEL_AI_ENABLE:\s*\$\{\{\s*vars\.FLEET_VERCEL_AI_ENABLE\s*\}\}/);
+    assert.match(section, /FLEET_CLOUDFLARE_AI_ENABLE:\s*\$\{\{\s*vars\.FLEET_CLOUDFLARE_AI_ENABLE\s*\}\}/);
+    assert.match(section, /FLEET_OPENROUTER_ENABLE:\s*\$\{\{\s*vars\.FLEET_OPENROUTER_ENABLE\s*\}\}/);
+  }
 });
 
 test("OAuth is local-only and Gemini API keys are a separate durable backup provider", () => {
@@ -100,11 +197,15 @@ test("OAuth is local-only and Gemini API keys are a separate durable backup prov
   assert.equal(geminiApi.auth?.mode, "api-key");
   assert.equal(geminiApi.auth?.sameProviderRotation, "healthy-round-robin");
   assert.equal(geminiApi.auth?.quotaScope, "credential-group");
-  assert.deepEqual(geminiApi.credentials.map((item) => item.id), ["account-1", "account-2"]);
+  assert.deepEqual(geminiApi.credentials.map((item) => item.id), ["account-1", "account-2", "account-3", "account-4", "account-5", "account-6"]);
   assert.ok(geminiApi.credentials.every((item) => item.targetEnv === "GEMINI_API_KEY"));
   assert.deepEqual(geminiApi.credentials.map((item) => item.quotaGroupEnv), [
     "GEMINI_API_KEY_1_QUOTA_GROUP",
     "GEMINI_API_KEY_2_QUOTA_GROUP",
+    "GEMINI_API_KEY_3_QUOTA_GROUP",
+    "GEMINI_API_KEY_4_QUOTA_GROUP",
+    "GEMINI_API_KEY_5_QUOTA_GROUP",
+    "GEMINI_API_KEY_6_QUOTA_GROUP",
   ]);
   assert.equal(geminiApi.models["gemini-3.7-flash"].free, true);
   const zen = registry.providers.find((item) => item.id === "opencode-zen");
@@ -113,13 +214,47 @@ test("OAuth is local-only and Gemini API keys are a separate durable backup prov
   assert.equal(zen.auth?.quotaScope, "account-wide");
 });
 
+test("six Gemini API slots require distinct declared projects before healthy rotation", () => {
+  const env = { FLEET_ACCOUNT_ROTATION_SEED: "5" };
+  for (let slot = 1; slot <= 6; slot += 1) {
+    env[`GEMINI_API_KEY_${slot}`] = `gemini-fixture-${slot}`;
+    env[`GEMINI_API_KEY_${slot}_QUOTA_GROUP`] = `project-${slot}-fixture`;
+  }
+  const healthy = selectProviderRoute({
+    registry,
+    bucket: "gemini",
+    env,
+    health: { "gemini-api": { status: "healthy", checkedAt: "2026-08-27T00:00:00Z" } },
+    now: Date.parse("2026-08-27T00:10:00Z"),
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+    rotationSeed: "5",
+  });
+  assert.equal(healthy.ok, true);
+  assert.equal(healthy.credential, "account-6");
+  assert.equal(healthy.quotaGroupRotation, true);
+
+  const rateLimited = selectProviderRoute({
+    registry,
+    bucket: "gemini",
+    env,
+    health: { "gemini-api": { status: "rate-limited", checkedAt: "2026-08-27T00:00:00Z" } },
+    now: Date.parse("2026-08-27T00:10:00Z"),
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+    rotationSeed: "5",
+  });
+  assert.equal(rateLimited.ok, false);
+  assert.match(rateLimited.skipped.join(","), /gemini-api:rate-limited/);
+});
+
 test("verified free fallbacks expose documented OpenRouter and NVIDIA routes", () => {
   const openrouter = registry.providers.find((item) => item.id === "openrouter");
   const nvidia = registry.providers.find((item) => item.id === "nvidia-nim");
   assert.ok(openrouter);
   assert.equal(openrouter.verification.status, "verified");
   assert.equal(openrouter.models["openrouter/free"].free, true);
-  assert.equal(openrouter.models["meta-llama/llama-3.2-3b-instruct:free"].free, true);
+  assert.equal(openrouter.models["nvidia/nemotron-3-ultra-550b-a55b:free"].free, true);
   assert.ok(nvidia);
   assert.equal(nvidia.verification.status, "verified");
   assert.equal(nvidia.models["moonshotai/kimi-k3"].free, true);
@@ -129,15 +264,70 @@ test("verified free fallbacks expose documented OpenRouter and NVIDIA routes", (
   assert.ok(nvidia.verification.docs.includes("https://build.nvidia.com/moonshotai/kimi-k3/modelcard"));
   assert.ok(nvidia.verification.docs.includes("https://docs.api.nvidia.com/nim/reference/moonshotai-kimi-k3-infer"));
   assert.equal(nvidia.production?.requiresEnv, "FLEET_NVIDIA_ENABLE");
+  assert.equal(nvidia.auth?.sameProviderRotation, "healthy-round-robin");
+  assert.equal(nvidia.auth?.quotaScope, "account-wide");
+  assert.deepEqual(nvidia.credentials.map((credential) => ({
+    id: credential.id,
+    githubSecret: credential.githubSecret,
+    env: credential.env,
+    targetEnv: credential.targetEnv,
+    quotaGroupEnv: credential.quotaGroupEnv,
+  })), [
+    { id: "account-1", githubSecret: "NVIDIA_API_KEY_1", env: "NVIDIA_API_KEY_1", targetEnv: "NVIDIA_API_KEY", quotaGroupEnv: undefined },
+    { id: "account-2", githubSecret: "NVIDIA_API_KEY_2", env: "NVIDIA_API_KEY_2", targetEnv: "NVIDIA_API_KEY", quotaGroupEnv: undefined },
+  ]);
   assert.deepEqual(
     registry.buckets.other.map((item) => `${item.provider}/${item.model}`),
     [
-      "opencode-zen/claude-opus-4-6",
-      "opencode-zen/claude-opus-4-6",
-      "openrouter/meta-llama/llama-3.2-3b-instruct:free",
+      "antigravity/claude-opus-4-6-thinking",
+      "gemini-api/gemini-3.7-flash",
+      "gemini-api/gemini-3.7-flash",
+      "gemini-api/gemini-3.7-flash",
+      "gemini-api/gemini-3.7-flash",
+      "gemini-api/gemini-3.7-flash",
+      "gemini-api/gemini-3.7-flash",
+      "vercel-ai-gateway/poolside/laguna-s-2.1-free",
+      "cloudflare-workers-ai/@cf/openai/gpt-oss-120b",
+      "cloudflare-workers-ai/@cf/zai-org/glm-4.7-flash",
+      "groq/qwen/qwen3.8-27b",
       "nvidia-nim/moonshotai/kimi-k3",
+      "nvidia-nim/moonshotai/kimi-k3",
+      "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+      "opencode-zen/claude-opus-4-6",
+      "opencode-zen/claude-opus-4-6",
     ],
   );
+  assert.deepEqual(
+    registry.buckets.other.filter((item) => item.provider === "nvidia-nim").map((item) => item.credential),
+    ["account-1", "account-2"],
+  );
+  assert.deepEqual(
+    registry.buckets.public.filter((item) => item.provider === "nvidia-nim").map((item) => item.credential),
+    ["account-1", "account-2"],
+  );
+});
+
+test("verified Groq fallback carries the official Qwen 3.8 27B route and account-wide limits", () => {
+  const groq = registry.providers.find((item) => item.id === "groq");
+  assert.ok(groq);
+  assert.equal(groq.kind, "free-api");
+  assert.equal(groq.enabled, true);
+  assert.equal(groq.free, true);
+  assert.equal(groq.auth?.mode, "api-key");
+  assert.equal(groq.auth?.quotaScope, "account-wide");
+  assert.equal(groq.production?.requiresEnv, "FLEET_GROQ_ENABLE");
+  assert.equal(groq.endpoint, "https://api.groq.com/openai/v1/chat/completions");
+  assert.equal(groq.credentials[0].githubSecret, "GROQ_API_KEY");
+  assert.equal(groq.credentials[0].env, "GROQ_API_KEY");
+  assert.equal(groq.models["qwen/qwen3.8-27b"].free, true);
+  assert.equal(groq.models["qwen/qwen3.8-27b"].availability, "preview");
+  assert.equal(groq.models["qwen/qwen3.8-27b"].contextTokens, 131_042);
+  assert.equal(groq.models["qwen/qwen3.8-27b"].maxOutputTokens, 16_384);
+  assert.deepEqual(groq.rateLimits.freePlan, { rpm: 30, rpd: 1_000, tpm: 8_000, tpd: 2_000_000 });
+  assert.ok(groq.verification.docs.includes("https://console.groq.com/docs/model/qwen/qwen3.8-27b"));
+  assert.ok(groq.verification.docs.includes("https://console.groq.com/docs/openai"));
+  assert.ok(groq.verification.docs.includes("https://console.groq.com/docs/rate-limits"));
+  assert.equal(groq.verification.preview, true);
 });
 
 test("GitHub secret mapping exposes names only and never credential values", () => {
@@ -145,6 +335,7 @@ test("GitHub secret mapping exposes names only and never credential values", () 
   assert.ok(mappings.some((item) => item.githubSecret === "OPENCODE_API_KEY" && item.env === "OPENCODE_API_KEY"));
   assert.ok(mappings.some((item) => item.githubSecret === "GEMINI_API_KEY_1" && item.targetEnv === "GEMINI_API_KEY"));
   assert.ok(mappings.some((item) => item.githubSecret === "GEMINI_API_KEY_2" && item.targetEnv === "GEMINI_API_KEY"));
+  assert.ok(mappings.some((item) => item.githubSecret === "GROQ_API_KEY" && item.env === "GROQ_API_KEY"));
   assert.deepEqual(Object.keys(mappings[0]).sort(), ["credential", "env", "expiresEnv", "githubSecret", "provider", "required", "targetEnv"].sort());
   assert.equal(JSON.stringify(mappings).includes("pk-fixture"), false);
   const resolved = resolveProviderCredentials(fixtureProvider("opencode-zen"), { OPENCODE_API_KEY: "pk-fixture" });
@@ -238,7 +429,7 @@ test("route selection reaches a verified free provider only with a fresh health 
   const route = selectProviderRoute({
     registry,
     bucket: "other",
-    env: { OPENROUTER_API_KEY: "or-fixture" },
+    env: { OPENROUTER_API_KEY: "or-fixture", FLEET_OPENROUTER_ENABLE: "true" },
     health: { openrouter: { status: "healthy", checkedAt: "2026-08-27T00:00:00Z" } },
     dataClass: "public",
     publicTarget: { private: false, visibility: "public" },
@@ -246,13 +437,13 @@ test("route selection reaches a verified free provider only with a fresh health 
   });
   assert.equal(route.ok, true);
   assert.equal(route.provider, "openrouter");
-  assert.equal(route.model, "meta-llama/llama-3.2-3b-instruct:free");
+  assert.equal(route.model, "nvidia/nemotron-3-ultra-550b-a55b:free");
   assert.equal(route.targetEnv, "OPENROUTER_API_KEY");
 
   const stale = selectProviderRoute({
     registry,
     bucket: "other",
-    env: { OPENROUTER_API_KEY: "or-fixture" },
+    env: { OPENROUTER_API_KEY: "or-fixture", FLEET_OPENROUTER_ENABLE: "true" },
     health: { openrouter: { status: "healthy", checkedAt: "2026-08-26T00:00:00Z" } },
     dataClass: "public",
     publicTarget: { private: false, visibility: "public" },
@@ -262,11 +453,87 @@ test("route selection reaches a verified free provider only with a fresh health 
   assert.match(stale.skipped.join(","), /openrouter:stale/);
 });
 
+test("Groq is reachable as a public fallback only with its key and fresh health", () => {
+  const now = Date.parse("2026-08-27T00:10:00Z");
+  const missing = selectProviderRoute({
+    registry,
+    bucket: "other",
+    env: { FLEET_GROQ_ENABLE: "true" },
+    health: { groq: { status: "healthy", checkedAt: "2026-08-27T00:00:00Z" } },
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+    now,
+  });
+  assert.equal(missing.ok, false);
+  assert.match(missing.skipped.join(","), /groq:missing/);
+
+  const route = selectProviderRoute({
+    registry,
+    bucket: "other",
+    model: "groq/qwen/qwen3.8-27b",
+    env: { GROQ_API_KEY: "groq-fixture", FLEET_GROQ_ENABLE: "true" },
+    health: { groq: { status: "healthy", checkedAt: "2026-08-27T00:00:00Z" } },
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+    now,
+  });
+  assert.deepEqual(route, {
+    ok: true,
+    bucket: "other",
+    provider: "groq",
+    model: "qwen/qwen3.8-27b",
+    credential: "default",
+    sourceEnv: "GROQ_API_KEY",
+    targetEnv: "GROQ_API_KEY",
+    free: true,
+    publicOnly: true,
+    modelReference: "groq/qwen/qwen3.8-27b",
+    routeClass: "public-free",
+    health: "fresh",
+  });
+});
+
+test("Groq stays disabled when its explicit enable variable is absent or false", () => {
+  for (const value of [undefined, "false", "0"]) {
+    const env = { GROQ_API_KEY: "groq-fixture", ...(value === undefined ? {} : { FLEET_GROQ_ENABLE: value }) };
+    const route = selectProviderRoute({
+      registry,
+      bucket: "other",
+      model: "groq/qwen/qwen3.8-27b",
+      env,
+      health: { groq: { status: "healthy", checkedAt: "2026-08-27T00:00:00Z" } },
+      dataClass: "public",
+      publicTarget: { private: false, visibility: "public" },
+      now: Date.parse("2026-08-27T00:10:00Z"),
+    });
+    assert.equal(route.ok, false, value || "missing");
+    assert.match(route.skipped.join(","), /groq:gate-disabled/, value || "missing");
+  }
+});
+
+test("Groq account-wide 429 state does not rotate or bypass the provider", () => {
+  const groqOnly = structuredClone(registry);
+  groqOnly.buckets.other = [
+    { provider: "groq", model: "qwen/qwen3.8-27b", credential: "default", priority: 1, free: true, publicOnly: true },
+  ];
+  const route = selectProviderRoute({
+    registry: groqOnly,
+    bucket: "other",
+    env: { GROQ_API_KEY: "groq-fixture" },
+    health: { groq: { status: "rate-limited", checkedAt: "2026-08-27T00:00:00Z" } },
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+    now: Date.parse("2026-08-27T00:10:00Z"),
+  });
+  assert.equal(route.ok, false);
+  assert.match(route.skipped.join(","), /groq:rate-limited/);
+});
+
 test("private and missing-public-target requests skip every public-only fallback", () => {
   const args = {
     registry,
     bucket: "other",
-    env: { OPENROUTER_API_KEY: "or-fixture" },
+    env: { OPENROUTER_API_KEY: "or-fixture", FLEET_OPENROUTER_ENABLE: "true" },
     health: { openrouter: { status: "healthy", checkedAt: "2026-08-27T00:00:00Z" } },
     now: Date.parse("2026-08-27T00:10:00Z"),
   };
@@ -512,9 +779,15 @@ test("healthy Zen credentials rotate deterministically while retaining account-w
 
 test("model selection is registry-backed and Gemini override is exact", () => {
   assert.deepEqual(resolveModelChain({}), [
-    "opencode/claude-opus-4-6",
-    "openrouter/meta-llama/llama-3.2-3b-instruct:free",
+    "antigravity/claude-opus-4-6-thinking",
+    "gemini-api/gemini-3.7-flash",
+    "vercel-ai-gateway/poolside/laguna-s-2.1-free",
+    "cloudflare-workers-ai/@cf/openai/gpt-oss-120b",
+    "cloudflare-workers-ai/@cf/zai-org/glm-4.7-flash",
+    "groq/qwen/qwen3.8-27b",
     "nvidia-nim/moonshotai/kimi-k3",
+    "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+    "opencode/claude-opus-4-6",
   ]);
   assert.deepEqual(resolveModelChain({ FLEET_GEMINI_MODEL: "gemini-3.7-flash-high" }), ["antigravity/gemini-3.7-flash-high"]);
   assert.deepEqual(resolveModelChain({ FLEET_GEMINI_MODEL: "gemini-3.7-flash" }), ["gemini-api/gemini-3.7-flash"]);
@@ -522,10 +795,51 @@ test("model selection is registry-backed and Gemini override is exact", () => {
   assert.deepEqual(resolveModelChain({}, { dataClass: "public", publicTarget: { private: false, visibility: "public" } }), [
     "antigravity/gemini-3.7-flash-high",
     "gemini-api/gemini-3.7-flash",
-    "openrouter/meta-llama/llama-3.2-3b-instruct:free",
+    "vercel-ai-gateway/poolside/laguna-s-2.1-free",
+    "cloudflare-workers-ai/@cf/openai/gpt-oss-120b",
+    "cloudflare-workers-ai/@cf/zai-org/glm-4.7-flash",
+    "groq/qwen/qwen3.8-27b",
     "nvidia-nim/moonshotai/kimi-k3",
+    "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
     "opencode/claude-opus-4-6",
   ]);
+  assert.deepEqual(resolveModelChain({ FLEET_MODEL_BUCKET: "other" }, { dataClass: "public", publicTarget: { private: false, visibility: "public" } }), [
+    "antigravity/gemini-3.7-flash-high",
+    "gemini-api/gemini-3.7-flash",
+    "vercel-ai-gateway/poolside/laguna-s-2.1-free",
+    "cloudflare-workers-ai/@cf/openai/gpt-oss-120b",
+    "cloudflare-workers-ai/@cf/zai-org/glm-4.7-flash",
+    "groq/qwen/qwen3.8-27b",
+    "nvidia-nim/moonshotai/kimi-k3",
+    "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+    "opencode/claude-opus-4-6",
+  ]);
+  assert.deepEqual(resolveModelChain({ FLEET_GEMINI_MODEL: "gemini-3.7-flash-high", GITHUB_ACTIONS: "true" }, { dataClass: "public", publicTarget: { private: false, visibility: "public" } }), [
+    "antigravity/gemini-3.7-flash-high",
+    "gemini-api/gemini-3.7-flash",
+    "vercel-ai-gateway/poolside/laguna-s-2.1-free",
+    "cloudflare-workers-ai/@cf/openai/gpt-oss-120b",
+    "cloudflare-workers-ai/@cf/zai-org/glm-4.7-flash",
+    "groq/qwen/qwen3.8-27b",
+    "nvidia-nim/moonshotai/kimi-k3",
+    "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+    "opencode/claude-opus-4-6",
+  ]);
+  assert.deepEqual(resolveModelChain({ FLEET_MODEL_CHAIN: "opencode/claude-opus-4-6" }, { dataClass: "public", publicTarget: { private: false, visibility: "public" } }), [
+    "antigravity/gemini-3.7-flash-high",
+    "gemini-api/gemini-3.7-flash",
+    "vercel-ai-gateway/poolside/laguna-s-2.1-free",
+    "cloudflare-workers-ai/@cf/openai/gpt-oss-120b",
+    "cloudflare-workers-ai/@cf/zai-org/glm-4.7-flash",
+    "groq/qwen/qwen3.8-27b",
+    "nvidia-nim/moonshotai/kimi-k3",
+    "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+    "opencode/claude-opus-4-6",
+  ]);
+  assert.throws(
+    () => resolveModelChain({ FLEET_MODEL_CHAIN: "opencode/claude-opus-4-6" }, { dataClass: "public", publicTarget: { private: true, visibility: "private" } }),
+    /MODEL_PUBLIC_TARGET_REQUIRED/,
+  );
 });
 
 test("Antigravity adapter is explicit, isolated, and uses documented headless flags", async () => {
@@ -628,7 +942,7 @@ test("free-provider adapters fail closed for private targets and require OpenRou
   let fetches = 0;
   const adapter = createFreeProviderAdapter({
     provider,
-    env: { OPENROUTER_API_KEY: "or-fixture" },
+    env: { OPENROUTER_API_KEY: "or-fixture", FLEET_OPENROUTER_ENABLE: "true" },
     fetchImpl: async (_url, options) => {
       fetches += 1;
       const body = JSON.parse(options.body);
@@ -644,12 +958,32 @@ test("free-provider adapters fail closed for private targets and require OpenRou
   assert.equal(fetches, 0);
   const result = await adapter.invoke({
     prompt: "public",
-    model: "openrouter/free",
+    model: "nvidia/nemotron-3-ultra-550b-a55b:free",
     dataClass: "public",
     publicTarget: { private: false, visibility: "public" },
   });
   assert.equal(result.response, "ok");
   assert.equal(fetches, 1);
+});
+
+test("OpenRouter remains disabled without its explicit gate and does not rotate on 429", () => {
+  const args = {
+    registry,
+    bucket: "other",
+    model: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+    env: { OPENROUTER_API_KEY: "or-fixture" },
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+    now: Date.parse("2026-08-27T00:10:00Z"),
+  };
+  const gated = selectProviderRoute({ ...args, env: { ...args.env, FLEET_OPENROUTER_ENABLE: "true" }, health: { openrouter: { status: "healthy", checkedAt: "2026-08-27T00:00:00Z" } } });
+  assert.equal(gated.ok, true);
+  const disabled = selectProviderRoute({ ...args, health: { openrouter: { status: "healthy", checkedAt: "2026-08-27T00:00:00Z" } } });
+  assert.equal(disabled.ok, false);
+  assert.match(disabled.skipped.join(","), /openrouter:gate-disabled/);
+  const limited = selectProviderRoute({ ...args, env: { ...args.env, FLEET_OPENROUTER_ENABLE: "true" }, health: { openrouter: { status: "rate-limited", checkedAt: "2026-08-27T00:00:00Z" } } });
+  assert.equal(limited.ok, false);
+  assert.match(limited.skipped.join(","), /openrouter:rate-limited/);
 });
 
 test("Gemini API adapter uses the documented model id and high reasoning level", async () => {
@@ -680,7 +1014,7 @@ test("NVIDIA Kimi K3 uses the documented free chat endpoint and exact model id",
   let endpoint;
   const result = await createFreeProviderAdapter({
     provider,
-    env: { NVIDIA_API_KEY: "nv-fixture", FLEET_NVIDIA_ENABLE: "true" },
+    env: { NVIDIA_API_KEY_1: "nv-fixture", FLEET_NVIDIA_ENABLE: "true" },
     fetchImpl: async (url, options) => {
       endpoint = url;
       request = JSON.parse(options.body);
@@ -690,7 +1024,7 @@ test("NVIDIA Kimi K3 uses the documented free chat endpoint and exact model id",
   }).invoke({
     prompt: "public",
     model: "moonshotai/kimi-k3",
-    account: "default",
+    account: "account-1",
     dataClass: "public",
     publicTarget: { private: false, visibility: "public" },
   });
@@ -699,6 +1033,218 @@ test("NVIDIA Kimi K3 uses the documented free chat endpoint and exact model id",
   assert.equal(request.model, "moonshotai/kimi-k3");
   assert.equal(request.stream, false);
   assert.equal(request.reasoning_effort, undefined, "NVIDIA defaults Kimi K3 reasoning effort to max");
+});
+
+test("NVIDIA named slots choose missing/auth-rejected fallback and healthy rotation deterministically", () => {
+  const nvidiaOnly = structuredClone(registry);
+  const refs = [
+    { provider: "nvidia-nim", model: "moonshotai/kimi-k3", credential: "account-1", priority: 1, free: true, publicOnly: true, fallbackOn: ["missing", "expired", "rejected"] },
+    { provider: "nvidia-nim", model: "moonshotai/kimi-k3", credential: "account-2", priority: 2, free: true, publicOnly: true, fallbackOn: ["missing", "expired", "rejected"] },
+  ];
+  nvidiaOnly.buckets.public = refs;
+  const args = {
+    registry: nvidiaOnly,
+    bucket: "public",
+    model: "nvidia-nim/moonshotai/kimi-k3",
+    env: { NVIDIA_API_KEY_1: "nv-one", NVIDIA_API_KEY_2: "nv-two", FLEET_NVIDIA_ENABLE: "true" },
+    health: { "nvidia-nim": { status: "healthy", checkedAt: "2026-08-27T00:00:00Z" } },
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+    now: Date.parse("2026-08-27T00:10:00Z"),
+  };
+  const first = selectProviderRoute({ ...args, rotationSeed: "0" });
+  const second = selectProviderRoute({ ...args, rotationSeed: "1" });
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  assert.equal(first.credential, "account-1");
+  assert.equal(second.credential, "account-2");
+  assert.equal(selectProviderRoute({ ...args, rotationSeed: "1" }).credential, "account-2");
+
+  const missingFirst = selectProviderRoute({
+    ...args,
+    env: { NVIDIA_API_KEY_2: "nv-two", FLEET_NVIDIA_ENABLE: "true" },
+    rotationSeed: "0",
+  });
+  assert.equal(missingFirst.ok, true);
+  assert.equal(missingFirst.credential, "account-2");
+
+  const rejectedFirst = selectProviderRoute({
+    ...args,
+    health: {
+      "nvidia-nim": {
+        status: "healthy",
+        checkedAt: "2026-08-27T00:00:00Z",
+        credentials: { "account-1": { status: "rejected", checkedAt: "2026-08-27T00:00:00Z" } },
+      },
+    },
+  });
+  assert.equal(rejectedFirst.ok, true);
+  assert.equal(rejectedFirst.credential, "account-2");
+});
+
+test("NVIDIA account-wide rate and quota failures never rotate between key slots", () => {
+  const nvidiaOnly = structuredClone(registry);
+  nvidiaOnly.buckets.public = [
+    { provider: "nvidia-nim", model: "moonshotai/kimi-k3", credential: "account-1", priority: 1, free: true, publicOnly: true },
+    { provider: "nvidia-nim", model: "moonshotai/kimi-k3", credential: "account-2", priority: 2, free: true, publicOnly: true },
+  ];
+  const base = {
+    registry: nvidiaOnly,
+    bucket: "public",
+    model: "nvidia-nim/moonshotai/kimi-k3",
+    env: { NVIDIA_API_KEY_1: "nv-one", NVIDIA_API_KEY_2: "nv-two", FLEET_NVIDIA_ENABLE: "true" },
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+    now: Date.parse("2026-08-27T00:10:00Z"),
+    rotationSeed: "1",
+  };
+  for (const status of ["rate-limited", "quota-exhausted"]) {
+    const providerWide = selectProviderRoute({
+      ...base,
+      health: { "nvidia-nim": { status, checkedAt: "2026-08-27T00:00:00Z" } },
+    });
+    assert.equal(providerWide.ok, false, `provider-wide ${status}`);
+    assert.match(providerWide.skipped.join(","), new RegExp(`nvidia-nim:${status}`));
+
+    const accountWide = selectProviderRoute({
+      ...base,
+      health: {
+        "nvidia-nim": {
+          status: "healthy",
+          checkedAt: "2026-08-27T00:00:00Z",
+          credentials: { "account-1": { status, checkedAt: "2026-08-27T00:00:00Z" } },
+        },
+      },
+    });
+    assert.equal(accountWide.ok, false, `account ${status}`);
+    assert.match(accountWide.skipped.join(","), new RegExp(`nvidia-nim:${status}`));
+  }
+});
+
+test("Groq adapter uses the documented OpenAI-compatible endpoint with bounded public requests", async () => {
+  const provider = fixtureProvider("groq");
+  let request;
+  let endpoint;
+  let signal;
+  const result = await createFreeProviderAdapter({
+    provider,
+    env: { GROQ_API_KEY: "groq-fixture", FLEET_GROQ_ENABLE: "true" },
+    fetchImpl: async (url, options) => {
+      endpoint = url;
+      signal = options.signal;
+      request = JSON.parse(options.body);
+      return { ok: true, text: async () => JSON.stringify({ choices: [{ message: { content: "ok" } }] }) };
+    },
+  }).invoke({
+    prompt: "public",
+    model: "qwen/qwen3.8-27b",
+    account: "default",
+    timeoutMs: 1_000_000,
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+  });
+  assert.equal(result.response, "ok");
+  assert.equal(endpoint, "https://api.groq.com/openai/v1/chat/completions");
+  assert.equal(request.model, "qwen/qwen3.8-27b");
+  assert.equal(request.stream, false);
+  assert.equal(request.max_completion_tokens, 1024);
+  assert.deepEqual(request.messages, [{ role: "user", content: "public" }]);
+  assert.equal(signal instanceof AbortSignal, true);
+  assert.equal(JSON.stringify(request).includes("groq-fixture"), false);
+});
+
+test("Vercel AI Gateway uses the exact free model, step-mapped key, and request-level no-training control", async () => {
+  const provider = fixtureProvider("vercel-ai-gateway");
+  let request;
+  let endpoint;
+  const result = await createFreeProviderAdapter({
+    provider,
+    env: { AI_GATEWAY_API_KEY: "vercel-fixture", FLEET_VERCEL_AI_ENABLE: "true" },
+    fetchImpl: async (url, options) => {
+      endpoint = url;
+      request = JSON.parse(options.body);
+      assert.equal(options.headers.authorization, "Bearer vercel-fixture");
+      return { ok: true, text: async () => JSON.stringify({ choices: [{ message: { content: "ok" } }] }) };
+    },
+  }).invoke({
+    prompt: "public",
+    model: "poolside/laguna-s-2.1-free",
+    account: "default",
+    timeoutMs: 1_000_000,
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+  });
+  assert.equal(result.response, "ok");
+  assert.equal(endpoint, "https://ai-gateway.vercel.sh/v1/chat/completions");
+  assert.equal(request.model, "poolside/laguna-s-2.1-free");
+  assert.equal(request.max_completion_tokens, 1024);
+  assert.equal(request.providerOptions.gateway.disallowPromptTraining, true);
+  assert.equal(JSON.stringify(request).includes("vercel-fixture"), false);
+});
+
+test("Cloudflare Workers AI requires a valid account ID before any fetch and bounds both model requests", async () => {
+  const provider = fixtureProvider("cloudflare-workers-ai");
+  let fetches = 0;
+  const adapter = createFreeProviderAdapter({
+    provider,
+    env: { CLOUDFLARE_API_TOKEN: "cf-fixture", FLEET_CLOUDFLARE_AI_ENABLE: "true" },
+    fetchImpl: async () => { fetches += 1; },
+  });
+  await assert.rejects(() => adapter.invoke({ prompt: "public", model: "@cf/openai/gpt-oss-120b", account: "default", dataClass: "public", publicTarget: { private: false, visibility: "public" } }), /FREE_PROVIDER_ACCOUNT_ID_INVALID/);
+  assert.equal(fetches, 0);
+
+  let endpoint;
+  let request;
+  const result = await createFreeProviderAdapter({
+    provider,
+    env: { CLOUDFLARE_API_TOKEN: "cf-fixture", CLOUDFLARE_ACCOUNT_ID: "0123456789abcdef0123456789abcdef", FLEET_CLOUDFLARE_AI_ENABLE: "true" },
+    fetchImpl: async (url, options) => {
+      endpoint = url;
+      request = JSON.parse(options.body);
+      return { ok: true, text: async () => JSON.stringify({ choices: [{ message: { content: "ok" } }] }) };
+    },
+  }).invoke({ prompt: "public", model: "@cf/openai/gpt-oss-120b", account: "default", dataClass: "public", publicTarget: { private: false, visibility: "public" } });
+  assert.equal(result.response, "ok");
+  assert.equal(endpoint, "https://api.cloudflare.com/client/v4/accounts/0123456789abcdef0123456789abcdef/ai/v1/chat/completions");
+  assert.equal(request.model, "@cf/openai/gpt-oss-120b");
+  assert.equal(request.max_completion_tokens, 512);
+  assert.equal(fetches, 0);
+});
+
+test("Groq adapter fails closed for private targets and missing credentials", async () => {
+  const provider = fixtureProvider("groq");
+  let fetches = 0;
+  const adapter = createFreeProviderAdapter({ provider, env: { FLEET_GROQ_ENABLE: "true" }, fetchImpl: async () => { fetches += 1; } });
+  await assert.rejects(
+    () => adapter.invoke({ prompt: "private", model: "qwen/qwen3.8-27b", dataClass: "private" }),
+    /FREE_PROVIDER_PUBLIC_TARGET_REQUIRED/,
+  );
+  await assert.rejects(
+    () => adapter.invoke({ prompt: "public", model: "qwen/qwen3.8-27b", dataClass: "public", publicTarget: { private: false, visibility: "public" } }),
+    /FREE_PROVIDER_CREDENTIAL_MISSING/,
+  );
+  assert.equal(fetches, 0);
+});
+
+test("Groq adapter rejects an oversized conservative budget before fetching", async () => {
+  const provider = fixtureProvider("groq");
+  let fetches = 0;
+  const adapter = createFreeProviderAdapter({
+    provider,
+    env: { GROQ_API_KEY: "groq-fixture", FLEET_GROQ_ENABLE: "true" },
+    fetchImpl: async () => { fetches += 1; },
+  });
+  await assert.rejects(
+    () => adapter.invoke({
+      prompt: "x".repeat(6_000),
+      model: "qwen/qwen3.8-27b",
+      account: "default",
+      dataClass: "public",
+      publicTarget: { private: false, visibility: "public" },
+    }),
+    /FREE_PROVIDER_PROMPT_BUDGET_EXCEEDED/,
+  );
+  assert.equal(fetches, 0);
 });
 
 test("model update metadata is digest-bound and rollback records are bounded and secretless", () => {

@@ -32,18 +32,24 @@ import {
   redactText,
   revisionCountForTarget,
 } from "./lib/pr-memory.mjs";
-import { compareJudgeProgress, planNoProgressResearch } from "./lib/revision-progress.mjs";
+import { buildJudgeProgressTelemetry, compareJudgeProgress, planNoProgressResearch } from "./lib/revision-progress.mjs";
 import {
   dispatchResearchWorkflow,
   readResearchEvents,
   requestResearchEscalation,
 } from "./lib/research-state.mjs";
 import {
+  emitCommentTelemetry,
   findPublicCommentFingerprint,
   listPublicComments,
   publicCommentFingerprint,
   withPublicCommentFingerprint,
 } from "./lib/public-comment.mjs";
+import {
+  isTelemetryValidationError,
+  recordTelemetryEvent,
+  telemetryPath,
+} from "./lib/telemetry.mjs";
 import {
   appendMemoryEntry,
   appendUniversalEntry,
@@ -269,6 +275,93 @@ const DISPATCH_SUMMARIES = {
   DISPATCH_HELD: "targeted merge gate dispatch completed and held for a new head",
 };
 
+function telemetryWorkflowRunId(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return "workflow";
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/.test(text)
+    ? text
+    : `workflow-${sha256(text).slice(0, 16)}`;
+}
+
+function workflowTelemetryOutcome(state, terminalState = "") {
+  const terminal = String(terminalState || "").toUpperCase();
+  if (/FAILED|UNKNOWN|VERIFY|REJECTED|ERROR/.test(terminal)) return { outcome: "failed", conclusion: "failure" };
+  if (state === "DISPATCH_HELD") return { outcome: "held", conclusion: "skipped" };
+  if (state === "DISPATCH_RELEASED") return { outcome: "succeeded", conclusion: "success" };
+  if (state === "DISPATCH_FAILED") return { outcome: "failed", conclusion: "failure" };
+  if (state === "DISPATCH_UNKNOWN") return { outcome: "unknown", conclusion: "unknown" };
+  if (state === "DISPATCH_CONSUMED") return { outcome: "started", conclusion: "unknown" };
+  if (state === "DISPATCHED") return { outcome: "succeeded", conclusion: "unknown" };
+  return { outcome: "started", conclusion: "unknown" };
+}
+
+/** Build a correlation-bound workflow lifecycle envelope without payload text. */
+export function buildWorkflowTelemetry({
+  target,
+  dispatchKey = "",
+  runId,
+  state,
+  terminalState = "",
+  workflowName = "merge",
+  job = "merge",
+} = {}) {
+  const normalized = normalizeTargetInput(target);
+  if (!normalized.ok) throw new Error("TELEMETRY_WORKFLOW_TARGET_INVALID");
+  const safeKey = String(dispatchKey || "").trim().toLowerCase();
+  const identity = `${normalized.repo}|${normalized.pr}|${normalized.headSha}|${safeKey}`;
+  const result = workflowTelemetryOutcome(state, terminalState);
+  const phase = state === "DISPATCH_CONSUMED" ? "start" : ["DISPATCH_RELEASED", "DISPATCH_HELD"].includes(state) ? "outcome" : "dispatch";
+  const safeName = String(workflowName || "merge").trim().toLowerCase();
+  const safeJob = String(job || "merge").trim().toLowerCase();
+  return {
+    runId: telemetryWorkflowRunId(runId),
+    correlationId: `corr-${sha256(`workflow|${identity}`).slice(0, 32)}`,
+    lane: "merge",
+    event: "workflow",
+    phase,
+    outcome: result.outcome,
+    repo: normalized.repo,
+    pr: normalized.pr,
+    headSha: normalized.headSha,
+    workflow: {
+      name: /^[a-z0-9][a-z0-9._-]{0,31}$/.test(safeName) ? safeName : "merge",
+      runId: telemetryWorkflowRunId(runId),
+      job: /^[a-z0-9][a-z0-9._-]{0,31}$/.test(safeJob) ? safeJob : "merge",
+      conclusion: result.conclusion,
+    },
+  };
+}
+
+function emitWorkflowTelemetry(stateRoot, event) {
+  if (!stateRoot) return null;
+  try {
+    return recordTelemetryEvent(telemetryPath(path.resolve(String(stateRoot))), event);
+  } catch (error) {
+    if (isTelemetryValidationError(error)) throw error;
+    return null;
+  }
+}
+
+/** Persist one bounded judge-progress decision from the live merge path. */
+export function recordJudgeProgressTelemetry({
+  stateRoot = STATE_ROOT,
+  runId,
+  target,
+  previous,
+  current,
+  lens = "unknown",
+  hold = false,
+} = {}) {
+  if (!stateRoot) return null;
+  const event = buildJudgeProgressTelemetry({ runId, target, previous, current, lens, hold });
+  try {
+    return recordTelemetryEvent(telemetryPath(path.resolve(String(stateRoot))), event);
+  } catch (error) {
+    if (isTelemetryValidationError(error)) throw error;
+    return null;
+  }
+}
+
 function dispatchKeyReference(dispatchKey) {
   return `dispatch-key:${dispatchKey}`;
 }
@@ -371,6 +464,12 @@ export async function dispatchTarget(
       }));
       const outcome = await persistState(state);
       if (outcome === "no-changes") throw new Error("dispatch event was not committed");
+      emitWorkflowTelemetry(root, buildWorkflowTelemetry({
+        target: normalized,
+        dispatchKey,
+        runId,
+        state,
+      }));
       return result && result.event ? result.event : result;
     } catch (error) {
       const failure = new Error(`STATE_PERSISTENCE_FAILED ${bounded(error.message, 200)}`);
@@ -460,6 +559,12 @@ export async function consumeDispatch(
     });
     const outcome = await persistState("DISPATCH_CONSUMED");
     if (outcome === "no-changes") throw new Error("dispatch consumed event was not committed");
+    emitWorkflowTelemetry(root, buildWorkflowTelemetry({
+      target: normalized,
+      dispatchKey,
+      runId,
+      state: "DISPATCH_CONSUMED",
+    }));
     return { consumed: true, event: result && result.event ? result.event : result };
   } catch (error) {
     const failure = new Error(`STATE_PERSISTENCE_FAILED ${bounded(error.message, 200)}`);
@@ -519,6 +624,13 @@ export function completeDispatch(
         : safeCommitState(root, ["state"], `[fleet] dispatch ${normalized.repo}#${normalized.pr} ${state}`, identity, process.env);
       if (outcome === "no-changes") throw new Error("dispatch terminal event was not committed");
     }
+    emitWorkflowTelemetry(root, buildWorkflowTelemetry({
+      target: normalized,
+      dispatchKey,
+      runId,
+      state,
+      terminalState,
+    }));
     return { completed: true, event: result && result.event ? result.event : result };
   } catch (error) {
     const failure = new Error(`STATE_PERSISTENCE_FAILED ${bounded(error.message, 200)}`);
@@ -1040,6 +1152,10 @@ async function postComment(repo, number, body, audit, identity, {
   existingComments,
   claimFingerprint,
   env = process.env,
+  telemetry,
+  telemetryFile,
+  runId = process.env.FLEET_RUN_ID || "comment",
+  correlationId,
 } = {}) {
   const safeBody = sanitizeCommentBody(body, MAX_COMMENT_CHARS);
   const fingerprint = publicCommentFingerprint({ kind, repo, pr: number, headSha, body: safeBody });
@@ -1063,21 +1179,34 @@ async function postComment(repo, number, body, audit, identity, {
   });
   if (existingMatch) {
     audit?.note?.("comment", `#${bounded(number, 20)} deduped ${fingerprint.slice(0, 20)}`);
+    emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "verify", outcome: "deduped", action: "existing" });
     if (existingMatch.id) await verifyCommentAuthor(repo, existingMatch.id, identity, env.FLEET_GH_TOKEN);
+    emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "verify", outcome: "succeeded", action: "verified" });
     return { ...existingMatch, deduped: true, fingerprint };
   }
-  if (typeof claimFingerprint === "function" && await claimFingerprint(fingerprint) !== true) {
-    audit?.note?.("comment", `#${bounded(number, 20)} durable claim deduped ${fingerprint.slice(0, 20)}`);
-    return { deduped: true, durableClaim: true, fingerprint };
+  if (typeof claimFingerprint === "function") {
+    const claimed = await claimFingerprint(fingerprint);
+    if (claimed !== true) {
+      emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "claim", outcome: "deduped", action: "claim_lost" });
+      return { deduped: true, durableClaim: true, fingerprint };
+    }
+    emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "claim", outcome: "succeeded", action: "claimed" });
   }
-  const markedBody = withPublicCommentFingerprint(safeBody, { kind, fingerprint });
-  const comment = gh([
-    "api", "-X", "POST", `/repos/${repo}/issues/${number}/comments`, "-F", `body=${markedBody}`,
-  ], env);
-  if (!comment || !comment.id) throw new Error("comment response missing id");
-  await verifyCommentAuthor(repo, comment.id, identity, env.FLEET_GH_TOKEN);
-  audit.note("comment", `#${bounded(number, 20)} posted`);
-  return { ...comment, fingerprint };
+  try {
+    const markedBody = withPublicCommentFingerprint(safeBody, { kind, fingerprint });
+    const comment = gh([
+      "api", "-X", "POST", `/repos/${repo}/issues/${number}/comments`, "-F", `body=${markedBody}`,
+    ], env);
+    if (!comment || !comment.id) throw new Error("comment response missing id");
+    emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "post", outcome: "succeeded", action: "posted" });
+    await verifyCommentAuthor(repo, comment.id, identity, env.FLEET_GH_TOKEN);
+    emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "verify", outcome: "succeeded", action: "verified" });
+    audit.note("comment", `#${bounded(number, 20)} posted`);
+    return { ...comment, fingerprint };
+  } catch (error) {
+    emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "post", outcome: "unknown", action: "posted" });
+    throw error;
+  }
 }
 
 /** Public judge comments mirror private state; failures remain bounded audit evidence. */
@@ -1094,6 +1223,10 @@ export async function attemptJudgeMirror({
   claimFingerprint,
   kind = "judge",
   env = process.env,
+  telemetry,
+  telemetryFile,
+  runId = env.FLEET_RUN_ID || "comment",
+  correlationId,
 } = {}) {
   const safeBody = sanitizeCommentBody(body, MAX_COMMENT_CHARS);
   const fingerprint = publicCommentFingerprint({ kind, repo, pr: number, headSha, body: safeBody });
@@ -1111,12 +1244,19 @@ export async function attemptJudgeMirror({
     });
     if (existingMatch) {
       audit?.note?.("judge-mirror", `public mirror deduped ${fingerprint.slice(0, 20)}`);
+      emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "verify", outcome: "deduped", action: "existing" });
       if (existingMatch.id) await verifyCommentAuthor(repo, existingMatch.id, identity, env.FLEET_GH_TOKEN);
+      emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "verify", outcome: "succeeded", action: "verified" });
       return { ok: true, deduped: true, fingerprint, comment: existingMatch };
     }
-    if (typeof claimFingerprint === "function" && await claimFingerprint(fingerprint) !== true) {
-      audit?.note?.("judge-mirror", `durable claim deduped ${fingerprint.slice(0, 20)}`);
-      return { ok: true, deduped: true, durableClaim: true, fingerprint };
+    if (typeof claimFingerprint === "function") {
+      const claimed = await claimFingerprint(fingerprint);
+      if (claimed !== true) {
+        emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "claim", outcome: "deduped", action: "claim_lost" });
+        audit?.note?.("judge-mirror", `durable claim deduped ${fingerprint.slice(0, 20)}`);
+        return { ok: true, deduped: true, durableClaim: true, fingerprint };
+      }
+      emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "claim", outcome: "succeeded", action: "claimed" });
     }
     const markedBody = withPublicCommentFingerprint(safeBody, { kind, fingerprint });
     await post(repo, number, markedBody, audit, identity, {
@@ -1126,9 +1266,16 @@ export async function attemptJudgeMirror({
       env,
       listComments,
       existingComments: comments,
+      telemetry,
+      telemetryFile,
+      runId,
+      correlationId,
     });
+    emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "post", outcome: "succeeded", action: "posted" });
+    emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "verify", outcome: "succeeded", action: "verified" });
     return { ok: true, fingerprint };
   } catch (error) {
+    emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "post", outcome: "unknown", action: "posted" });
     audit?.incident?.("judge-mirror", `public mirror failed for ${bounded(repo, MAX_REPO_CHARS)}#${bounded(number, 20)}: ${bounded(error.message, 180)}`);
     return { ok: false, reason: bounded(error.message, 180) };
   }
@@ -1758,6 +1905,19 @@ export async function main(env = process.env) {
       const judgeScores = judgeScoreMetadata(correctness, standards, threshold, targetCheckSucceeded);
       const reviewNotes = judgeReviewNotes([correctness, standards]);
       if (correctness.infrastructureFailure === true || standards.infrastructureFailure === true) {
+        recordJudgeProgressTelemetry({
+          stateRoot: STATE_ROOT,
+          runId,
+          target,
+          previous: priorJudge,
+          current: {
+            state: "JUDGE_UNAVAILABLE",
+            infrastructureFailure: true,
+            headSha: target.headSha,
+            judgeScores,
+            blockerIds: [],
+          },
+        });
         persistMergeMemoryEvent(
           target,
           runId,
@@ -1779,6 +1939,20 @@ export async function main(env = process.env) {
       blockers = [...correctness.blockers, ...standards.blockers].slice(0, 8);
       allBlockers = targetCheckSucceeded ? blockers : ["deterministic target checks did not report exact success", ...blockers];
       const judgeState = approved ? "JUDGE_APPROVED" : "JUDGE_REJECTED";
+      const currentJudge = {
+        state: judgeState,
+        headSha: target.headSha,
+        judgeScores,
+        blockerIds: allBlockers.map(blockerIdentifier),
+        verdict: approved ? "approve" : "reject",
+      };
+      recordJudgeProgressTelemetry({
+        stateRoot: STATE_ROOT,
+        runId,
+        target,
+        previous: priorJudge,
+        current: currentJudge,
+      });
       const verdictBody = buildJudgeComment({
         correctness,
         standards,
@@ -1817,15 +1991,19 @@ export async function main(env = process.env) {
           evidenceAvailable: true,
           judgeResults: [correctness, standards],
           previousJudge: priorJudge,
-          currentJudge: {
-            headSha: target.headSha,
-            judgeScores,
-            blockerIds: allBlockers.map(blockerIdentifier),
-          },
+          currentJudge,
           revisionAttempts,
           maxRevisions,
         });
         if (disposition.state === "NO_PROGRESS") {
+          recordJudgeProgressTelemetry({
+            stateRoot: STATE_ROOT,
+            runId,
+            target,
+            previous: priorJudge,
+            current: currentJudge,
+            hold: true,
+          });
           persistMergeMemoryEvent(
             target,
             runId,

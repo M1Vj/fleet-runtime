@@ -1,8 +1,41 @@
 import { createHash } from "node:crypto";
+import { recordTelemetryEvent } from "./telemetry.mjs";
 
 const FINGERPRINT_RE = /^comment-[a-f0-9]{64}$/i;
 const MARKER_RE = /<!--\s*fleet-pr-memory:\s*([a-z0-9_-]{1,32})(?:\s+(comment-[a-f0-9]{64}))?\s*-->/gi;
 const MAX_BODY_CHARS = 6000;
+
+/** Emit one redacted comment state without accepting public body text. */
+export function emitCommentTelemetry({
+  telemetry,
+  telemetryFile,
+  runId,
+  correlationId,
+  lane = "merge",
+  repo,
+  pr,
+  headSha,
+  fingerprint,
+  phase,
+  outcome,
+  action,
+} = {}) {
+  const event = {
+    runId,
+    correlationId,
+    lane,
+    event: "comment",
+    phase,
+    outcome,
+    repo,
+    pr,
+    headSha,
+    comment: { fingerprint, action },
+  };
+  if (typeof telemetry === "function") return telemetry(event);
+  if (telemetryFile) return recordTelemetryEvent(telemetryFile, event);
+  return null;
+}
 
 function sha256(value) {
   return createHash("sha256").update(String(value), "utf8").digest("hex");

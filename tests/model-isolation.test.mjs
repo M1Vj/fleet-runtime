@@ -1,11 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { askModel, assertDisposableModelWorkspace, createDisposableModelWorkspace, PUBLIC_READ_MODEL_POLICY, recordRouteFailure, runOnce } from "../scripts/lib/model.mjs";
+import { readProviderHealthState } from "../scripts/lib/provider-health-state.mjs";
+import { readTelemetryEvents } from "../scripts/lib/telemetry.mjs";
 
 test("model workspace is disposable, outside private state, and deny-all", () => {
   const repo = mkdtempSync(path.join(tmpdir(), "fleet-model-repo-"));
@@ -249,8 +251,9 @@ test("selected Zen and direct fallback routes use provider-specific execution", 
       env: {
         FLEET_OPENCODE_AUTH: "auth-fixture",
         OPENCODE_API_KEY: "pk-fixture",
-        FLEET_MODEL_CHAIN: "opencode/claude-opus-4-6,openrouter/meta-llama/llama-3.2-3b-instruct:free",
+        FLEET_MODEL_CHAIN: "opencode/claude-opus-4-6,openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
         OPENROUTER_API_KEY: "or-fixture",
+        FLEET_OPENROUTER_ENABLE: "true",
         FLEET_STATE_ROOT: state,
       },
       repoRoot: repo,
@@ -264,8 +267,10 @@ test("selected Zen and direct fallback routes use provider-specific execution", 
       fetchImpl: async () => ({ ok: true, text: async () => JSON.stringify({ choices: [{ message: { content: "ok" } }] }) }),
     });
     assert.equal(result.complete, true);
-    assert.equal(result.modelMode, "openrouter/meta-llama/llama-3.2-3b-instruct:free");
-    assert.deepEqual(calls.map((args) => args.slice(args.indexOf("-m"), args.indexOf("-m") + 2)), [["-m", "opencode/claude-opus-4-6"]]);
+    assert.equal(result.modelMode, "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free");
+    assert.deepEqual(calls, [], "public repository variables cannot put paid Zen ahead of the governed free-first ladder");
+    const providerEvents = readTelemetryEvents(state).filter((event) => event.event === "provider");
+    assert.ok(providerEvents.some((event) => event.phase === "selected" && event.provider?.name === "openrouter"));
 
     calls.length = 0;
     invocation = 0;
@@ -290,10 +295,88 @@ test("selected Zen and direct fallback routes use provider-specific execution", 
         });
         return child;
       },
+      dataClass: "public",
+      publicTarget: { private: false, visibility: "public" },
     });
     assert.equal(override.complete, true);
     assert.equal(override.modelMode, "opencode/claude-opus-4-6@max");
     assert.deepEqual(calls.map((args) => args.slice(args.indexOf("-m"), args.indexOf("-m") + 2)), [["-m", "opencode/claude-opus-4-6"]]);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("public model overrides still require a verified public target", async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), "fleet-model-public-override-repo-"));
+  const state = mkdtempSync(path.join(tmpdir(), "fleet-model-public-override-state-"));
+  try {
+    await assert.rejects(
+      () => askModel({
+        prompt: "private target must not use a public override",
+        timeoutMs: 1000,
+        env: { OPENCODE_API_KEY: "zen-fixture", FLEET_STATE_ROOT: state },
+        repoRoot: repo,
+        stateRoot: state,
+        modelOverride: "opencode/claude-opus-4-6",
+        dataClass: "public",
+        publicTarget: { private: true, visibility: "private" },
+        skipCircuitCheck: true,
+        maxRounds: 1,
+      }),
+      /MODEL_PUBLIC_TARGET_REQUIRED/,
+    );
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("provider-health lock contention does not abort fallback to final paid Zen", async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), "fleet-model-busy-fallback-repo-"));
+  const state = mkdtempSync(path.join(tmpdir(), "fleet-model-busy-fallback-state-"));
+  const lock = path.join(state, "state", "provider-health.json.lock");
+  const captured = [];
+  const now = Date.parse("2026-08-29T02:00:00.000Z");
+  const spawnImpl = (_command, args) => {
+    captured.push([...args]);
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => {};
+    queueMicrotask(() => {
+      child.stdout.emit("data", Buffer.from('{"text":"zen fallback"}\n'));
+      child.emit("close", 0);
+    });
+    return child;
+  };
+  try {
+    mkdirSync(path.dirname(lock), { recursive: true, mode: 0o700 });
+    mkdirSync(lock, { mode: 0o700 });
+    const result = await askModel({
+      prompt: "fallback after a public provider limit",
+      timeoutMs: 1000,
+      env: {
+        FLEET_MODEL_CHAIN: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free,opencode/claude-opus-4-6",
+        OPENROUTER_API_KEY: "or-fixture",
+        FLEET_OPENROUTER_ENABLE: "true",
+        OPENCODE_API_KEY: "zen-fixture",
+        FLEET_STATE_ROOT: state,
+      },
+      repoRoot: repo,
+      stateRoot: state,
+      skipCircuitCheck: true,
+      maxRounds: 1,
+      dataClass: "public",
+      publicTarget: { private: false, visibility: "public" },
+      providerHealth: { openrouter: { status: "healthy", checkedAt: new Date(now).toISOString() } },
+      now,
+      fetchImpl: async () => ({ ok: false, status: 429, text: async () => "rate limited" }),
+      spawnImpl,
+    });
+    assert.equal(result.complete, true);
+    assert.equal(result.modelMode, "opencode/claude-opus-4-6");
+    assert.equal(captured.length, 1);
   } finally {
     rmSync(repo, { recursive: true, force: true });
     rmSync(state, { recursive: true, force: true });
@@ -309,8 +392,9 @@ test("a public direct route uses its first bounded request as the live health ca
       prompt: "inspect this public repository",
       timeoutMs: 1000,
       env: {
-        FLEET_MODEL_CHAIN: "openrouter/meta-llama/llama-3.2-3b-instruct:free",
+        FLEET_MODEL_CHAIN: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
         OPENROUTER_API_KEY: "or-fixture",
+        FLEET_OPENROUTER_ENABLE: "true",
         FLEET_STATE_ROOT: state,
       },
       repoRoot: repo,
@@ -324,8 +408,83 @@ test("a public direct route uses its first bounded request as the live health ca
       },
     });
     assert.equal(result.complete, true);
-    assert.equal(result.modelMode, "openrouter/meta-llama/llama-3.2-3b-instruct:free");
+    assert.equal(result.modelMode, "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free");
     assert.equal(fetches, 1, "the task request is the canary; no quota-wasting preflight call");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("a provider-wide 429 cooldown survives a later model call through private state", async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), "fleet-model-durable-cooldown-repo-"));
+  const state = mkdtempSync(path.join(tmpdir(), "fleet-model-durable-cooldown-state-"));
+  let fetches = 0;
+  const now = Date.parse("2026-08-29T02:00:00.000Z");
+  const options = {
+    prompt: "inspect this public repository",
+    timeoutMs: 1000,
+    env: {
+      FLEET_MODEL_CHAIN: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+      OPENROUTER_API_KEY: "or-fixture",
+      FLEET_OPENROUTER_ENABLE: "true",
+      FLEET_STATE_ROOT: state,
+      FLEET_RUN_ID: "durable-cooldown-run",
+    },
+    repoRoot: repo,
+    stateRoot: state,
+    skipCircuitCheck: true,
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+    providerHealth: { openrouter: { status: "healthy", checkedAt: new Date(now).toISOString() } },
+    now,
+    fetchImpl: async () => {
+      fetches += 1;
+      return { ok: false, status: 429, text: async () => "rate limited" };
+    },
+  };
+  try {
+    const first = await askModel(options);
+    assert.equal(first.complete, false);
+    assert.equal(first.authState, "rate-limited");
+    assert.equal(readProviderHealthState(state, { now }).openrouter.status, "rate-limited");
+    const second = await askModel(options);
+    assert.equal(second.complete, false);
+    assert.equal(fetches, 1, "the later call must load the durable cooldown and skip the provider");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("distinct same-shaped model calls retain distinct provider telemetry", async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), "fleet-model-invocation-telemetry-repo-"));
+  const state = mkdtempSync(path.join(tmpdir(), "fleet-model-invocation-telemetry-state-"));
+  const options = {
+    prompt: "inspect this public repository",
+    timeoutMs: 1000,
+    env: {
+      FLEET_MODEL_CHAIN: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+      OPENROUTER_API_KEY: "or-fixture",
+      FLEET_OPENROUTER_ENABLE: "true",
+      FLEET_STATE_ROOT: state,
+      FLEET_RUN_ID: "same-shaped-calls",
+    },
+    repoRoot: repo,
+    stateRoot: state,
+    skipCircuitCheck: true,
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+    providerHealth: { openrouter: { status: "healthy", checkedAt: new Date().toISOString() } },
+    fetchImpl: async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ choices: [{ message: { content: "ok" } }] }) }),
+  };
+  try {
+    await askModel(options);
+    await askModel(options);
+    const selected = readTelemetryEvents(state).filter((event) => event.event === "provider" && event.phase === "selected");
+    assert.equal(selected.length, 2);
+    assert.equal(new Set(selected.map((event) => event.invocationId)).size, 2);
+    assert.equal(new Set(selected.map((event) => event.correlationId)).size, 2);
   } finally {
     rmSync(repo, { recursive: true, force: true });
     rmSync(state, { recursive: true, force: true });
@@ -519,6 +678,9 @@ test("local Gemini override invokes the gated Antigravity adapter without an API
     assert.equal(captured[0].env.HOME, "/tmp/fleet-home-fixture");
     assert.equal(captured[0].env.GEMINI_API_KEY, undefined);
     assert.equal(captured[0].args.at(-1), "--sandbox");
+    const providerEvents = readTelemetryEvents(state).filter((event) => event.event === "provider");
+    assert.ok(providerEvents.length >= 2);
+    assert.ok(providerEvents.every((event) => event.provider.routeClass === "local"));
   } finally {
     rmSync(repo, { recursive: true, force: true });
     rmSync(state, { recursive: true, force: true });

@@ -63,7 +63,7 @@ test("auth classification ignores reply-derived text and reads CLI stderr only",
     const result = await askModel({
       prompt: "judge",
       timeoutMs: 1000,
-      env: { OPENCODE_API_KEY: "pk-fixture", FLEET_STATE_ROOT: state },
+      env: { OPENCODE_API_KEY: "pk-fixture", FLEET_MODEL_CHAIN: "opencode/claude-opus-4-6", FLEET_STATE_ROOT: state },
       repoRoot: repo,
       stateRoot: state,
       skipCircuitCheck: true,

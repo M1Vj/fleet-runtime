@@ -91,9 +91,11 @@ function parseFindings(reply) {
 }
 
 export async function analyzeOne(repo, kind, prepared, audit) {
+  const prompt = buildPromptFor({ repo, kind, hasSource: Boolean(prepared?.workspace) });
+  const freshMeta = prepared?.meta ? requireFreshPublicDeepTarget(repo) : null;
   const result = await askModel({
-    prompt: buildPromptFor({ repo, kind, hasSource: Boolean(prepared) }),
-    ...(prepared ? { workspace: prepared.workspace, profile: "public-read", dataClass: "public", publicTarget: prepared.meta } : {}),
+    prompt,
+    ...(freshMeta ? publicDeepModelOptions(freshMeta, prepared?.workspace ? { workspace: prepared.workspace, profile: "public-read" } : {}) : {}),
     timeoutMs: 540000,
     env: process.env,
     preferVariantMax: true,
@@ -118,6 +120,21 @@ function buildPromptFor(task) {
   return buildPrompt(task);
 }
 
+export function publicDeepModelOptions(meta, extra = {}) {
+  if (!meta || meta.private !== false || meta.visibility !== "public") {
+    throw new Error("DEEP_PUBLIC_TARGET_REQUIRED");
+  }
+  return { ...extra, dataClass: "public", publicTarget: meta };
+}
+
+export function requireFreshPublicDeepTarget(repo, { ghImpl = gh } = {}) {
+  const meta = ghImpl(["api", `/repos/${repo}`], process.env);
+  if (!meta || meta.full_name !== repo || meta.private !== false || meta.visibility !== "public") {
+    throw Object.assign(new Error("DEEP_PUBLIC_TARGET_REJECTED"), { code: 4 });
+  }
+  return meta;
+}
+
 async function mainWorker() {
   const runId = `deep-${process.env.FLEET_WORKER_IDX || 0}-${Date.now()}`;
   const audit = new AuditBuffer(scrub(process.env));
@@ -128,7 +145,7 @@ async function mainWorker() {
   const kind = process.env.FLEET_KIND;
   audit.note("task", `${repo} ${kind}`);
   const meta = gh(["api", `/repos/${repo}`], process.env);
-  const publicVerified = Boolean(meta) && meta.private === false && meta.visibility === "public";
+  const publicVerified = Boolean(meta) && meta.full_name === repo && meta.private === false && meta.visibility === "public";
   let prepared;
   if (publicVerified) {
     try {
@@ -136,7 +153,7 @@ async function mainWorker() {
       audit.note("workspace", `public-read source mount for ${repo}`);
     } catch (error) {
       audit.note("workspace", `public mount unavailable for ${repo} (${String(error.message || error).slice(0, 80)}); falling back to prompt-only`);
-      prepared = undefined;
+      prepared = { meta };
     }
   } else {
     audit.note("workspace", `${repo} is not verified public; prompt-only deny-all analysis`);
@@ -156,7 +173,7 @@ async function mainWorker() {
     }
     throw err;
   } finally {
-    if (prepared) disposeModelWorkspace(prepared.workspace);
+    if (prepared?.workspace) disposeModelWorkspace(prepared.workspace);
   }
   const outPath = path.join(process.env.FLEET_ARTIFACT_DIR || ".", `report-${repo.replace("/", "__")}.json`);
   writeFileSync(outPath, JSON.stringify({ repo, kind, ...analysis, finishedUtc: new Date().toISOString() }, null, 2));
@@ -235,6 +252,8 @@ async function mainCommit() {
   audit.note("reports", `written=${processed}`);
   makeTerminal(REPO_ROOT)("SUCCESS", { runId, reportsCommitted: processed });
   const commitPaths = ["state/queue.jsonl", "docs/reports"];
+  if (existsSync(path.join(REPO_ROOT, "state", "provider-health.json"))) commitPaths.push("state/provider-health.json");
+  if (existsSync(path.join(REPO_ROOT, "state", "telemetry.jsonl"))) commitPaths.push("state/telemetry.jsonl");
   if (existsSync(path.join(REPO_ROOT, "state", "memory"))) commitPaths.push("state/memory");
   if (gitHasChanges(REPO_ROOT, commitPaths)) {
     gitAdd(REPO_ROOT, commitPaths);
@@ -249,9 +268,11 @@ async function mainCommit() {
   return 0;
 }
 
-const mode = process.env.FLEET_DEEP_MODE;
-if (mode === "commit") {
-  process.exit(await mainCommit());
-} else {
-  process.exit(await mainWorker());
+if (process.argv[1] && import.meta.url.endsWith(path.basename(process.argv[1]))) {
+  const mode = process.env.FLEET_DEEP_MODE;
+  if (mode === "commit") {
+    process.exit(await mainCommit());
+  } else {
+    process.exit(await mainWorker());
+  }
 }

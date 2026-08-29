@@ -22,7 +22,34 @@ import { gh, ghInput, safeCommitState, scrub, sha256 } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
 import { verifyCommentAuthor, verifyMergePullAuthor, verifyPullAuthor } from "./lib/verify.mjs";
-import { appendMemoryEvent, containsSecretLike, normalizeAuditRunId, readMemoryEvents, redactText, revisionCountForTarget } from "./lib/pr-memory.mjs";
+import {
+  appendMemoryEvent,
+  claimCommentFingerprint,
+  containsSecretLike,
+  findLatestPriorJudgeEvent,
+  normalizeAuditRunId,
+  readMemoryEvents,
+  redactText,
+  revisionCountForTarget,
+} from "./lib/pr-memory.mjs";
+import { buildJudgeProgressTelemetry, compareJudgeProgress, planNoProgressResearch } from "./lib/revision-progress.mjs";
+import {
+  dispatchResearchWorkflow,
+  readResearchEvents,
+  requestResearchEscalation,
+} from "./lib/research-state.mjs";
+import {
+  emitCommentTelemetry,
+  findPublicCommentFingerprint,
+  listPublicComments,
+  publicCommentFingerprint,
+  withPublicCommentFingerprint,
+} from "./lib/public-comment.mjs";
+import {
+  isTelemetryValidationError,
+  recordTelemetryEvent,
+  telemetryPath,
+} from "./lib/telemetry.mjs";
 import {
   appendMemoryEntry,
   appendUniversalEntry,
@@ -90,7 +117,7 @@ function stateRootOrThrow() {
 
 // --- Fleet persistent memory (best-effort; failures never fail the lane) ---
 
-const UNIVERSAL_MEMORY_STATES = new Set(["BLOCKED", "STALLED", "EXHAUSTED"]);
+const UNIVERSAL_MEMORY_STATES = new Set(["BLOCKED", "STALLED", "EXHAUSTED", "NO_PROGRESS"]);
 
 /** Load a repo memory page as a bounded untrusted prompt block; "" when absent. */
 export function loadFleetMemoryPromptBlock(repo, { stateRoot = STATE_ROOT } = {}) {
@@ -236,7 +263,7 @@ const OUTSTANDING_DISPATCH_STATES = new Set([
   "DISPATCH_HELD",
 ]);
 const COMPLETED_DISPATCH_STATES = new Set(["DISPATCH_RELEASED", "DISPATCH_HELD"]);
-const DISPATCH_HELD_TERMINAL_STATES = new Set(["BLOCKED", "MERGE_UNKNOWN", "MERGE_VERIFY_FAILED", "READY_REQUIRED", "APPROVED_NO_MERGE", "REVISION_QUEUED"]);
+const DISPATCH_HELD_TERMINAL_STATES = new Set(["BLOCKED", "NO_PROGRESS", "MERGE_UNKNOWN", "MERGE_VERIFY_FAILED", "READY_REQUIRED", "APPROVED_NO_MERGE", "REVISION_QUEUED"]);
 const DEFINITIVE_DISPATCH_FAILURE_STATUSES = new Set([400, 401, 403, 404, 405, 410, 422]);
 const DISPATCH_SUMMARIES = {
   DISPATCH_INTENT: "targeted merge gate dispatch intent persisted",
@@ -247,6 +274,93 @@ const DISPATCH_SUMMARIES = {
   DISPATCH_RELEASED: "targeted merge gate dispatch completed and released",
   DISPATCH_HELD: "targeted merge gate dispatch completed and held for a new head",
 };
+
+function telemetryWorkflowRunId(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return "workflow";
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/.test(text)
+    ? text
+    : `workflow-${sha256(text).slice(0, 16)}`;
+}
+
+function workflowTelemetryOutcome(state, terminalState = "") {
+  const terminal = String(terminalState || "").toUpperCase();
+  if (/FAILED|UNKNOWN|VERIFY|REJECTED|ERROR/.test(terminal)) return { outcome: "failed", conclusion: "failure" };
+  if (state === "DISPATCH_HELD") return { outcome: "held", conclusion: "skipped" };
+  if (state === "DISPATCH_RELEASED") return { outcome: "succeeded", conclusion: "success" };
+  if (state === "DISPATCH_FAILED") return { outcome: "failed", conclusion: "failure" };
+  if (state === "DISPATCH_UNKNOWN") return { outcome: "unknown", conclusion: "unknown" };
+  if (state === "DISPATCH_CONSUMED") return { outcome: "started", conclusion: "unknown" };
+  if (state === "DISPATCHED") return { outcome: "succeeded", conclusion: "unknown" };
+  return { outcome: "started", conclusion: "unknown" };
+}
+
+/** Build a correlation-bound workflow lifecycle envelope without payload text. */
+export function buildWorkflowTelemetry({
+  target,
+  dispatchKey = "",
+  runId,
+  state,
+  terminalState = "",
+  workflowName = "merge",
+  job = "merge",
+} = {}) {
+  const normalized = normalizeTargetInput(target);
+  if (!normalized.ok) throw new Error("TELEMETRY_WORKFLOW_TARGET_INVALID");
+  const safeKey = String(dispatchKey || "").trim().toLowerCase();
+  const identity = `${normalized.repo}|${normalized.pr}|${normalized.headSha}|${safeKey}`;
+  const result = workflowTelemetryOutcome(state, terminalState);
+  const phase = state === "DISPATCH_CONSUMED" ? "start" : ["DISPATCH_RELEASED", "DISPATCH_HELD"].includes(state) ? "outcome" : "dispatch";
+  const safeName = String(workflowName || "merge").trim().toLowerCase();
+  const safeJob = String(job || "merge").trim().toLowerCase();
+  return {
+    runId: telemetryWorkflowRunId(runId),
+    correlationId: `corr-${sha256(`workflow|${identity}`).slice(0, 32)}`,
+    lane: "merge",
+    event: "workflow",
+    phase,
+    outcome: result.outcome,
+    repo: normalized.repo,
+    pr: normalized.pr,
+    headSha: normalized.headSha,
+    workflow: {
+      name: /^[a-z0-9][a-z0-9._-]{0,31}$/.test(safeName) ? safeName : "merge",
+      runId: telemetryWorkflowRunId(runId),
+      job: /^[a-z0-9][a-z0-9._-]{0,31}$/.test(safeJob) ? safeJob : "merge",
+      conclusion: result.conclusion,
+    },
+  };
+}
+
+function emitWorkflowTelemetry(stateRoot, event) {
+  if (!stateRoot) return null;
+  try {
+    return recordTelemetryEvent(telemetryPath(path.resolve(String(stateRoot))), event);
+  } catch (error) {
+    if (isTelemetryValidationError(error)) throw error;
+    return null;
+  }
+}
+
+/** Persist one bounded judge-progress decision from the live merge path. */
+export function recordJudgeProgressTelemetry({
+  stateRoot = STATE_ROOT,
+  runId,
+  target,
+  previous,
+  current,
+  lens = "unknown",
+  hold = false,
+} = {}) {
+  if (!stateRoot) return null;
+  const event = buildJudgeProgressTelemetry({ runId, target, previous, current, lens, hold });
+  try {
+    return recordTelemetryEvent(telemetryPath(path.resolve(String(stateRoot))), event);
+  } catch (error) {
+    if (isTelemetryValidationError(error)) throw error;
+    return null;
+  }
+}
 
 function dispatchKeyReference(dispatchKey) {
   return `dispatch-key:${dispatchKey}`;
@@ -350,6 +464,12 @@ export async function dispatchTarget(
       }));
       const outcome = await persistState(state);
       if (outcome === "no-changes") throw new Error("dispatch event was not committed");
+      emitWorkflowTelemetry(root, buildWorkflowTelemetry({
+        target: normalized,
+        dispatchKey,
+        runId,
+        state,
+      }));
       return result && result.event ? result.event : result;
     } catch (error) {
       const failure = new Error(`STATE_PERSISTENCE_FAILED ${bounded(error.message, 200)}`);
@@ -439,6 +559,12 @@ export async function consumeDispatch(
     });
     const outcome = await persistState("DISPATCH_CONSUMED");
     if (outcome === "no-changes") throw new Error("dispatch consumed event was not committed");
+    emitWorkflowTelemetry(root, buildWorkflowTelemetry({
+      target: normalized,
+      dispatchKey,
+      runId,
+      state: "DISPATCH_CONSUMED",
+    }));
     return { consumed: true, event: result && result.event ? result.event : result };
   } catch (error) {
     const failure = new Error(`STATE_PERSISTENCE_FAILED ${bounded(error.message, 200)}`);
@@ -498,6 +624,13 @@ export function completeDispatch(
         : safeCommitState(root, ["state"], `[fleet] dispatch ${normalized.repo}#${normalized.pr} ${state}`, identity, process.env);
       if (outcome === "no-changes") throw new Error("dispatch terminal event was not committed");
     }
+    emitWorkflowTelemetry(root, buildWorkflowTelemetry({
+      target: normalized,
+      dispatchKey,
+      runId,
+      state,
+      terminalState,
+    }));
     return { completed: true, event: result && result.event ? result.event : result };
   } catch (error) {
     const failure = new Error(`STATE_PERSISTENCE_FAILED ${bounded(error.message, 200)}`);
@@ -572,7 +705,7 @@ function persistMergeMemoryEvent(target, runId, attempt, state, details, identit
       pr: target.pr,
       headSha: target.headSha,
       attempt,
-      kind: "judge",
+      kind: details.kind || "judge",
       state,
       summary: details.summary,
       changedPaths: details.changedPaths || [],
@@ -580,6 +713,7 @@ function persistMergeMemoryEvent(target, runId, attempt, state, details, identit
       reviewNotes: details.reviewNotes || [],
       judgeScores: details.judgeScores,
       judgeStatus: details.judgeStatus,
+      commentFingerprint: details.commentFingerprint,
       artifactRefs: details.artifactRefs || [],
     });
     // Best-effort fleet-memory page upsert: written BEFORE the state commit so
@@ -618,6 +752,46 @@ function persistMergeMemoryEvent(target, runId, attempt, state, details, identit
   return event;
 }
 
+function claimMergeComment(target, runId, fingerprint, identity, audit) {
+  const memoryFile = path.join(stateRootOrThrow(), "state", "pr-memory.jsonl");
+  let claim;
+  try {
+    claim = claimCommentFingerprint(memoryFile, {
+      runId,
+      lane: "merge",
+      repo: target.repo,
+      pr: target.pr,
+      headSha: target.headSha,
+      commentFingerprint: fingerprint,
+    });
+    if (!claim.claimed) return false;
+    const outcome = safeCommitState(
+      STATE_ROOT,
+      ["state"],
+      `[fleet] comment claim ${target.repo}#${target.pr}`,
+      identity,
+      process.env,
+    );
+    if (outcome === "no-changes") throw new Error("comment claim was not committed");
+    audit?.note?.("comment-claim", fingerprint.slice(0, 20));
+    return true;
+  } catch (error) {
+    const failure = new Error(`STATE_PERSISTENCE_FAILED ${bounded(error.message, 200)}`);
+    failure.code = 7;
+    throw failure;
+  }
+}
+
+function listIssueComments(repo, number, env = process.env) {
+  return listPublicComments({
+    repo,
+    pr: number,
+    listPage: (targetRepo, targetPr, page, pageSize) => gh([
+      "api", `/repos/${targetRepo}/issues/${targetPr}/comments?per_page=${pageSize}&page=${page}`,
+    ], env),
+  });
+}
+
 const COMPLETED_JUDGE_STATES = new Set(["JUDGE_APPROVED", "JUDGE_REJECTED"]);
 
 /** Return the latest completed judge event for this exact PR head. */
@@ -631,6 +805,101 @@ export function findCompletedJudgeEvent(events, target) {
       && Number(event.pr) === normalized.pr
       && String(event.headSha || "").toLowerCase() === normalized.headSha)
     .at(-1) || null;
+}
+
+function targetEventMatches(event, target) {
+  return Boolean(event
+    && String(event.repo || "").toLowerCase() === String(target.repo || "").toLowerCase()
+    && Number(event.pr) === target.pr
+    && String(event.headSha || "").toLowerCase() === target.headSha);
+}
+
+function eventTime(value) {
+  const parsed = Date.parse(String(value || ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function researchCorrelationFromNoProgress(event) {
+  const refs = Array.isArray(event?.artifactRefs) ? event.artifactRefs : [];
+  return refs
+    .map((value) => String(value || "").trim().toLowerCase())
+    .map((value) => value.match(/^research-correlation:(research-[a-f0-9]{32})$/)?.[1] || "")
+    .find(Boolean) || "";
+}
+
+function researchCorrelationForHold(memory, noProgress) {
+  const source = Array.isArray(memory) ? memory : [];
+  const holdIndex = source.lastIndexOf(noProgress);
+  const holdAt = eventTime(noProgress?.createdAt);
+  const requestEvent = source
+    .map((event, index) => ({ event, index }))
+    .filter(({ event, index }) => event?.state === "RESEARCH_REQUESTED"
+      && targetEventMatches(event, noProgress)
+      && (holdIndex < 0 || index > holdIndex)
+      && (!holdAt || eventTime(event.createdAt) === null || eventTime(event.createdAt) >= holdAt))
+    .map(({ event }) => event)
+    .at(-1);
+  if (requestEvent) return { correlationId: researchCorrelationFromNoProgress(requestEvent), requestEvent };
+  const direct = researchCorrelationFromNoProgress(noProgress);
+  return { correlationId: direct, requestEvent: null };
+}
+
+/**
+ * Decide whether a same-head NO_PROGRESS hold may be released once. The
+ * release requires a newer, exact-target RESEARCH_COMPLETED event carrying
+ * the correlation recorded on the hold. A private consumption event makes the
+ * release idempotent; public judge mirrors are never part of this path.
+ */
+export function researchContinuationDisposition({
+  memoryEvents = [],
+  researchEvents = [],
+  target,
+  latestJudge,
+  revisionAttempts = 0,
+  maxRevisions = 2,
+} = {}) {
+  const normalized = normalizeTargetInput(target);
+  if (!normalized.ok) return { ready: false, reason: "invalid-target" };
+  const memory = Array.isArray(memoryEvents) ? memoryEvents : [];
+  const noProgress = memory
+    .filter((event) => event?.state === "NO_PROGRESS" && targetEventMatches(event, normalized))
+    .at(-1);
+  if (!noProgress) return { ready: false, reason: "no-progress-hold" };
+  if (latestJudge && latestJudge.state !== "JUDGE_REJECTED") {
+    return { ready: false, reason: "latest-judge-not-rejected", noProgress };
+  }
+  const correlation = researchCorrelationForHold(memory, noProgress);
+  const correlationId = correlation.correlationId;
+  if (!correlationId) return { ready: false, reason: "research-correlation-missing", noProgress };
+  const consumedRef = `research-correlation:${correlationId}`;
+  if (memory.some((event) => event?.state === "RESEARCH_CONTINUATION_CONSUMED"
+    && targetEventMatches(event, normalized)
+    && Array.isArray(event.artifactRefs)
+    && event.artifactRefs.includes(consumedRef))) {
+    return { ready: false, reason: "research-continuation-consumed", correlationId, noProgress, requestEvent: correlation.requestEvent };
+  }
+  if (Number(revisionAttempts) >= Number(maxRevisions)) {
+    return { ready: false, reason: "revision-cap-reached", correlationId, noProgress, requestEvent: correlation.requestEvent };
+  }
+  const noProgressAt = eventTime(noProgress.createdAt);
+  const completed = (Array.isArray(researchEvents) ? researchEvents : [])
+    .filter((event) => event?.state === "RESEARCH_COMPLETED"
+      && event.correlationId === correlationId
+      && targetEventMatches(event, normalized))
+    .at(-1);
+  if (!completed) return { ready: false, reason: "research-completion-missing", correlationId, noProgress, requestEvent: correlation.requestEvent };
+  const completedAt = eventTime(completed.createdAt);
+  if (noProgressAt === null || completedAt === null || completedAt <= noProgressAt) {
+    return { ready: false, reason: "research-completion-not-newer", correlationId, noProgress, completed, requestEvent: correlation.requestEvent };
+  }
+  return {
+    ready: true,
+    reason: "research-completion-ready",
+    correlationId,
+    noProgress,
+    requestEvent: correlation.requestEvent,
+    completed,
+  };
 }
 
 function judgeReviewNotes(results = []) {
@@ -659,6 +928,51 @@ function persistRevisionIntent(target, runId, attempt, blockerIds, identity, aud
     identity,
     audit,
   );
+}
+
+/** Consume one completed research correlation and queue one revision attempt. */
+export function queueResearchContinuationRevision({
+  target,
+  continuation,
+  runId,
+  revisionAttempts = 0,
+  identity,
+  audit,
+  env = process.env,
+  persistMemory = persistMergeMemoryEvent,
+  persistIntent = persistRevisionIntent,
+  writeOutput = writeRevisionOutput,
+} = {}) {
+  if (!continuation?.ready || !continuation.correlationId) {
+    return { queued: false, reason: continuation?.reason || "research-continuation-not-ready" };
+  }
+  const attempt = Number(revisionAttempts) + 1;
+  const blockers = Array.isArray(continuation.noProgress?.blockerIds)
+    ? continuation.noProgress.blockerIds
+    : [];
+  const artifactRef = `research-correlation:${continuation.correlationId}`;
+  persistMemory(
+    target,
+    runId,
+    attempt,
+    "RESEARCH_CONTINUATION_CONSUMED",
+    {
+      kind: "research",
+      summary: "newer exact-head research completion released one no-progress hold",
+      blockerIds: blockers,
+      artifactRefs: [artifactRef],
+    },
+    identity,
+    audit,
+  );
+  persistIntent(target, runId, attempt, blockers, identity, audit);
+  writeOutput(env);
+  return {
+    queued: true,
+    state: "REVISION_QUEUED",
+    attempt,
+    correlationId: continuation.correlationId,
+  };
 }
 
 function bestEffortPostConsumptionFailure({ audit, runId, identity, targetRepo, targetPr, headSha, dispatchKey, error }) {
@@ -831,22 +1145,137 @@ export function releaseSetupFailedDispatch(
   return { released: Boolean(completion.completed), event: completion.event };
 }
 
-async function postComment(repo, number, body, audit, identity) {
-  const comment = gh([
-    "api", "-X", "POST", `/repos/${repo}/issues/${number}/comments`, "-F", `body=${sanitizeCommentBody(body, MAX_COMMENT_CHARS)}`,
-  ], process.env);
-  if (!comment || !comment.id) throw new Error("comment response missing id");
-  await verifyCommentAuthor(repo, comment.id, identity, process.env.FLEET_GH_TOKEN);
-  audit.note("comment", `#${bounded(number, 20)} posted`);
-  return comment;
+async function postComment(repo, number, body, audit, identity, {
+  kind = "gate",
+  headSha = "",
+  listComments,
+  existingComments,
+  claimFingerprint,
+  env = process.env,
+  telemetry,
+  telemetryFile,
+  runId = process.env.FLEET_RUN_ID || "comment",
+  correlationId,
+} = {}) {
+  const safeBody = sanitizeCommentBody(body, MAX_COMMENT_CHARS);
+  const fingerprint = publicCommentFingerprint({ kind, repo, pr: number, headSha, body: safeBody });
+  let comments = existingComments;
+  try {
+    if (comments === undefined) {
+      const list = listComments || ((targetRepo, targetPr) => listIssueComments(targetRepo, targetPr, env));
+      comments = typeof list === "function" ? await list(repo, number) : [];
+    }
+  } catch (error) {
+    throw new Error(`COMMENT_IDEMPOTENCY_CHECK_FAILED ${bounded(error.message, 180)}`);
+  }
+  const existingMatch = findPublicCommentFingerprint(comments, {
+    kind,
+    repo,
+    pr: number,
+    headSha,
+    body: safeBody,
+    fingerprint,
+    authorLogin: identity?.login,
+  });
+  if (existingMatch) {
+    audit?.note?.("comment", `#${bounded(number, 20)} deduped ${fingerprint.slice(0, 20)}`);
+    emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "verify", outcome: "deduped", action: "existing" });
+    if (existingMatch.id) await verifyCommentAuthor(repo, existingMatch.id, identity, env.FLEET_GH_TOKEN);
+    emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "verify", outcome: "succeeded", action: "verified" });
+    return { ...existingMatch, deduped: true, fingerprint };
+  }
+  if (typeof claimFingerprint === "function") {
+    const claimed = await claimFingerprint(fingerprint);
+    if (claimed !== true) {
+      emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "claim", outcome: "deduped", action: "claim_lost" });
+      return { deduped: true, durableClaim: true, fingerprint };
+    }
+    emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "claim", outcome: "succeeded", action: "claimed" });
+  }
+  try {
+    const markedBody = withPublicCommentFingerprint(safeBody, { kind, fingerprint });
+    const comment = gh([
+      "api", "-X", "POST", `/repos/${repo}/issues/${number}/comments`, "-F", `body=${markedBody}`,
+    ], env);
+    if (!comment || !comment.id) throw new Error("comment response missing id");
+    emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "post", outcome: "succeeded", action: "posted" });
+    await verifyCommentAuthor(repo, comment.id, identity, env.FLEET_GH_TOKEN);
+    emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "verify", outcome: "succeeded", action: "verified" });
+    audit.note("comment", `#${bounded(number, 20)} posted`);
+    return { ...comment, fingerprint };
+  } catch (error) {
+    emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "post", outcome: "unknown", action: "posted" });
+    throw error;
+  }
 }
 
 /** Public judge comments mirror private state; failures remain bounded audit evidence. */
-export async function attemptJudgeMirror({ repo, number, body, audit, identity, post = postComment } = {}) {
+export async function attemptJudgeMirror({
+  repo,
+  number,
+  headSha = "",
+  body,
+  audit,
+  identity,
+  post = postComment,
+  listComments,
+  existingComments,
+  claimFingerprint,
+  kind = "judge",
+  env = process.env,
+  telemetry,
+  telemetryFile,
+  runId = env.FLEET_RUN_ID || "comment",
+  correlationId,
+} = {}) {
+  const safeBody = sanitizeCommentBody(body, MAX_COMMENT_CHARS);
+  const fingerprint = publicCommentFingerprint({ kind, repo, pr: number, headSha, body: safeBody });
   try {
-    await post(repo, number, body, audit, identity);
-    return { ok: true };
+    let comments = existingComments;
+    if (comments === undefined && typeof listComments === "function") comments = await listComments(repo, number);
+    const existingMatch = findPublicCommentFingerprint(comments, {
+      kind,
+      repo,
+      pr: number,
+      headSha,
+      body: safeBody,
+      fingerprint,
+      authorLogin: identity?.login,
+    });
+    if (existingMatch) {
+      audit?.note?.("judge-mirror", `public mirror deduped ${fingerprint.slice(0, 20)}`);
+      emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "verify", outcome: "deduped", action: "existing" });
+      if (existingMatch.id) await verifyCommentAuthor(repo, existingMatch.id, identity, env.FLEET_GH_TOKEN);
+      emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "verify", outcome: "succeeded", action: "verified" });
+      return { ok: true, deduped: true, fingerprint, comment: existingMatch };
+    }
+    if (typeof claimFingerprint === "function") {
+      const claimed = await claimFingerprint(fingerprint);
+      if (claimed !== true) {
+        emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "claim", outcome: "deduped", action: "claim_lost" });
+        audit?.note?.("judge-mirror", `durable claim deduped ${fingerprint.slice(0, 20)}`);
+        return { ok: true, deduped: true, durableClaim: true, fingerprint };
+      }
+      emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "claim", outcome: "succeeded", action: "claimed" });
+    }
+    const markedBody = withPublicCommentFingerprint(safeBody, { kind, fingerprint });
+    await post(repo, number, markedBody, audit, identity, {
+      kind,
+      headSha,
+      fingerprint,
+      env,
+      listComments,
+      existingComments: comments,
+      telemetry,
+      telemetryFile,
+      runId,
+      correlationId,
+    });
+    emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "post", outcome: "succeeded", action: "posted" });
+    emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "verify", outcome: "succeeded", action: "verified" });
+    return { ok: true, fingerprint };
   } catch (error) {
+    emitCommentTelemetry({ telemetry, telemetryFile, runId, correlationId, repo, pr: number, headSha, fingerprint, phase: "post", outcome: "unknown", action: "posted" });
     audit?.incident?.("judge-mirror", `public mirror failed for ${bounded(repo, MAX_REPO_CHARS)}#${bounded(number, 20)}: ${bounded(error.message, 180)}`);
     return { ok: false, reason: bounded(error.message, 180) };
   }
@@ -1049,6 +1478,8 @@ export function revisionDisposition({
   revisionAllowed,
   evidenceAvailable,
   judgeResults = [],
+  previousJudge,
+  currentJudge,
   revisionAttempts = 0,
   maxRevisions = 2,
 } = {}) {
@@ -1061,6 +1492,19 @@ export function revisionDisposition({
   if (fleetAuthored && revisionAllowed && Number(revisionAttempts) >= Number(maxRevisions)) {
     return { revisionNeeded: false, state: "BLOCKED", why: "revision cap reached" };
   }
+  if (previousJudge && currentJudge) {
+    const progress = compareJudgeProgress(previousJudge, currentJudge);
+    if (!progress.progress) {
+      return {
+        revisionNeeded: false,
+        state: "NO_PROGRESS",
+        why: progress.exactRepeat
+          ? "judge score and blocker IDs repeated at the new head"
+          : "judge result did not improve the minimum score or eliminate a blocker",
+        comparison: progress,
+      };
+    }
+  }
   return {
     revisionNeeded: Boolean(fleetAuthored && revisionAllowed),
     state: fleetAuthored && revisionAllowed ? "REVISION_QUEUED" : "BLOCKED",
@@ -1068,10 +1512,77 @@ export function revisionDisposition({
   };
 }
 
+/** Persist one bounded research request after a repeated/regressed revision. */
+async function persistNoProgressResearchRequest(target, runId, attempt, previousJudge, currentJudge, identity, audit, env = process.env) {
+  let planned;
+  try {
+    const memoryFile = path.join(stateRootOrThrow(), "state", "pr-memory.jsonl");
+    planned = planNoProgressResearch({
+      events: readMemoryEvents(memoryFile),
+      target,
+      previous: previousJudge,
+      current: currentJudge,
+    });
+    if (!planned.request || !planned.event) return planned;
+    const researchFailure = planned.failure || {
+      ...planned.fingerprint,
+      hard: true,
+      diagnosisConfidence: "low",
+    };
+    const request = await requestResearchEscalation({
+      stateRoot: STATE_ROOT,
+      runId: `${bounded(runId, MAX_RUN_CHARS)}-research`,
+      repo: target.repo,
+      pr: target.pr,
+      headSha: target.headSha,
+      failure: researchFailure,
+      persist: ({ event }) => {
+        const outcome = safeCommitState(
+          STATE_ROOT,
+          ["state"],
+          `[fleet] research ${event.state} ${target.repo}#${target.pr}`,
+          identity,
+          env,
+        );
+        if (outcome === "no-changes") throw new Error("research state event was not committed");
+        return outcome;
+      },
+      dispatch: (payload) => dispatchResearchWorkflow(payload, { env }),
+    });
+    const result = appendMemoryEvent(memoryFile, {
+      runId,
+      lane: "merge",
+      repo: target.repo,
+      pr: target.pr,
+      headSha: target.headSha,
+      attempt,
+      kind: "research",
+      state: "RESEARCH_REQUESTED",
+      summary: "bounded research requested after judge no progress",
+      blockerIds: currentJudge.blockerIds || [],
+      artifactRefs: [`research-correlation:${request.event?.correlationId || planned.event.correlationId}`],
+    });
+    const outcome = safeCommitState(
+      STATE_ROOT,
+      ["state"],
+      `[fleet] research no-progress ${target.repo}#${target.pr}`,
+      identity,
+      process.env,
+    );
+    if (result.appended && outcome === "no-changes") throw new Error("research event was not committed");
+    audit?.note?.("research", `no-progress research ${request.dispatched ? "dispatched" : "requested"}`);
+    return { ...request, memoryEvent: result.event };
+  } catch (error) {
+    audit?.incident?.("research", `no-progress research request skipped: ${bounded(error.message, 180)}`);
+    return { request: false, reason: "persistence-failed" };
+  }
+}
+
 /** Reuse an exact-head rejection without re-judging or reposting public comments. */
 export function recoverRejectedJudge({
   target,
   existingJudge,
+  memoryEvents = [],
   fleetAuthored,
   revisionAllowed,
   evidenceAvailable,
@@ -1083,6 +1594,21 @@ export function recoverRejectedJudge({
   writeOutput = writeRevisionOutput,
   env = process.env,
 } = {}) {
+  const repeatedNoProgress = (Array.isArray(memoryEvents) ? memoryEvents : []).some((event) => (
+    event
+    && event.state === "NO_PROGRESS"
+    && event.repo === target?.repo
+    && Number(event.pr) === Number(target?.pr)
+    && String(event.headSha || "").toLowerCase() === String(target?.headSha || "").toLowerCase()
+  ));
+  if (repeatedNoProgress) {
+    return {
+      revisionNeeded: false,
+      state: "NO_PROGRESS",
+      why: "same-head revision already recorded no progress",
+      publicComment: false,
+    };
+  }
   const scores = existingJudge && existingJudge.judgeScores;
   const priorResult = {
     verdict: "reject",
@@ -1285,17 +1811,46 @@ export async function main(env = process.env) {
     const maxRevisions = normalizeMaxRevisions(env.FLEET_MAX_REVISIONS, 2);
     const threshold = cls.depth >= 3 ? 95 : cls.depth >= 2 ? 90 : 80;
     const existingJudge = findCompletedJudgeEvent(memoryEvents, target);
+    const priorJudge = findLatestPriorJudgeEvent(memoryEvents, target);
+    let researchEvents = [];
+    try {
+      researchEvents = readResearchEvents(path.join(STATE_ROOT, "state", "research.jsonl"));
+    } catch (error) {
+      // A malformed research ledger must fail closed: the no-progress hold stays
+      // in place and no public or revision action is inferred from it.
+      audit.incident("research", `research continuation unavailable: ${bounded(error.message, 180)}`);
+    }
+    const researchContinuation = researchContinuationDisposition({
+      memoryEvents,
+      researchEvents,
+      target,
+      latestJudge: existingJudge,
+      revisionAttempts,
+      maxRevisions,
+    });
 
     if (!evidence.available) {
       const disposition = evidenceUnavailableDisposition();
       return targetTerminal(disposition.state, { why: disposition.why });
     }
     if (secretHits.length > 0) {
-      await postComment(target.repo, target.pr, "🛑 **fleet merge-gate**: potential secrets detected in the patch. Human review is required; no revision or merge is attempted.", audit, identity);
+      await postComment(target.repo, target.pr, "🛑 **fleet merge-gate**: potential secrets detected in the patch. Human review is required; no revision or merge is attempted.", audit, identity, {
+        kind: "secret-gate",
+        headSha: target.headSha,
+        env,
+        listComments: (repo, number) => listIssueComments(repo, number, env),
+        claimFingerprint: (fingerprint) => claimMergeComment(target, runId, fingerprint, identity, audit),
+      });
       return targetTerminal("BLOCKED", { why: "secrets in diff" });
     }
     if (cls.humanOnly) {
-      await postComment(target.repo, target.pr, `🧑‍⚖️ **fleet merge-gate**: human review required.\n\n${cls.reasons.map((reason) => `- ${reason}`).join("\n")}`, audit, identity);
+      await postComment(target.repo, target.pr, `🧑‍⚖️ **fleet merge-gate**: human review required.\n\n${cls.reasons.map((reason) => `- ${reason}`).join("\n")}`, audit, identity, {
+        kind: "human-gate",
+        headSha: target.headSha,
+        env,
+        listComments: (repo, number) => listIssueComments(repo, number, env),
+        claimFingerprint: (fingerprint) => claimMergeComment(target, runId, fingerprint, identity, audit),
+      });
       return targetTerminal("BLOCKED", { why: "human-only policy" });
     }
 
@@ -1304,6 +1859,20 @@ export async function main(env = process.env) {
     let allBlockers = [];
     let correctness;
     let standards;
+    if (researchContinuation.ready && fleetAuthored && cls.revisionAllowed) {
+      const queued = queueResearchContinuationRevision({
+        target,
+        continuation: researchContinuation,
+        runId,
+        revisionAttempts,
+        identity,
+        audit,
+        env,
+      });
+      if (queued.queued) {
+        return targetTerminal("REVISION_QUEUED", { why: "newer exact-head research completion released the no-progress hold" });
+      }
+    }
     if (existingJudge) {
       audit.note("judge-dedupe", `same-head ${existingJudge.state} reused for ${target.repo}#${target.pr}`);
       const scores = existingJudge.judgeScores;
@@ -1316,6 +1885,7 @@ export async function main(env = process.env) {
         const disposition = recoverRejectedJudge({
           target,
           existingJudge,
+          memoryEvents,
           fleetAuthored,
           revisionAllowed: cls.revisionAllowed,
           evidenceAvailable: evidence.available,
@@ -1335,6 +1905,19 @@ export async function main(env = process.env) {
       const judgeScores = judgeScoreMetadata(correctness, standards, threshold, targetCheckSucceeded);
       const reviewNotes = judgeReviewNotes([correctness, standards]);
       if (correctness.infrastructureFailure === true || standards.infrastructureFailure === true) {
+        recordJudgeProgressTelemetry({
+          stateRoot: STATE_ROOT,
+          runId,
+          target,
+          previous: priorJudge,
+          current: {
+            state: "JUDGE_UNAVAILABLE",
+            infrastructureFailure: true,
+            headSha: target.headSha,
+            judgeScores,
+            blockerIds: [],
+          },
+        });
         persistMergeMemoryEvent(
           target,
           runId,
@@ -1356,6 +1939,34 @@ export async function main(env = process.env) {
       blockers = [...correctness.blockers, ...standards.blockers].slice(0, 8);
       allBlockers = targetCheckSucceeded ? blockers : ["deterministic target checks did not report exact success", ...blockers];
       const judgeState = approved ? "JUDGE_APPROVED" : "JUDGE_REJECTED";
+      const currentJudge = {
+        state: judgeState,
+        headSha: target.headSha,
+        judgeScores,
+        blockerIds: allBlockers.map(blockerIdentifier),
+        verdict: approved ? "approve" : "reject",
+      };
+      recordJudgeProgressTelemetry({
+        stateRoot: STATE_ROOT,
+        runId,
+        target,
+        previous: priorJudge,
+        current: currentJudge,
+      });
+      const verdictBody = buildJudgeComment({
+        correctness,
+        standards,
+        evidenceDigest: evidence.digest,
+        targetCheckSucceeded,
+        extraBlockers: targetCheckSucceeded ? [] : ["deterministic target checks did not report exact success"],
+      });
+      const verdictFingerprint = publicCommentFingerprint({
+        kind: "judge",
+        repo: target.repo,
+        pr: target.pr,
+        headSha: target.headSha,
+        body: sanitizeCommentBody(verdictBody, MAX_COMMENT_CHARS),
+      });
       persistMergeMemoryEvent(
         target,
         runId,
@@ -1367,17 +1978,11 @@ export async function main(env = process.env) {
           reviewNotes,
           judgeScores,
           judgeStatus: "completed",
+          commentFingerprint: verdictFingerprint,
         },
         identity,
         audit,
       );
-      const verdictBody = buildJudgeComment({
-        correctness,
-        standards,
-        evidenceDigest: evidence.digest,
-        targetCheckSucceeded,
-        extraBlockers: targetCheckSucceeded ? [] : ["deterministic target checks did not report exact success"],
-      });
       let disposition;
       if (!approved) {
         disposition = revisionDisposition({
@@ -1385,15 +1990,66 @@ export async function main(env = process.env) {
           revisionAllowed: cls.revisionAllowed,
           evidenceAvailable: true,
           judgeResults: [correctness, standards],
+          previousJudge: priorJudge,
+          currentJudge,
           revisionAttempts,
           maxRevisions,
         });
+        if (disposition.state === "NO_PROGRESS") {
+          recordJudgeProgressTelemetry({
+            stateRoot: STATE_ROOT,
+            runId,
+            target,
+            previous: priorJudge,
+            current: currentJudge,
+            hold: true,
+          });
+          persistMergeMemoryEvent(
+            target,
+            runId,
+            revisionAttempts + 1,
+            "NO_PROGRESS",
+            {
+              kind: "terminal",
+              summary: disposition.why,
+              blockerIds: allBlockers.map(blockerIdentifier),
+              judgeScores,
+              judgeStatus: "completed",
+            },
+            identity,
+            audit,
+            env,
+          );
+          await persistNoProgressResearchRequest(
+            target,
+            runId,
+            revisionAttempts + 1,
+            priorJudge,
+            { headSha: target.headSha, judgeScores, blockerIds: allBlockers.map(blockerIdentifier) },
+            identity,
+            audit,
+          );
+        }
         if (disposition.revisionNeeded) {
           persistRevisionIntent(target, runId, revisionAttempts + 1, allBlockers.map(blockerIdentifier), identity, audit);
           writeRevisionOutput(env);
         }
       }
-      await attemptJudgeMirror({ repo: target.repo, number: target.pr, body: verdictBody, audit, identity });
+      // A repeated/regressed judge result is private NO_PROGRESS evidence;
+      // do not add another public mirror for the same unresolved cycle.
+      if (disposition?.state !== "NO_PROGRESS") {
+        await attemptJudgeMirror({
+          repo: target.repo,
+          number: target.pr,
+          headSha: target.headSha,
+          body: verdictBody,
+          audit,
+          identity,
+          listComments: (repo, number) => listIssueComments(repo, number, env),
+          claimFingerprint: (fingerprint) => claimMergeComment(target, runId, fingerprint, identity, audit),
+          env,
+        });
+      }
       if (!approved) {
         if (disposition.revisionNeeded) return targetTerminal("REVISION_QUEUED", { why: targetCheckSucceeded ? "judges rejected" : "deterministic target checks did not report exact success" });
         return targetTerminal(disposition.state, { why: disposition.why });

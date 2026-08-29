@@ -20,6 +20,26 @@ function requireAttribution(identity) {
   return { name, email };
 }
 
+function byteEqual(left, right) {
+  return Buffer.from(String(left ?? ""), "utf8").equals(Buffer.from(String(right ?? ""), "utf8"));
+}
+
+/** Return false when every proposed file is byte-identical to the exact head. */
+export function revisionHasByteChanges(files, baseFiles) {
+  if (!Array.isArray(baseFiles)) return true;
+  const base = new Map(
+    baseFiles
+      .filter((file) => file && typeof file.path === "string")
+      .map((file) => [file.path, file.content]),
+  );
+  return (Array.isArray(files) ? files : []).some((file) => (
+    !file
+    || typeof file.path !== "string"
+    || !base.has(file.path)
+    || !byteEqual(file.content, base.get(file.path))
+  ));
+}
+
 function assertBaseTreeSafe(tree, targetPaths) {
   if (!tree || tree.truncated === true) throw new Error("BASE_TREE_TRUNCATED");
   if (!Array.isArray(tree.tree)) throw new Error("BASE_TREE_INVALID");
@@ -37,7 +57,7 @@ function assertBaseTreeSafe(tree, targetPaths) {
  * Build and publish one Git Data API commit. The API object is intentionally
  * pluggable so tests can prove ordering and race behavior without network calls.
  */
-export async function applyAtomicRevision({ api, repo, branch, expectedHead, files, message, identity }) {
+export async function applyAtomicRevision({ api, repo, branch, expectedHead, files, baseFiles, message, identity }) {
   if (!api || typeof api.getCommit !== "function" || typeof api.getTree !== "function" || typeof api.createBlob !== "function" || typeof api.createTree !== "function" || typeof api.createCommit !== "function" || typeof api.getRef !== "function" || typeof api.updateRef !== "function") {
     throw new Error("atomic revision API is incomplete");
   }
@@ -49,6 +69,11 @@ export async function applyAtomicRevision({ api, repo, branch, expectedHead, fil
   for (const file of files) {
     if (!file || typeof file.path !== "string" || !isRevisionPathPolicySafe(file.path)) throw new Error(`unsafe revision path ${file && file.path || ""}`);
     if (typeof file.content !== "string") throw new Error(`revision content must be text ${file.path}`);
+  }
+  if (Array.isArray(baseFiles) && !revisionHasByteChanges(files, baseFiles)) {
+    const failure = new Error("REVISION_NO_PROGRESS byte-identical output");
+    failure.code = "REVISION_NO_PROGRESS";
+    throw failure;
   }
 
   const initialRef = await api.getRef(repo, targetBranch);

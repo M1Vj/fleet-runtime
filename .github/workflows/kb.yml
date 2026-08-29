@@ -26,8 +26,10 @@ jobs:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
-      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      OPENCODE_API_KEY_2: ${{ secrets.OPENCODE_API_KEY_2 }}
+      FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN }}
+      FLEET_MODEL_BUCKET: ${{ vars.FLEET_MODEL_BUCKET }}
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
     steps:
       - name: checkout runtime
@@ -68,8 +70,10 @@ jobs:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
-      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      OPENCODE_API_KEY_2: ${{ secrets.OPENCODE_API_KEY_2 }}
+      FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN }}
+      FLEET_MODEL_BUCKET: ${{ vars.FLEET_MODEL_BUCKET }}
       GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
       GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
       GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
@@ -120,8 +124,10 @@ jobs:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
-      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      OPENCODE_API_KEY_2: ${{ secrets.OPENCODE_API_KEY_2 }}
+      FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN }}
+      FLEET_MODEL_BUCKET: ${{ vars.FLEET_MODEL_BUCKET }}
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
     steps:
       - name: checkout runtime

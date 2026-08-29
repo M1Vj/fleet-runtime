@@ -1,0 +1,120 @@
+name: fleet-promote-capability
+run-name: "fleet governed capability promotion ${{ github.run_id }}"
+
+# Promotion stays manual and disabled until the owner enables the exact gate
+# variable. Candidate jobs are secretless; only the trusted job receives the
+# private-state token and can create an attributed, non-force draft PR.
+on:
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: "Path to a candidate manifest JSON in this checkout"
+        required: true
+        type: string
+      registry_path:
+        description: "Registry path used for the plan"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-state-writer
+  cancel-in-progress: false
+
+jobs:
+  candidate-tests:
+    if: ${{ vars.FLEET_PROMOTION_ENABLE == 'true' }}
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      plan: ${{ steps.plan.outputs.path }}
+    steps:
+      - name: checkout candidate source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: setup node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+      - name: run trusted promotion contract tests
+        run: node --test tests/capability-registry.test.mjs tests/promotion-state.test.mjs tests/promote-capability.test.mjs
+      - name: prepare candidate plan without activation
+        id: plan
+        env:
+          CANDIDATE_PATH: ${{ inputs.candidate }}
+          REGISTRY_PATH: ${{ inputs.registry_path }}
+        run: |
+          mkdir -p artifacts
+          if [ -n "$REGISTRY_PATH" ]; then
+            node scripts/promote-capability.mjs --candidate "$CANDIDATE_PATH" --registry "$REGISTRY_PATH" --base-sha "$GITHUB_SHA" --plan-only > artifacts/promotion-plan.json
+          else
+            node scripts/promote-capability.mjs --candidate "$CANDIDATE_PATH" --base-sha "$GITHUB_SHA" --plan-only > artifacts/promotion-plan.json
+          fi
+          node scripts/promote-capability.mjs --plan artifacts/promotion-plan.json
+          echo "path=artifacts/promotion-plan.json" >> "$GITHUB_OUTPUT"
+      - name: upload immutable promotion plan
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: promotion-plan-${{ github.run_id }}
+          path: artifacts/promotion-plan.json
+          if-no-files-found: error
+          retention-days: 14
+
+  trusted-state-activation:
+    needs: candidate-tests
+    if: ${{ vars.FLEET_PROMOTION_ENABLE == 'true' && needs.candidate-tests.result == 'success' }}
+    permissions:
+      contents: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: checkout runtime verifier
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: setup node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+      - name: download immutable promotion plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: promotion-plan-${{ github.run_id }}
+          path: artifacts
+      - name: checkout private state for durable event commits
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: execute governed branch and draft PR transaction
+        env:
+          FLEET_PROMOTION_ENABLE: ${{ vars.FLEET_PROMOTION_ENABLE }}
+          FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+          FLEET_EXPECT_LOGIN: M1Vj
+          FLEET_PROMOTION_REPO: M1Vj/fleet-runtime
+          FLEET_KILL_SWITCH_PATH: state-control/state/KILL_SWITCH
+          CANDIDATE_PATH: ${{ inputs.candidate }}
+          PLAN_PATH: artifacts/promotion-plan.json
+          STATE_ROOT: state-control
+          BASE_SHA: ${{ github.sha }}
+        run: |
+          test "$FLEET_PROMOTION_ENABLE" = true
+          test -n "$FLEET_GH_TOKEN"
+          node scripts/promote-capability.mjs \
+            --candidate "$CANDIDATE_PATH" \
+            --plan "$PLAN_PATH" \
+            --state-root "$STATE_ROOT" \
+            --base-sha "$BASE_SHA" \
+            --execute

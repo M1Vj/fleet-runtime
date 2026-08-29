@@ -50,10 +50,10 @@
 - [x] Run target-controlled checkout/install/build/test in a separate job with no model or mutation credential and no private state checkout.
 - [x] Enforce the managed-repository, same-repository `fleet/` head, sensitive/UI-path, complete-patch, and exact-SHA policies.
 - [x] Merge through the pull-request merge endpoint only with the reviewed SHA and verify the returned merge SHA, PR state, author/committer attribution, and merge-parent structure.
-- [x] Configure global concurrency with `queue: max` so serialization does not cancel earlier pending target runs.
+- [x] Configure one global non-canceling concurrency group using supported GitHub Actions keys; durable dispatch claims suppress duplicate target work.
 - [x] Preserve the latest active dispatch claims across memory rotation, even when they temporarily exceed the nominal line bound.
 - [x] Ensure `GITHUB_OUTPUT` values are bounded and no scheduled path invokes `revise.mjs` with empty inputs.
-- [x] Run focused tests and current actionlint. Actionlint 1.7.12 predates GitHub's May 2026 `queue` addition and reports only that known stale-schema diagnostic; with that one diagnostic ignored, it reports no other error.
+- [x] Run focused tests and validate workflow YAML; the final workflow does not use the unsupported `concurrency.queue` key.
 - [x] Commit target dispatch and subsequent security corrections.
 
 ### Task 3b: Frozen-review hardening

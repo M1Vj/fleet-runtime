@@ -1,0 +1,886 @@
+{
+  "schemaVersion": 1,
+  "registryVersion": "2026-08-29.2",
+  "generatedAt": "2026-08-29T00:00:00.000Z",
+  "updatePolicy": {
+    "source": "committed-provider-registry",
+    "autoActivate": false,
+    "rollbackOnHealthFailure": true,
+    "maxHealthAgeMs": 900000
+  },
+  "providers": [
+    {
+      "id": "antigravity",
+      "name": "Google Antigravity CLI (local OAuth profile)",
+      "kind": "cli",
+      "enabled": false,
+      "free": true,
+      "localOnly": true,
+      "production": {
+        "enabled": false,
+        "requiresEnv": "FLEET_ANTIGRAVITY_ENABLE"
+      },
+      "auth": {
+        "mode": "oauth",
+        "portability": "local-only",
+        "renewable": false,
+        "githubActions": false
+      },
+      "credentials": [
+        {
+          "id": "local-oauth",
+          "localOnly": true,
+          "profile": "~/.gemini/antigravity-cli",
+          "required": false
+        }
+      ],
+      "endpoint": null,
+      "verification": {
+        "status": "documented-local-oauth",
+        "docs": [
+          "https://antigravity.google/docs/cli/headless/",
+          "https://antigravity.google/docs/cli/install/"
+        ],
+        "blocker": "The official CLI documentation describes cached local account credentials for headless mode, but no portable renewable OAuth export/import for ephemeral GitHub runners. Keep OAuth local-only."
+      },
+      "models": {
+        "gemini-3.7-flash-high": {
+          "free": true,
+          "family": "gemini-flash",
+          "availability": "antigravity-local-only"
+        },
+        "claude-opus-4-6-thinking": {
+          "free": true,
+          "family": "claude-opus",
+          "availability": "antigravity-local-only"
+        }
+      }
+    },
+    {
+      "id": "gemini-api",
+      "name": "Google Gemini API (AI Studio key backup)",
+      "kind": "free-api",
+      "enabled": true,
+      "free": true,
+      "localOnly": false,
+      "production": {
+        "enabled": true
+      },
+      "auth": {
+        "mode": "api-key",
+        "sameProviderRotation": "healthy-round-robin",
+        "quotaScope": "credential-group"
+      },
+      "fallbackPolicy": {
+        "credentialFallbackOn": ["missing", "expired", "rejected"],
+        "noCredentialRotationOn": ["rate-limited", "quota-exhausted"]
+      },
+      "credentials": [
+        {
+          "id": "account-1",
+          "githubSecret": "GEMINI_API_KEY_1",
+          "env": "GEMINI_API_KEY_1",
+          "targetEnv": "GEMINI_API_KEY",
+          "expiresEnv": "GEMINI_API_KEY_1_EXPIRES_AT",
+          "quotaGroupEnv": "GEMINI_API_KEY_1_QUOTA_GROUP",
+          "required": false
+        },
+        {
+          "id": "account-2",
+          "githubSecret": "GEMINI_API_KEY_2",
+          "env": "GEMINI_API_KEY_2",
+          "targetEnv": "GEMINI_API_KEY",
+          "expiresEnv": "GEMINI_API_KEY_2_EXPIRES_AT",
+          "quotaGroupEnv": "GEMINI_API_KEY_2_QUOTA_GROUP",
+          "required": false
+        },
+        {
+          "id": "account-3",
+          "githubSecret": "GEMINI_API_KEY_3",
+          "env": "GEMINI_API_KEY_3",
+          "targetEnv": "GEMINI_API_KEY",
+          "expiresEnv": "GEMINI_API_KEY_3_EXPIRES_AT",
+          "quotaGroupEnv": "GEMINI_API_KEY_3_QUOTA_GROUP",
+          "required": false
+        },
+        {
+          "id": "account-4",
+          "githubSecret": "GEMINI_API_KEY_4",
+          "env": "GEMINI_API_KEY_4",
+          "targetEnv": "GEMINI_API_KEY",
+          "expiresEnv": "GEMINI_API_KEY_4_EXPIRES_AT",
+          "quotaGroupEnv": "GEMINI_API_KEY_4_QUOTA_GROUP",
+          "required": false
+        },
+        {
+          "id": "account-5",
+          "githubSecret": "GEMINI_API_KEY_5",
+          "env": "GEMINI_API_KEY_5",
+          "targetEnv": "GEMINI_API_KEY",
+          "expiresEnv": "GEMINI_API_KEY_5_EXPIRES_AT",
+          "quotaGroupEnv": "GEMINI_API_KEY_5_QUOTA_GROUP",
+          "required": false
+        },
+        {
+          "id": "account-6",
+          "githubSecret": "GEMINI_API_KEY_6",
+          "env": "GEMINI_API_KEY_6",
+          "targetEnv": "GEMINI_API_KEY",
+          "expiresEnv": "GEMINI_API_KEY_6_EXPIRES_AT",
+          "quotaGroupEnv": "GEMINI_API_KEY_6_QUOTA_GROUP",
+          "required": false
+        }
+      ],
+      "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+      "verification": {
+        "status": "verified",
+        "docs": [
+          "https://ai.google.dev/gemini-api/docs/openai",
+          "https://ai.google.dev/gemini-api/docs/models/gemini-3.7-flash",
+          "https://ai.google.dev/gemini-api/docs/get-started"
+        ],
+        "terms": "AI Studio keys have a documented free tier with quotas; paid tier requires Cloud Billing."
+      },
+      "models": {
+        "gemini-3.7-flash": {
+          "free": true,
+          "family": "gemini-flash",
+          "availability": "documented"
+        },
+        "gemini-3.6-flash": {
+          "free": true,
+          "family": "gemini-flash",
+          "availability": "documented"
+        }
+      }
+    },
+    {
+      "id": "opencode-zen",
+      "name": "OpenCode Zen",
+      "kind": "gateway",
+      "enabled": true,
+      "free": false,
+      "localOnly": false,
+      "production": {
+        "enabled": true
+      },
+      "auth": {
+        "mode": "api-key",
+        "sameProviderRotation": "healthy-round-robin",
+        "quotaScope": "account-wide"
+      },
+      "fallbackPolicy": {
+        "credentialFallbackOn": ["missing", "expired", "rejected"],
+        "noCredentialRotationOn": ["rate-limited", "quota-exhausted"]
+      },
+      "credentials": [
+        {
+          "id": "default",
+          "githubSecret": "OPENCODE_API_KEY",
+          "env": "OPENCODE_API_KEY",
+          "targetEnv": "OPENCODE_API_KEY",
+          "required": true
+        },
+        {
+          "id": "backup",
+          "githubSecret": "OPENCODE_API_KEY_2",
+          "env": "OPENCODE_API_KEY_2",
+          "targetEnv": "OPENCODE_API_KEY",
+          "required": false
+        }
+      ],
+      "endpoint": "https://opencode.ai/zen/v1",
+      "verification": {
+        "status": "verified",
+        "docs": [
+          "https://opencode.ai/docs/providers",
+          "https://dev.opencode.ai/docs/zen"
+        ],
+        "terms": "OpenCode Zen requires an API key and bills per request; it is the durable paid route for private lanes."
+      },
+      "models": {
+        "claude-opus-4-6": {
+          "free": false,
+          "family": "claude-opus",
+          "availability": "documented"
+        }
+      }
+    },
+    {
+      "id": "openrouter",
+      "name": "OpenRouter explicit free-model route",
+      "kind": "free-api",
+      "enabled": true,
+      "free": true,
+      "localOnly": false,
+      "production": {
+        "enabled": true,
+        "requiresEnv": "FLEET_OPENROUTER_ENABLE"
+      },
+      "auth": {
+        "mode": "api-key",
+        "quotaScope": "account-wide"
+      },
+      "privacy": {
+        "requireZdr": true,
+        "dataCollection": "deny"
+      },
+      "fallbackPolicy": {
+        "credentialFallbackOn": ["missing", "expired", "rejected"],
+        "noCredentialRotationOn": ["rate-limited", "quota-exhausted"]
+      },
+      "credentials": [
+        {
+          "id": "default",
+          "githubSecret": "OPENROUTER_API_KEY",
+          "env": "OPENROUTER_API_KEY",
+          "targetEnv": "OPENROUTER_API_KEY",
+          "required": false
+        }
+      ],
+      "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+      "verification": {
+        "status": "verified",
+        "docs": [
+          "https://openrouter.ai/docs/guides/routing/routers/free-router",
+          "https://openrouter.ai/docs/guides/routing/model-variants/free",
+          "https://openrouter.ai/docs/guides/routing/provider-selection",
+          "https://openrouter.ai/docs/guides/features/zdr",
+          "https://openrouter.ai/docs/guides/privacy/data-collection"
+        ],
+        "terms": "The exact nvidia/nemotron-3-ultra-550b-a55b:free route is zero-cost but low-volume: OpenRouter documents 50 requests/day without purchased credits. Enforce ZDR and deny data collection per request."
+      },
+      "rateLimits": {
+        "scope": "account",
+        "freePlan": {
+          "requestsPerDay": 50
+        }
+      },
+      "requestBudget": {
+        "maxPromptBytes": 32768,
+        "maxCompletionTokens": 1024,
+        "maxResponseBytes": 131072,
+        "maxTimeoutMs": 60000
+      },
+      "models": {
+        "openrouter/free": {
+          "free": true,
+          "family": "free-router",
+          "availability": "dynamic"
+        },
+        "nvidia/nemotron-3-ultra-550b-a55b:free": {
+          "free": true,
+          "family": "nemotron",
+          "availability": "verified-free",
+          "contextTokens": 1000000,
+          "maxOutputTokens": 65536
+        }
+      }
+    },
+    {
+      "id": "vercel-ai-gateway",
+      "name": "Vercel AI Gateway (free coding model)",
+      "kind": "free-api",
+      "enabled": true,
+      "free": true,
+      "localOnly": false,
+      "production": {
+        "enabled": true,
+        "requiresEnv": "FLEET_VERCEL_AI_ENABLE"
+      },
+      "auth": {
+        "mode": "api-key",
+        "quotaScope": "account-wide"
+      },
+      "fallbackPolicy": {
+        "credentialFallbackOn": ["missing", "expired", "rejected"],
+        "noCredentialRotationOn": ["rate-limited", "quota-exhausted"]
+      },
+      "credentials": [
+        {
+          "id": "default",
+          "githubSecret": "VERCEL_AI_GATEWAY_API_KEY",
+          "env": "AI_GATEWAY_API_KEY",
+          "targetEnv": "AI_GATEWAY_API_KEY",
+          "required": false
+        }
+      ],
+      "endpoint": "https://ai-gateway.vercel.sh/v1/chat/completions",
+      "verification": {
+        "status": "verified",
+        "docs": [
+          "https://vercel.com/docs/ai-gateway/pricing",
+          "https://vercel.com/docs/ai-gateway",
+          "https://vercel.com/docs/ai-gateway/authentication-and-byok",
+          "https://vercel.com/docs/ai-gateway/models-and-providers",
+          "https://vercel.com/ai-gateway/models/laguna-s-2.1-free/api",
+          "https://vercel.com/changelog/zero-data-retention-no-prompt-training-on-ai-gateway"
+        ],
+        "terms": "Vercel AI Gateway includes a recurring $5/month free credit tier. Upstream provider privacy varies; send the documented request-level disallowPromptTraining control, but do not claim zero-data retention for the free model."
+      },
+      "rateLimits": {
+        "scope": "account",
+        "freePlan": {
+          "monthlyCreditsUsd": 5
+        }
+      },
+      "requestBudget": {
+        "maxPromptBytes": 32768,
+        "maxCompletionTokens": 1024,
+        "maxResponseBytes": 131072,
+        "maxTimeoutMs": 60000
+      },
+      "models": {
+        "poolside/laguna-s-2.1-free": {
+          "free": true,
+          "family": "laguna",
+          "availability": "verified-free",
+          "contextTokens": 262144,
+          "maxOutputTokens": 32768
+        }
+      }
+    },
+    {
+      "id": "cloudflare-workers-ai",
+      "name": "Cloudflare Workers AI (OpenAI-compatible free allocation)",
+      "kind": "free-api",
+      "enabled": true,
+      "free": true,
+      "localOnly": false,
+      "production": {
+        "enabled": true,
+        "requiresEnv": "FLEET_CLOUDFLARE_AI_ENABLE"
+      },
+      "auth": {
+        "mode": "api-key",
+        "quotaScope": "account-wide"
+      },
+      "fallbackPolicy": {
+        "credentialFallbackOn": ["missing", "expired", "rejected"],
+        "noCredentialRotationOn": ["rate-limited", "quota-exhausted"]
+      },
+      "credentials": [
+        {
+          "id": "default",
+          "githubSecret": "CLOUDFLARE_API_TOKEN",
+          "env": "CLOUDFLARE_API_TOKEN",
+          "targetEnv": "CLOUDFLARE_API_TOKEN",
+          "required": false
+        }
+      ],
+      "endpoint": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions",
+      "accountIdEnv": "CLOUDFLARE_ACCOUNT_ID",
+      "verification": {
+        "status": "verified",
+        "docs": [
+          "https://developers.cloudflare.com/workers-ai/configuration/open-ai-compatibility/",
+          "https://developers.cloudflare.com/workers-ai/platform/pricing/",
+          "https://developers.cloudflare.com/changelog/post/2026-07-28-models-require-workers-paid/",
+          "https://developers.cloudflare.com/workers-ai/models/gpt-oss-120b/",
+          "https://developers.cloudflare.com/workers-ai/models/glm-4.7-flash/",
+          "https://developers.cloudflare.com/workers-ai/platform/data-usage/",
+          "https://developers.cloudflare.com/api/resources/ai/subresources/models/methods/list/"
+        ],
+        "terms": "Workers AI Free provides 10,000 neurons per account per day, resetting at 00:00 UTC. Cloudflare does not use Customer Content to train or improve services without explicit consent."
+      },
+      "rateLimits": {
+        "scope": "account",
+        "freePlan": {
+          "neuronsPerDay": 10000,
+          "resetUtc": "00:00"
+        }
+      },
+      "requestBudget": {
+        "maxPromptBytes": 8192,
+        "maxCompletionTokens": 512,
+        "maxResponseBytes": 131072,
+        "maxTimeoutMs": 45000
+      },
+      "models": {
+        "@cf/openai/gpt-oss-120b": {
+          "free": true,
+          "family": "gpt-oss",
+          "availability": "workers-free"
+        },
+        "@cf/zai-org/glm-4.7-flash": {
+          "free": true,
+          "family": "glm",
+          "availability": "workers-free"
+        }
+      }
+    },
+    {
+      "id": "nvidia-nim",
+      "name": "NVIDIA Hosted NIM (Developer Program prototype)",
+      "kind": "free-api",
+      "enabled": true,
+      "free": true,
+      "localOnly": false,
+      "production": {
+        "enabled": true,
+        "requiresEnv": "FLEET_NVIDIA_ENABLE"
+      },
+      "auth": {
+        "mode": "api-key",
+        "sameProviderRotation": "healthy-round-robin",
+        "quotaScope": "account-wide"
+      },
+      "fallbackPolicy": {
+        "credentialFallbackOn": ["missing", "expired", "rejected"],
+        "noCredentialRotationOn": ["rate-limited", "quota-exhausted"]
+      },
+      "credentials": [
+        {
+          "id": "account-1",
+          "githubSecret": "NVIDIA_API_KEY_1",
+          "env": "NVIDIA_API_KEY_1",
+          "targetEnv": "NVIDIA_API_KEY",
+          "required": false
+        },
+        {
+          "id": "account-2",
+          "githubSecret": "NVIDIA_API_KEY_2",
+          "env": "NVIDIA_API_KEY_2",
+          "targetEnv": "NVIDIA_API_KEY",
+          "required": false
+        }
+      ],
+      "endpoint": "https://integrate.api.nvidia.com/v1/chat/completions",
+      "verification": {
+        "status": "verified",
+        "docs": [
+          "https://docs.api.nvidia.com/nim/re/docs/api-quickstart",
+          "https://docs.api.nvidia.com/nim/reference/llm-apis",
+          "https://docs.api.nvidia.com/nim/docs/run-anywhere",
+          "https://build.nvidia.com/moonshotai/kimi-k3/modelcard",
+          "https://docs.api.nvidia.com/nim/reference/moonshotai-kimi-k3-infer"
+        ],
+        "terms": "NVIDIA lists moonshotai/kimi-k3 as an available free endpoint governed by its API Trial Terms for prototyping; production use requires the applicable NVIDIA license. Limits remain account-wide and the explicit FLEET_NVIDIA_ENABLE gate stays off by default."
+      },
+      "models": {
+        "moonshotai/kimi-k3": {
+          "free": true,
+          "family": "kimi-k3",
+          "availability": "free-endpoint",
+          "contextTokens": 1048576,
+          "maxOutputTokens": 65536,
+          "modalities": ["text", "image"],
+          "reasoningEffort": ["low", "high", "max"]
+        },
+        "meta/llama-3.1-8b-instruct": {
+          "free": true,
+          "family": "llama",
+          "availability": "documented"
+        },
+        "openai/gpt-oss-20b": {
+          "free": true,
+          "family": "gpt-oss",
+          "availability": "documented"
+        }
+      }
+    },
+    {
+      "id": "groq",
+      "name": "Groq Hosted Qwen (Free Plan preview)",
+      "kind": "free-api",
+      "enabled": true,
+      "free": true,
+      "localOnly": false,
+      "production": {
+        "enabled": true,
+        "requiresEnv": "FLEET_GROQ_ENABLE"
+      },
+      "auth": {
+        "mode": "api-key",
+        "quotaScope": "account-wide"
+      },
+      "fallbackPolicy": {
+        "credentialFallbackOn": ["missing", "expired", "rejected"],
+        "noCredentialRotationOn": ["rate-limited", "quota-exhausted"]
+      },
+      "credentials": [
+        {
+          "id": "default",
+          "githubSecret": "GROQ_API_KEY",
+          "env": "GROQ_API_KEY",
+          "targetEnv": "GROQ_API_KEY",
+          "required": false
+        }
+      ],
+      "endpoint": "https://api.groq.com/openai/v1/chat/completions",
+      "verification": {
+        "status": "verified",
+        "preview": true,
+        "docs": [
+          "https://console.groq.com/docs/model/qwen/qwen3.8-27b",
+          "https://console.groq.com/docs/openai",
+          "https://console.groq.com/docs/api-reference",
+          "https://console.groq.com/docs/rate-limits"
+        ],
+        "terms": "Groq lists qwen/qwen3.8-27b as a preview model with Free Plan limits of 30 RPM, 1K RPD, 8K TPM, and 2M TPD. Limits apply at the organization level; preview availability and model support may change or be deprecated."
+      },
+      "rateLimits": {
+        "scope": "organization",
+        "freePlan": {
+          "rpm": 30,
+          "rpd": 1000,
+          "tpm": 8000,
+          "tpd": 2000000
+        }
+      },
+      "models": {
+        "qwen/qwen3.8-27b": {
+          "free": true,
+          "family": "qwen-27b",
+          "availability": "preview",
+          "contextTokens": 131042,
+          "maxOutputTokens": 16384,
+          "modalities": ["text", "image"]
+        }
+      }
+    }
+  ],
+  "buckets": {
+    "gemini": [
+      {
+        "provider": "antigravity",
+        "model": "gemini-3.7-flash-high",
+        "credential": "local-oauth",
+        "priority": 1,
+        "free": true,
+        "localOnly": true,
+        "publicOnly": true
+      },
+      {
+        "provider": "gemini-api",
+        "model": "gemini-3.7-flash",
+        "credential": "account-1",
+        "priority": 2,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "gemini-api",
+        "model": "gemini-3.7-flash",
+        "credential": "account-2",
+        "priority": 3,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "gemini-api",
+        "model": "gemini-3.7-flash",
+        "credential": "account-3",
+        "priority": 4,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "gemini-api",
+        "model": "gemini-3.7-flash",
+        "credential": "account-4",
+        "priority": 5,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "gemini-api",
+        "model": "gemini-3.7-flash",
+        "credential": "account-5",
+        "priority": 6,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "gemini-api",
+        "model": "gemini-3.7-flash",
+        "credential": "account-6",
+        "priority": 7,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      }
+    ],
+    "other": [
+      {
+        "provider": "antigravity",
+        "model": "claude-opus-4-6-thinking",
+        "credential": "local-oauth",
+        "priority": 1,
+        "free": true,
+        "localOnly": true,
+        "publicOnly": true
+      },
+      {
+        "provider": "gemini-api",
+        "model": "gemini-3.7-flash",
+        "credential": "account-1",
+        "priority": 2,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "gemini-api",
+        "model": "gemini-3.7-flash",
+        "credential": "account-2",
+        "priority": 3,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "gemini-api",
+        "model": "gemini-3.7-flash",
+        "credential": "account-3",
+        "priority": 4,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "gemini-api",
+        "model": "gemini-3.7-flash",
+        "credential": "account-4",
+        "priority": 5,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "gemini-api",
+        "model": "gemini-3.7-flash",
+        "credential": "account-5",
+        "priority": 6,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "gemini-api",
+        "model": "gemini-3.7-flash",
+        "credential": "account-6",
+        "priority": 7,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "vercel-ai-gateway",
+        "model": "poolside/laguna-s-2.1-free",
+        "credential": "default",
+        "priority": 8,
+        "free": true,
+        "publicOnly": true
+      },
+      {
+        "provider": "cloudflare-workers-ai",
+        "model": "@cf/openai/gpt-oss-120b",
+        "credential": "default",
+        "priority": 9,
+        "free": true,
+        "publicOnly": true
+      },
+      {
+        "provider": "cloudflare-workers-ai",
+        "model": "@cf/zai-org/glm-4.7-flash",
+        "credential": "default",
+        "priority": 10,
+        "free": true,
+        "publicOnly": true
+      },
+      {
+        "provider": "groq",
+        "model": "qwen/qwen3.8-27b",
+        "credential": "default",
+        "priority": 11,
+        "free": true,
+        "publicOnly": true
+      },
+      {
+        "provider": "nvidia-nim",
+        "model": "moonshotai/kimi-k3",
+        "credential": "account-1",
+        "priority": 12,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "nvidia-nim",
+        "model": "moonshotai/kimi-k3",
+        "credential": "account-2",
+        "priority": 13,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "openrouter",
+        "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "credential": "default",
+        "priority": 14,
+        "free": true,
+        "publicOnly": true
+      },
+      {
+        "provider": "opencode-zen",
+        "model": "claude-opus-4-6",
+        "credential": "default",
+        "priority": 15,
+        "free": false
+      },
+      {
+        "provider": "opencode-zen",
+        "model": "claude-opus-4-6",
+        "credential": "backup",
+        "priority": 16,
+        "free": false,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      }
+    ],
+    "public": [
+      {
+        "provider": "antigravity",
+        "model": "gemini-3.7-flash-high",
+        "credential": "local-oauth",
+        "priority": 1,
+        "free": true,
+        "localOnly": true,
+        "publicOnly": true
+      },
+      {
+        "provider": "gemini-api",
+        "model": "gemini-3.7-flash",
+        "credential": "account-1",
+        "priority": 2,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "gemini-api",
+        "model": "gemini-3.7-flash",
+        "credential": "account-2",
+        "priority": 3,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "gemini-api",
+        "model": "gemini-3.7-flash",
+        "credential": "account-3",
+        "priority": 4,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "gemini-api",
+        "model": "gemini-3.7-flash",
+        "credential": "account-4",
+        "priority": 5,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "gemini-api",
+        "model": "gemini-3.7-flash",
+        "credential": "account-5",
+        "priority": 6,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "gemini-api",
+        "model": "gemini-3.7-flash",
+        "credential": "account-6",
+        "priority": 7,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "vercel-ai-gateway",
+        "model": "poolside/laguna-s-2.1-free",
+        "credential": "default",
+        "priority": 8,
+        "free": true,
+        "publicOnly": true
+      },
+      {
+        "provider": "cloudflare-workers-ai",
+        "model": "@cf/openai/gpt-oss-120b",
+        "credential": "default",
+        "priority": 9,
+        "free": true,
+        "publicOnly": true
+      },
+      {
+        "provider": "cloudflare-workers-ai",
+        "model": "@cf/zai-org/glm-4.7-flash",
+        "credential": "default",
+        "priority": 10,
+        "free": true,
+        "publicOnly": true
+      },
+      {
+        "provider": "groq",
+        "model": "qwen/qwen3.8-27b",
+        "credential": "default",
+        "priority": 11,
+        "free": true,
+        "publicOnly": true
+      },
+      {
+        "provider": "nvidia-nim",
+        "model": "moonshotai/kimi-k3",
+        "credential": "account-1",
+        "priority": 12,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "nvidia-nim",
+        "model": "moonshotai/kimi-k3",
+        "credential": "account-2",
+        "priority": 13,
+        "free": true,
+        "publicOnly": true,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      },
+      {
+        "provider": "openrouter",
+        "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "credential": "default",
+        "priority": 14,
+        "free": true,
+        "publicOnly": true
+      },
+      {
+        "provider": "opencode-zen",
+        "model": "claude-opus-4-6",
+        "credential": "default",
+        "priority": 15,
+        "free": false
+      },
+      {
+        "provider": "opencode-zen",
+        "model": "claude-opus-4-6",
+        "credential": "backup",
+        "priority": 16,
+        "free": false,
+        "fallbackOn": ["missing", "expired", "rejected"]
+      }
+    ]
+  }
+}

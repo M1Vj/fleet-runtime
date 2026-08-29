@@ -8,6 +8,7 @@ import {
   readFileSync,
   realpathSync,
   readdirSync,
+  rmSync,
   statSync,
   symlinkSync,
   unlinkSync,
@@ -18,6 +19,7 @@ import path from "node:path";
 
 import {
   appendMemoryEvent,
+  claimCommentFingerprint,
   buildMemoryContext,
   deterministicEventId,
   memoryPath,
@@ -26,6 +28,28 @@ import {
   revisionCountForTarget,
   rotateMemory,
 } from "../scripts/lib/pr-memory.mjs";
+
+test("competing public-comment claims produce one durable intent", () => {
+  const file = tempMemory();
+  try {
+    const base = {
+      lane: "merge",
+      repo: "M1Vj/fleet-runtime",
+      pr: 11,
+      headSha: "a".repeat(40),
+      commentFingerprint: `comment-${"b".repeat(64)}`,
+    };
+    const first = claimCommentFingerprint(file, { ...base, runId: "run-one" });
+    const second = claimCommentFingerprint(file, { ...base, runId: "run-two" });
+    assert.equal(first.claimed, true);
+    assert.equal(second.claimed, false);
+    const intents = readMemoryEvents(file).filter((event) => event.state === "COMMENT_INTENT");
+    assert.equal(intents.length, 1);
+    assert.equal(intents[0].commentFingerprint, base.commentFingerprint);
+  } finally {
+    rmSync(path.dirname(path.dirname(file)), { recursive: true, force: true });
+  }
+});
 
 function tempMemory() {
   const root = mkdtempSync(path.join(tmpdir(), "pr-memory-test-"));

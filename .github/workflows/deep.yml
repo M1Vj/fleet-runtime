@@ -31,7 +31,14 @@ jobs:
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
     steps:
       - name: sanitize workers input
-        run: echo "FLEET_MAX_WORKERS=$(echo '${{ github.event.inputs.workers }}' | grep -E '^[0-9]+$' || echo 4)" >> "$GITHUB_ENV"
+        env:
+          WORKERS_INPUT: ${{ github.event.inputs.workers }}
+        run: |
+          case "$WORKERS_INPUT" in
+            ''|*[!0-9]*) workers=4 ;;
+            *) workers="$WORKERS_INPUT" ;;
+          esac
+          printf 'FLEET_MAX_WORKERS=%s\n' "$workers" >> "$GITHUB_ENV"
       - name: checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -79,8 +86,13 @@ jobs:
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
-      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      OPENCODE_API_KEY_2: ${{ secrets.OPENCODE_API_KEY_2 }}
+      FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN }}
+      FLEET_MODEL_BUCKET: ${{ vars.FLEET_MODEL_BUCKET }}
+      FLEET_GEMINI_MODEL: ${{ vars.FLEET_GEMINI_MODEL }}
+      FLEET_PROVIDER_HEALTH_JSON: ${{ vars.FLEET_PROVIDER_HEALTH_JSON }}
+      FLEET_NVIDIA_ENABLE: ${{ vars.FLEET_NVIDIA_ENABLE }}
       FLEET_REPO: ${{ matrix.worker.repo || matrix.repo }}
       FLEET_KIND: ${{ matrix.worker.kind || matrix.kind }}
     steps:
@@ -109,14 +121,63 @@ jobs:
       - name: install pinned opencode cli
         if: ${{ env.FLEET_REPO != '' }}
         run: npm install -g opencode-ai@1.18.21
+      - name: verify public target for free-provider credentials
+        id: public
+        if: ${{ env.FLEET_REPO != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+        run: |
+          echo "verified=false" >> "$GITHUB_OUTPUT"
+          full_name=$(gh api "repos/$FLEET_REPO" --jq '.full_name')
+          visibility=$(gh api "repos/$FLEET_REPO" --jq 'if .private == false and .visibility == "public" then "public" else "restricted" end')
+          if [ "$full_name" = "$FLEET_REPO" ] && [ "$visibility" = "public" ]; then
+            echo "verified=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: analyze as sub-agent
         if: ${{ env.FLEET_REPO != '' }}
+        env:
+          GEMINI_API_KEY_1: ${{ steps.public.outputs.verified == 'true' && secrets.GEMINI_API_KEY_1 || '' }}
+          GEMINI_API_KEY_2: ${{ steps.public.outputs.verified == 'true' && secrets.GEMINI_API_KEY_2 || '' }}
+          GEMINI_API_KEY_3: ${{ steps.public.outputs.verified == 'true' && secrets.GEMINI_API_KEY_3 || '' }}
+          GEMINI_API_KEY_4: ${{ steps.public.outputs.verified == 'true' && secrets.GEMINI_API_KEY_4 || '' }}
+          GEMINI_API_KEY_5: ${{ steps.public.outputs.verified == 'true' && secrets.GEMINI_API_KEY_5 || '' }}
+          GEMINI_API_KEY_6: ${{ steps.public.outputs.verified == 'true' && secrets.GEMINI_API_KEY_6 || '' }}
+          GEMINI_API_KEY_1_QUOTA_GROUP: ${{ steps.public.outputs.verified == 'true' && vars.GEMINI_API_KEY_1_QUOTA_GROUP || '' }}
+          GEMINI_API_KEY_2_QUOTA_GROUP: ${{ steps.public.outputs.verified == 'true' && vars.GEMINI_API_KEY_2_QUOTA_GROUP || '' }}
+          GEMINI_API_KEY_3_QUOTA_GROUP: ${{ steps.public.outputs.verified == 'true' && vars.GEMINI_API_KEY_3_QUOTA_GROUP || '' }}
+          GEMINI_API_KEY_4_QUOTA_GROUP: ${{ steps.public.outputs.verified == 'true' && vars.GEMINI_API_KEY_4_QUOTA_GROUP || '' }}
+          GEMINI_API_KEY_5_QUOTA_GROUP: ${{ steps.public.outputs.verified == 'true' && vars.GEMINI_API_KEY_5_QUOTA_GROUP || '' }}
+          GEMINI_API_KEY_6_QUOTA_GROUP: ${{ steps.public.outputs.verified == 'true' && vars.GEMINI_API_KEY_6_QUOTA_GROUP || '' }}
+          OPENROUTER_API_KEY: ${{ steps.public.outputs.verified == 'true' && secrets.OPENROUTER_API_KEY || '' }}
+          NVIDIA_API_KEY_1: ${{ steps.public.outputs.verified == 'true' && secrets.NVIDIA_API_KEY_1 || '' }}
+          NVIDIA_API_KEY_2: ${{ steps.public.outputs.verified == 'true' && secrets.NVIDIA_API_KEY_2 || '' }}
+          GROQ_API_KEY: ${{ steps.public.outputs.verified == 'true' && secrets.GROQ_API_KEY || '' }}
+          AI_GATEWAY_API_KEY: ${{ steps.public.outputs.verified == 'true' && secrets.VERCEL_AI_GATEWAY_API_KEY || '' }}
+          CLOUDFLARE_API_TOKEN: ${{ steps.public.outputs.verified == 'true' && secrets.CLOUDFLARE_API_TOKEN || '' }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ steps.public.outputs.verified == 'true' && vars.CLOUDFLARE_ACCOUNT_ID || '' }}
+          FLEET_GROQ_ENABLE: ${{ vars.FLEET_GROQ_ENABLE }}
+          FLEET_VERCEL_AI_ENABLE: ${{ vars.FLEET_VERCEL_AI_ENABLE }}
+          FLEET_CLOUDFLARE_AI_ENABLE: ${{ vars.FLEET_CLOUDFLARE_AI_ENABLE }}
+          FLEET_OPENROUTER_ENABLE: ${{ vars.FLEET_OPENROUTER_ENABLE }}
         run: |
           mkdir -p artifacts
           FLEET_ARTIFACT_DIR=artifacts node scripts/deep.mjs
       - name: dump opencode logs on failure
         if: failure()
         run: tail -n 60 $HOME/.local/share/opencode/log/*.log 2>/dev/null || true
+      - name: export bounded provider cooldown state
+        if: always()
+        env:
+          FLEET_PROVIDER_HEALTH_ARTIFACT_DIR: ${{ github.workspace }}/provider-health-artifacts
+          FLEET_PROVIDER_HEALTH_ARTIFACT_ID: deep-${{ github.run_id }}-${{ strategy.job-index }}
+        run: node scripts/provider-health-artifact.mjs export
+      - name: upload provider cooldown state
+        if: ${{ always() && hashFiles('provider-health-artifacts/provider-health-*.json') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: provider-health-deep-${{ strategy.job-index }}
+          path: provider-health-artifacts/provider-health-*.json
+          retention-days: 1
       - name: upload findings
         if: ${{ env.FLEET_REPO != '' && hashFiles('artifacts/report-*.json') != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -136,7 +197,14 @@ jobs:
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
     steps:
       - name: sanitize workers input
-        run: echo "FLEET_MAX_WORKERS=$(echo '${{ github.event.inputs.workers }}' | grep -E '^[0-9]+$' || echo 4)" >> "$GITHUB_ENV"
+        env:
+          WORKERS_INPUT: ${{ github.event.inputs.workers }}
+        run: |
+          case "$WORKERS_INPUT" in
+            ''|*[!0-9]*) workers=4 ;;
+            *) workers="$WORKERS_INPUT" ;;
+          esac
+          printf 'FLEET_MAX_WORKERS=%s\n' "$workers" >> "$GITHUB_ENV"
       - name: checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -163,5 +231,16 @@ jobs:
         continue-on-error: true
       - name: ensure artifacts dir
         run: mkdir -p artifacts
+      - name: download provider cooldown state
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: provider-health-deep-*
+          merge-multiple: true
+          path: provider-health-artifacts
+        continue-on-error: true
+      - name: import bounded provider cooldown state
+        env:
+          FLEET_PROVIDER_HEALTH_ARTIFACT_DIR: ${{ github.workspace }}/provider-health-artifacts
+        run: node scripts/provider-health-artifact.mjs import
       - name: commit reports as M1Vj
         run: FLEET_ARTIFACT_DIR=artifacts FLEET_DEEP_MODE=commit node scripts/deep.mjs

@@ -5,6 +5,8 @@ import { validateDirectives } from "../scripts/lib/directives.mjs";
 
 const watchdogWorkflow = readFileSync(new URL("../.github/workflows/watchdog.yml", import.meta.url), "utf8");
 const watchdogSource = readFileSync(new URL("../scripts/watchdog.mjs", import.meta.url), "utf8");
+const deepSource = readFileSync(new URL("../scripts/deep.mjs", import.meta.url), "utf8");
+const improveSource = readFileSync(new URL("../scripts/improve.mjs", import.meta.url), "utf8");
 
 test("valid report directive passes", () => {
   const r = validateDirectives('[{"kind":"report","section":"triage","text":"all quiet"}]');
@@ -228,8 +230,24 @@ test("malformed heartbeats collapse to one canonical unknown alert identity", as
 
 test("resolveModelChain parsing", async () => {
   const { resolveModelChain } = await import("../scripts/lib/model.mjs");
-  assert.deepEqual(resolveModelChain({}), ["opencode/x-preview-f-free"]);
-  assert.equal(resolveModelChain({ FLEET_MODEL_CHAIN: "a/b,c/d" }).length, 2);
+  assert.deepEqual(resolveModelChain({}), [
+    "antigravity/claude-opus-4-6-thinking",
+    "gemini-api/gemini-3.7-flash",
+    "vercel-ai-gateway/poolside/laguna-s-2.1-free",
+    "cloudflare-workers-ai/@cf/openai/gpt-oss-120b",
+    "cloudflare-workers-ai/@cf/zai-org/glm-4.7-flash",
+    "groq/qwen/qwen3.8-27b",
+    "nvidia-nim/moonshotai/kimi-k3",
+    "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+    "opencode/claude-opus-4-6",
+  ]);
+  assert.equal(resolveModelChain({ FLEET_MODEL_CHAIN: "opencode/claude-opus-4-6,openrouter/nvidia/nemotron-3-ultra-550b-a55b:free" }).length, 2);
+  assert.throws(() => resolveModelChain({ FLEET_MODEL_CHAIN: "a/b,c/d" }), /MODEL_REFERENCE_UNVERIFIED/);
+});
+
+test("public repository research explicitly opts into verified-public data routing", () => {
+  assert.match(deepSource, /dataClass:\s*"public"/);
+  assert.match(improveSource, /dataClass:\s*"public"/);
 });
 
 test("summarizeEvents window filtering", async () => {

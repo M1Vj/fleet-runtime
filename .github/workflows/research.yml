@@ -1,0 +1,190 @@
+name: fleet-research
+run-name: "fleet research ${{ github.run_id }}"
+
+# Deliberately no schedule. A trusted planner dispatches a single run for a
+# correlated failure, or an owner starts one from the Actions UI.
+on:
+  workflow_dispatch:
+    inputs:
+      correlation_id:
+        description: "research-<32 hex> correlation key from private state"
+        type: string
+        required: true
+      artifact_digest:
+        description: "optional sha256 digest of a sanitized request artifact"
+        type: string
+        required: false
+        default: ""
+      fingerprint_id:
+        description: "bounded failure fingerprint ID from private state"
+        type: string
+        required: false
+        default: ""
+      trigger:
+        description: "bounded research trigger"
+        type: string
+        required: false
+        default: ""
+      query:
+        description: "bounded public research query"
+        type: string
+        required: false
+        default: ""
+  repository_dispatch:
+    types: [research-requested]
+
+concurrency:
+  group: fleet-state-writer
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  planner:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      correlation_id: ${{ steps.plan.outputs.correlation_id }}
+    env:
+      FLEET_RESEARCH_CORRELATION_ID: ${{ inputs.correlation_id || github.event.client_payload.correlation_id }}
+      FLEET_RESEARCH_FINGERPRINT_ID: ${{ inputs.fingerprint_id || github.event.client_payload.fingerprint_id }}
+      FLEET_RESEARCH_TRIGGER: ${{ inputs.trigger || github.event.client_payload.trigger }}
+      FLEET_RESEARCH_QUERY: ${{ inputs.query || github.event.client_payload.query }}
+      FLEET_RESEARCH_MODE: planner
+      FLEET_ARTIFACT_DIR: artifacts
+    steps:
+      - name: checkout runtime
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: setup node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+      - name: build sanitized request artifact
+        id: plan
+        run: |
+          node scripts/research.mjs
+          correlation=$(node -e 'const fs=require("fs"); const p=JSON.parse(fs.readFileSync("artifacts/research-request.json","utf8")); process.stdout.write(p.correlationId)')
+          echo "correlation_id=$correlation" >> "$GITHUB_OUTPUT"
+      - name: upload sanitized request
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: research-request-${{ github.run_id }}
+          path: artifacts/research-request.json
+          if-no-files-found: error
+          retention-days: 7
+
+  retrieval:
+    needs: planner
+    if: ${{ needs.planner.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      FLEET_RESEARCH_MODE: retrieval
+      FLEET_ARTIFACT_DIR: artifacts
+      FLEET_RESEARCH_REQUEST_PATH: artifacts/research-request.json
+    steps:
+      - name: checkout runtime
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: setup node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+      - name: install pinned opencode cli
+        run: npm install -g opencode-ai@1.18.21
+      - name: download sanitized request
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: research-request-${{ github.run_id }}
+          path: artifacts
+      - name: public retrieval model
+        env:
+          # The model key is scoped to this step. The script strips tokens,
+          # state roots, cookies, and credentials before invoking OpenCode.
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: |
+          # scripts/research.mjs enforces profile: public-read with read-only
+          # workspace tools; source URLs are fetched by its SSRF-safe boundary.
+          # bash, webfetch, edit, skill, task, and mutation tools remain denied.
+          node scripts/research.mjs
+      - name: upload retrieval result
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: research-result-${{ github.run_id }}
+          path: artifacts/research-result.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  finalizer:
+    needs: [planner, retrieval]
+    if: ${{ always() && needs.planner.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
+      FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
+      FLEET_RESEARCH_MODE: finalizer
+      FLEET_ARTIFACT_DIR: artifacts
+      FLEET_RESEARCH_REQUEST_PATH: artifacts/research-request.json
+      FLEET_RESEARCH_RESULT_PATH: artifacts/research-result.json
+      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+    steps:
+      - name: checkout runtime
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: checkout private state
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: M1Vj/fleet-control
+          token: ${{ secrets.FLEET_GH_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: state-control
+      - name: setup node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+      - name: download sanitized request
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: research-request-${{ github.run_id }}
+          path: artifacts
+      - name: download retrieval result
+        if: ${{ needs.retrieval.result == 'success' }}
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: research-result-${{ github.run_id }}
+          path: artifacts
+      - name: verify private state writer identity
+        env:
+          FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+        run: |
+          node --input-type=module -e 'import { runGate } from "./scripts/lib/gate.mjs"; await runGate(process.env);'
+      - name: append terminal private event
+        run: node scripts/research.mjs
+      - name: commit terminal event to private state
+        run: |
+          git -C state-control config user.name M1Vj
+          git -C state-control config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git -C state-control add state/research.jsonl
+          if git -C state-control diff --cached --quiet; then exit 0; fi
+          git -C state-control commit -m "[fleet] research terminal $GITHUB_RUN_ID"
+          git -C state-control config credential.helper '!f() { echo username=M1Vj; echo password=$FLEET_GH_TOKEN; }; f'
+          git -C state-control push origin HEAD:main
+      - name: 'dispatch exact merge continuation (merge.yml; allow_merge: "false")'
+        if: ${{ needs.retrieval.result == 'success' }}
+        env:
+          FLEET_RESEARCH_MODE: continuation-dispatch
+          FLEET_RESEARCH_CORRELATION_ID: ${{ needs.planner.outputs.correlation_id }}
+        run: node scripts/research.mjs

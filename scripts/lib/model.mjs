@@ -2,8 +2,78 @@ import { spawn } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { createHash, randomUUID } from "node:crypto";
+import { recordTelemetryEvent, isTelemetryValidationError } from "./telemetry.mjs";
+import { mergeProviderHealthSnapshots, persistProviderHealthState, readProviderHealthState } from "./provider-health-state.mjs";
 import { gatewayCircuitOpen, markGatewayDown, markGatewayUp } from "./gateway-health.mjs";
 import { classifyProviderAuthFailure, providerAuthStatus, resolveProviderAuth } from "./provider-auth.mjs";
+import {
+  createAntigravityAdapter,
+  createFreeProviderAdapter,
+  loadProviderRegistry,
+  normalizeProviderHealthStatus,
+  parseProviderModelReference,
+  providerModelReference,
+  selectProviderRoute,
+} from "./provider-registry.mjs";
+
+function telemetryStateFile(env = process.env) {
+  const root = String(env?.FLEET_STATE_ROOT || "");
+  if (!root || !path.isAbsolute(root) || path.resolve(root) !== root || root.endsWith(path.sep)) return "";
+  return path.join(root, "state", "telemetry.jsonl");
+}
+
+function telemetryCorrelation(env, route = {}, invocationId = "") {
+  const runId = telemetryRunId(env);
+  const target = `${route.provider || "provider"}|${route.model || "model"}|${route.repo || ""}|${route.pr || 0}|${route.headSha || ""}`;
+  return `corr-${createHash("sha256").update(`${runId}|${invocationId}|${target}`).digest("hex").slice(0, 32)}`;
+}
+
+function telemetryRunId(env) {
+  return String(env?.FLEET_RUN_ID || env?.GITHUB_RUN_ID || "local-model").replace(/[^A-Za-z0-9._:-]/g, "-").slice(0, 100) || "local-model";
+}
+
+function telemetryDurationBucket(value) {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms < 1000) return "lt1s";
+  if (ms < 5000) return "1to5s";
+  if (ms < 15000) return "5to15s";
+  if (ms < 30000) return "15to30s";
+  return "gt30s";
+}
+
+function telemetryLane(env) {
+  const value = String(env?.FLEET_LANE || "unknown").trim().toLowerCase();
+  return new Set(["merge", "revise", "research", "deep", "improve", "patrol", "watchdog", "promotion", "sentinel", "selftest", "kb", "retro", "thesis", "terminal", "unknown"]).has(value) ? value : "unknown";
+}
+
+function telemetryAccountScope(selected, isZen) {
+  if (selected?.quotaGroup) return "project";
+  const scope = String(selected?.providerObject?.auth?.quotaScope || "").toLowerCase();
+  if (scope === "account" || scope === "account-wide" || isZen) return "account";
+  return "provider";
+}
+
+function telemetryErrorCode(value) {
+  const state = String(value || "").toLowerCase();
+  if (state.includes("rate")) return "rate_limited";
+  if (state.includes("quota") || state.includes("exhaust")) return "quota_exhausted";
+  if (state.includes("auth") || state.includes("reject") || state.includes("credential")) return "auth_rejected";
+  if (state.includes("timeout")) return "timeout";
+  if (state.includes("network") || state.includes("spawn") || state.includes("unavailable")) return "network";
+  return state ? "unknown" : "none";
+}
+
+function emitModelTelemetry(env, input) {
+  const file = telemetryStateFile(env);
+  if (!file) return null;
+  try {
+    return recordTelemetryEvent(file, input);
+  } catch (error) {
+    if (isTelemetryValidationError(error)) throw error;
+    return null;
+  }
+}
 
 export const DISPOSABLE_MODEL_POLICY = Object.freeze({
   permission: {
@@ -35,7 +105,9 @@ export const PUBLIC_READ_MODEL_POLICY = Object.freeze({
     list: "allow",
     glob: "allow",
     grep: "allow",
-    webfetch: "allow",
+    // Public source retrieval is performed by the SSRF-safe fetch boundary;
+    // the model must not open arbitrary URLs from hostile prompt content.
+    webfetch: "deny",
     bash: "deny",
     edit: "deny",
     external_directory: "deny",
@@ -159,18 +231,85 @@ function collectText(obj, out = []) {
   return out;
 }
 
-export function resolveModelChain(env = process.env) {
-  const primary = "opencode/x-preview-f-free";
-  const raw = String(env.FLEET_MODEL_CHAIN || "").trim();
-  if (!raw) return [primary];
-  const chain = raw.split(",").map((m) => m.trim()).filter(Boolean);
-  return chain.length > 0 ? chain : [primary];
+const DEFAULT_MODEL_BUCKET = "other";
+
+function canonicalModelReference(reference, registry) {
+  const parsed = parseProviderModelReference(reference, registry);
+  if (!parsed || !parsed.model || !parsed.provider?.models?.[parsed.model]) {
+    throw new Error("MODEL_REFERENCE_UNVERIFIED");
+  }
+  const canonical = providerModelReference(parsed.provider, parsed.model);
+  const registered = Object.values(registry.buckets || {}).some((refs) => Array.isArray(refs)
+    && refs.some((ref) => providerModelReference(ref.provider, ref.model) === canonical));
+  if (!registered) throw new Error("MODEL_REFERENCE_UNVERIFIED");
+  return canonical;
 }
 
-export function runOnce({ prompt, sessionId, variant, timeoutMs, env, files = [], model = "opencode/x-preview-f-free", modelOverride, workspace, repoRoot = process.cwd(), stateRoot = env.FLEET_STATE_ROOT || "", spawnImpl = spawn }) {
+function bucketEntryForReference(reference, registry) {
+  const canonical = canonicalModelReference(reference, registry);
+  for (const [bucket, refs] of Object.entries(registry.buckets || {})) {
+    const ref = Array.isArray(refs)
+      ? refs.find((item) => providerModelReference(item.provider, item.model) === canonical)
+      : null;
+    if (ref) {
+      const provider = registry.providers.find((item) => item.id === ref.provider);
+      return { bucket, ref, provider, reference: canonical };
+    }
+  }
+  return null;
+}
+
+function uniqueReferences(references) {
+  return [...new Set(references)];
+}
+
+/** Resolve only registry-backed provider/model references in priority order. */
+export function resolveModelChain(env = process.env, { dataClass = "private", publicTarget } = {}) {
+  const registry = loadProviderRegistry();
+  if (dataClass === "public" && (publicTarget?.private !== false || publicTarget?.visibility !== "public")) {
+    throw new Error("MODEL_PUBLIC_TARGET_REQUIRED");
+  }
+  const publicRequest = dataClass === "public"
+    && publicTarget?.private === false
+    && publicTarget?.visibility === "public";
+  const publicFallbacks = () => uniqueReferences(
+    (registry.buckets?.public || [])
+      .slice()
+      .sort((a, b) => a.priority - b.priority)
+      .map((ref) => providerModelReference(ref.provider, ref.model)),
+  );
+  const raw = String(env.FLEET_MODEL_CHAIN || "").trim();
+  if (raw) {
+    const chain = raw.split(",").map((m) => m.trim()).filter(Boolean);
+    if (chain.length === 0) throw new Error("MODEL_CHAIN_EMPTY");
+    const preferred = chain.map((reference) => canonicalModelReference(reference, registry));
+    // Repository variables may narrow private lanes, but they cannot reorder a
+    // verified-public lane around its governed free-first policy. Call sites
+    // that intentionally require one exact model use modelOverride instead.
+    return publicRequest ? publicFallbacks() : uniqueReferences(preferred);
+  }
+  const requestedGemini = String(env.FLEET_GEMINI_MODEL || "").trim();
+  if (requestedGemini) {
+    const refs = Array.isArray(registry.buckets?.gemini)
+      ? registry.buckets.gemini.filter((item) => item.model === requestedGemini)
+      : [];
+    const references = uniqueReferences(refs.map((ref) => providerModelReference(ref.provider, ref.model)));
+    if (references.length !== 1) throw new Error("MODEL_GEMINI_MODEL_UNVERIFIED");
+    return uniqueReferences(publicRequest ? [...references, ...publicFallbacks()] : references);
+  }
+  const bucket = publicRequest
+    ? "public"
+    : (String(env.FLEET_MODEL_BUCKET || DEFAULT_MODEL_BUCKET).trim() || DEFAULT_MODEL_BUCKET);
+  const refs = registry.buckets?.[bucket];
+  if (!Array.isArray(refs) || refs.length === 0) throw new Error("MODEL_BUCKET_UNVERIFIED");
+  return uniqueReferences(refs.slice().sort((a, b) => a.priority - b.priority).map((ref) => providerModelReference(ref.provider, ref.model)));
+}
+
+export function runOnce({ prompt, sessionId, variant, timeoutMs, env, files = [], model = "opencode/claude-opus-4-6", workspace, repoRoot = process.cwd(), stateRoot = env.FLEET_STATE_ROOT || "", spawnImpl = spawn }) {
   return new Promise((resolve) => {
-    const missing = !resolveProviderAuth(env).ok;
-    const args = ["run", "--format", "json", "-m", modelOverride || model];
+    const auth = resolveProviderAuth(env);
+    const missing = !auth.ok;
+    const args = ["run", "--format", "json", "-m", model];
     if (env.FLEET_OPENCODE_DEBUG === "1") args.push("--print-logs", "--log-level", "DEBUG");
     if (!missing && variant) args.push("--variant", variant);
     if (!missing && sessionId) args.push("-s", sessionId);
@@ -210,7 +349,7 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs, env, files = []
     delete childEnv.GDRIVE_CLIENT_SECRET;
     // Legacy migration path only: owner-Mac OAuth snapshots are never the
     // production dependency; GitHub provisions OPENCODE_API_KEY instead.
-    childEnv.OPENCODE_AUTH_CONTENT = env.FLEET_OPENCODE_AUTH || "";
+    childEnv.OPENCODE_AUTH_CONTENT = auth.mode === "legacy-oauth-migration" ? env.FLEET_OPENCODE_AUTH || "" : "";
     childEnv.OPENCODE_DISABLE_AUTOUPDATE = "1";
     const child = spawnImpl("opencode", args, { env: childEnv, stdio: ["ignore", "pipe", "pipe"], cwd: workspaceRoot });
     const timer = setTimeout(() => {
@@ -263,32 +402,347 @@ function sleep(ms) {
   return new Promise((res) => setTimeout(res, ms));
 }
 
-async function askModelInternal({ prompt, sessionId, timeoutMs = 480000, env = process.env, preferVariantMax = true, maxRounds = 4, files = [], modelOverride, workspace, repoRoot = process.cwd(), stateRoot: privateStateRoot = env.FLEET_STATE_ROOT || "", spawnImpl, skipCircuitCheck = false }) {
+function parseHealthSnapshot(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return structuredClone(value);
+  if (typeof value !== "string" || !value.trim()) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function routeEntryForReference(reference, registry) {
+  try {
+    return bucketEntryForReference(reference, registry);
+  } catch {
+    return null;
+  }
+}
+
+function isPublicTarget(dataClass, publicTarget) {
+  return dataClass === "public" && publicTarget?.private === false && publicTarget?.visibility === "public";
+}
+
+function directRouteEligible(entry, dataClass, publicTarget) {
+  return entry?.provider?.kind === "free-api" && isPublicTarget(dataClass, publicTarget);
+}
+
+function localRouteEligible(entry, env) {
+  return entry?.provider?.localOnly === true
+    && /^(?:1|true)$/i.test(String(env?.FLEET_ANTIGRAVITY_LOCAL || ""))
+    && !/^(?:1|true)$/i.test(String(env?.GITHUB_ACTIONS || ""));
+}
+
+function routeHealthForSelection({ entry, health, now, circuitOpen }) {
+  const snapshot = structuredClone(health || {});
+  if (entry?.provider?.id === "opencode-zen" && !snapshot[entry.provider.id] && !circuitOpen) {
+    // Existing OpenCode auth plus a closed gateway circuit is the Zen health
+    // signal. Direct APIs require an explicit fresh snapshot instead.
+    snapshot[entry.provider.id] = { status: "healthy", checkedAt: new Date(now).toISOString() };
+  }
+  return snapshot;
+}
+
+function materializeRouteEnv(route, env) {
+  const childEnv = { ...env };
+  if (route?.sourceEnv && route?.targetEnv && typeof env?.[route.sourceEnv] === "string") {
+    childEnv[route.targetEnv] = env[route.sourceEnv];
+  }
+  if (route?.provider !== "opencode-zen") return childEnv;
+  // OpenCode receives only its selected target key. Backup keys and unrelated
+  // provider credentials are removed before the child process is spawned.
+  for (const key of Object.keys(childEnv)) {
+    if (/TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL/i.test(key)
+      && key !== "OPENCODE_API_KEY"
+      && key !== "OPENCODE_AUTH_CONTENT") delete childEnv[key];
+  }
+  delete childEnv.FLEET_OPENCODE_AUTH;
+  if (route.sourceEnv && route.sourceEnv !== "OPENCODE_API_KEY") delete childEnv[route.sourceEnv];
+  return childEnv;
+}
+
+function routeFailureState(error) {
+  const code = String(error?.code || error?.message || "");
+  if (/CREDENTIAL_(?:MISSING|EXPIRED|LOCAL_ONLY)/.test(code)) return code.includes("EXPIRED") ? "expired" : "missing";
+  if (/_AUTH_REJECTED|_REJECTED/.test(code)) return "rejected";
+  if (/_RATE_LIMITED/.test(code)) return "rate-limited";
+  if (/_QUOTA_EXHAUSTED|_EXHAUSTED/.test(code)) return "quota-exhausted";
+  if (/_TIMEOUT/.test(code)) return "timeout";
+  return "";
+}
+
+export function recordRouteFailure(health, route, state, now) {
+  if (!route?.provider || !state) return;
+  const normalizedState = state === "exhausted" ? "quota-exhausted" : state;
+  const current = health[route.provider] && typeof health[route.provider] === "object" ? health[route.provider] : {};
+  const credentials = current.credentials && typeof current.credentials === "object" ? { ...current.credentials } : {};
+  credentials[route.credential] = {
+    ...(credentials[route.credential] || {}),
+    status: normalizedState,
+    checkedAt: new Date(now).toISOString(),
+  };
+  const quotaGroups = current.quotaGroups && typeof current.quotaGroups === "object" ? { ...current.quotaGroups } : {};
+  if (["rate-limited", "quota-exhausted"].includes(normalizedState)
+    && route.quotaGroupRotation === true
+    && typeof route.quotaGroup === "string"
+    && route.quotaGroup.length > 0) {
+    quotaGroups[route.quotaGroup] = {
+      ...(quotaGroups[route.quotaGroup] || {}),
+      status: normalizedState,
+      checkedAt: new Date(now).toISOString(),
+    };
+  }
+  health[route.provider] = {
+    ...current,
+    checkedAt: new Date(now).toISOString(),
+    // Keep a credential-group provider healthy when the selected project is
+    // limited. Without an explicit, validated group map, the failure remains
+    // provider-wide and prevents quota-evasion retries.
+    ...(normalizedState === "rejected" || normalizedState === "missing" || normalizedState === "expired"
+      ? { status: normalizeProviderHealthStatus(current.status, "healthy") }
+      : ["rate-limited", "quota-exhausted"].includes(normalizedState)
+        && route.quotaGroupRotation === true && typeof route.quotaGroup === "string"
+        ? { status: normalizeProviderHealthStatus(current.status, "healthy") }
+        : { status: normalizedState }),
+    credentials,
+    ...(Object.keys(quotaGroups).length > 0 ? { quotaGroups } : {}),
+  };
+}
+
+function classifyModelRouteFailure(text) {
+  const value = String(text || "");
+  if (/\b429\b|rate[ -]?limit|too many requests/i.test(value)) return "rate-limited";
+  if (/\b402\b|quota exceeded|credits? exhausted|payment required|usage limit/i.test(value)) return "quota-exhausted";
+  if (/\b(?:401|403)\b|unauthorized|forbidden|invalid[_ -]?api[_ -]?key/i.test(value)) return "rejected";
+  return "";
+}
+
+function directAttempt({ route, error, elapsedMs }) {
+  const code = String(error?.code || error?.message || "FREE_PROVIDER_REQUEST_FAILED");
+  return {
+    round: 1,
+    model: route.modelReference,
+    provider: route.provider,
+    adapter: route.providerObject?.id === "antigravity" ? "antigravity-cli" : "direct-api",
+    auth: "yes",
+    exit: -1,
+    interrupted: code === "FREE_PROVIDER_TIMEOUT",
+    gotReply: false,
+    hadSession: false,
+    elapsedMs,
+    error: code.replace(/[^A-Z0-9_-]/g, "_").slice(0, 80),
+  };
+}
+
+async function askDirectRoute({ route, prompt, timeoutMs, env, dataClass, publicTarget, effort, fetchImpl, allowLocal, spawnImpl }) {
+  const started = Date.now();
+  try {
+    const adapter = route.providerObject?.id === "antigravity"
+      ? createAntigravityAdapter({ provider: route.providerObject, env, allowLocal, spawnImpl })
+      : createFreeProviderAdapter({ provider: route.providerObject, env, fetchImpl });
+    const adapterOptions = {
+      prompt,
+      model: route.model,
+      account: route.credential,
+      timeoutMs,
+      dataClass,
+      publicTarget,
+      effort,
+    };
+    const result = await adapter.invoke(adapterOptions);
+    return {
+      reply: result.response,
+      sessionId: "",
+      modelMode: route.modelReference,
+      attempts: [{ round: 1, model: route.modelReference, provider: route.provider, adapter: route.providerObject?.id === "antigravity" ? "antigravity-cli" : "direct-api", auth: "yes", exit: 0, interrupted: false, gotReply: true, hadSession: false, elapsedMs: Date.now() - started }],
+      complete: true,
+    };
+  } catch (error) {
+    return {
+      reply: "",
+      sessionId: "",
+      modelMode: route.modelReference,
+      attempts: [directAttempt({ route, error, elapsedMs: Date.now() - started })],
+      complete: false,
+      authState: routeFailureState(error),
+    };
+  }
+}
+
+async function askModelInternal({ prompt, sessionId, timeoutMs = 480000, env = process.env, preferVariantMax = true, maxRounds = 4, files = [], modelOverride, workspace, repoRoot = process.cwd(), stateRoot: privateStateRoot = env.FLEET_STATE_ROOT || "", spawnImpl, skipCircuitCheck = false, dataClass = "private", publicTarget, providerHealth, effort = "high", fetchImpl = globalThis.fetch, now = Date.now(), rotationSeed, invocationId = `call-${randomUUID()}` }) {
+  const registry = loadProviderRegistry();
+  if (dataClass === "public" && (publicTarget?.private !== false || publicTarget?.visibility !== "public")) {
+    throw new Error("MODEL_PUBLIC_TARGET_REQUIRED");
+  }
+  const chain = modelOverride
+    ? [canonicalModelReference(modelOverride, registry)]
+    : resolveModelChain(env, { dataClass, publicTarget });
   const healthRoot = env.FLEET_STATE_ROOT || process.cwd();
-  const authStatus = providerAuthStatus(env, { circuitOpen: !skipCircuitCheck && !sessionId && gatewayCircuitOpen(healthRoot) });
-  if (!authStatus.ready) {
+  const circuitOpen = !skipCircuitCheck && !sessionId && gatewayCircuitOpen(healthRoot);
+  const authStatus = providerAuthStatus(env, { circuitOpen });
+  const explicitHealth = parseHealthSnapshot(providerHealth ?? env.FLEET_PROVIDER_HEALTH_JSON);
+  const persistedHealth = privateStateRoot ? readProviderHealthState(privateStateRoot, { now }) : {};
+  const runtimeHealth = mergeProviderHealthSnapshots(explicitHealth, persistedHealth, now);
+  const effectiveRotationSeed = rotationSeed ?? env.FLEET_ACCOUNT_ROTATION_SEED ?? env.GITHUB_RUN_ID ?? "";
+  const entries = chain.map((reference) => routeEntryForReference(reference, registry));
+  const hasDirectEligible = entries.some((entry) => directRouteEligible(entry, dataClass, publicTarget));
+  const allowLocal = entries.some((entry) => localRouteEligible(entry, env));
+  const hasLocalEligible = entries.some((entry) => localRouteEligible(entry, env));
+  if (!authStatus.ready && !hasDirectEligible && !hasLocalEligible) {
     return authStatus.stage === "credentials"
       ? { reply: "", sessionId: "", modelMode: "auth-missing", attempts: [{ round: 0, skipped: "model-auth-missing" }], complete: false, authMissing: true }
       : { reply: "", sessionId: "", modelMode: "circuit-open", attempts: [{ round: 0, skipped: "circuit-open" }], complete: false, circuitOpen: true };
   }
-  const chain = modelOverride ? [modelOverride] : resolveModelChain(env);
   const allAttempts = [];
   let lastSid = sessionId || "";
   let lastMode = "";
   let lastAuthState = "";
+  let attemptedZen = false;
+  let lastProvider = "";
+  let lastCredential = "";
+  const replayedReferences = new Set();
   for (let ci = 0; ci < chain.length; ci++) {
-    const r = await askOnModel({ model: chain[ci], isPrimary: ci === 0, prompt, sessionId: lastSid || undefined, timeoutMs, env, preferVariantMax, maxRounds, files, workspace, repoRoot, stateRoot: privateStateRoot, spawnImpl });
-    allAttempts.push(...(r.attempts || []));
-    if (r.sessionId) lastSid = r.sessionId;
-    lastMode = r.modelMode || lastMode;
-    lastAuthState = r.authState || lastAuthState;
-    if (r.complete) {
-      try { markGatewayUp(healthRoot); } catch {}
-      return { reply: r.reply, sessionId: lastSid, modelMode: lastMode, attempts: allAttempts, complete: true };
+    const reference = chain[ci];
+    const entry = routeEntryForReference(reference, registry);
+    if (!entry?.provider) {
+      allAttempts.push({ round: 0, model: reference, skipped: "model-reference-unverified" });
+      lastMode = reference;
+      continue;
     }
-    if (lastAuthState) break;
+    const isZen = entry.provider.id === "opencode-zen";
+    const routeHealth = routeHealthForSelection({ entry, health: runtimeHealth, now, circuitOpen });
+    const route = selectProviderRoute({
+      registry,
+      bucket: entry.bucket,
+      model: reference,
+      env,
+      health: routeHealth,
+      now,
+      freeOnly: !isZen,
+      allowPaid: isZen,
+      allowLocal,
+      allowLiveCanary: !isZen,
+      dataClass,
+      publicTarget,
+      rotationSeed: effectiveRotationSeed,
+    });
+    if (!route.ok) {
+      allAttempts.push({ round: 0, model: reference, provider: entry.provider.id, skipped: route.reason || "route-unavailable", skippedRoutes: route.skipped || [] });
+      lastMode = reference;
+      continue;
+    }
+    const selected = { ...route, providerObject: entry.provider };
+    const correlationId = telemetryCorrelation(env, selected, invocationId);
+    emitModelTelemetry(env, {
+      runId: telemetryRunId(env),
+      correlationId,
+      invocationId,
+      lane: telemetryLane(env),
+      event: "provider",
+      phase: "selected",
+      outcome: "started",
+      provider: {
+        name: selected.provider,
+        model: selected.model,
+        routeClass: selected.routeClass || (isZen ? "private-paid" : "public-free"),
+        accountScope: telemetryAccountScope(selected, isZen),
+        chainIndex: ci,
+        cooldownBucket: "none",
+      },
+    });
+    if (isZen) attemptedZen = true;
+    const routeEnv = materializeRouteEnv(selected, env);
+    const routeSession = isZen
+      && lastProvider === selected.provider
+      && lastCredential === selected.credential
+      ? lastSid
+      : "";
+    const result = isZen
+      ? await askOnModel({ model: selected.modelReference, isPrimary: ci === 0, prompt, sessionId: routeSession || undefined, timeoutMs, env: routeEnv, preferVariantMax, maxRounds, files, workspace, repoRoot, stateRoot: privateStateRoot, spawnImpl })
+      : await askDirectRoute({ route: selected, prompt, timeoutMs, env, dataClass, publicTarget, effort, fetchImpl, allowLocal, spawnImpl });
+    allAttempts.push(...(result.attempts || []));
+    const lastAttempt = Array.isArray(result.attempts) && result.attempts.length > 0 ? result.attempts.at(-1) : {};
+    emitModelTelemetry(env, {
+      runId: telemetryRunId(env),
+      correlationId,
+      invocationId,
+      lane: telemetryLane(env),
+      event: "provider",
+      phase: "attempt",
+      outcome: result.complete ? "succeeded" : "failed",
+      provider: {
+        name: selected.provider,
+        model: selected.model,
+        routeClass: selected.routeClass || (isZen ? "private-paid" : "public-free"),
+        accountScope: telemetryAccountScope(selected, isZen),
+        attempt: Number(lastAttempt.round) || 1,
+        chainIndex: ci,
+        durationBucket: telemetryDurationBucket(lastAttempt.elapsedMs),
+        errorCode: telemetryErrorCode(result.authState || lastAttempt.error),
+        httpClass: "none",
+        cooldownBucket: "none",
+      },
+    });
+    if (isZen && result.sessionId) lastSid = result.sessionId;
+    if (!isZen) lastSid = "";
+    lastProvider = selected.provider;
+    lastCredential = selected.credential;
+    lastMode = result.modelMode || selected.modelReference;
+    lastAuthState = result.authState || "";
+    if (result.complete) {
+      if (isZen) {
+        try { markGatewayUp(healthRoot); } catch {}
+      }
+      return { reply: result.reply, sessionId: isZen ? lastSid : "", modelMode: lastMode, attempts: allAttempts, complete: true };
+    }
+    recordRouteFailure(runtimeHealth, selected, lastAuthState, now);
+    if (privateStateRoot && ["rejected", "rate-limited", "quota-exhausted", "timeout", "unavailable"].includes(lastAuthState)) {
+      try {
+        persistProviderHealthState(privateStateRoot, runtimeHealth, { now });
+      } catch (error) {
+        // Another process owns the short atomic-write lock. Its write will be
+        // reloaded by the next call; do not sacrifice this call's fallback.
+        // Malformed/symlinked state and every other persistence error remain
+        // fail-closed.
+        if (error?.code !== "PROVIDER_HEALTH_STATE_BUSY") throw error;
+      }
+    }
+    emitModelTelemetry(env, {
+      runId: telemetryRunId(env),
+      correlationId,
+      invocationId,
+      lane: telemetryLane(env),
+      event: "provider",
+      phase: "fallback",
+      outcome: "started",
+      provider: {
+        name: selected.provider,
+        model: selected.model,
+        routeClass: selected.routeClass || (isZen ? "private-paid" : "public-free"),
+        accountScope: telemetryAccountScope(selected, isZen),
+        chainIndex: ci + 1,
+        errorCode: telemetryErrorCode(lastAuthState),
+        cooldownBucket: "none",
+      },
+    });
+    const canRotateCredential = lastAuthState === "rejected"
+      || ((lastAuthState === "rate-limited" || lastAuthState === "quota-exhausted") && selected.quotaGroupRotation === true);
+    if (canRotateCredential && !replayedReferences.has(reference)) {
+      // Re-run the same model reference once so selectProviderRoute can pick a
+      // cold credential from the same provider. Rate/quota failures are replayed
+      // only when the selected route proved a distinct credential-group map.
+      replayedReferences.add(reference);
+      chain.splice(ci + 1, 0, reference);
+    }
+    // Auth failures are eligible for a cold credential or another provider.
+    // Account-group rate/quota failures may use the next declared project;
+    // provider-wide limits continue to the next provider only.
   }
-  try { markGatewayDown(healthRoot, allAttempts.map((x) => x.errTail || "").join(" ").slice(-200)); } catch {}
+  if (attemptedZen) {
+    try { markGatewayDown(healthRoot, allAttempts.map((x) => x.errTail || x.error || "").join(" ").slice(-200)); } catch {}
+  }
   return {
     reply: "",
     sessionId: lastSid,
@@ -324,32 +778,25 @@ export async function askModel(opts = {}) {
   }
 }
 
-function stripAuth(env) {
-  const clone = { ...env };
-  delete clone.FLEET_OPENCODE_AUTH;
-  delete clone.OPENCODE_AUTH_CONTENT;
-  return clone;
-}
-
 async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env, preferVariantMax, maxRounds, files, workspace, repoRoot, stateRoot: privateStateRoot, spawnImpl }) {
   const healthRoot = env.FLEET_STATE_ROOT || process.cwd();
   let sid = sessionId || "";
   let mode = preferVariantMax && isPrimary ? "max" : "plain";
-  let useAuth = true;
+  let restarted = false;
   let promptNow = prompt;
   const attempts = [];
+  let routeState = "";
   for (let round = 1; round <= maxRounds; round++) {
     if (round > 1) {
       const backoff = Math.round(20000 + Math.random() * 15000);
       await sleep(backoff);
     }
-    const roundEnv = useAuth ? env : stripAuth(env);
-    const r = await runOnce({ prompt: promptNow, sessionId: sid || undefined, variant: mode === "max" ? "max" : undefined, timeoutMs, env: roundEnv, files, model, workspace, repoRoot, stateRoot: privateStateRoot, spawnImpl });
+    const r = await runOnce({ prompt: promptNow, sessionId: sid || undefined, variant: mode === "max" ? "max" : undefined, timeoutMs, env, files, model, workspace, repoRoot, stateRoot: privateStateRoot, spawnImpl });
     attempts.push({
       round,
       model,
       mode,
-      auth: useAuth ? "yes" : "anon",
+      auth: "yes",
       exit: r.exitCode,
       interrupted: r.interrupted,
       gotReply: Boolean(r.reply),
@@ -368,26 +815,44 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
     if (authState) {
       return { reply: "", sessionId: sid, modelMode: mode, attempts, complete: false, authState };
     }
+    routeState = classifyModelRouteFailure(r.stderrTail || "") || routeState;
     if (mode === "max") {
       mode = "plain";
       continue;
     }
-    if (useAuth) {
-      useAuth = false;
+    if (!restarted) {
+      restarted = true;
       sid = "";
       promptNow = prompt;
       continue;
     }
-    promptNow = "You were interrupted mid-task. Continue from where you stopped and finish the job. Output ONLY the requested final answer now.";
-    sid = "";
+    promptNow = sid
+      ? "You were interrupted mid-task. Continue from where you stopped and finish the job. Output ONLY the requested final answer now."
+      : prompt;
   }
-  return { reply: "", sessionId: sid, modelMode: mode, attempts, complete: false };
+  return { reply: "", sessionId: sid, modelMode: mode, attempts, complete: false, ...(routeState ? { authState: routeState } : {}) };
 }
 
 export async function askModelResilient(opts) {
   const first = await askModel(opts);
   if (first.complete || first.authState || first.authMissing) return { ...first, ladders: 1 };
   const cooldownMs = opts.cooldownMs ?? 90000;
+  emitModelTelemetry(opts.env || process.env, {
+    runId: telemetryRunId(opts.env || process.env),
+    correlationId: telemetryCorrelation(opts.env || process.env, { provider: "model-ladder", model: "fallback" }),
+    lane: telemetryLane(opts.env || process.env),
+    event: "provider",
+    phase: "cooldown",
+    outcome: "started",
+    provider: {
+      name: "model-ladder",
+      model: "fallback",
+      routeClass: "unknown",
+      accountScope: "provider",
+      cooldownBucket: cooldownMs < 60000 ? "lt1m" : cooldownMs <= 300000 ? "1to5m" : "gt5m",
+      errorCode: telemetryErrorCode(first.authState || "unavailable"),
+    },
+  });
   await new Promise((r) => setTimeout(r, cooldownMs));
   const second = await askModel({ ...opts, maxRounds: Math.max(2, (opts.maxRounds || 4) - 1) });
   return { ...second, ladders: 2 };

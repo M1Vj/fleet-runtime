@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "tools": [
+    {
+      "id": "rank-primary-sources",
+      "version": "1.0.0",
+      "digest": "sha256:8e982ca49b028703727cb7fe99e18b2ac3218b029e8c720ea37e8ea9ba14aaa8",
+      "status": "inactive",
+      "kind": "declarative-v1",
+      "operations": [
+        {"op": "filter-eq", "field": "verified", "value": true},
+        {"op": "sort-number", "field": "authority", "direction": "desc"},
+        {"op": "take", "count": 4},
+        {"op": "select", "fields": ["url", "title", "authority", "verified"]}
+      ],
+      "purpose": "Keep verified sources and rank them by declared authority.",
+      "description": "A bounded source-ranking pipeline with no executable authority.",
+      "provenance": {
+        "source": "fleet-runtime built-in",
+        "license": "MIT",
+        "author": "M1Vj"
+      },
+      "capabilities": [
+        "source-ranking",
+        "json-selection",
+        "result-aggregation",
+        "no-shell",
+        "no-network",
+        "no-env",
+        "no-write"
+      ],
+      "protectedPathExclusions": [
+        ".github/workflows/**",
+        "config/providers.json",
+        "scripts/lib/provider-registry.mjs",
+        "scripts/lib/model.mjs",
+        "state/**"
+      ],
+      "tokenBounds": {
+        "maxInputChars": 32768,
+        "maxOutputChars": 8192
+      },
+      "fixtures": [
+        {
+          "id": "verified-authority-order",
+          "expected": ["verified", "authority", "take", "select"]
+        }
+      ],
+      "judges": []
+    }
+  ]
+}

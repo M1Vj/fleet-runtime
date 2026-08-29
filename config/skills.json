@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "skills": [
+    {
+      "id": "research-hard-fail",
+      "version": "1.0.0",
+      "path": "skills/research-hard-fail/SKILL.md",
+      "digest": "sha256:6aca5bf8c7e6028bb2a9e3bac9bffb5230c8bd17948bf7036b15808a6efd458a",
+      "status": "inactive",
+      "lanes": ["research", "improve"],
+      "purpose": "Investigate hard or repeated failures with bounded public evidence.",
+      "description": "A text-only, public-evidence research procedure with an explicit hostile-content boundary.",
+      "provenance": {
+        "source": "fleet-runtime built-in",
+        "license": "MIT",
+        "author": "M1Vj"
+      },
+      "capabilities": [
+        "public-research",
+        "hostile-evidence-normalization",
+        "citation-extraction",
+        "citation-verification",
+        "text-only",
+        "no-shell",
+        "no-network",
+        "no-env",
+        "no-write"
+      ],
+      "protectedPathExclusions": [
+        ".github/workflows/**",
+        "config/providers.json",
+        "scripts/lib/provider-registry.mjs",
+        "scripts/lib/model.mjs",
+        "state/**"
+      ],
+      "tokenBounds": {
+        "maxInputChars": 32768,
+        "maxOutputChars": 8192
+      },
+      "fixtures": [
+        {
+          "id": "hostile-page",
+          "expectedTrust": "untrusted-evidence",
+          "expectedInjection": true
+        }
+      ],
+      "judges": []
+    }
+  ]
+}

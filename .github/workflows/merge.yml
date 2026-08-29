@@ -35,7 +35,6 @@ permissions:
 concurrency:
   group: fleet-merge-gate
   cancel-in-progress: false
-  queue: max
 
 jobs:
   scan:
@@ -324,8 +323,10 @@ jobs:
         id: gate
         env:
           FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
-          FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_API_KEY_2: ${{ secrets.OPENCODE_API_KEY_2 }}
+          FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN }}
+          FLEET_MODEL_BUCKET: ${{ vars.FLEET_MODEL_BUCKET }}
           FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
           FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
           OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
@@ -341,8 +342,10 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && needs.authorize.result == 'success' && needs.authorize.outputs.repo != '' && needs.authorize.outputs.pr != '' && needs.authorize.outputs.head_sha != '' && steps.gate.outputs.revision_needed == 'true' }}
         env:
           FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
-          FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_API_KEY_2: ${{ secrets.OPENCODE_API_KEY_2 }}
+          FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN }}
+          FLEET_MODEL_BUCKET: ${{ vars.FLEET_MODEL_BUCKET }}
           FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
           FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
           OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json

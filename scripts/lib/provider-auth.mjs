@@ -11,7 +11,8 @@ export function resolveProviderAuth(env = process.env) {
   const providerKey = typeof env.OPENCODE_API_KEY === "string" ? env.OPENCODE_API_KEY.trim() : "";
   if (providerKey) return { ok: true, mode: "provider-key" };
   const legacyAuth = typeof env.FLEET_OPENCODE_AUTH === "string" ? env.FLEET_OPENCODE_AUTH.trim() : "";
-  if (legacyAuth) return { ok: true, mode: "legacy-oauth-migration" };
+  const githubHost = /^(?:1|true)$/i.test(String(env.GITHUB_ACTIONS || "")) || Boolean(env.GITHUB_RUN_ID) || Boolean(env.GITHUB_WORKFLOW);
+  if (legacyAuth && !githubHost) return { ok: true, mode: "legacy-oauth-migration" };
   return { ok: false, mode: "none", reason: "MODEL_AUTH_MISSING", retryable: true };
 }
 

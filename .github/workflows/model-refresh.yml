@@ -1,0 +1,63 @@
+name: fleet-model-refresh
+run-name: "fleet model metadata refresh ${{ github.run_id }}"
+
+on:
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-model-refresh
+  cancel-in-progress: false
+
+jobs:
+  propose:
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.FLEET_MODEL_REFRESH_ENABLE == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      FLEET_ARTIFACT_DIR: artifacts
+    steps:
+      - name: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: setup node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20"
+      - name: verify refresh boundary
+        run: node --test tests/model-registry-refresh.test.mjs && node --check scripts/model-registry-refresh.mjs
+      - name: build redacted proposal
+        env:
+          GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
+          GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
+          GEMINI_API_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
+          GEMINI_API_KEY_6: ${{ secrets.GEMINI_API_KEY_6 }}
+          GEMINI_API_KEY_1_QUOTA_GROUP: ${{ vars.GEMINI_API_KEY_1_QUOTA_GROUP }}
+          GEMINI_API_KEY_2_QUOTA_GROUP: ${{ vars.GEMINI_API_KEY_2_QUOTA_GROUP }}
+          GEMINI_API_KEY_3_QUOTA_GROUP: ${{ vars.GEMINI_API_KEY_3_QUOTA_GROUP }}
+          GEMINI_API_KEY_4_QUOTA_GROUP: ${{ vars.GEMINI_API_KEY_4_QUOTA_GROUP }}
+          GEMINI_API_KEY_5_QUOTA_GROUP: ${{ vars.GEMINI_API_KEY_5_QUOTA_GROUP }}
+          GEMINI_API_KEY_6_QUOTA_GROUP: ${{ vars.GEMINI_API_KEY_6_QUOTA_GROUP }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          NVIDIA_API_KEY_1: ${{ secrets.NVIDIA_API_KEY_1 }}
+          NVIDIA_API_KEY_2: ${{ secrets.NVIDIA_API_KEY_2 }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          AI_GATEWAY_API_KEY: ${{ secrets.VERCEL_AI_GATEWAY_API_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/model-registry-refresh.mjs
+      - name: upload proposal
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: model-registry-proposal-${{ github.run_id }}
+          path: artifacts/model-registry-proposal.json
+          if-no-files-found: error
+          retention-days: 14

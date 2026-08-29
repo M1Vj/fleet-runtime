@@ -35,6 +35,7 @@ test("provider auth resolution prefers the durable key and labels legacy snapsho
   const migrationOnly = resolveProviderAuth({ FLEET_OPENCODE_AUTH: "snapshot" });
   assert.equal(migrationOnly.ok, true);
   assert.equal(migrationOnly.mode, "legacy-oauth-migration");
+  assert.deepEqual(resolveProviderAuth({ FLEET_OPENCODE_AUTH: "snapshot", GITHUB_ACTIONS: "true" }), { ok: false, mode: "none", reason: "MODEL_AUTH_MISSING", retryable: true });
   assert.deepEqual(resolveProviderAuth({}), { ok: false, mode: "none", reason: "MODEL_AUTH_MISSING", retryable: true });
 });
 
@@ -62,7 +63,7 @@ test("auth classification ignores reply-derived text and reads CLI stderr only",
     const result = await askModel({
       prompt: "judge",
       timeoutMs: 1000,
-      env: { OPENCODE_API_KEY: "pk-fixture", FLEET_STATE_ROOT: state },
+      env: { OPENCODE_API_KEY: "pk-fixture", FLEET_MODEL_CHAIN: "opencode/claude-opus-4-6", FLEET_STATE_ROOT: state },
       repoRoot: repo,
       stateRoot: state,
       skipCircuitCheck: true,
@@ -198,10 +199,10 @@ test("the model process receives OPENCODE_API_KEY while other key-like variables
   }
 });
 
-test("merge-gate workflows provision the provider key next to the legacy migration secret", () => {
+test("merge-gate workflows provision only the durable provider key", () => {
   for (const section of ["  gate:", "      - name: autonomous revision"]) {
     const slice = mergeWorkflow.slice(mergeWorkflow.indexOf(section));
     assert.match(slice, /OPENCODE_API_KEY:\s*\$\{\{\s*secrets\.OPENCODE_API_KEY\s*\}\}/, section);
-    assert.match(slice, /FLEET_OPENCODE_AUTH:\s*\$\{\{\s*secrets\.FLEET_OPENCODE_AUTH\s*\}\}/, section);
+    assert.doesNotMatch(slice, /FLEET_OPENCODE_AUTH|OPENCODE_AUTH_CONTENT/, section);
   }
 });

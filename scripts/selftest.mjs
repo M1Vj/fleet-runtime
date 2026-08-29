@@ -11,9 +11,175 @@ import { validateDirectives } from "./lib/directives.mjs";
 import { eventKey, loadLedger, has, append } from "./lib/ledger.mjs";
 import { expectUser, verifyCommit } from "./lib/verify.mjs";
 import { decideStale, planWatchdogActions } from "./lib/watchdog-decide.mjs";
+import { loadProviderRegistry, providerModelReference, selectProviderRoute } from "./lib/provider-registry.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
+
+export const SELFTEST_PUBLIC_REPO = "M1Vj/fleet-runtime";
+export const SELFTEST_PUBLIC_CANARY_PROMPT = "Reply with exactly PUBLIC_CANARY_OK. Do not inspect files, use tools, or access private data.";
+export const SELFTEST_VISION_CANARY_PROMPT = "Two images are attached in order. Reply ONLY strict JSON {\"same\":false,\"colors\":[\"<dominant color of first>\",\"<dominant color of second>\"]}.";
+
+const PUBLIC_REPO_RE = /^M1Vj\/[A-Za-z0-9._-]+$/;
+
+export function isPublicCanarySuccess(result) {
+  return result?.complete === true && String(result?.reply ?? "").trim() === "PUBLIC_CANARY_OK";
+}
+
+export function parseVisionCanaryReply(reply) {
+  let parsed;
+  try {
+    parsed = JSON.parse(String(reply ?? "").trim());
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const keys = Object.keys(parsed);
+  if (keys.length !== 2 || !keys.includes("same") || !keys.includes("colors")) return null;
+  if (parsed.same !== false || !Array.isArray(parsed.colors) || parsed.colors.length !== 2) return null;
+  if (parsed.colors.some((color) => typeof color !== "string" || color.trim() === "")) return null;
+  return parsed;
+}
+
+function verifiedPublicTarget(value) {
+  if (!value || value.private !== false || value.visibility !== "public" || !PUBLIC_REPO_RE.test(String(value.full_name || ""))) {
+    throw new Error("MODEL_PUBLIC_TARGET_REQUIRED");
+  }
+  return {
+    full_name: String(value.full_name),
+    private: false,
+    visibility: "public",
+  };
+}
+
+export function visionCapabilityRequired(env = process.env) {
+  return /^(?:1|true)$/i.test(String(env?.FLEET_REQUIRE_VISION || ""));
+}
+
+/** Verify the fixed selftest repository before sending any model request. */
+export async function resolveVerifiedPublicTarget({ env = process.env, fetchImpl = globalThis.fetch } = {}) {
+  const repo = String(env?.GITHUB_REPOSITORY || SELFTEST_PUBLIC_REPO).trim();
+  if (repo !== SELFTEST_PUBLIC_REPO || typeof fetchImpl !== "function") throw new Error("SELFTEST_PUBLIC_TARGET_UNAVAILABLE");
+  const headers = {
+    Accept: "application/vnd.github+json",
+    "User-Agent": "fleet-selftest",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+  if (typeof env?.FLEET_GH_TOKEN === "string" && env.FLEET_GH_TOKEN.trim()) {
+    headers.Authorization = `Bearer ${env.FLEET_GH_TOKEN}`;
+  }
+  let response;
+  try {
+    response = await fetchImpl(`https://api.github.com/repos/${repo}`, { headers, redirect: "error" });
+  } catch {
+    throw new Error("SELFTEST_PUBLIC_TARGET_UNAVAILABLE");
+  }
+  if (!response?.ok) throw new Error("SELFTEST_PUBLIC_TARGET_UNAVAILABLE");
+  let metadata;
+  try { metadata = await response.json(); } catch { throw new Error("SELFTEST_PUBLIC_TARGET_UNAVAILABLE"); }
+  if (!metadata || metadata.full_name !== repo || metadata.private !== false || metadata.visibility !== "public") {
+    throw new Error("MODEL_PUBLIC_TARGET_REQUIRED");
+  }
+  return verifiedPublicTarget(metadata);
+}
+
+/** Run the harmless public model canary with the same public-data contract as free routes. */
+export async function runModelLiveness({ ask = askModel, env = process.env, publicTarget } = {}) {
+  const target = verifiedPublicTarget(publicTarget);
+  return ask({
+    prompt: SELFTEST_PUBLIC_CANARY_PROMPT,
+    timeoutMs: 240000,
+    env,
+    profile: "public-read",
+    dataClass: "public",
+    publicTarget: target,
+    preferVariantMax: true,
+    skipCircuitCheck: true,
+  });
+}
+
+/** Select only an explicitly configured public model whose registry metadata declares image input. */
+export function findVisionRoute({ registry = loadProviderRegistry(), env = process.env, publicTarget, health = {}, now = Date.now(), rotationSeed } = {}) {
+  const target = verifiedPublicTarget(publicTarget);
+  const refs = Array.isArray(registry?.buckets?.public)
+    ? registry.buckets.public.slice().sort((left, right) => Number(left.priority || 0) - Number(right.priority || 0))
+    : [];
+  const skipped = [];
+  const seen = new Set();
+  for (const ref of refs) {
+    const provider = registry?.providers?.find((entry) => entry.id === ref.provider);
+    const metadata = provider?.models?.[ref.model];
+    if (!provider || !Array.isArray(metadata?.modalities) || !metadata.modalities.includes("image")) continue;
+    const modelReference = providerModelReference(provider, ref.model);
+    if (!modelReference || seen.has(modelReference)) continue;
+    seen.add(modelReference);
+    const selected = selectProviderRoute({
+      registry,
+      bucket: "public",
+      model: modelReference,
+      env,
+      health,
+      now,
+      freeOnly: true,
+      allowPaid: false,
+      allowLocal: true,
+      allowLiveCanary: true,
+      dataClass: "public",
+      publicTarget: target,
+      rotationSeed,
+    });
+    if (selected?.ok) {
+      return {
+        ...selected,
+        modelReference,
+        provider: selected.provider || provider.id,
+        model: selected.model || ref.model,
+        capabilities: [...metadata.modalities],
+      };
+    }
+    skipped.push(`${modelReference}:${selected?.reason || "unavailable"}`);
+  }
+  return { ok: false, reason: "VISION_CAPABILITY_UNAVAILABLE", skipped };
+}
+
+/** Execute T10 only through the selected vision route; never treat text-only output as capability proof. */
+export async function runVisionCanary({ ask = askModel, registry = loadProviderRegistry(), env = process.env, publicTarget, files = [], health = {}, now = Date.now(), rotationSeed } = {}) {
+  const target = verifiedPublicTarget(publicTarget);
+  const route = findVisionRoute({ registry, env, publicTarget: target, health, now, rotationSeed });
+  if (!route.ok) {
+    return {
+      complete: false,
+      capabilityAvailable: false,
+      required: visionCapabilityRequired(env),
+      status: visionCapabilityRequired(env) ? "failed" : "degraded",
+      reason: "VISION_CAPABILITY_UNAVAILABLE",
+      route: null,
+      attempts: [],
+    };
+  }
+  const result = await ask({
+    prompt: SELFTEST_VISION_CANARY_PROMPT,
+    skipCircuitCheck: true,
+    files,
+    timeoutMs: 240000,
+    env,
+    profile: "public-read",
+    dataClass: "public",
+    publicTarget: target,
+    modelOverride: route.modelReference,
+    preferVariantMax: false,
+    maxRounds: 2,
+  });
+  const validReply = result?.complete === true && parseVisionCanaryReply(result.reply);
+  return {
+    ...result,
+    complete: Boolean(validReply),
+    capabilityAvailable: true,
+    required: true,
+    status: validReply ? "passed" : "failed",
+    route,
+  };
+}
 
 function fakeFetch(user) {
   return async () => ({
@@ -28,6 +194,8 @@ export async function main() {
   const redact = scrub(process.env);
   const audit = new AuditBuffer(redact);
   let failed = false;
+  let publicTarget = null;
+  let modelResult = { complete: false, reply: "", sessionId: "", modelMode: "unavailable", attempts: [] };
 
   try {
     const badEnv = { ...process.env, FLEET_EXPECT_LOGIN: "M1Vj-wrong" };
@@ -81,17 +249,17 @@ export async function main() {
       failed = true;
     }
 
-    const modelResult = await askModel({
-      prompt: "Reply with exactly ALIVE",
-      timeoutMs: 240000,
-      env: process.env,
-      preferVariantMax: true,
-      skipCircuitCheck: true,
-    });
-    if (modelResult.complete && modelResult.reply.includes("ALIVE") && modelResult.sessionId) {
-      audit.note("T5", `PASS model liveness mode=${modelResult.modelMode} session=${modelResult.sessionId} attempts=${JSON.stringify(modelResult.attempts)}`);
-    } else {
-      audit.incident("T5", `model liveness failed mode=${modelResult.modelMode} attempts=${JSON.stringify(modelResult.attempts)} reply=${modelResult.reply.slice(0, 100)}`);
+    try {
+      publicTarget = await resolveVerifiedPublicTarget({ env: process.env });
+      modelResult = await runModelLiveness({ env: process.env, publicTarget });
+      if (isPublicCanarySuccess(modelResult)) {
+        audit.note("T5", `PASS public model liveness mode=${modelResult.modelMode} session=${modelResult.sessionId || "none"} attempts=${JSON.stringify(modelResult.attempts)}`);
+      } else {
+        audit.incident("T5", `public model liveness failed mode=${modelResult.modelMode} attempts=${JSON.stringify(modelResult.attempts)} reply=${modelResult.reply.slice(0, 100)}`);
+        failed = true;
+      }
+    } catch (err) {
+      audit.incident("T5", `public target/model liveness failed ${String(err.message).slice(0, 160)}`);
       failed = true;
     }
 
@@ -169,50 +337,41 @@ export async function main() {
       const fileB = path.join(dir10, "b.png");
       writeFileSync(fileA, solidPng(255, 0, 0));
       writeFileSync(fileB, solidPng(0, 0, 255));
-      const vresPrompt = "Two images attached in order. Reply ONLY strict JSON {\"same\":false,\"colors\":[\"<dominant color of first>\",\"<dominant color of second>\"]}";
-      const vres = await askModel({
-        prompt: vresPrompt,
-        skipCircuitCheck: true,
-        files: [fileA, fileB],
-        timeoutMs: 240000,
-        env: process.env,
-        preferVariantMax: false,
-        maxRounds: 2,
-      });
-      let finalReply = vres.reply;
-      let parsedT10 = null;
-      const tryParse = () => {
-        try {
-          return JSON.parse(String(finalReply).match(/\{[\s\S]*\}/)[0]);
-        } catch {
-          return null;
+      if (!publicTarget) {
+        if (visionCapabilityRequired(process.env)) {
+          audit.incident("T10", "vision capability unavailable: verified public target unavailable");
+          failed = true;
+        } else {
+          audit.note("T10-DEGRADED", "vision capability unavailable: verified public target unavailable");
         }
-      };
-      parsedT10 = tryParse();
-      if (!parsedT10) {
-        audit.note("T10-retry", "first vision attempt unusable; cooling down and retrying");
-        await new Promise((r) => setTimeout(r, 45000));
-        const retry = await askModel({
-          prompt: vresPrompt,
-          files: [fileA, fileB],
-          timeoutMs: 240000,
-          env: { ...process.env, FLEET_WORKSPACE_ROOT: process.cwd() },
-          preferVariantMax: false,
-          maxRounds: 2,
-        });
-        finalReply = retry.complete ? retry.reply : finalReply;
-        parsedT10 = tryParse();
-      }
-      if (parsedT10 && ("same" in parsedT10 || Array.isArray(parsedT10.colors))) {
-        const recognized = Array.isArray(parsedT10.colors) && parsedT10.colors.some((c) => /red|blue/i.test(String(c)));
-        audit.note(
-          "T10",
-          `PASS vision transport verified (image attachments processed end-to-end); recognition=${recognized ? "colors named" : "weak on synthetic solids (free-model limitation)"}`,
-        );
-        if (!recognized) audit.note("T10-quality", String(finalReply).slice(0, 200));
       } else {
-        audit.incident("T10", `vision transport failed: ${String(finalReply).slice(0, 140)}`);
-        failed = true;
+        const vres = await runVisionCanary({
+          env: process.env,
+          publicTarget,
+          files: [fileA, fileB],
+        });
+        if (!vres.capabilityAvailable) {
+          const detail = `vision capability unavailable route=${(vres.skipped || []).slice(0, 3).join(",") || "none-configured"}`;
+          if (vres.required) {
+            audit.incident("T10", detail);
+            failed = true;
+          } else {
+            audit.note("T10-DEGRADED", detail);
+          }
+        }
+        let finalReply = vres.reply;
+        const parsedT10 = parseVisionCanaryReply(finalReply);
+        if (vres.capabilityAvailable && vres.complete && parsedT10) {
+          const recognized = Array.isArray(parsedT10.colors) && parsedT10.colors.some((c) => /red|blue/i.test(String(c)));
+          audit.note(
+            "T10",
+            `PASS vision route=${vres.route.provider}/${vres.route.model} transport verified (image attachments processed end-to-end); recognition=${recognized ? "colors named" : "weak on synthetic solids (free-model limitation)"}`,
+          );
+          if (!recognized) audit.note("T10-quality", String(finalReply).slice(0, 200));
+        } else if (vres.capabilityAvailable) {
+          audit.incident("T10", `vision transport failed: ${String(finalReply).slice(0, 140)}`);
+          failed = true;
+        }
       }
     } catch (err) {
       audit.incident("T10", `vision canary error ${String(err.message).slice(0, 150)}`);

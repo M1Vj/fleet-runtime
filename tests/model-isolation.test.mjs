@@ -416,6 +416,54 @@ test("a public direct route uses its first bounded request as the live health ca
   }
 });
 
+test("public direct routes forward staged external images and reject private-boundary attachments", async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), "fleet-model-direct-image-repo-"));
+  const state = mkdtempSync(path.join(tmpdir(), "fleet-model-direct-image-state-"));
+  const safeRoot = mkdtempSync(path.join(tmpdir(), "fleet-model-direct-image-safe-"));
+  const safeFile = path.join(safeRoot, "red.png");
+  const repoFile = path.join(repo, "private.png");
+  writeFileSync(safeFile, "safe-image-bytes\n", "utf8");
+  writeFileSync(repoFile, "private-image-bytes\n", "utf8");
+  const publicTarget = { private: false, visibility: "public" };
+  const requests = [];
+  const base = {
+    prompt: "describe the image",
+    timeoutMs: 1000,
+    env: {
+      NVIDIA_API_KEY_1: "nv-fixture",
+      FLEET_NVIDIA_ENABLE: "true",
+      FLEET_STATE_ROOT: state,
+    },
+    repoRoot: repo,
+    stateRoot: state,
+    skipCircuitCheck: true,
+    modelOverride: "nvidia-nim/moonshotai/kimi-k3",
+    dataClass: "public",
+    publicTarget,
+    fetchImpl: async (_url, options) => {
+      requests.push(JSON.parse(options.body));
+      return { ok: true, text: async () => JSON.stringify({ choices: [{ message: { content: "ok" } }] }) };
+    },
+  };
+  try {
+    const result = await askModel({ ...base, files: [safeFile] });
+    assert.equal(result.complete, true);
+    assert.deepEqual(requests[0].messages[0].content[0], { type: "text", text: "describe the image" });
+    assert.match(requests[0].messages[0].content[1].image_url.url, /^data:image\/png;base64,/);
+    assert.equal(Buffer.from(requests[0].messages[0].content[1].image_url.url.split(",", 2)[1], "base64").toString("utf8"), "safe-image-bytes\n");
+
+    requests.length = 0;
+    const rejected = await askModel({ ...base, files: [repoFile] });
+    assert.equal(rejected.complete, false);
+    assert.equal(requests.length, 0, "private-boundary attachments must never reach a provider");
+    assert.match(rejected.attempts.at(-1)?.error || "", /ATTACHMENT/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
+    rmSync(safeRoot, { recursive: true, force: true });
+  }
+});
+
 test("a provider-wide 429 cooldown survives a later model call through private state", async () => {
   const repo = mkdtempSync(path.join(tmpdir(), "fleet-model-durable-cooldown-repo-"));
   const state = mkdtempSync(path.join(tmpdir(), "fleet-model-durable-cooldown-state-"));

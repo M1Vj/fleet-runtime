@@ -1008,6 +1008,86 @@ test("Gemini API adapter uses the documented model id and high reasoning level",
   assert.equal(request.reasoning_effort, "high");
 });
 
+test("free-provider adapters encode bounded image attachments as OpenAI multimodal content", async () => {
+  const provider = fixtureProvider("nvidia-nim");
+  let request;
+  const adapter = createFreeProviderAdapter({
+    provider,
+    env: { NVIDIA_API_KEY_1: "nv-fixture", FLEET_NVIDIA_ENABLE: "true" },
+    fetchImpl: async (_url, options) => {
+      request = JSON.parse(options.body);
+      return { ok: true, text: async () => JSON.stringify({ choices: [{ message: { content: "ok" } }] }) };
+    },
+  });
+  const result = await adapter.invoke({
+    prompt: "describe the image",
+    model: "moonshotai/kimi-k3",
+    account: "account-1",
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+    files: [{ mimeType: "image/png", data: Buffer.from("png-fixture").toString("base64") }],
+  });
+  assert.equal(result.response, "ok");
+  assert.deepEqual(request.messages, [{
+    role: "user",
+    content: [
+      { type: "text", text: "describe the image" },
+      { type: "image_url", image_url: { url: `data:image/png;base64,${Buffer.from("png-fixture").toString("base64")}` } },
+    ],
+  }]);
+});
+
+test("free-provider adapters fail closed for malformed, unsupported, or oversized attachments", async () => {
+  const provider = fixtureProvider("nvidia-nim");
+  const adapter = createFreeProviderAdapter({
+    provider,
+    env: { NVIDIA_API_KEY_1: "nv-fixture", FLEET_NVIDIA_ENABLE: "true" },
+    fetchImpl: async () => ({ ok: true, text: async () => JSON.stringify({ choices: [{ message: { content: "must not call" } }] }) }),
+  });
+  const base = {
+    prompt: "describe the image",
+    model: "moonshotai/kimi-k3",
+    account: "account-1",
+    dataClass: "public",
+    publicTarget: { private: false, visibility: "public" },
+  };
+  await assert.rejects(
+    () => adapter.invoke({ ...base, files: [{ mimeType: "text/plain", data: Buffer.from("not an image").toString("base64") }] }),
+    /FREE_PROVIDER_ATTACHMENT_TYPE_UNSUPPORTED/,
+  );
+  await assert.rejects(
+    () => adapter.invoke({ ...base, files: [{ mimeType: "image/png", data: "not-base64!" }] }),
+    /FREE_PROVIDER_ATTACHMENT_INVALID/,
+  );
+  await assert.rejects(
+    () => adapter.invoke({ ...base, files: [{ mimeType: "image/png", data: Buffer.alloc(2 * 1024 * 1024 + 1).toString("base64") }] }),
+    /FREE_PROVIDER_ATTACHMENT_TOO_LARGE/,
+  );
+});
+
+test("free-provider adapters report image capability gaps before network access", async () => {
+  const provider = fixtureProvider("nvidia-nim");
+  provider.models["moonshotai/kimi-k3"] = { ...provider.models["moonshotai/kimi-k3"], modalities: ["text"] };
+  let fetches = 0;
+  const adapter = createFreeProviderAdapter({
+    provider,
+    env: { NVIDIA_API_KEY_1: "nv-fixture", FLEET_NVIDIA_ENABLE: "true" },
+    fetchImpl: async () => { fetches += 1; return { ok: true, text: async () => "{}" }; },
+  });
+  await assert.rejects(
+    () => adapter.invoke({
+      prompt: "describe the image",
+      model: "moonshotai/kimi-k3",
+      account: "account-1",
+      dataClass: "public",
+      publicTarget: { private: false, visibility: "public" },
+      files: [{ mimeType: "image/png", data: Buffer.from("png-fixture").toString("base64") }],
+    }),
+    /FREE_PROVIDER_ATTACHMENT_UNSUPPORTED/,
+  );
+  assert.equal(fetches, 0);
+});
+
 test("NVIDIA Kimi K3 uses the documented free chat endpoint and exact model id", async () => {
   const provider = fixtureProvider("nvidia-nim");
   let request;

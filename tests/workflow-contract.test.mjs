@@ -11,6 +11,7 @@ const reviseSource = readFileSync(new URL("../scripts/revise.mjs", import.meta.u
 const improveSource = readFileSync(new URL("../scripts/improve.mjs", import.meta.url), "utf8");
 const deepWorkflow = readFileSync(new URL("../.github/workflows/deep.yml", import.meta.url), "utf8");
 const improveWorkflow = readFileSync(new URL("../.github/workflows/improve.yml", import.meta.url), "utf8");
+const selftestWorkflow = readFileSync(new URL("../.github/workflows/selftest.yml", import.meta.url), "utf8");
 
 test("manual dispatch has an explicit, fail-closed target contract", () => {
   assert.match(workflow, /workflow_dispatch:\s*\n\s+inputs:/);
@@ -206,6 +207,32 @@ test("production model workflows use provider keys without legacy OAuth snapshot
     const provider = text.match(/OPENCODE_API_KEY: \$\{\{ secrets\.OPENCODE_API_KEY \}\}/g) || [];
     assert.ok(provider.length > 0, `${name}: durable provider key is required`);
     assert.doesNotMatch(text, /FLEET_OPENCODE_AUTH|OPENCODE_AUTH_CONTENT/, `${name}: legacy OAuth is local migration only`);
+  }
+});
+
+test("selftest forwards every optional provider slot only to the selftest step", () => {
+  const stepStart = selftestWorkflow.indexOf("      - name: selftest");
+  const stepEnd = selftestWorkflow.indexOf("      - name: dump opencode logs on failure");
+  assert.ok(stepStart >= 0 && stepEnd > stepStart);
+  const step = selftestWorkflow.slice(stepStart, stepEnd);
+  for (const name of [
+    "GEMINI_API_KEY_1", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3", "GEMINI_API_KEY_4", "GEMINI_API_KEY_5", "GEMINI_API_KEY_6",
+    "NVIDIA_API_KEY_1", "NVIDIA_API_KEY_2", "GROQ_API_KEY", "OPENROUTER_API_KEY", "AI_GATEWAY_API_KEY",
+    "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID",
+  ]) {
+    assert.match(step, new RegExp(`${name}:\\s*\\$\\{\\{\\s*secrets\\.${name === "AI_GATEWAY_API_KEY" ? "VERCEL_AI_GATEWAY_API_KEY" : name}\\s*\\}\\}`), name);
+    assert.doesNotMatch(selftestWorkflow.slice(0, stepStart), new RegExp(`^\\s+${name}:`, "m"), `${name} must not be job-global`);
+  }
+  for (const suffix of ["EXPIRES_AT", "QUOTA_GROUP"]) {
+    for (let index = 1; index <= 6; index += 1) {
+      const name = `GEMINI_API_KEY_${index}_${suffix}`;
+      assert.match(step, new RegExp(`${name}:\\s*\\$\\{\\{\\s*vars\\.${name}\\s*\\}\\}`), name);
+    }
+  }
+  for (const name of [
+    "FLEET_NVIDIA_ENABLE", "FLEET_GROQ_ENABLE", "FLEET_OPENROUTER_ENABLE", "FLEET_VERCEL_AI_ENABLE", "FLEET_CLOUDFLARE_AI_ENABLE",
+  ]) {
+    assert.match(step, new RegExp(`${name}:\\s*\\$\\{\\{\\s*vars\\.${name}\\s*\\}\\}`), name);
   }
 });
 

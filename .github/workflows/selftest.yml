@@ -48,6 +48,40 @@ jobs:
       - name: install pinned opencode cli
         run: npm install -g opencode-ai@1.18.21
       - name: selftest
+        env:
+          # Optional provider slots are step-local and remain empty unless the
+          # owner provisions the matching repository secret. Gates stay
+          # disabled by default through repository variables.
+          GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
+          GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
+          GEMINI_API_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
+          GEMINI_API_KEY_6: ${{ secrets.GEMINI_API_KEY_6 }}
+          GEMINI_API_KEY_1_EXPIRES_AT: ${{ vars.GEMINI_API_KEY_1_EXPIRES_AT }}
+          GEMINI_API_KEY_2_EXPIRES_AT: ${{ vars.GEMINI_API_KEY_2_EXPIRES_AT }}
+          GEMINI_API_KEY_3_EXPIRES_AT: ${{ vars.GEMINI_API_KEY_3_EXPIRES_AT }}
+          GEMINI_API_KEY_4_EXPIRES_AT: ${{ vars.GEMINI_API_KEY_4_EXPIRES_AT }}
+          GEMINI_API_KEY_5_EXPIRES_AT: ${{ vars.GEMINI_API_KEY_5_EXPIRES_AT }}
+          GEMINI_API_KEY_6_EXPIRES_AT: ${{ vars.GEMINI_API_KEY_6_EXPIRES_AT }}
+          GEMINI_API_KEY_1_QUOTA_GROUP: ${{ vars.GEMINI_API_KEY_1_QUOTA_GROUP }}
+          GEMINI_API_KEY_2_QUOTA_GROUP: ${{ vars.GEMINI_API_KEY_2_QUOTA_GROUP }}
+          GEMINI_API_KEY_3_QUOTA_GROUP: ${{ vars.GEMINI_API_KEY_3_QUOTA_GROUP }}
+          GEMINI_API_KEY_4_QUOTA_GROUP: ${{ vars.GEMINI_API_KEY_4_QUOTA_GROUP }}
+          GEMINI_API_KEY_5_QUOTA_GROUP: ${{ vars.GEMINI_API_KEY_5_QUOTA_GROUP }}
+          GEMINI_API_KEY_6_QUOTA_GROUP: ${{ vars.GEMINI_API_KEY_6_QUOTA_GROUP }}
+          NVIDIA_API_KEY_1: ${{ secrets.NVIDIA_API_KEY_1 }}
+          NVIDIA_API_KEY_2: ${{ secrets.NVIDIA_API_KEY_2 }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          AI_GATEWAY_API_KEY: ${{ secrets.VERCEL_AI_GATEWAY_API_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          FLEET_NVIDIA_ENABLE: ${{ vars.FLEET_NVIDIA_ENABLE }}
+          FLEET_GROQ_ENABLE: ${{ vars.FLEET_GROQ_ENABLE }}
+          FLEET_OPENROUTER_ENABLE: ${{ vars.FLEET_OPENROUTER_ENABLE }}
+          FLEET_VERCEL_AI_ENABLE: ${{ vars.FLEET_VERCEL_AI_ENABLE }}
+          FLEET_CLOUDFLARE_AI_ENABLE: ${{ vars.FLEET_CLOUDFLARE_AI_ENABLE }}
         run: node scripts/selftest.mjs
       - name: dump opencode logs on failure
         if: failure()

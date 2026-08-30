@@ -28,6 +28,58 @@ const CLOUDFLARE_ENDPOINT_TEMPLATE = "https://api.cloudflare.com/client/v4/accou
 const GROQ_TPM_LIMIT = 8_000;
 const GROQ_COMPLETION_TOKEN_RESERVE = 1_024;
 const GROQ_INPUT_SAFETY_RESERVE = 1_024;
+const MAX_PROVIDER_ATTACHMENT_COUNT = 4;
+const MAX_PROVIDER_ATTACHMENT_BYTES = 2 * 1024 * 1024;
+const MAX_PROVIDER_ATTACHMENT_TOTAL_BYTES = 4 * 1024 * 1024;
+const MAX_PROVIDER_ATTACHMENT_BASE64_LENGTH = Math.ceil(MAX_PROVIDER_ATTACHMENT_BYTES / 3) * 4;
+const PROVIDER_IMAGE_MIME_TYPES = new Set([
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+]);
+const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+/** Limits for direct-provider image transport; values are intentionally small. */
+export const PROVIDER_ATTACHMENT_LIMITS = Object.freeze({
+  maxCount: MAX_PROVIDER_ATTACHMENT_COUNT,
+  maxBytes: MAX_PROVIDER_ATTACHMENT_BYTES,
+  maxTotalBytes: MAX_PROVIDER_ATTACHMENT_TOTAL_BYTES,
+});
+
+function normalizeProviderAttachmentMime(value) {
+  const mime = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return mime === "image/jpg" ? "image/jpeg" : mime;
+}
+
+/**
+ * Validate already-staged, secret-free image payloads before direct transport.
+ * Callers must stage filesystem paths inside their own disposable boundary and
+ * pass only canonical base64 bytes here; this function never reads paths.
+ */
+export function normalizeProviderAttachments(files = []) {
+  if (!Array.isArray(files)) throw providerError("FREE_PROVIDER_ATTACHMENTS_INVALID");
+  if (files.length > MAX_PROVIDER_ATTACHMENT_COUNT) throw providerError("FREE_PROVIDER_ATTACHMENT_COUNT_EXCEEDED");
+  let totalBytes = 0;
+  return files.map((attachment) => {
+    if (!attachment || typeof attachment !== "object" || Array.isArray(attachment)) {
+      throw providerError("FREE_PROVIDER_ATTACHMENT_INVALID");
+    }
+    const mimeType = normalizeProviderAttachmentMime(attachment.mimeType);
+    if (!PROVIDER_IMAGE_MIME_TYPES.has(mimeType)) throw providerError("FREE_PROVIDER_ATTACHMENT_TYPE_UNSUPPORTED");
+    const data = typeof attachment.data === "string" ? attachment.data : "";
+    if (!data || data.length > MAX_PROVIDER_ATTACHMENT_BASE64_LENGTH || data.length % 4 !== 0 || !BASE64_RE.test(data)) {
+      throw providerError(data.length > MAX_PROVIDER_ATTACHMENT_BASE64_LENGTH ? "FREE_PROVIDER_ATTACHMENT_TOO_LARGE" : "FREE_PROVIDER_ATTACHMENT_INVALID");
+    }
+    let decoded;
+    try { decoded = Buffer.from(data, "base64"); } catch { throw providerError("FREE_PROVIDER_ATTACHMENT_INVALID"); }
+    if (decoded.length === 0 || decoded.toString("base64") !== data) throw providerError("FREE_PROVIDER_ATTACHMENT_INVALID");
+    if (decoded.length > MAX_PROVIDER_ATTACHMENT_BYTES) throw providerError("FREE_PROVIDER_ATTACHMENT_TOO_LARGE");
+    totalBytes += decoded.length;
+    if (totalBytes > MAX_PROVIDER_ATTACHMENT_TOTAL_BYTES) throw providerError("FREE_PROVIDER_ATTACHMENT_TOTAL_TOO_LARGE");
+    return { mimeType, data, bytes: decoded.length };
+  });
+}
 
 const DEFAULT_REGISTRY_PATH = new URL("../../config/providers.json", import.meta.url);
 
@@ -688,7 +740,7 @@ async function readBoundedResponseText(response, maxLength = MAX_PROCESS_OUTPUT)
  */
 export function createAntigravityAdapter({ provider, env = process.env, allowProduction = false, allowLocal = false, baseDir = os.tmpdir(), spawnImpl = spawn } = {}) {
   return {
-    async invoke({ prompt, model, account, effort, timeoutMs = DEFAULT_AGY_TIMEOUT_MS, dataClass = "private", publicTarget } = {}) {
+    async invoke({ prompt, model, account, effort, timeoutMs = DEFAULT_AGY_TIMEOUT_MS, dataClass = "private", publicTarget, files = [] } = {}) {
       const production = provider?.production?.enabled === true;
       const gateName = provider?.production?.requiresEnv || "FLEET_ANTIGRAVITY_ENABLE";
       const localMode = provider?.auth?.mode === "oauth" || provider?.localOnly === true;
@@ -709,6 +761,8 @@ export function createAntigravityAdapter({ provider, env = process.env, allowPro
       if (dataClass !== "public" || publicTarget?.private !== false || publicTarget?.visibility !== "public") throw new Error("ANTIGRAVITY_PUBLIC_TARGET_REQUIRED");
       if (typeof prompt !== "string" || prompt.length === 0 || prompt.length > 120000) throw new Error("ANTIGRAVITY_PROMPT_INVALID");
       if (!modelIsKnown(provider, model)) throw new Error("ANTIGRAVITY_MODEL_UNVERIFIED");
+      if (!Array.isArray(files)) throw new Error("ANTIGRAVITY_ATTACHMENTS_INVALID");
+      if (files.length > 0) throw new Error("ANTIGRAVITY_ATTACHMENT_UNSUPPORTED");
       const configuredLocalCredential = localMode
         ? provider.credentials?.find((credential) => credential.id === (account || provider.credentials?.[0]?.id))
         : null;
@@ -758,7 +812,7 @@ export function createAntigravityAdapter({ provider, env = process.env, allowPro
 /** Build a generic free API boundary that refuses every unverified slot. */
 export function createFreeProviderAdapter({ provider, env = process.env, fetchImpl = globalThis.fetch } = {}) {
   return {
-    async invoke({ prompt, model, account, effort = "high", timeoutMs = 60 * 1000, dataClass = "private", publicTarget } = {}) {
+    async invoke({ prompt, model, account, effort = "high", timeoutMs = 60 * 1000, dataClass = "private", publicTarget, files = [] } = {}) {
       if (provider?.kind !== "free-api" || provider.free !== true || provider.verification?.status !== "verified") throw new Error("FREE_PROVIDER_UNVERIFIED");
       if (provider.enabled !== true || provider.production?.enabled !== true) throw new Error("FREE_PROVIDER_DISABLED");
       if (provider.production?.requiresEnv && !/^(?:1|true)$/i.test(String(env[provider.production.requiresEnv] || ""))) throw new Error("FREE_PROVIDER_GATE_DISABLED");
@@ -767,6 +821,11 @@ export function createFreeProviderAdapter({ provider, env = process.env, fetchIm
       if (!modelIsKnown(provider, model)) throw new Error("FREE_PROVIDER_MODEL_UNVERIFIED");
       if (typeof fetchImpl !== "function") throw providerError("FREE_PROVIDER_FETCH_UNAVAILABLE");
       if (typeof prompt !== "string" || prompt.length === 0 || prompt.length > 120000) throw providerError("FREE_PROVIDER_PROMPT_INVALID");
+      const attachments = normalizeProviderAttachments(files);
+      const metadata = modelMetadata(provider, model);
+      if (attachments.length > 0 && (!Array.isArray(metadata?.modalities) || !metadata.modalities.includes("image"))) {
+        throw providerError("FREE_PROVIDER_ATTACHMENT_UNSUPPORTED");
+      }
       const groqBudget = provider.id === "groq" ? groqRequestBudget(prompt) : null;
       const budget = groqBudget || providerRequestBudget(provider, prompt);
       const endpoint = buildProviderEndpoint(provider, env);
@@ -781,7 +840,18 @@ export function createFreeProviderAdapter({ provider, env = process.env, fetchIm
       try {
         const requestBody = {
           model,
-          messages: [{ role: "user", content: prompt }],
+          messages: [{
+            role: "user",
+            content: attachments.length > 0
+              ? [
+                { type: "text", text: prompt },
+                ...attachments.map(({ mimeType, data }) => ({
+                  type: "image_url",
+                  image_url: { url: `data:${mimeType};base64,${data}` },
+                })),
+              ]
+              : prompt,
+          }],
           stream: false,
           ...(budget ? { max_completion_tokens: budget.maxCompletionTokens } : {}),
           ...(provider.id === "gemini-api" ? { reasoning_effort: effort || "high" } : {}),

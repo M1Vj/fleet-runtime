@@ -12,6 +12,7 @@ import {
   createFreeProviderAdapter,
   loadProviderRegistry,
   normalizeProviderHealthStatus,
+  normalizeProviderAttachments,
   parseProviderModelReference,
   providerModelReference,
   selectProviderRoute,
@@ -136,6 +137,66 @@ function canonicalPath(value) {
 function isWithin(child, parent) {
   const relative = path.relative(canonicalPath(parent), canonicalPath(child));
   return relative === "" || (relative && !relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+const MODEL_ATTACHMENT_MAX_COUNT = 4;
+const MODEL_ATTACHMENT_MAX_BYTES = 2 * 1024 * 1024;
+const MODEL_ATTACHMENT_MAX_TOTAL_BYTES = 4 * 1024 * 1024;
+const MODEL_IMAGE_MIME_BY_EXTENSION = Object.freeze({
+  ".gif": "image/gif",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
+  ".png": "image/png",
+  ".webp": "image/webp",
+});
+
+function modelAttachmentMimeType(filePath) {
+  return MODEL_IMAGE_MIME_BY_EXTENSION[path.extname(filePath).toLowerCase()] || "application/octet-stream";
+}
+
+/**
+ * Copy external attachments into the disposable model workspace and prepare
+ * bounded base64 payloads for direct public providers. Repository/state files
+ * are rejected rather than silently sent to a public endpoint.
+ */
+function prepareDirectAttachments({ files = [], workspace, repoRoot, stateRoot } = {}) {
+  if (!Array.isArray(files)) throw new Error("MODEL_ATTACHMENTS_INVALID");
+  if (files.length > MODEL_ATTACHMENT_MAX_COUNT) throw new Error("MODEL_ATTACHMENT_COUNT_EXCEEDED");
+  if (files.length === 0) return [];
+  if (typeof workspace !== "string" || !path.isAbsolute(workspace)) throw new Error("MODEL_WORKSPACE_NOT_ISOLATED");
+  const attachmentDir = path.join(workspace, "attachments");
+  const prepared = [];
+  let totalBytes = 0;
+  let index = 0;
+  for (const value of files) {
+    if (typeof value !== "string" || !value.trim()) throw new Error("MODEL_ATTACHMENT_INVALID");
+    const source = path.resolve(value);
+    let sourceStat;
+    try { sourceStat = lstatSync(source); } catch { throw new Error("MODEL_ATTACHMENT_UNAVAILABLE"); }
+    if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error("MODEL_ATTACHMENT_INVALID");
+    if (isWithin(source, repoRoot || process.cwd()) || (stateRoot && isWithin(source, stateRoot))) {
+      throw new Error("MODEL_ATTACHMENT_PRIVATE_BOUNDARY");
+    }
+    if (sourceStat.size > MODEL_ATTACHMENT_MAX_BYTES) throw new Error("MODEL_ATTACHMENT_TOO_LARGE");
+    let staged = source;
+    const relative = path.relative(workspace, source);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      mkdirSync(attachmentDir, { recursive: true, mode: 0o700 });
+      staged = path.join(attachmentDir, `${index += 1}-${path.basename(source).replace(/[^A-Za-z0-9._-]/g, "-")}`);
+      copyFileSync(source, staged);
+      chmodSync(staged, 0o600);
+    }
+    let data;
+    try { data = readFileSync(staged); } catch { throw new Error("MODEL_ATTACHMENT_UNAVAILABLE"); }
+    if (data.length === 0) throw new Error("MODEL_ATTACHMENT_INVALID");
+    if (data.length > MODEL_ATTACHMENT_MAX_BYTES) throw new Error("MODEL_ATTACHMENT_TOO_LARGE");
+    totalBytes += data.length;
+    if (totalBytes > MODEL_ATTACHMENT_MAX_TOTAL_BYTES) throw new Error("MODEL_ATTACHMENT_TOTAL_TOO_LARGE");
+    prepared.push({ mimeType: modelAttachmentMimeType(staged), data: data.toString("base64") });
+  }
+  // Re-run the provider-independent canonical validation here so direct route
+  // callers cannot accidentally bypass count, MIME, or base64 checks.
+  return normalizeProviderAttachments(prepared).map(({ mimeType, data }) => ({ mimeType, data }));
 }
 
 /** Create an explicit, disposable OpenCode cwd that cannot contain private state. */
@@ -536,12 +597,13 @@ function directAttempt({ route, error, elapsedMs }) {
   };
 }
 
-async function askDirectRoute({ route, prompt, timeoutMs, env, dataClass, publicTarget, effort, fetchImpl, allowLocal, spawnImpl }) {
+async function askDirectRoute({ route, prompt, timeoutMs, env, dataClass, publicTarget, effort, files, workspace, repoRoot, stateRoot, fetchImpl, allowLocal, spawnImpl }) {
   const started = Date.now();
   try {
     const adapter = route.providerObject?.id === "antigravity"
       ? createAntigravityAdapter({ provider: route.providerObject, env, allowLocal, spawnImpl })
       : createFreeProviderAdapter({ provider: route.providerObject, env, fetchImpl });
+    const directFiles = prepareDirectAttachments({ files, workspace, repoRoot, stateRoot });
     const adapterOptions = {
       prompt,
       model: route.model,
@@ -550,6 +612,7 @@ async function askDirectRoute({ route, prompt, timeoutMs, env, dataClass, public
       dataClass,
       publicTarget,
       effort,
+      files: directFiles,
     };
     const result = await adapter.invoke(adapterOptions);
     return {
@@ -661,7 +724,7 @@ async function askModelInternal({ prompt, sessionId, timeoutMs = 480000, env = p
       : "";
     const result = isZen
       ? await askOnModel({ model: selected.modelReference, isPrimary: ci === 0, prompt, sessionId: routeSession || undefined, timeoutMs, env: routeEnv, preferVariantMax, maxRounds, files, workspace, repoRoot, stateRoot: privateStateRoot, spawnImpl })
-      : await askDirectRoute({ route: selected, prompt, timeoutMs, env, dataClass, publicTarget, effort, fetchImpl, allowLocal, spawnImpl });
+      : await askDirectRoute({ route: selected, prompt, timeoutMs, env, dataClass, publicTarget, effort, files, workspace, repoRoot, stateRoot: privateStateRoot, fetchImpl, allowLocal, spawnImpl });
     allAttempts.push(...(result.attempts || []));
     const lastAttempt = Array.isArray(result.attempts) && result.attempts.length > 0 ? result.attempts.at(-1) : {};
     emitModelTelemetry(env, {

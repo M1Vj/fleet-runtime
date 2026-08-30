@@ -216,6 +216,7 @@ test("selftest forwards every optional provider slot only to the selftest step",
   assert.ok(stepStart >= 0 && stepEnd > stepStart);
   const step = selftestWorkflow.slice(stepStart, stepEnd);
   for (const name of [
+    "OPENCODE_API_KEY", "OPENCODE_API_KEY_2",
     "GEMINI_API_KEY_1", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3", "GEMINI_API_KEY_4", "GEMINI_API_KEY_5", "GEMINI_API_KEY_6",
     "NVIDIA_API_KEY_1", "NVIDIA_API_KEY_2", "GROQ_API_KEY", "OPENROUTER_API_KEY", "AI_GATEWAY_API_KEY",
     "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID",

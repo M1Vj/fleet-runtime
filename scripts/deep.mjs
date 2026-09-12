@@ -178,7 +178,7 @@ async function mainCommit() {
       `# Deep ${data.kind} — ${data.repo}`,
       "",
       `- generatedUtc: ${data.finishedUtc}`,
-      `- model: opencode/x-preview-f-free (${data.modelMode})`,
+      `- model: ${data.modelMode}`,
       "",
       `## Verdict`,
       "",

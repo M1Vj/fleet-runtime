@@ -1,10 +1,12 @@
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import path from "node:path";
 
+export const TERMINAL_STATES = ["SUCCESS", "NO-OP", "BLOCKED", "STALLED", "EXHAUSTED", "REVISION_QUEUED", "SCAN-DONE"];
+
 export function makeTerminal(root, { lane = "unknown", requireWrite = false } = {}) {
   const eventsPath = path.join(root, "state", "events.jsonl");
   return function terminal(state, details = {}) {
-    const named = ["SUCCESS", "NO-OP", "BLOCKED", "STALLED", "EXHAUSTED"].includes(state) ? state : "BLOCKED";
+    const named = TERMINAL_STATES.includes(state) ? state : "BLOCKED";
     const record = JSON.stringify({ t: new Date().toISOString(), lane, state: named, ...details });
     try {
       mkdirSync(path.dirname(eventsPath), { recursive: true });

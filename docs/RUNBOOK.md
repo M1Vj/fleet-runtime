@@ -101,19 +101,47 @@ opencode installed:
 
 Set repo variable `FLEET_MODEL_CHAIN` (comma-separated, priority order):
 
-    opencode/x-preview-f-free, opencode/gemini-3-flash, opencode/minimax-m3-free
+    opencode/muse-spark-1.3-contributor-free, opencode/muse-spark-1.2-contributor-free, opencode/mimo-v2.5-free, opencode/deepseek-v4-flash-free
 
 Semantics (`scripts/lib/model.mjs`): each entry gets its own ladder — variant `max`, then
 plain, then anonymous (auth stripped), then resume rounds (default 4; thesis/KB drafts 5)
 with 20-35 s spacing; first complete reply wins; on whole-chain failure a second ladder runs
 after a 90 s cooldown (120 s for long-form lanes). Per-call timeouts: 480 s default, 540 s
 deep analysis, 600 s thesis/KB/revision. The breaker opens (30 min) only after the entire
-chain fails. Judges can route to a different model via `FLEET_JUDGE_MODEL`. Default remains
-Ox/Alpha-only per fleet mandate. Known upstream behavior: on API errors like 429,
+chain fails. Judges can route to a different model via `FLEET_JUDGE_MODEL`. All four
+defaults are verified-live free IDs (Zen catalog 2026-09-10); retired IDs
+(`opencode/x-preview-f-free`, `opencode/minimax-m3-free`, paid `opencode/gemini-3-flash`)
+are rejected by the allowlist even when set via env. Paid fallback
+`opencode/muse-spark-1.3` stays known to the registry but out of the default chain. Known upstream behavior: on API errors like 429,
 `opencode run` may hang silently (opencode issues #8203/#22243/#29134); countermeasures are
 hard timeouts, failure-time log dumps (`~/.local/share/opencode/log/*.log` tails), and
 `max-parallel` limits on model-heavy matrices. If hangs become chronic, pin another model id
 in `scripts/lib/model.mjs`; gating and attribution are model-independent.
+
+### Credential rotation pool
+
+Auth slots: `FLEET_OPENCODE_AUTH` (slot 1, legacy) plus `FLEET_OPENCODE_AUTH_2`..`_9`.
+`scripts/lib/model.mjs` picks the least-recently-healthy non-cooldown slot per call
+(`scripts/lib/credential-pool.mjs`); auth/quota/429-class failures cool a slot down for
+15 min (`FLEET_AUTH_COOLDOWN_MS` overrides), successes clear it, and expired cooldowns
+rejoin automatically — back to slot 1 first. All slots down emits `STALLED` plus a
+`[FLEET-AUTH]` onboarding alert on `M1Vj/fleet-control` (add account N+1, then it
+rejoins on its own). Pool health (slot numbers only, never key material) lives at
+`state/credential-health.json` in fleet-control. Full steps: `docs/account-onboarding.md`.
+
+### Non-stop rotation + self-tuning chain
+
+Exhaustion never halts: all-slots-cooldown writes `state/auth-exhausted.json`
+(timestamp + slot count + cooldown floor) + `STALLED`, then continues degraded
+with anon rounds and returns `{complete:false, degraded:true, exhausted:true}`
+for normal caller retry/next-scan; watchdog/retro own issue filing, never the
+model call. Chain self-tunes via `state/model-chain.json`
+(`{chain, updatedAt, source, ttlMs}`): explicit `FLEET_MODEL_CHAIN` env >
+fresh file (TTL 7d, `FLEET_CHAIN_TTL_MS`) > code default; stale/invalid falls
+back, never stuck. Refresh: `scripts/model-refresh.mjs` (weekly
+`.github/workflows/model-refresh.yml`) re-ranks the live Zen catalog,
+free-tier + allowlisted, primary pinned first (per-model success/latency is
+phase 2).
 
 ## 8. PR lifecycle hygiene rules
 

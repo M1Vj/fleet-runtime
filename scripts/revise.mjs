@@ -6,11 +6,92 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { runGate } from "./lib/gate.mjs";
 import { ghInput, putFileContent } from "./lib/util.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
-import { scrub, gh, gitAdd, gitCommit, gitPush, configureIdentity } from "./lib/util.mjs";
+import { scrub, gh, gitAdd, gitCommit, gitPush, gitRevParse, gitHasChanges, configureIdentity } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";
+import { isSafeRepoPath, harvestFencedFiles } from "./lib/directives.mjs";
+import { verifyCommentAuthor, verifyCommit } from "./lib/verify.mjs";
+import { makeTerminal } from "./lib/terminal.mjs";
 
 const REPO_ROOT = process.cwd();
-const REVISIONS_PATH = path.join(process.env.FLEET_STATE_ROOT || REPO_ROOT, "state", "revisions.jsonl");
+const STATE_ROOT = process.env.FLEET_STATE_ROOT || REPO_ROOT;
+const REVISIONS_PATH = path.join(STATE_ROOT, "state", "revisions.jsonl");
+
+export function killSwitchEngaged() {
+  const p = process.env.FLEET_KILL_SWITCH_PATH || path.join(STATE_ROOT, "state", "KILL_SWITCH");
+  try {
+    return existsSync(p);
+  } catch {
+    return false;
+  }
+}
+
+// Parse the REVISION agent's plain-text format:
+//
+//   REVISED
+//   SUMMARY: <one line>
+//   FILE path=<repo-relative/path>
+//   ```<optional lang>
+//   <complete corrected file content>
+//   ```
+//
+// Accepts any repo-relative path (code, docs, workflows — not just markdown),
+// unlike the shared harvester which only recognizes doc-like extensions.
+// Falls back to harvestFencedFiles for harvester-style replies.
+export function parseRevisedFiles(reply) {
+  const lines = String(reply || "").split("\n");
+  const files = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^FILE\s+path=(.+?)\s*$/);
+    if (!m) continue;
+    const filePath = m[1].trim().replace(/^["']|["']$/g, "");
+    let j = i + 1;
+    while (j < lines.length && lines[j].trim() === "") j++;
+    if (j >= lines.length || !/^```/.test(lines[j].trim())) continue;
+    const content = [];
+    j++;
+    while (j < lines.length && !/^```/.test(lines[j].trim())) {
+      content.push(lines[j]);
+      j++;
+    }
+    const text = content.join("\n");
+    if (filePath && text.trim().length > 0) files.push({ path: filePath, content: text });
+    i = j;
+  }
+  if (files.length > 0) return files;
+  try {
+    return harvestFencedFiles(reply);
+  } catch {
+    return [];
+  }
+}
+
+// Revision scope rule (mirrors the prompt): only files already in the PR diff,
+// plus at most 2 brand-new supporting files. Returns { ok, errors }.
+export function validateRevisionFiles(files, changedPaths) {
+  const errors = [];
+  const allowed = new Set(changedPaths || []);
+  let newCount = 0;
+  for (const f of files || []) {
+    if (!isSafeRepoPath(f.path)) {
+      errors.push(`unsafe path: ${f.path}`);
+      continue;
+    }
+    if (!allowed.has(f.path)) {
+      newCount++;
+      if (newCount > 2) errors.push(`too many new files (max 2 supporting): ${f.path}`);
+    }
+    if (String(f.content || "").length > 60000) errors.push(`too large: ${f.path} (${String(f.content).length})`);
+  }
+  if ((files || []).length === 0) errors.push("no files");
+  return { ok: errors.length === 0, errors };
+}
+
+function appendLine(obj) {
+  try {
+    mkdirSync(path.dirname(REVISIONS_PATH), { recursive: true });
+    appendFileSync(REVISIONS_PATH, JSON.stringify(obj) + "\n");
+  } catch {}
+}
 
 function readRevisions() {
   return existsSync(REVISIONS_PATH) ? readFileSync(REVISIONS_PATH, "utf8").split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean) : [];
@@ -30,9 +111,11 @@ async function main() {
   const max = Number(process.env.FLEET_MAX_REVISIONS || 2);
   const used = countFor(repo, prNumber);
   audit.note("quota", `revisions used=${used}/${max}`);
+  const earlyTerminal = makeTerminal(STATE_ROOT, { lane: "revise" });
   if (used >= max) {
     console.log("REVISE_STATE=EXHAUSTED");
     appendLine({ t: new Date().toISOString(), repo, pr: prNumber, state: "exhausted" });
+    earlyTerminal("EXHAUSTED", { repo, pr: prNumber, why: "max-revisions" });
     return 0;
   }
 
@@ -40,7 +123,6 @@ async function main() {
   const comments = gh(["api", `/repos/${repo}/issues/${prNumber}/comments?per_page=20`], process.env) || [];
   const lastJudge = [...comments].reverse().find((c) => c.body && c.body.includes("fleet judge panel"));
   if (!lastJudge) throw new Error("no judge feedback found");
-  const blockersMatch = lastJudge.body.match(/\*\*Blockers:\*\*[\s\S]*?(- .*)?(\n|$)/);
   const blockersSection = lastJudge.body.split("**Blockers:**")[1] || "";
   const blockerLines = blockersSection.split("\n").filter((l) => l.trim().startsWith("- ")).slice(0, 8);
 
@@ -74,21 +156,29 @@ async function main() {
     lastJudge.body.slice(0, 5000),
   ].join("\n");
 
+  if (pr.state !== "open") {
+    appendLine({ t: new Date().toISOString(), repo, pr: prNumber, state: "pr-closed" });
+    earlyTerminal("NO-OP", { repo, pr: prNumber, why: `state=${pr.state}` });
+    console.log("REVISE_STATE=NO_CHANGES");
+    return 0;
+  }
+
   let result = await askModel({
     prompt: promptV3,
     timeoutMs: 600000,
     env: process.env,
-    preferVariantMax: true,
+    // Contributor tier: high thinking effort, never the max variant.
+    preferVariantMax: false,
     maxRounds: 4,
   });
   audit.note("revise", `complete=${result.complete}`);
   if (!result.complete || !result.reply) {
     appendLine({ t: new Date().toISOString(), repo, pr: prNumber, state: "model-unavailable" });
+    earlyTerminal("STALLED", { repo, pr: prNumber, why: "model-unavailable" });
     console.log("REVISE_STATE=MODEL_UNAVAILABLE");
     return 6;
   }
-  const { harvestFencedFiles } = await import("./lib/directives.mjs");
-  let files = harvestFencedFiles(result.reply);
+  let files = parseRevisedFiles(result.reply);
   if (files.length === 0 && result.sessionId) {
     const firm = await askModel({
       prompt: "You returned no parseable FILE blocks. Re-output using EXACTLY: 'REVISED', 'SUMMARY: <line>', then per file 'FILE path=<path>' + fenced complete content.",
@@ -98,28 +188,31 @@ async function main() {
       preferVariantMax: false,
       maxRounds: 2,
     });
-    if (firm.reply) files = harvestFencedFiles(firm.reply);
+    if (firm.reply) files = parseRevisedFiles(firm.reply);
   }
   if (files.length === 0) {
     process.stdout.write(`REVISE_REPLY=${String(result.reply).slice(0, 240)}\n`);
     appendLine({ t: new Date().toISOString(), repo, pr: prNumber, state: "no-parseable-files" });
+    earlyTerminal("NO-OP", { repo, pr: prNumber, why: "no-parseable-files" });
     console.log("REVISE_STATE=NO_CHANGES");
     return 0;
   }
 
   const branch = pr.head.ref;
-  const validationErrors = [];
-    for (const f of files) {
-      if (!f.path.startsWith("v2/")) validationErrors.push(`outside v2/: ${f.path}`);
-      if (!isSafeRepoPath(f.path)) validationErrors.push(`unsafe path: ${f.path}`);
-      if (f.content.length > 60000) validationErrors.push(`too large: ${f.path} (${f.content.length})`);
-    }
-    if (validationErrors.length > 0) {
-      audit.incident("validate", validationErrors.slice(0, 5).join("; "));
-      console.log(`REVISE_STATE=REJECTED ${validationErrors[0]}`);
-      return 5;
-    }
-    for (const f of files) {
+  const validation = validateRevisionFiles(files, changedPaths);
+  if (!validation.ok) {
+    audit.incident("validate", validation.errors.slice(0, 5).join("; "));
+    appendLine({ t: new Date().toISOString(), repo, pr: prNumber, state: "rejected", errors: validation.errors.slice(0, 5) });
+    console.log(`REVISE_STATE=REJECTED ${validation.errors[0]}`);
+    return 5;
+  }
+  if (killSwitchEngaged()) {
+    audit.incident("kill-switch", "revision push refused: KILL_SWITCH engaged (files validated but not pushed)");
+    appendLine({ t: new Date().toISOString(), repo, pr: prNumber, state: "kill-switch-skipped" });
+    console.log("REVISE_STATE=BLOCKED kill-switch");
+    return 2;
+  }
+  for (const f of files) {
     let sha;
     try {
       const ex = gh(["api", `/repos/${repo}/contents/${f.path}?ref=${branch}`], process.env);
@@ -138,20 +231,40 @@ async function main() {
       process.env,
     );
   }
-  summary = String(result.reply).split("\n").find((l) => l.startsWith("SUMMARY:"))?.replace(/^SUMMARY:\s*/, "") || String(summary).slice(0, 200);
-  gh(["api", "-X", "POST", `/repos/${repo}/issues/${prNumber}/comments`, "-F", `body=🔧 **fleet revision agent** (round ${used + 1}/${max}): pushed corrected files (${files.map((f) => f.path).join(", ")}). ${summary}\n\nMerge gate re-evaluates automatically.`], process.env);
+  // Record the push fact BEFORE the comment-verify step so a verify
+  // throw never leaves an unrecorded push behind for retries to duplicate.
+  appendLine({ t: new Date().toISOString(), repo, pr: prNumber, state: "pushed", round: used + 1, files: files.map((f) => f.path) });
+  const summaryLine = String(result.reply).split("\n").find((l) => l.startsWith("SUMMARY:"));
+  const summary = (summaryLine ? summaryLine.replace(/^SUMMARY:\s*/, "") : `round ${used + 1} revision`).slice(0, 200);
+  const comment = gh(["api", "-X", "POST", `/repos/${repo}/issues/${prNumber}/comments`, "-F", `body=🔧 **fleet revision agent** (round ${used + 1}/${max}): pushed corrected files (${files.map((f) => f.path).join(", ")}). ${summary}\n\nMerge gate re-evaluates automatically.`], process.env);
+  try {
+    await verifyCommentAuthor(repo, comment.id, identity, process.env.FLEET_GH_TOKEN);
+    audit.note("comment-verify", `revision comment attribution verified id=${comment.id}`);
+  } catch (err) {
+    audit.incident("comment-verify", `ATTRIBUTION FAILURE on revision comment: ${String(err.message).slice(0, 160)}`);
+    throw err;
+  }
 
-  function appendLine(obj) {
-    try {
-      mkdirSync(path.dirname(REVISIONS_PATH), { recursive: true });
-      appendFileSync(REVISIONS_PATH, JSON.stringify(obj) + "\n");
-    } catch {}
+  const terminal = makeTerminal(STATE_ROOT, { lane: "revise" });
+  terminal("SUCCESS", { repo, pr: prNumber, round: used + 1, files: files.length });
+  try {
+    audit.writeMarkdown(path.join(STATE_ROOT, "audit"), `revise-${Date.now()}`, `Revise ${repo}#${prNumber}`, "ok");
+  } catch {}
+  try {
+    if (gitHasChanges(STATE_ROOT, ["state", "audit"])) {
+      gitAdd(STATE_ROOT, ["state", "audit"]);
+      if (gitCommit(STATE_ROOT, `[fleet] revise ${repo}#${prNumber} round ${used + 1}`, identity) === "committed") {
+        gitPush(STATE_ROOT, "main", process.env);
+        const shaAfter = gitRevParse(STATE_ROOT, "HEAD");
+        await verifyCommit("M1Vj/fleet-control", shaAfter, identity, process.env.FLEET_GH_TOKEN);
+        audit.note("push-verify", `sha=${shaAfter.slice(0, 10)}`);
+      }
+    }
+  } catch (err) {
+    audit.incident("push-verify", `bookkeeping push failed (revision already pushed): ${String(err.message).slice(0, 160)}`);
   }
-  function writeAudit(a, rid) {
-    try {
-      a.writeMarkdown(path.join(REPO_ROOT, "audit"), rid, `Revise ${repo}#${prNumber}`, "ok");
-    } catch {}
-  }
+  console.log(`REVISE_STATE=PUSHED round=${used + 1}/${max}`);
+  return 0;
 }
 
 

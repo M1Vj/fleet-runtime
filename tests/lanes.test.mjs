@@ -109,8 +109,9 @@ test("shouldCoalesce only for schedule trigger", async () => {
 
 test("resolveModelChain parsing", async () => {
   const { resolveModelChain } = await import("../scripts/lib/model.mjs");
-  assert.deepEqual(resolveModelChain({}), ["opencode/x-preview-f-free"]);
-  assert.equal(resolveModelChain({ FLEET_MODEL_CHAIN: "a/b,c/d" }).length, 2);
+  const { DEFAULT_MODEL_CHAIN } = await import("../scripts/lib/provider-registry.mjs");
+  assert.deepEqual(resolveModelChain({}), DEFAULT_MODEL_CHAIN);
+  assert.equal(resolveModelChain({ FLEET_MODEL_CHAIN: "opencode/nemotron-3.5-lightning-free,opencode/mimo-v2.5-free" }).length, 2);
 });
 
 test("summarizeEvents window filtering", async () => {

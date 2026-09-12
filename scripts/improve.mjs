@@ -9,7 +9,7 @@ import { scrub, gh, ghInput, putFileContent, ensureBranch, gitAdd, gitCommit, gi
 import { askModel, askModelResilient } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor, verifyCommentAuthor } from "./lib/verify.mjs";
 import { makeTerminal } from "./lib/terminal.mjs";
-import { isSafeRepoPath, sanitizeControlChars, extractJsonObject } from "./lib/directives.mjs";
+import { isSafeRepoPath, sanitizeControlChars, extractJsonObject, firstBalancedObject, harvestFencedFiles } from "./lib/directives.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
@@ -212,6 +212,286 @@ export function parsePlan(replyText) {
   };
 }
 
+export const PLAN_MAX_FILES = 6;
+export const PLAN_MAX_FILE_CHARS = 15000;
+
+// Tolerant PLAN salvage (fleet issue #10): free-model replies are often tiny
+// non-conforming JSON (prose prefix/suffix, fences, unquoted keys, trailing
+// commas, single-file object). Harvest candidates with the shared helpers,
+// normalize outside strings only (never rewrite file contents), and validate
+// against the same schema parsePlan demands. No fabrication, same budgets.
+function quoteUnquotedKeysOutsideStrings(s) {
+  let out = "";
+  let inStr = false;
+  let esc = false;
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i];
+    if (inStr) {
+      out += ch;
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      i++;
+      continue;
+    }
+    if (ch === '"') {
+      inStr = true;
+      out += ch;
+      i++;
+      continue;
+    }
+    if (ch === "{" || ch === ",") {
+      out += ch;
+      i++;
+      let j = i;
+      while (j < s.length && /\s/.test(s[j])) j++;
+      let k = j;
+      while (k < s.length && /[A-Za-z_0-9]/.test(s[k])) k++;
+      let m = k;
+      while (m < s.length && /\s/.test(s[m])) m++;
+      const word = s.slice(j, k);
+      if (word.length > 0 && /^[A-Za-z_]/.test(word) && s[m] === ":") {
+        out += s.slice(i, j) + `"${word}"`;
+        i = k;
+        continue;
+      }
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+function stripTrailingCommasOutsideStrings(s) {
+  let out = "";
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      out += ch;
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') {
+      inStr = true;
+      out += ch;
+      continue;
+    }
+    if (ch === ",") {
+      let j = i + 1;
+      while (j < s.length && /\s/.test(s[j])) j++;
+      if (s[j] === "}" || s[j] === "]") continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+export function normalizePlanJsonText(raw) {
+  let s = String(raw ?? "").replace(/^\uFEFF/, "").trim();
+  const fenced = s.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenced && fenced[1].includes("{")) s = fenced[1].trim();
+  s = quoteUnquotedKeysOutsideStrings(s);
+  s = stripTrailingCommasOutsideStrings(s);
+  return s;
+}
+
+export function coercePlanObject(obj, fallbackTitle) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) throw new Error("plan object invalid");
+  let files = obj.files;
+  if (files && typeof files === "object" && !Array.isArray(files)) {
+    files = [files];
+  } else if (!files && typeof obj.path === "string" && typeof obj.content === "string") {
+    files = [{ path: obj.path, content: obj.content }];
+  } else if (!files && obj.file && typeof obj.file === "object" && !Array.isArray(obj.file)) {
+    files = [obj.file];
+  }
+  if (!Array.isArray(files) || files.length === 0 || files.length > PLAN_MAX_FILES) throw new Error("files invalid");
+  const clean = [];
+  for (const f of files) {
+    if (!f || typeof f !== "object" || Array.isArray(f)) throw new Error("file entry invalid");
+    if (!f.path || typeof f.content !== "string") throw new Error("file entry invalid");
+    const p = String(f.path).trim();
+    if (!isSafeRepoPath(p)) throw new Error(`forbidden path ${f.path}`);
+    if (f.content.length > PLAN_MAX_FILE_CHARS) throw new Error("file too large");
+    clean.push({ path: p, content: f.content });
+  }
+  return {
+    title: String(obj.title || fallbackTitle || "fleet improvement").slice(0, 120),
+    summary: String(obj.summary || "").slice(0, 1000),
+    prBody: String(obj.prBody || "").slice(0, 6000),
+    files: clean,
+    risks: String(obj.risks || "").slice(0, 800),
+  };
+}
+
+export function tryParsePlanText(candidateText, fallbackTitle) {
+  const raw = String(candidateText ?? "");
+  const variants = [raw];
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start !== -1 && end > start) {
+    const sliced = raw.slice(start, end + 1);
+    if (sliced !== raw) variants.push(sliced);
+  }
+  const norm = normalizePlanJsonText(raw);
+  if (!variants.includes(norm)) variants.push(norm);
+  const nStart = norm.indexOf("{");
+  const nEnd = norm.lastIndexOf("}");
+  if (nStart !== -1 && nEnd > nStart) {
+    const nSliced = norm.slice(nStart, nEnd + 1);
+    if (!variants.includes(nSliced)) variants.push(nSliced);
+  }
+  for (const v of [...variants]) {
+    try {
+      const sanitized = sanitizeControlChars(v);
+      if (!variants.includes(sanitized)) variants.push(sanitized);
+    } catch {}
+  }
+  let lastErr = new Error("unparseable plan");
+  for (const v of variants) {
+    try {
+      return coercePlanObject(JSON.parse(v), fallbackTitle);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  try {
+    return coercePlanObject(extractJsonObject(raw), fallbackTitle);
+  } catch {}
+  try {
+    return coercePlanObject(extractJsonObject(norm), fallbackTitle);
+  } catch {}
+  throw lastErr;
+}
+
+export function harvestPlanCandidates(replyText) {
+  const text = String(replyText ?? "");
+  const out = [];
+  const seen = new Set();
+  const push = (s) => {
+    const t = String(s ?? "").trim();
+    if (t.length < 2 || !t.includes("{")) return;
+    if (seen.has(t)) return;
+    seen.add(t);
+    out.push(t);
+  };
+  for (const m of text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)) push(m[1]);
+  let rest = text;
+  for (let i = 0; i < 20; i++) {
+    let found;
+    try {
+      found = firstBalancedObject(rest);
+    } catch {
+      break;
+    }
+    push(found);
+    const idx = rest.indexOf(found);
+    if (idx === -1) break;
+    rest = rest.slice(idx + found.length);
+    if (!rest.includes("{")) break;
+  }
+  push(text);
+  return out;
+}
+
+export function salvagePlan(replyText, fallbackTitle) {
+  const candidates = harvestPlanCandidates(replyText);
+  let lastErr = new Error("no plan candidates");
+  for (const cand of candidates) {
+    try {
+      const plan = tryParsePlanText(cand, fallbackTitle);
+      return { ...plan, degraded: false };
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
+export function collectValidPlanFiles(replyText) {
+  const valid = [];
+  const seenPath = new Set();
+  const consider = (p, c) => {
+    const pp = String(p ?? "").trim();
+    if (typeof c !== "string") return;
+    if (!isSafeRepoPath(pp)) return;
+    if (c.length > PLAN_MAX_FILE_CHARS) return;
+    if (seenPath.has(pp)) return;
+    seenPath.add(pp);
+    valid.push({ path: pp, content: c });
+  };
+  for (const cand of harvestPlanCandidates(replyText)) {
+    if (valid.length >= PLAN_MAX_FILES) break;
+    let obj;
+    try {
+      const norm = normalizePlanJsonText(cand);
+      try {
+        obj = JSON.parse(norm);
+      } catch {
+        obj = JSON.parse(sanitizeControlChars(norm));
+      }
+    } catch {
+      continue;
+    }
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) continue;
+    let files = obj.files;
+    if (files && typeof files === "object" && !Array.isArray(files)) files = [files];
+    else if (!files && typeof obj.path === "string" && typeof obj.content === "string") files = [{ path: obj.path, content: obj.content }];
+    else if (!files && obj.file && typeof obj.file === "object" && !Array.isArray(obj.file)) files = [obj.file];
+    if (!Array.isArray(files)) continue;
+    for (const f of files) {
+      if (valid.length >= PLAN_MAX_FILES) break;
+      if (!f || typeof f !== "object" || Array.isArray(f)) continue;
+      consider(f.path, f.content);
+    }
+  }
+  try {
+    for (const f of extractFileBlocks(String(replyText))) {
+      if (valid.length >= PLAN_MAX_FILES) break;
+      consider(f.path, f.content);
+    }
+  } catch {}
+  try {
+    for (const f of harvestFencedFiles(String(replyText))) {
+      if (valid.length >= PLAN_MAX_FILES) break;
+      consider(f.path, f.content);
+    }
+  } catch {}
+  return valid.slice(0, PLAN_MAX_FILES);
+}
+
+export function salvagePartialPlan(replyText, fallbackTitle) {
+  const files = collectValidPlanFiles(replyText);
+  if (files.length === 0) throw new Error("no valid files for partial plan");
+  let meta = {};
+  for (const cand of harvestPlanCandidates(replyText)) {
+    try {
+      const obj = JSON.parse(normalizePlanJsonText(cand));
+      if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+        meta = obj;
+        break;
+      }
+    } catch {
+      continue;
+    }
+  }
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) meta = {};
+  return {
+    title: String(meta.title || fallbackTitle || "fleet improvement (partial)").slice(0, 120),
+    summary: String(meta.summary || "").slice(0, 1000),
+    prBody: String(meta.prBody || meta.summary || "").slice(0, 6000),
+    files,
+    risks: String(meta.risks || "partial plan: subset of valid files salvaged").slice(0, 800),
+    degraded: true,
+  };
+}
+
 async function modePlan(audit) {
   const identity = await runGate(process.env);
   configureIdentity(REPO_ROOT, identity);
@@ -272,21 +552,58 @@ async function modePlan(audit) {
         try {
           parsed = parsePlanV2(plan.reply);
         } catch (errV2) {
-          audit.note("plan-v2", `fallbacks rejected (${errV2.message.slice(0, 100)}); repair round`);
-          let repair = { complete: false, reply: "", sessionId: plan.sessionId };
-          if (plan.sessionId) {
-            repair = await askModel({
-              prompt: "Your previous answer did not match the required format. Re-output it now following EXACTLY: first line PLAN; then TITLE:, SUMMARY:, RISKS: single-line values; then per file a line FILE path=<path> and one fenced code block with the raw file content. No other prose.",
-              sessionId: plan.sessionId,
-              timeoutMs: 300000,
-              env: process.env,
-              preferVariantMax: false,
-            });
-          }
-          if (repair.complete && repair.reply) {
-            parsed = parsePlanV3(repair.reply, idea.title);
-          } else {
-            parsed = parsePlan(plan.reply);
+          audit.note("plan-v2", `fallbacks rejected (${errV2.message.slice(0, 100)}); salvage`);
+          let salvaged = null;
+          try {
+            salvaged = salvagePlan(plan.reply, idea.title);
+            audit.note("plan-salvage", `salvaged full plan files=${salvaged.files.length}`);
+            parsed = salvaged;
+          } catch (errSalv) {
+            audit.note("plan-salvage", `no candidate validated (${String(errSalv.message || errSalv).slice(0, 100)}); repair round`);
+            // Bounded ONE repair round via askModel (same resilient model
+            // chain + variant ladder askModelResilient wraps; the second
+            // Resilient ladder is deliberately skipped to bound cost).
+            let repair = { complete: false, reply: "", sessionId: plan.sessionId };
+            if (plan.sessionId) {
+              repair = await askModel({
+                prompt: "Your previous answer did not match the required format. Re-output it now following EXACTLY: first line PLAN; then TITLE:, SUMMARY:, RISKS: single-line values; then per file a line FILE path=<path> and one fenced code block with the raw file content. No other prose.",
+                sessionId: plan.sessionId,
+                timeoutMs: 300000,
+                env: process.env,
+                preferVariantMax: false,
+              });
+            }
+            if (repair.complete && repair.reply) {
+              try {
+                parsed = parsePlanV3(repair.reply, idea.title);
+              } catch {
+                try {
+                  parsed = parsePlanV2(repair.reply);
+                } catch {
+                  try {
+                    salvaged = salvagePlan(repair.reply, idea.title);
+                    audit.note("plan-salvage", `repair salvaged files=${salvaged.files.length}`);
+                    parsed = salvaged;
+                  } catch {
+                    const combined = `${plan.reply}\n${repair.reply}`;
+                    try {
+                      salvaged = salvagePartialPlan(combined, idea.title);
+                    } catch {
+                      salvaged = salvagePartialPlan(plan.reply, idea.title);
+                    }
+                    audit.note("plan-salvage", `degraded partial plan files=${salvaged.files.length} (subset of valid files)`);
+                    parsed = salvaged;
+                  }
+                }
+              }
+            } else {
+              try {
+                parsed = parsePlan(plan.reply);
+              } catch {
+                parsed = salvagePartialPlan(plan.reply, idea.title);
+                audit.note("plan-salvage", `degraded partial plan files=${parsed.files.length} (no repair reply)`);
+              }
+            }
           }
         }
       }
@@ -294,6 +611,7 @@ async function modePlan(audit) {
       plans += 1;
       console.log(`IMPROVE_PLAN_OK=${data.repo}`);
     } catch (err) {
+      audit.note("plan-salvage", `salvage attempted; unfixable (${String(err.message || err).slice(0, 120)})`);
       audit.incident("plan-parse", `${data.repo}: ${err.message}`);
     }
   }

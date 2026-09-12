@@ -8,6 +8,7 @@ import { scrub, gh } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";
 import { verifyIssueAuthor } from "./lib/verify.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
+import { makeTerminal } from "./lib/terminal.mjs";
 
 const REPO_ROOT = process.env.FLEET_STATE_ROOT || process.cwd();
 
@@ -35,6 +36,9 @@ async function modePropose(audit) {
   const recentIssues = gh(["api", `/repos/M1Vj/fleet-control/issues?since=${today}T00:00:00Z&state=all&per_page=50`], process.env) || [];
   if (recentIssues.some((i) => i.title && i.title.startsWith("[RETRO]"))) {
     audit.note("dedupe", "retro already filed today");
+    try {
+      makeTerminal(REPO_ROOT, { lane: "retro" })("NO-OP", { why: "retro-already-filed" });
+    } catch {}
     console.log("RETRO_STATE=NO-OP");
     return 0;
   }
@@ -70,7 +74,14 @@ async function modePropose(audit) {
     digest.slice(0, 30000),
   ].join("\n");
 
-  let result = await askModel({ prompt, timeoutMs: 480000, env: process.env, preferVariantMax: true, maxRounds: 3 });
+  let result = await askModel({
+    prompt,
+    timeoutMs: 480000,
+    env: process.env,
+    // Contributor tier: high thinking effort, never the max variant.
+    preferVariantMax: false,
+    maxRounds: 3,
+  });
   if (!result.complete) {
     await new Promise((r) => setTimeout(r, 60000));
     result = await askModel({ prompt, timeoutMs: 480000, env: process.env, preferVariantMax: false, maxRounds: 3 });
@@ -105,6 +116,9 @@ async function modePropose(audit) {
   void identity;
   await verifyIssueAuthor("M1Vj/fleet-control", issue.number, identity, process.env.FLEET_GH_TOKEN);
   audit.note("issue", `#${issue.number}`);
+  try {
+    makeTerminal(REPO_ROOT, { lane: "retro" })("SUCCESS", { issue: issue.number, proposals: parsed.proposals.length });
+  } catch {}
   console.log(`RETRO_STATE=SUCCESS issue=${issue.number}`);
   return 0;
 

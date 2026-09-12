@@ -7,9 +7,66 @@ import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
 import { verifyCommit, verifyIssueAuthor } from "./lib/verify.mjs";
 import { planWatchdogActions } from "./lib/watchdog-decide.mjs";
+import { makeTerminal } from "./lib/terminal.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
+
+// Stale thresholds: a task stuck in_progress longer than this with attempts
+// remaining is resumed (requeued to pending); one that already exhausted its
+// attempts trips the breaker and is parked as stalled.
+export const QUEUE_STALE_MS = 40 * 60 * 1000;
+export const QUEUE_MAX_ATTEMPTS = 3;
+export const ALERT_DEDUPE_MS = 6 * 3600 * 1000;
+
+export function refreshQueue(tasks, nowMs = Date.now(), staleMs = QUEUE_STALE_MS, maxAttempts = QUEUE_MAX_ATTEMPTS) {
+  let requeued = 0;
+  let stalled = 0;
+  for (const t of tasks || []) {
+    if (!t || t.status !== "in_progress" || !t.updatedUtc) continue;
+    const age = nowMs - Date.parse(t.updatedUtc);
+    if (Number.isNaN(age) || age <= staleMs) continue;
+    if ((t.attempts || 0) < maxAttempts) {
+      t.status = "pending";
+      t.attempts = (t.attempts || 0) + 1;
+      t.updatedUtc = new Date(nowMs).toISOString();
+      t.note = "watchdog-resume-stale";
+      requeued++;
+    } else {
+      t.status = "stalled";
+      t.updatedUtc = new Date(nowMs).toISOString();
+      t.note = "watchdog-breaker-max-attempts";
+      stalled++;
+    }
+  }
+  return { requeued, stalled };
+}
+
+export function parseQueue(text) {
+  return String(text || "")
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+// Avoid filing a [WATCHDOG] alert every 15 minutes while stale: skip when a
+// recent open watchdog alert already exists.
+export function recentWatchdogAlert(issues, nowMs = Date.now(), windowMs = ALERT_DEDUPE_MS) {
+  for (const i of issues || []) {
+    if (!i || i.state === "closed") continue;
+    if (!String(i.title || "").startsWith("[WATCHDOG]")) continue;
+    const created = Date.parse(i.created_at || "");
+    if (!Number.isNaN(created) && nowMs - created < windowMs) return i;
+  }
+  return null;
+}
 
 function heartbeatPath() {
   return path.join(REPO_ROOT, "state", "heartbeat.json");
@@ -46,12 +103,17 @@ export async function main() {
     }
     const plan = planWatchdogActions(heartbeat, Date.now());
     audit.note("heartbeat", `decision=${plan.reason} ageMinutes=${plan.ageMinutes}`);
+    const terminal = makeTerminal(REPO_ROOT, { lane: "watchdog" });
 
     if (!plan.stale) {
       audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Watchdog", "ok-fresh");
       console.log("FLEET_RUN_RESULT=" + JSON.stringify({ runId, status: "fresh", action: "none" }));
       return 0;
     }
+
+    // Breaker tripped: patrol heartbeat is stale. Record STALLED first so the
+    // outage is visible in the status digest even if recovery below fails.
+    terminal("STALLED", { runId, why: plan.reason, ageMinutes: plan.ageMinutes });
 
     const enablePlan = {
       "M1Vj/fleet-runtime": ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml"],
@@ -69,21 +131,16 @@ export async function main() {
       }
     }
     const queuePath = path.join(REPO_ROOT, "state", "queue.jsonl");
+    let queueStats = { requeued: 0, stalled: 0 };
     if (existsSync(queuePath)) {
       try {
-        const queue = readFileSync(queuePath, "utf8").split("\n").filter(Boolean)
-          .map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-        const now = Date.now();
-        let changed = false;
-        for (const t of queue) {
-          if (t.status === "in_progress" && t.updatedUtc && now - new Date(t.updatedUtc).getTime() > 40 * 60 * 1000) {
-            t.updatedUtc = new Date().toISOString();
-            changed = true;
-          }
-        }
-        if (changed) {
+        const queue = parseQueue(readFileSync(queuePath, "utf8"));
+        queueStats = refreshQueue(queue, Date.now());
+        if (queueStats.requeued + queueStats.stalled > 0) {
           writeFileSync(queuePath, queue.map((t) => JSON.stringify(t)).join("\n") + "\n");
-          audit.note("queue-recheck", "stale in_progress timestamps refreshed");
+          audit.note("queue-resume", `requeued=${queueStats.requeued} breaker-stalled=${queueStats.stalled} (stale>40min, attempts<${QUEUE_MAX_ATTEMPTS} resume)`);
+        } else {
+          audit.note("queue-recheck", "no stale in_progress tasks");
         }
       } catch (err) {
         audit.note("queue-recheck", `skipped: ${err.message.slice(0, 120)}`);
@@ -94,16 +151,28 @@ export async function main() {
     const runsList = (recentRuns.workflow_runs || [])
       .map((r) => `- ${r.name} ${r.status}/${r.conclusion} ${r.html_url}`)
       .join("\n");
-    const issue = gh(
-      [
-        "api", "-X", "POST", "/repos/M1Vj/fleet-control/issues",
-        "-f", `title=${plan.actions.find((a) => a.kind === "file-alert-issue").title}`,
-        "-f", `body=Patrol heartbeat is stale (${plan.ageMinutes} minutes).\nRe-enable was attempted. Recent runs:\n${runsList}\n\nCheck model auth secret freshness and Actions quota.`,
-      ],
-      process.env,
-    );
-    await verifyIssueAuthor("M1Vj/fleet-control", issue.number, identity, process.env.FLEET_GH_TOKEN);
-    audit.note("alert-issue", `#${issue.number}`);
+    let issueNumber = null;
+    try {
+      const openIssues = gh(["api", "/repos/M1Vj/fleet-control/issues?state=open&per_page=50"], process.env) || [];
+      const dupe = recentWatchdogAlert(openIssues, Date.now());
+      if (dupe) {
+        audit.note("alert-dedupe", `open watchdog alert #${dupe.number} already exists, skipping new issue`);
+      } else {
+        const issue = gh(
+          [
+            "api", "-X", "POST", "/repos/M1Vj/fleet-control/issues",
+            "-f", `title=${plan.actions.find((a) => a.kind === "file-alert-issue").title}`,
+            "-f", `body=Patrol heartbeat is stale (${plan.ageMinutes} minutes).\nRe-enable was attempted. Recent runs:\n${runsList}\n\nCheck model auth secret freshness and Actions quota.`,
+          ],
+          process.env,
+        );
+        await verifyIssueAuthor("M1Vj/fleet-control", issue.number, identity, process.env.FLEET_GH_TOKEN);
+        audit.note("alert-issue", `#${issue.number}`);
+        issueNumber = issue.number;
+      }
+    } catch (err) {
+      audit.incident("alert-issue", `alert filing skipped: ${String(err.message).slice(0, 140)}`);
+    }
 
     audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Watchdog", "ok-stale-recovered");
     if (gitHasChanges(REPO_ROOT, ["state", "audit"])) {
@@ -114,7 +183,8 @@ export async function main() {
       await verifyCommit("M1Vj/fleet-control", sha, identity, process.env.FLEET_GH_TOKEN);
       audit.note("push-verify", `attribution verified sha=${sha.slice(0, 10)}`);
     }
-    console.log("FLEET_RUN_RESULT=" + JSON.stringify({ runId, status: "stale-recovered", issue: issue.number }));
+    console.log("FLEET_RUN_RESULT=" + JSON.stringify({ runId, status: "stale-recovered", issue: issueNumber, queue: queueStats }));
+    terminal("SUCCESS", { runId, recovered: true, issue: issueNumber, ...queueStats });
     return 0;
   } catch (err) {
     const code = err.code && Number.isInteger(err.code) ? err.code : 1;

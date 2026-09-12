@@ -32,9 +32,16 @@ export async function main() {
 
     for (const repoFullName of ["M1Vj/fleet-runtime", "M1Vj/fleet-control"]) {
       for (const wf of ["patrol.yml", "watchdog.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml"]) {
-        gh(["api", "-X", "PUT", `/repos/${repoFullName}/actions/workflows/${wf}/disable`], process.env);
+        try {
+          gh(["api", "-X", "PUT", `/repos/${repoFullName}/actions/workflows/${wf}/disable`], process.env);
+          audit.note("disable", `${repoFullName}/${wf} disabled`);
+        } catch (err) {
+          // Absent workflows 404 (e.g. thesis/kb/retro only exist on
+          // fleet-runtime) — tolerate, the kill-switch file is the real halt.
+          if (!/404|not found/i.test(String(err.message))) throw err;
+          audit.note("disable-skip", `${repoFullName}/${wf} absent`);
+        }
       }
-      audit.note("disable", wf);
     }
 
     const issue = gh(

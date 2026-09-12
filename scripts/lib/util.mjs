@@ -19,10 +19,23 @@ export function dayPath(iso = utcNowISO()) {
 export function scrub(env) {
   const token = env.FLEET_GH_TOKEN || "";
   const auth = env.FLEET_OPENCODE_AUTH || "";
+  // Pattern-based redaction alongside the exact-value replacement above:
+  // catches token-shaped substrings even when the exact env value is
+  // unknown (other actors' tokens, pasted creds in diffs/logs).
+  const PATTERNS = [
+    /(ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9_]{10,}/g,
+    /github_pat_[A-Za-z0-9_]+/g,
+    /AKIA[0-9A-Z]{16}/g,
+    /sk-[A-Za-z0-9_-]{10,}/g,
+    /xox[bpas]-[A-Za-z0-9-]+/g,
+    /AIza[A-Za-z0-9_-]+/g,
+    /Bearer\s+[A-Za-z0-9._~+/-]+/gi,
+  ];
   return (str) => {
     let out = String(str ?? "");
     if (token) out = out.split(token).join("***");
     if (auth && auth.length > 16) out = out.split(auth).join("***");
+    for (const re of PATTERNS) out = out.replace(re, "***");
     return out;
   };
 }

@@ -88,10 +88,11 @@ export async function main() {
       preferVariantMax: true,
       skipCircuitCheck: true,
     });
-    if (modelResult.complete && modelResult.reply.includes("ALIVE") && modelResult.sessionId) {
+    const deadModelUsed = String(modelResult.modelMode || "").includes("x-preview");
+    if (modelResult.complete && !deadModelUsed && modelResult.reply.includes("ALIVE") && modelResult.sessionId) {
       audit.note("T5", `PASS model liveness mode=${modelResult.modelMode} session=${modelResult.sessionId} attempts=${JSON.stringify(modelResult.attempts)}`);
     } else {
-      audit.incident("T5", `model liveness failed mode=${modelResult.modelMode} attempts=${JSON.stringify(modelResult.attempts)} reply=${modelResult.reply.slice(0, 100)}`);
+      audit.incident("T5", `model liveness failed deadModel=${deadModelUsed} mode=${modelResult.modelMode} attempts=${JSON.stringify(modelResult.attempts)} reply=${modelResult.reply.slice(0, 100)}`);
       failed = true;
     }
 
@@ -236,6 +237,110 @@ export async function main() {
         audit.incident("T11", `canary failed scriptExists=${existsOk} exit=${r.status} out=${String(r.stdout).slice(-160)} err=${String(r.stderr).slice(-320)} stateRootSet=${Boolean(childEnv.FLEET_STATE_ROOT)}`);
         failed = true;
       }
+    }
+
+    // T12 (lane B): terminal accepts the full 7-state set incl. merge-gate states.
+    try {
+      const { makeTerminal, TERMINAL_STATES } = await import("./lib/terminal.mjs");
+      const tdir = mkdtempSync(path.join(tmpdir(), "fleetterm-"));
+      const term = makeTerminal(tdir, { lane: "selftest" });
+      const got = [term("REVISION_QUEUED", { probe: 1 }), term("SCAN-DONE", { probe: 1 }), term("BOGUS-STATE", { probe: 1 })];
+      const lines = (await import("node:fs")).readFileSync(path.join(tdir, "state", "events.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l).state);
+      if (
+        TERMINAL_STATES.length === 7 &&
+        got[0] === "REVISION_QUEUED" && got[1] === "SCAN-DONE" && got[2] === "BLOCKED" &&
+        lines.includes("REVISION_QUEUED") && lines.includes("SCAN-DONE")
+      ) {
+        audit.note("T12", "PASS terminal 7-state set (REVISION_QUEUED/SCAN-DONE kept, unknown fails closed to BLOCKED)");
+      } else {
+        audit.incident("T12", `terminal states wrong: ${JSON.stringify({ got, lines })}`);
+        failed = true;
+      }
+    } catch (err) {
+      audit.incident("T12", `terminal canary error ${String(err.message).slice(0, 150)}`);
+      failed = true;
+    }
+
+    // T13 (lane B): merge-gate tier1 fence + CI-green verdict matrix.
+    try {
+      const { isTier1Eligible, ciVerdict, mergeAlreadyRecorded } = await import("./merge.mjs");
+      const t13ok =
+        isTier1Eligible({ tier1: ["a/b"], excluded: [], allOwned: false }, "a/b") === true &&
+        isTier1Eligible({ tier1: ["a/b"], excluded: [], allOwned: false }, "c/d") === false &&
+        isTier1Eligible({ tier1: [], excluded: [], allOwned: true }, "c/d") === true &&
+        isTier1Eligible({ tier1: ["a/b"], excluded: ["a/b"], allOwned: true }, "a/b") === false &&
+        isTier1Eligible(null, "a/b") === false &&
+        ciVerdict({ state: "success", runs: [{ name: "ci", status: "completed", conclusion: "success" }] }).ok === true &&
+        ciVerdict({ state: null, runs: [] }).ok === true &&
+        ciVerdict({ state: "success", runs: [{ name: "ci", status: "completed", conclusion: "failure" }] }).ok === false &&
+        ciVerdict({ state: "pending", runs: [] }).ok === false &&
+        ciVerdict({ state: "success", runs: [{ name: "ci", status: "in_progress", conclusion: null }] }).pending === true &&
+        mergeAlreadyRecorded("/nonexistent-merges.jsonl", "a/b", 1, "sha") === false;
+      if (t13ok) audit.note("T13", "PASS merge tier1 fence + CI-green matrix + idempotency miss");
+      else {
+        audit.incident("T13", "merge gate pure helpers wrong");
+        failed = true;
+      }
+    } catch (err) {
+      audit.incident("T13", `merge helper canary error ${String(err.message).slice(0, 150)}`);
+      failed = true;
+    }
+
+    // T14 (lane B): watchdog queue resume (<3 attempts) vs breaker (>=3).
+    try {
+      const { refreshQueue, recentWatchdogAlert } = await import("./watchdog.mjs");
+      const nowT = Date.now();
+      const old = new Date(nowT - 60 * 60 * 1000).toISOString();
+      const tasks = [
+        { id: "a", status: "in_progress", attempts: 1, updatedUtc: old },
+        { id: "b", status: "in_progress", attempts: 3, updatedUtc: old },
+        { id: "c", status: "in_progress", attempts: 0, updatedUtc: new Date(nowT - 60000).toISOString() },
+        { id: "d", status: "pending", attempts: 0, updatedUtc: old },
+      ];
+      const stats = refreshQueue(tasks, nowT);
+      const dupe = recentWatchdogAlert([{ title: "[WATCHDOG] x", state: "open", created_at: new Date(nowT - 3600000).toISOString(), number: 7 }], nowT);
+      const noDupe = recentWatchdogAlert([{ title: "[WATCHDOG] x", state: "open", created_at: new Date(nowT - 30 * 3600000).toISOString(), number: 8 }], nowT);
+      if (
+        stats.requeued === 1 && stats.stalled === 1 &&
+        tasks[0].status === "pending" && tasks[0].attempts === 2 &&
+        tasks[1].status === "stalled" &&
+        tasks[2].status === "in_progress" && tasks[3].status === "pending" &&
+        dupe && dupe.number === 7 && noDupe === null
+      ) {
+        audit.note("T14", "PASS queue resume/breaker + watchdog alert dedupe");
+      } else {
+        audit.incident("T14", `queue canary wrong: ${JSON.stringify(stats)}`);
+        failed = true;
+      }
+    } catch (err) {
+      audit.incident("T14", `queue canary error ${String(err.message).slice(0, 150)}`);
+      failed = true;
+    }
+
+    // T15 (lane B): revise parser handles code files + scope validation.
+    try {
+      const { parseRevisedFiles, validateRevisionFiles } = await import("./revise.mjs");
+      const reply = "REVISED\nSUMMARY: fix retry\nFILE path=src/worker.ts\n```ts\nexport const x = 1;\n```\nFILE path=docs/note.md\n```md\n# hi\n```";
+      const parsed = parseRevisedFiles(reply);
+      const vOk = validateRevisionFiles(parsed, ["src/worker.ts"]);
+      const vBad = validateRevisionFiles([{ path: "../evil.sh", content: "x" }], ["src/worker.ts"]);
+      const vMany = validateRevisionFiles(
+        [{ path: "a1.ts", content: "x" }, { path: "a2.ts", content: "x" }, { path: "a3.ts", content: "x" }],
+        ["src/worker.ts"],
+      );
+      if (
+        parsed.length === 2 && parsed[0].path === "src/worker.ts" && parsed[0].content.includes("export const x") &&
+        vOk.ok === true && vOk.errors.length === 0 &&
+        vBad.ok === false && vMany.ok === false
+      ) {
+        audit.note("T15", "PASS revise parser (code files) + scope validation (diff+2-new, traversal rejected)");
+      } else {
+        audit.incident("T15", `revise canary wrong: files=${parsed.length} vOk=${vOk.ok} vBad=${vBad.ok} vMany=${vMany.ok}`);
+        failed = true;
+      }
+    } catch (err) {
+      audit.incident("T15", `revise canary error ${String(err.message).slice(0, 150)}`);
+      failed = true;
     }
 
     let t7Note = "";

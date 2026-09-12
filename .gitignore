@@ -4,3 +4,4 @@ node_modules/
 auth.json
 .DS_Store
 .opencode-attachments/
+state/

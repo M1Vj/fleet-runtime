@@ -5,16 +5,18 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
-import { scrub, gh, ghInput, gitRevParse, configureIdentity, safeCommitState, installCredentialHelper } from "./lib/util.mjs";
+import { scrub, gh, ghInput, gitRevParse, configureIdentity, installCredentialHelper, gitAdd, gitCommit, gitPush, gitHasChanges } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
 import { verifyCommit } from "./lib/verify.mjs";
 import { findSuperseded, isStale } from "./lib/pr-hygiene.mjs";
-import { verifyPullAuthor } from "./lib/verify.mjs";
+import { verifyPullAuthor, verifyCommentAuthor } from "./lib/verify.mjs";
 
 const REPO_ROOT = process.cwd();
 const STATE_ROOT = process.env.FLEET_STATE_ROOT || REPO_ROOT;
+const AUDIT_DIR = path.join(STATE_ROOT, "audit");
 const MERGES_PATH = path.join(STATE_ROOT, "state", "merges.jsonl");
+const TARGETS_PATH = path.join(STATE_ROOT, "state", "targets.json");
 const TARGET_REPO = process.env.FLEET_TARGET_REPO || "";
 const PR_NUMBER = Number(process.env.FLEET_PR_NUMBER || 0);
 
@@ -80,6 +82,153 @@ export function secretsInDiff(files) {
   return hits;
 }
 
+// Untrusted-checkout execution: PR code (npm install/build/test,
+// visual-check) must never see secrets. Mirrors the model.mjs child-env
+// pattern, but also strips model auth — builds must still run.
+export function sanitizedExecEnv(env = process.env) {
+  const out = { ...env };
+  for (const key of Object.keys(out)) {
+    if (/TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL/i.test(key)) delete out[key];
+  }
+  delete out.FLEET_GH_TOKEN;
+  delete out.GH_TOKEN;
+  delete out.FLEET_OPENCODE_AUTH;
+  delete out.OPENCODE_AUTH_CONTENT;
+  delete out.OPENCODE_API_KEY;
+  delete out.GDRIVE_REFRESH_TOKEN;
+  delete out.GDRIVE_CLIENT_SECRET;
+  return out;
+}
+
+// Kill-switch re-check before every mutation: runGate enforces it at startup,
+// but a STOP may land while judges/checks are running.
+export function killSwitchEngaged() {
+  const p = process.env.FLEET_KILL_SWITCH_PATH || path.join(STATE_ROOT, "state", "KILL_SWITCH");
+  try {
+    return existsSync(p);
+  } catch {
+    return false;
+  }
+}
+
+export function readTargets() {
+  try {
+    if (existsSync(TARGETS_PATH)) return JSON.parse(readFileSync(TARGETS_PATH, "utf8"));
+  } catch {}
+  return { tier1: [], excluded: [] };
+}
+
+// Mirror of patrol's eligibility: merges only proceed on tier1 (or everywhere
+// when the fleet is configured with allOwned). Fail-closed when unknown.
+export function isTier1Eligible(targets, repo) {
+  if (!targets || typeof targets !== "object") return false;
+  if (Array.isArray(targets.excluded) && targets.excluded.includes(repo)) return false;
+  if (targets.allOwned === true) return true;
+  return Array.isArray(targets.tier1) && targets.tier1.includes(repo);
+}
+
+// Ledger idempotency: never re-gate an exact SHA already merged successfully.
+export function mergeAlreadyRecorded(mergesPath, repo, prNumber, headSha) {
+  try {
+    if (!existsSync(mergesPath)) return false;
+    for (const line of readFileSync(mergesPath, "utf8").split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const r = JSON.parse(trimmed);
+        if (r.repo === repo && Number(r.pr) === Number(prNumber) && r.sha === headSha && r.state === "SUCCESS") return true;
+      } catch {}
+    }
+  } catch {}
+  return false;
+}
+
+const CI_BAD_CONCLUSIONS = new Set(["failure", "cancelled", "timed_out", "action_required", "stale"]);
+const CI_PENDING_STATUS = new Set(["queued", "in_progress", "waiting", "requested", "pending"]);
+
+// Pure CI-green verdict over the combined status + check-runs of one exact SHA.
+// Empty (no checks configured) counts as green; anything failing or still
+// running blocks the merge until the next 15-minute gate pass.
+export function ciVerdict({ state, runs, error }) {
+  // Fail-closed: a CI API error means unknown status — never treat as
+  // green. The merge BLOCKEDs and retries on the next gate pass.
+  if (error) {
+    return { ok: false, pending: false, why: `ci-unknown: ${String(error).slice(0, 160)}` };
+  }
+  const list = Array.isArray(runs) ? runs : [];
+  const bad = list.filter((r) => r.conclusion && CI_BAD_CONCLUSIONS.has(String(r.conclusion)));
+  if (state === "failure" || bad.length > 0) {
+    return { ok: false, pending: false, why: `failing checks: ${bad.map((r) => r.name || "?").join(", ") || "commit status= failure"}`.slice(0, 200) };
+  }
+  const waiting = list.filter((r) => r.status && CI_PENDING_STATUS.has(String(r.status)));
+  if (state === "pending" || waiting.length > 0) {
+    return { ok: false, pending: true, why: `checks still running (${waiting.length || "status=pending"})` };
+  }
+  if (list.length === 0 && (state === null || state === undefined || state === "")) return { ok: true, pending: false, why: "no-checks" };
+  return { ok: true, pending: false, why: `green (${list.length} runs, status=${state || "n/a"})` };
+}
+
+export function fetchCi(repo, sha, env = process.env) {
+  let state = null;
+  let runs = [];
+  let error = null;
+  try {
+    const s = gh(["api", `/repos/${repo}/commits/${sha}/status?per_page=100`], env);
+    state = s && s.state;
+  } catch (err) {
+    error = String((err && err.message) || err).slice(0, 200);
+  }
+  try {
+    const c = gh(["api", `/repos/${repo}/commits/${sha}/check-runs?per_page=100`], env);
+    runs = (c && c.check_runs) || [];
+  } catch (err) {
+    error = String((err && err.message) || err).slice(0, 200);
+  }
+  return { state, runs, error };
+}
+
+// Post a marker-tagged comment at most once (scan recent comments for the
+// marker first) so 15-minute retries never spam the PR while CI runs.
+export async function postCommentOnce(repo, number, marker, body, audit, env = process.env) {
+  try {
+    const comments = gh(["api", `/repos/${repo}/issues/${number}/comments?per_page=20`], env) || [];
+    if (comments.some((c) => c.body && String(c.body).includes(marker))) {
+      audit.note("comment-dedupe", `#${number} marker already present, skipped`);
+      return null;
+    }
+  } catch {}
+  const c = gh(["api", "-X", "POST", `/repos/${repo}/issues/${number}/comments`, "-F", `body=${marker}\n\n${body}`], env);
+  const user = gh(["api", `/repos/${repo}/issues/comments/${c.id}`], env);
+  if ((user.user && user.user.login) !== "M1Vj") throw new Error("comment attribution mismatch");
+  // Fail-closed: attribution-verify failure must throw (same as
+  // postComment) — never swallow.
+  await verifyCommentAuthor(repo, c.id, { login: "M1Vj" }, env.FLEET_GH_TOKEN);
+  audit.note("comment", `#${number} posted`);
+  return c;
+}
+
+// Attributable state push: commit + push as M1Vj, then verify the SHA landed
+// under M1Vj in fleet-control. Bookkeeping only — never throws; the merge
+// outcome itself is enforced separately via verifyCommit on the merge commit.
+export async function commitPushVerify(repoDir, subpaths, message, identity, audit, env = process.env) {
+  try {
+    const existing = subpaths.filter((p2) => existsSync(path.join(repoDir, p2)));
+    const changed = existing.filter((p2) => gitHasChanges(repoDir, [p2]));
+    if (changed.length === 0) return "no-changes";
+    gitAdd(repoDir, changed);
+    const outcome = gitCommit(repoDir, message, identity);
+    if (outcome !== "committed") return outcome;
+    gitPush(repoDir, "main", env);
+    const sha = gitRevParse(repoDir, "HEAD");
+    await verifyCommit("M1Vj/fleet-control", sha, identity, env.FLEET_GH_TOKEN);
+    audit.note("push-verify", `state committed+verified sha=${sha.slice(0, 10)}`);
+    return outcome;
+  } catch (err) {
+    audit.incident("push-verify", `bookkeeping push failed (merge outcome unaffected): ${String(err.message).slice(0, 160)}`);
+    return "push-failed";
+  }
+}
+
 async function getPr() {
   const pr = gh(["api", `/repos/${TARGET_REPO}/pulls/${PR_NUMBER}`], process.env);
   const files = gh(["api", `/repos/${TARGET_REPO}/pulls/${PR_NUMBER}/files?per_page=100`], process.env) || [];
@@ -109,16 +258,16 @@ async function runDeterministicChecks(repo, headSha, audit) {
       scripts = JSON.parse(readFileSync(pkgPath, "utf8")).scripts || {};
     } catch {}
     if (Object.keys(scripts).length > 0) {
-      const inst = spawnSync("bash", ["-lc", "npm install --no-audit --no-fund"], { cwd: workdir, encoding: "utf8", timeout: 420000 });
+      const inst = spawnSync("bash", ["-lc", "npm install --no-audit --no-fund"], { cwd: workdir, encoding: "utf8", timeout: 420000, env: sanitizedExecEnv(process.env) });
       evidenceLines.push(`npm install: exit=${inst.status}`);
       if (inst.status !== 0) return { ok: false, evidence: evidenceLines.join("\n") + `\n${String(inst.stderr).slice(-400)}` };
       if (scripts.build) {
-        const b = spawnSync("bash", ["-lc", "npm run build"], { cwd: workdir, encoding: "utf8", timeout: 600000 });
+        const b = spawnSync("bash", ["-lc", "npm run build"], { cwd: workdir, encoding: "utf8", timeout: 600000, env: sanitizedExecEnv(process.env) });
         evidenceLines.push(`npm run build: exit=${b.status}`);
         if (b.status !== 0) return { ok: false, evidence: evidenceLines.join("\n") + `\n${String(b.stderr).slice(-600)}` };
       }
       if (scripts.test) {
-        const t = spawnSync("bash", ["-lc", `${scripts.test} || true`], { cwd: workdir, encoding: "utf8", timeout: 420000 });
+        const t = spawnSync("bash", ["-lc", `${scripts.test} || true`], { cwd: workdir, encoding: "utf8", timeout: 420000, env: sanitizedExecEnv(process.env) });
         evidenceLines.push(`npm test: ran (exit=${t.status}, non-blocking per repo config)`);
       }
     } else {
@@ -142,25 +291,18 @@ async function recordTerminalState(state, details) {
   appendFileSync(MERGES_PATH, JSON.stringify({ t: new Date().toISOString(), state, ...details }) + "\n");
 }
 
-function writeMergeState(state, details) {
-  try {
-    mkdirSync(path.dirname(MERGES_PATH), { recursive: true });
-    appendFileSync(MERGES_PATH, JSON.stringify({ t: new Date().toISOString(), state, ...details }) + "\n");
-  } catch {}
-}
-
-async function commitState(audit, identity, message) {
-  if (gitHasChanges(REPO_ROOT, ["state"]) || gitHasChanges(STATE_ROOT, ["state"])) {
-    gitAdd(REPO_ROOT, ["state"]);
-    gitCommit(REPO_ROOT, message, identity);
-    gitPush(REPO_ROOT, "main", process.env);
-    const sha = gitRevParse(REPO_ROOT, "HEAD");
-    await import("./lib/verify.mjs").then((v) => v.verifyCommit("M1Vj/fleet-control", sha, identity, process.env.FLEET_GH_TOKEN));
-    audit.note("push-verify", `sha=${sha.slice(0, 10)}`);
+  function writeMergeState(state, details) {
+    try {
+      mkdirSync(path.dirname(MERGES_PATH), { recursive: true });
+      appendFileSync(MERGES_PATH, JSON.stringify({ t: new Date().toISOString(), state, ...details }) + "\n");
+    } catch {}
   }
-}
 
 async function runHygiene(identity, audit) {
+  if (killSwitchEngaged()) {
+    audit.incident("kill-switch", "hygiene skipped: KILL_SWITCH engaged (no closes, no comments)");
+    return 0;
+  }
   const repos = gh(["api", "/user/repos?affiliation=owner&per_page=100&sort=pushed"], process.env) || [];
   const entries = [];
   for (const r of repos) {
@@ -218,8 +360,13 @@ async function discoverFleetPRs(limit = 3) {
 async function main() {
   const runId = `merge-${Date.now()}`;
   const audit = new AuditBuffer(scrub(process.env));
-  const identity = await runGate(process.env);
-  configureIdentity(REPO_ROOT, identity);
+  // M2: unexpected throws (SHA-moved, merge-not-merged, post-verify, …)
+  // must still land a terminal BLOCKED event + audit finish + ledger
+  // entry via the existing helpers — never a bare MERGE_GATE_FAILED.
+  let identity;
+  try {
+    identity = await runGate(process.env);
+    configureIdentity(REPO_ROOT, identity);
   if (process.env.FLEET_GH_TOKEN) {
     if (!process.env.GH_TOKEN) process.env.GH_TOKEN = process.env.FLEET_GH_TOKEN;
     if (!process.env.FLEET_GH_USER) process.env.FLEET_GH_USER = identity.login;
@@ -234,7 +381,7 @@ async function main() {
       writeMergeState("NO-OP", { why: "scan-empty" });
       return;
     }
-    mkdirSync(path.join(REPO_ROOT, "audit"), { recursive: true });
+    mkdirSync(AUDIT_DIR, { recursive: true });
     for (const item of queue) {
       try {
         const { spawnSync } = await import("node:child_process");
@@ -254,8 +401,8 @@ async function main() {
     }
     await runHygiene(identity, audit);
 
-    audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Merge gate scan", "ok");
-    safeCommitState(REPO_ROOT, ["state", "audit"], `[fleet] merge-gate scan ${runId}`, identity, process.env);
+    audit.writeMarkdown(AUDIT_DIR, runId, "Merge gate scan", "ok");
+    await commitPushVerify(STATE_ROOT, ["state", "audit"], `[fleet] merge-gate scan ${runId}`, identity, audit, process.env);
     console.log("MERGE_TERMINAL_STATE=SCAN-DONE");
     return;
   }
@@ -266,15 +413,29 @@ async function main() {
     console.log("MERGE_TERMINAL_STATE=NO-OP");
     return finish(audit, runId, "NO-OP");
   }
+  // Tier1 fence: autonomous merges only proceed on tier1 repos.
+  if (!isTier1Eligible(readTargets(), TARGET_REPO)) {
+    audit.note("tier1", `${TARGET_REPO} not tier1 — autonomous merge refused, no comment posted`);
+    await recordTerminalState("NO-OP", { repo: TARGET_REPO, pr: PR_NUMBER, why: "not-tier1" });
+    console.log("MERGE_TERMINAL_STATE=NO-OP");
+    return finish(audit, runId, "NO-OP");
+  }
   await verifyPullAuthor(TARGET_REPO, PR_NUMBER, identity, process.env.FLEET_GH_TOKEN);
   if (!pr.head || !pr.head.sha) throw new Error("no head sha");
+  const evalSha = pr.head.sha;
+  // Ledger idempotency: an exact SHA already merged successfully is done.
+  if (mergeAlreadyRecorded(MERGES_PATH, TARGET_REPO, PR_NUMBER, evalSha)) {
+    audit.note("idempotency", `SUCCESS already recorded for ${TARGET_REPO}#${PR_NUMBER}@${evalSha.slice(0, 10)}`);
+    console.log("MERGE_TERMINAL_STATE=NO-OP");
+    return finish(audit, runId, "NO-OP");
+  }
 
   const cls = classify(files);
   const secretHits = secretsInDiff(files);
   audit.note("classify", JSON.stringify({ ...cls, secretHits: secretHits.length }));
 
   const terminal = async (state, extra = {}) => {
-    await recordTerminalState(state, { repo: TARGET_REPO, pr: PR_NUMBER, ...extra });
+    await recordTerminalState(state, { repo: TARGET_REPO, pr: PR_NUMBER, sha: evalSha, ...extra });
     console.log(`MERGE_TERMINAL_STATE=${state}`);
   };
 
@@ -299,7 +460,7 @@ async function main() {
       encoding: "utf8",
       timeout: 2400000,
       env: {
-        ...process.env,
+        ...sanitizedExecEnv(process.env),
         FLEET_REPO: TARGET_REPO,
         FLEET_HEAD_SHA: pr.head.sha,
         FLEET_BASE_SHA: pr.base ? pr.base.sha : "",
@@ -325,11 +486,15 @@ async function main() {
     if (!visualOk) riskCommentBits.push("visual gate: console errors or critical a11y violations present");
   }
 
-  if (cls.risk === "HIGH") {
+  // Depth-3 (large/destructive diffs) always needs a human — the old
+  // cls.risk === "HIGH" string is dead (classify emits depth-N), so gate on
+  // depth with the HIGH string kept as a backstop. Depth-1/2 judge flow
+  // below is unchanged.
+  if (cls.depth === 3 || cls.risk === "HIGH") {
     await postComment(
       TARGET_REPO,
       PR_NUMBER,
-      "⚖️ **fleet merge-gate**: classified HIGH RISK — human review required.\n\nReasons:\n" +
+      "⚖️ **fleet merge-gate**: classified HIGH RISK (depth-3) — human review required.\n\nReasons:\n" +
         riskCommentBits.map((r) => `- ${r}`).join("\n") +
         "\n\nThe fleet will keep this PR as a draft. A maintainer can merge manually once satisfied.",
       audit,
@@ -398,7 +563,7 @@ async function main() {
       if (revCount >= 2) {
         await postComment(TARGET_REPO, PR_NUMBER, "🛡️ **fleet merge-gate**: maximum revisions reached and judges still reject. Auto-closing this draft — the improvement lane will propose a fresh approach informed by this feedback.", audit);
         gh(["api", "-X", "PATCH", `/repos/${TARGET_REPO}/pulls/${PR_NUMBER}`, "-f", "state=closed"], process.env);
-        await recordTerminalState("EXHAUSTED", { repo: TARGET_REPO, pr: PR_NUMBER, why: "max revisions; still rejected", scores: [correctness.score, standards.score] });
+        await recordTerminalState("EXHAUSTED", { repo: TARGET_REPO, pr: PR_NUMBER, sha: evalSha, why: "max revisions; still rejected", scores: [correctness.score, standards.score] });
         console.log("MERGE_TERMINAL_STATE=EXHAUSTED");
         return finish(audit, runId, "EXHAUSTED");
       }
@@ -407,11 +572,49 @@ async function main() {
       try {
         appendFileSync(process.env.GITHUB_OUTPUT, "revision_needed=true\n");
       } catch {}
-      await recordTerminalState("STALLED", { repo: TARGET_REPO, pr: PR_NUMBER, why: "judges rejected; revision queued" });
+      await recordTerminalState("REVISION_QUEUED", { repo: TARGET_REPO, pr: PR_NUMBER, sha: evalSha, why: "judges rejected; revision queued" });
       console.log("MERGE_TERMINAL_STATE=REVISION_QUEUED");
       return finish(audit, runId, "REVISION_QUEUED");
     }
     await terminal("BLOCKED", { why: "judges rejected", scores: [correctness.score, standards.score] });
+    return finish(audit, runId, "BLOCKED");
+  }
+
+  // Pre-merge gates on the exact evaluated SHA: kill-switch, SHA stability
+  // (PR must not have moved under us while judges ran), then CI green.
+  if (killSwitchEngaged()) {
+    audit.incident("kill-switch", "merge refused: KILL_SWITCH engaged after judges approved");
+    await terminal("BLOCKED", { why: "kill-switch-engaged" });
+    return finish(audit, runId, "BLOCKED");
+  }
+
+  const fresh = gh(["api", `/repos/${TARGET_REPO}/pulls/${PR_NUMBER}`], process.env);
+  if (fresh.state !== "open") {
+    await terminal("NO-OP", { why: `pr state=${fresh.state} at merge time` });
+    return finish(audit, runId, "NO-OP");
+  }
+  if (!fresh.head || fresh.head.sha !== evalSha) {
+    await postCommentOnce(
+      TARGET_REPO, PR_NUMBER, "<!-- fleet:sha-gate -->",
+      `⏳ **fleet merge-gate**: judges approved \`${evalSha.slice(0, 10)}\` but the PR head has since moved to \`${String(fresh.head && fresh.head.sha || "?").slice(0, 10)}\`. Re-evaluating on the next gate pass against the exact new SHA.`,
+      audit,
+    );
+    await terminal("BLOCKED", { why: "sha-changed", evalSha, headSha: fresh.head && fresh.head.sha });
+    return finish(audit, runId, "BLOCKED");
+  }
+
+  const ci = fetchCi(TARGET_REPO, evalSha, process.env);
+  const verdict = ciVerdict(ci);
+  audit.note("ci-gate", `${verdict.why} @${evalSha.slice(0, 10)}`);
+  if (!verdict.ok) {
+    await postCommentOnce(
+      TARGET_REPO, PR_NUMBER, "<!-- fleet:ci-gate -->",
+      verdict.pending
+        ? `⏳ **fleet merge-gate**: judges approved, but CI is not green yet on \`${evalSha.slice(0, 10)}\` (${verdict.why}). The gate retries automatically — no action needed.`
+        : `🛑 **fleet merge-gate**: judges approved, but CI is RED on \`${evalSha.slice(0, 10)}\` (${verdict.why}). Auto-merge refused until checks pass.`,
+      audit,
+    );
+    await terminal("BLOCKED", { why: verdict.pending ? "ci-pending" : "ci-red", ci: verdict.why });
     return finish(audit, runId, "BLOCKED");
   }
 
@@ -424,6 +627,11 @@ async function main() {
     }
   }
 
+  if (killSwitchEngaged()) {
+    audit.incident("kill-switch", "merge refused at merge instant: KILL_SWITCH engaged");
+    await terminal("BLOCKED", { why: "kill-switch-engaged" });
+    return finish(audit, runId, "BLOCKED");
+  }
   try {
     gh(["pr", "merge", String(PR_NUMBER), "--merge", "--delete-branch", "-R", TARGET_REPO], process.env);
   } catch (err) {
@@ -431,6 +639,18 @@ async function main() {
       gh(["pr", "ready", String(PR_NUMBER), "-R", TARGET_REPO], process.env);
       await new Promise((r) => setTimeout(r, 3000));
       gh(["pr", "merge", String(PR_NUMBER), "--merge", "--delete-branch", "-R", TARGET_REPO], process.env);
+    } else if (/behind|not mergeable|update branch|conflict/i.test(String(err.message))) {
+      // Pull-rebase collision analog: ask GitHub to update the branch onto
+      // base, wait, then retry the merge exactly once.
+      audit.note("update-branch", `merge blocked (${String(err.message).slice(0, 100)}); updating branch and retrying once`);
+      gh(["api", "-X", "POST", `/repos/${TARGET_REPO}/pulls/${PR_NUMBER}/update-branch`], process.env);
+      await new Promise((r) => setTimeout(r, 15000));
+      const moved = gh(["api", `/repos/${TARGET_REPO}/pulls/${PR_NUMBER}`], process.env);
+      if (!moved.head || moved.head.sha === evalSha) {
+        gh(["pr", "merge", String(PR_NUMBER), "--merge", "--delete-branch", "-R", TARGET_REPO], process.env);
+      } else {
+        throw new Error(`branch moved during update (${evalSha.slice(0, 10)} -> ${String(moved.head.sha).slice(0, 10)}); re-gate required`);
+      }
     } else {
       throw err;
     }
@@ -447,11 +667,23 @@ async function main() {
   audit.note("merged", `merge_commit=${String(mergedMeta.merge_commit_sha).slice(0, 10)}`);
   await terminal("SUCCESS", { mergeCommit: mergedMeta.merge_commit_sha, scores: [correctness.score, standards.score] });
   return finish(audit, runId, "SUCCESS");
-
-  function finish(a, rid, stateName) {
-    a.writeMarkdown(path.join(REPO_ROOT, "audit"), rid, `Merge gate ${TARGET_REPO}#${PR_NUMBER}`, stateName);
+  } catch (err) {
+    const msg = String((err && err.message) || err).slice(0, 200);
+    audit.incident("fatal", `unexpected merge-gate failure: ${msg}`);
     try {
-      safeCommitState(REPO_ROOT, ["state", "audit"], `[fleet] merge-gate ${rid} ${stateName}`, identity, process.env);
+      await recordTerminalState("BLOCKED", { repo: TARGET_REPO, pr: PR_NUMBER, why: `unexpected: ${msg.slice(0, 160)}` });
+    } catch {}
+    console.log("MERGE_TERMINAL_STATE=BLOCKED");
+    return finish(audit, runId, "BLOCKED");
+  }
+
+  async function finish(a, rid, stateName) {
+    a.writeMarkdown(AUDIT_DIR, rid, `Merge gate ${TARGET_REPO}#${PR_NUMBER}`, stateName);
+    // Durable state (merges.jsonl) + audit live in fleet-control; commit and
+    // push as M1Vj with attribution verify. Best-effort: the terminal state
+    // above is already recorded locally.
+    try {
+      await commitPushVerify(STATE_ROOT, ["state", "audit"], `[fleet] merge-gate ${rid} ${stateName}`, identity, a, process.env);
     } catch {}
     return 0;
   }
@@ -478,7 +710,8 @@ async function judge({ repo, prNumber, title, body, files, extraEvidence, lens, 
     prompt,
     timeoutMs: 480000,
     env: process.env,
-    preferVariantMax: true,
+    // Contributor tier: high thinking effort, never the max variant.
+    preferVariantMax: false,
     maxRounds: 3,
     ...(judgeModel ? { modelOverride: judgeModel } : {}),
   });

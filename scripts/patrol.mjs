@@ -42,6 +42,18 @@ function readJson(p, fallback) {
   }
 }
 
+// Kill-switch re-check: runGate enforces it at startup, but a STOP may land
+// mid-run. All GitHub API mutations must consult this first; state/audit
+// bookkeeping commits remain allowed so the halt itself is observable.
+function killSwitchEngaged() {
+  const p = process.env.FLEET_KILL_SWITCH_PATH || path.join(REPO_ROOT, "state", "KILL_SWITCH");
+  try {
+    return existsSync(p);
+  } catch {
+    return false;
+  }
+}
+
 async function collectSignals(env, audit) {
   const repos = gh(["api", "/user/repos?affiliation=owner&per_page=100&sort=pushed"], env);
   audit.note("enumerate", `owned repos=${repos.length}`);
@@ -104,6 +116,8 @@ function buildPrompt(digest) {
 }
 
 function eligible(targets, repo) {
+  // Fail-closed on unknown targets (mirrors merge.isTier1Eligible).
+  if (!targets || typeof targets !== "object") return false;
   if ((targets.excluded || []).includes(repo)) return false;
   if (targets.allOwned === true) return true;
   return (targets.tier1 || []).includes(repo);
@@ -150,6 +164,11 @@ async function executeDirectives(env, identity, directives, targets, audit) {
       if (d.kind === "report") {
         results.push({ kind: d.kind, ok: true, note: d.section });
       } else if (d.kind === "fleet_issue") {
+        if (killSwitchEngaged()) {
+          audit.incident("kill-switch", "fleet_issue skipped: KILL_SWITCH engaged mid-run");
+          results.push({ kind: d.kind, ok: true, skipped: "kill-switch" });
+          continue;
+        }
         const created = gh(["api", "-X", "POST", "/repos/M1Vj/fleet-control/issues", "-f", `title=${d.title}`, "-f", `body=${d.body}`], env);
         await verifyIssueAuthor("M1Vj/fleet-control", created.number, identity, env.FLEET_GH_TOKEN);
         mutations += 1;
@@ -160,17 +179,41 @@ async function executeDirectives(env, identity, directives, targets, audit) {
           continue;
         }
         if (d.kind === "comment") {
+          if (killSwitchEngaged()) {
+            audit.incident("kill-switch", `comment skipped on ${d.repo}#${d.number}: KILL_SWITCH engaged mid-run`);
+            results.push({ kind: d.kind, ok: true, skipped: "kill-switch" });
+            continue;
+          }
           const created = gh(["api", "-X", "POST", `/repos/${d.repo}/issues/${d.number}/comments`, "-f", `body=${d.body}`], env);
           await verifyCommentAuthor(d.repo, created.id, identity, env.FLEET_GH_TOKEN);
           mutations += 1;
           results.push({ kind: d.kind, ok: true, commentId: created.id });
         } else {
+          if (killSwitchEngaged()) {
+            audit.incident("kill-switch", `label skipped on ${d.repo}#${d.number}: KILL_SWITCH engaged mid-run`);
+            results.push({ kind: d.kind, ok: true, skipped: "kill-switch" });
+            continue;
+          }
           for (const label of d.labels) {
             try {
               gh(["api", "-X", "POST", `/repos/${d.repo}/issues/${d.number}/labels`, "-f", `labels[]=${label}`], env);
-            } catch {
-              gh(["api", "-X", "POST", `/repos/${d.repo}/labels`, "-f", `name=${label}`, "-f", "color=ededed"], env);
-              gh(["api", "-X", "POST", `/repos/${d.repo}/issues/${d.number}/labels`, "-f", `labels[]=${label}`], env);
+            } catch (addErr) {
+              // Label may not exist yet: create it (tolerate 422 = already
+              // exists after a concurrent create), then retry the attach
+              // (tolerate 422 = already attached).
+              try {
+                gh(["api", "-X", "POST", `/repos/${d.repo}/labels`, "-f", `name=${label}`, "-f", "color=ededed"], env);
+              } catch (createErr) {
+                if (!/422|already.?exists/i.test(String(createErr.message))) throw createErr;
+                audit.note("label-422", `${d.repo}: label ${label} already exists (tolerated)`);
+              }
+              try {
+                gh(["api", "-X", "POST", `/repos/${d.repo}/issues/${d.number}/labels`, "-f", `labels[]=${label}`], env);
+              } catch (retryErr) {
+                if (!/422|already/i.test(String(retryErr.message))) throw retryErr;
+                audit.note("label-422", `${d.repo}#${d.number}: label ${label} already attached (tolerated)`);
+              }
+              void addErr;
             }
           }
           mutations += 1;
@@ -179,6 +222,11 @@ async function executeDirectives(env, identity, directives, targets, audit) {
       } else if (d.kind === "draft_pr") {
         if (!eligible(targets, d.repo)) {
           results.push({ kind: d.kind, ok: true, downgraded: `${d.repo} not tier1` });
+          continue;
+        }
+        if (killSwitchEngaged()) {
+          audit.incident("kill-switch", `draft_pr skipped on ${d.repo}: KILL_SWITCH engaged mid-run`);
+          results.push({ kind: d.kind, ok: true, skipped: "kill-switch" });
           continue;
         }
         const meta = gh(["api", `/repos/${d.repo}`], env);
@@ -260,6 +308,8 @@ export async function main() {
         timeoutMs: 480000,
         env: process.env,
         sessionId: undefined,
+        // Contributor tier: high thinking effort, never the max variant.
+        preferVariantMax: false,
       });
       modelMode = modelResult.modelMode;
       audit.note("model", `mode=${modelMode} complete=${modelResult.complete} attempts=${JSON.stringify(modelResult.attempts)} session=${modelResult.sessionId ? "captured" : "none"}`);
@@ -295,10 +345,19 @@ export async function main() {
     const { mutations, results } = await executeDirectives(process.env, identity, directives, targets, audit);
     audit.note("executor", `mutations=${mutations}`);
 
-    for (const group of signals) {
-      for (const p of group.openPulls || []) append(ledgerPath(), eventKey("sig-pr", group.repo, String(p.n), String(p.updated)), {});
-      for (const i of group.activeIssues || []) append(ledgerPath(), eventKey("sig-issue", group.repo, String(i.n), String(i.updated)), {});
-      for (const r of group.failingRuns24h || []) append(ledgerPath(), eventKey("sig-run", group.repo, String(r.id), String(r.created)), {});
+    // Mark signals seen only after executor success or permanent rejection
+    // (invalid kind/duplicate/downgraded all record ok:true). Transient
+    // executor errors (ok:false) leave signals unmarked so they retry next
+    // scan. Idempotency keys unchanged.
+    const transientFailed = (results || []).some((r) => r && r.ok === false);
+    if (transientFailed) {
+      audit.note("ledger-defer", "transient executor errors; signals NOT marked seen, will retry next scan");
+    } else {
+      for (const group of signals) {
+        for (const p of group.openPulls || []) append(ledgerPath(), eventKey("sig-pr", group.repo, String(p.n), String(p.updated)), {});
+        for (const i of group.activeIssues || []) append(ledgerPath(), eventKey("sig-issue", group.repo, String(i.n), String(i.updated)), {});
+        for (const r of group.failingRuns24h || []) append(ledgerPath(), eventKey("sig-run", group.repo, String(r.id), String(r.created)), {});
+      }
     }
 
     writeFileSync(
@@ -374,6 +433,9 @@ export async function main() {
         gitAdd(REPO_ROOT, ["audit"]);
         gitCommit(REPO_ROOT, `[fleet] patrol-failure-audit ${runId}`, identity);
         gitPush(REPO_ROOT, "main", process.env);
+        const failSha = gitRevParse(REPO_ROOT, "HEAD");
+        await verifyCommit("M1Vj/fleet-control", failSha, identity, process.env.FLEET_GH_TOKEN);
+        audit.note("push-verify", `failure audit attribution verified sha=${failSha.slice(0, 10)}`);
       } catch {
         /* best-effort failure audit */
       }

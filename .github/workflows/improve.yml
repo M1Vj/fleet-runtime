@@ -29,7 +29,7 @@ jobs:
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
-      FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || 'opencode/muse-spark-1.3-contributor-free,opencode/muse-spark-1.2-contributor-free,opencode/mimo-v2.5-free,opencode/deepseek-v4-flash-free' }}
+      FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
       FLEET_TOP_K: ${{ github.event.inputs.top_k || '2' }}
     steps:
@@ -70,7 +70,7 @@ jobs:
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
-      FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || 'opencode/muse-spark-1.3-contributor-free,opencode/muse-spark-1.2-contributor-free,opencode/mimo-v2.5-free,opencode/deepseek-v4-flash-free' }}
+      FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
       FLEET_REPO: ${{ matrix.repo }}
@@ -119,7 +119,7 @@ jobs:
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
-      FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || 'opencode/muse-spark-1.3-contributor-free,opencode/muse-spark-1.2-contributor-free,opencode/mimo-v2.5-free,opencode/deepseek-v4-flash-free' }}
+      FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
     steps:
@@ -236,7 +236,7 @@ jobs:
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
-      FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || 'opencode/muse-spark-1.3-contributor-free,opencode/muse-spark-1.2-contributor-free,opencode/mimo-v2.5-free,opencode/deepseek-v4-flash-free' }}
+      FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
       FLEET_LENS: ${{ matrix.lens }}
@@ -287,7 +287,7 @@ jobs:
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
-      FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || 'opencode/muse-spark-1.3-contributor-free,opencode/muse-spark-1.2-contributor-free,opencode/mimo-v2.5-free,opencode/deepseek-v4-flash-free' }}
+      FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
     steps:
       - name: checkout fleet repo

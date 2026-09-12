@@ -139,6 +139,7 @@ jobs:
       OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
+      FLEET_ANALYZE_RESULT: ${{ needs.analyze.result }}
     steps:
       - name: sanitize workers input
         run: echo "FLEET_MAX_WORKERS=$(echo '${{ github.event.inputs.workers }}' | grep -E '^[0-9]+$' || echo 3)" >> "$GITHUB_ENV"

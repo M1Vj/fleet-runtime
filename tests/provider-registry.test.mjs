@@ -34,6 +34,7 @@ test("unsafe, dead, and forbidden values rejected", () => {
   assert.equal(isAllowedModel("   "), false);
   assert.equal(isAllowedModel(null), false);
   assert.equal(isAllowedModel("opencode/x-preview-f-free"), false);
+  assert.equal(isAllowedModel("codexswap-alpha/x-preview-f-free"), false);
   assert.equal(isAllowedModel("opencode/minimax-m3-free"), false);
   assert.equal(isAllowedModel("opencode/gemini-3-flash"), false);
   assert.equal(isAllowedModel("../evil"), false);

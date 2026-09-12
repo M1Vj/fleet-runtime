@@ -114,7 +114,7 @@ test("runOnce keeps secret-stripped env plus OPENCODE_AUTH_CONTENT", async () =>
   const bin = path.join(dir, "opencode");
   writeFileSync(
     bin,
-    `#!/usr/bin/env node\nconst fs=require("fs");\nconst e={FLEET_GH_TOKEN:process.env.FLEET_GH_TOKEN,GH_TOKEN:process.env.GH_TOKEN,OPENCODE_AUTH_CONTENT:(process.env.OPENCODE_AUTH_CONTENT||"").slice(0,4),MY_API_KEY:process.env.MY_API_KEY};\nfs.writeFileSync(${JSON.stringify(seen)},JSON.stringify(e));\nconsole.log(JSON.stringify({text:"ok",sessionID:"s1"}));\n`,
+    `#!/usr/bin/env node\nconst fs=require("fs");\nconst e={FLEET_GH_TOKEN:process.env.FLEET_GH_TOKEN,GH_TOKEN:process.env.GH_TOKEN,OPENCODE_AUTH_CONTENT:(process.env.OPENCODE_AUTH_CONTENT||"").slice(0,4),OPENCODE_CONFIG_CONTENT:process.env.OPENCODE_CONFIG_CONTENT,MY_API_KEY:process.env.MY_API_KEY};\nfs.writeFileSync(${JSON.stringify(seen)},JSON.stringify(e));\nconsole.log(JSON.stringify({text:"ok",sessionID:"s1"}));\n`,
   );
   chmodSync(bin, 0o755);
   const env = {
@@ -131,6 +131,69 @@ test("runOnce keeps secret-stripped env plus OPENCODE_AUTH_CONTENT", async () =>
   assert.equal(got.GH_TOKEN, undefined);
   assert.equal(got.MY_API_KEY, undefined);
   assert.equal(got.OPENCODE_AUTH_CONTENT, "auth");
+  assert.deepEqual(JSON.parse(got.OPENCODE_CONFIG_CONTENT), {
+    model: PRIMARY_MODEL,
+    small_model: PRIMARY_MODEL,
+  });
+});
+
+test("runOnce preserves safe config while pinning selected model helpers", async () => {
+  const { runOnce } = await import("../scripts/lib/model.mjs");
+  const dir = mkdtempSync(path.join(tmpdir(), "fleetmodel-"));
+  const seen = path.join(dir, "env.json");
+  const bin = path.join(dir, "opencode");
+  writeFileSync(
+    bin,
+    `#!/usr/bin/env node\nconst fs=require("fs");fs.writeFileSync(${JSON.stringify(seen)},process.env.OPENCODE_CONFIG_CONTENT);console.log(JSON.stringify({text:"ok",sessionID:"s-config-1"}));\n`,
+  );
+  chmodSync(bin, 0o755);
+  const env = {
+    ...process.env,
+    PATH: `${dir}:${process.env.PATH}`,
+    FLEET_OPENCODE_AUTH: "auth",
+    OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: { read: "allow" } }),
+  };
+  await runOnce({ prompt: "hi", timeoutMs: 15000, env, model: "opencode/nemotron-3.5-lightning-free" });
+  assert.deepEqual(JSON.parse(readFileSync(seen, "utf8")), {
+    permission: { read: "allow" },
+    model: "opencode/nemotron-3.5-lightning-free",
+    small_model: "opencode/nemotron-3.5-lightning-free",
+  });
+});
+
+test("runOnce preserves the workspace permission boundary when pinning models", async () => {
+  const { runOnce } = await import("../scripts/lib/model.mjs");
+  const dir = mkdtempSync(path.join(tmpdir(), "fleetmodel-"));
+  const workspace = mkdtempSync(path.join(tmpdir(), "fleetworkspace-"));
+  const seen = path.join(dir, "env.json");
+  const bin = path.join(dir, "opencode");
+  writeFileSync(path.join(workspace, "opencode.json"), JSON.stringify({
+    permission: { edit: "deny", bash: "deny", read: "allow" },
+  }));
+  writeFileSync(
+    bin,
+    `#!/usr/bin/env node\nconst fs=require("fs");fs.writeFileSync(${JSON.stringify(seen)},process.env.OPENCODE_CONFIG_CONTENT);console.log(JSON.stringify({text:"ok",sessionID:"s-workspace-1"}));\n`,
+  );
+  chmodSync(bin, 0o755);
+  const env = { ...process.env, PATH: `${dir}:${process.env.PATH}`, FLEET_OPENCODE_AUTH: "auth" };
+  await runOnce({ prompt: "hi", timeoutMs: 15000, env, workspace, model: "opencode/nemotron-3.5-lightning-free" });
+  assert.deepEqual(JSON.parse(readFileSync(seen, "utf8")), {
+    permission: { edit: "deny", bash: "deny", read: "allow" },
+    model: "opencode/nemotron-3.5-lightning-free",
+    small_model: "opencode/nemotron-3.5-lightning-free",
+  });
+});
+
+test("runOnce rejects an error event even when the CLI exits zero", async () => {
+  const { runOnce } = await import("../scripts/lib/model.mjs");
+  const dir = mkdtempSync(path.join(tmpdir(), "fleetmodel-"));
+  const bin = path.join(dir, "opencode");
+  writeFileSync(bin, "#!/usr/bin/env node\nconsole.log(JSON.stringify({type:'error',error:{message:'provider failed'}}));\n");
+  chmodSync(bin, 0o755);
+  const env = { ...process.env, PATH: `${dir}:${process.env.PATH}`, FLEET_OPENCODE_AUTH: "auth" };
+  const result = await runOnce({ prompt: "hi", timeoutMs: 15000, env });
+  assert.equal(result.reply, "");
+  assert.match(result.stderrTail, /provider failed/);
 });
 
 test("runOnce selects pooled slot, strips slot keys, records slot number", async () => {

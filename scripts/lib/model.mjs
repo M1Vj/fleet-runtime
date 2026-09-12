@@ -19,6 +19,12 @@
  * 4. STRICT NEGATIVE INVARIANT:
  *    DO NOT USE GEMINI MODELS UNDER ANY CIRCUMSTANCES. Gemini models are
  *    strictly forbidden and must fail closed if requested.
+ * 5. Core-Behavior Continuity Directive:
+ *    Follow the configured real-provider model ladder, session/resume flow,
+ *    and recovery behavior. Do not steer away from that core behavior, invent
+ *    a replacement objective, or independently remove, switch, or fabricate
+ *    capabilities. Treat failures as bugs to diagnose and repair in place;
+ *    every change must preserve or improve the real behavior with evidence.
  * ============================================================================
  */
 import { spawn } from "node:child_process";
@@ -53,6 +59,53 @@ export const MODEL_TIMEOUTS = { standard: 480000, long: 540000, extended: 600000
 export const CHAIN_RETRY_COOLDOWN_MS = 90000;
 export const CHAIN_RETRY_COOLDOWN_LONG_MS = 120000;
 
+function parseConfigObject(raw) {
+  try {
+    const parsed = JSON.parse(String(raw || ""));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function mergeConfig(base, overlay) {
+  if (!base || typeof base !== "object" || Array.isArray(base)) return overlay;
+  if (!overlay || typeof overlay !== "object" || Array.isArray(overlay)) return base;
+  const out = { ...base };
+  for (const [key, value] of Object.entries(overlay)) {
+    out[key] = value && typeof value === "object" && !Array.isArray(value)
+      ? mergeConfig(out[key] || {}, value)
+      : value;
+  }
+  return out;
+}
+
+function stripSecretConfig(value, key = "") {
+  if (/(token|secret|password|api[_-]?key|authorization|cookie)/i.test(key)) return undefined;
+  if (Array.isArray(value)) return value.map((item) => stripSecretConfig(item)).filter((item) => item !== undefined);
+  if (!value || typeof value !== "object") return value;
+  const out = {};
+  for (const [childKey, childValue] of Object.entries(value)) {
+    const clean = stripSecretConfig(childValue, childKey);
+    if (clean !== undefined) out[childKey] = clean;
+  }
+  return out;
+}
+
+export function buildOpenCodeConfigContent(selectedModel, existing = "", workspace = "") {
+  let config = {};
+  try {
+    const workspaceConfigPath = workspace ? path.join(workspace, "opencode.json") : "";
+    const workspaceConfig = workspaceConfigPath && existsSync(workspaceConfigPath)
+      ? parseConfigObject(readFileSync(workspaceConfigPath, "utf8"))
+      : {};
+    config = mergeConfig(workspaceConfig, parseConfigObject(existing));
+  } catch {}
+  config.model = selectedModel;
+  config.small_model = selectedModel;
+  return JSON.stringify(stripSecretConfig(config));
+}
+
 function deepFind(obj, key, out = []) {
   if (obj === null || typeof obj !== "object") return out;
   if (Array.isArray(obj)) {
@@ -77,6 +130,11 @@ function collectText(obj, out = []) {
     else collectText(v, out);
   }
   return out;
+}
+
+function isErrorEvent(event) {
+  const type = String(event?.type || event?.event || event?.status || "").toLowerCase();
+  return type === "error" || type.endsWith(".error") || Boolean(event?.error && typeof event.error === "object");
 }
 
 export const MODEL_CHAIN_FILE = "state/model-chain.json";
@@ -252,6 +310,10 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
     delete childEnv.GDRIVE_CLIENT_SECRET;
     stripSlotKeys(childEnv);
     childEnv.OPENCODE_AUTH_CONTENT = authValue;
+    // Pin OpenCode's internal title/summary helpers to the same selected live
+    // contributor model. Otherwise OpenCode may call its paid default small
+    // model even though the primary `-m` argument is free and valid.
+    childEnv.OPENCODE_CONFIG_CONTENT = buildOpenCodeConfigContent(selected, childEnv.OPENCODE_CONFIG_CONTENT, workspace);
     childEnv.OPENCODE_DISABLE_AUTOUPDATE = "1";
     const child = spawn("opencode", args, { env: childEnv, stdio: ["ignore", "pipe", "pipe"], cwd: workspace || undefined });
     const timer = setTimeout(() => {
@@ -278,7 +340,14 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
           if (!trimmed.startsWith("{")) continue;
           try { events.push(JSON.parse(trimmed)); } catch { continue; }
         }
-        reply = events.map((e) => collectText(e).join("")).filter(Boolean).join("\n").trim();
+        const errorEvent = events.find(isErrorEvent);
+        if (errorEvent) {
+          reply = "";
+          const errorMessage = errorEvent?.error?.message || errorEvent?.message || "model returned an error event";
+          stderr += `\n${String(errorMessage).slice(0, 400)}`;
+        } else {
+          reply = events.map((e) => collectText(e).join("")).filter(Boolean).join("\n").trim();
+        }
         const ids = events.map((e) => deepFind(e, "sessionID")).flat();
         sid = ids[ids.length - 1] || "";
       } catch {

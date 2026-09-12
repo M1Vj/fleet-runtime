@@ -1,6 +1,6 @@
 # fleet-runtime
 
-Public GitHub Actions execution shell that autonomously patrols, audits, improves, and safely merges the owner's M1Vj repositories using the Ox/Alpha model (`opencode/x-preview-f-free`), with every mutation attributed fail-closed to the M1Vj user account.
+Public GitHub Actions execution shell that autonomously patrols, audits, improves, and safely merges the owner's M1Vj repositories using the live contributor ladder (`opencode/muse-spark-1.3-contributor-free` primary → `opencode/nemotron-3-ultra-free` → `opencode/muse-spark-1.2-contributor-free` → `opencode/nemotron-3.5-lightning-free` → `opencode/mimo-v2.5-free` → `opencode/ling-3.0-flash-fin-free`; no Gemini — `opencode/x-preview-f-free` is retired to DEAD_IDS), with every mutation attributed fail-closed to the M1Vj user account.
 
 ## Architecture
 

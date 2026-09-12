@@ -33,6 +33,19 @@ function sessionsPath() {
   return path.join(STATE_DIR, "sessions.json");
 }
 
+function loadPatrolSession() {
+  const data = readJson(sessionsPath(), {});
+  const row = data?.["patrol-latest"];
+  if (!row || typeof row !== "object") return "";
+  const sessionId = typeof row.sessionId === "string" ? row.sessionId : "";
+  const updated = Date.parse(String(row.updatedAt || ""));
+  return /^[A-Za-z0-9._:-]{1,160}$/.test(sessionId)
+    && Number.isFinite(updated)
+    && Date.now() - updated <= 24 * 60 * 60 * 1000
+    ? sessionId
+    : "";
+}
+
 function readJson(p, fallback) {
   if (!existsSync(p)) return fallback;
   try {
@@ -42,6 +55,9 @@ function readJson(p, fallback) {
   }
 }
 
+// Exit-code taxonomy (surfaced, never hidden): 2 kill-switch, 3 identity,
+// 4 scope, 5 rejected directives, 6 model-unavailable. Gateway outage and
+// validator exhaustion must exit 6/5, never 0 with a neutral pass.
 // Kill-switch re-check: runGate enforces it at startup, but a STOP may land
 // mid-run. All GitHub API mutations must consult this first; state/audit
 // bookkeeping commits remain allowed so the halt itself is observable.
@@ -276,9 +292,12 @@ export async function main() {
     gwRoot = process.env.FLEET_STATE_ROOT || REPO_ROOT;
     const { gatewayDown } = await import("./lib/gateway-health.mjs");
     if (gatewayDown(gwRoot)) {
-      terminal("STALLED", { runId, why: "gateway-circuit-open" });
-      console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "skipped-gateway-down" })}`);
-      return 0;
+      // Finish-loop: gateway outage is MODEL_UNAVAILABLE (exit 6), surfaced
+      // not hidden. No silent neutral-pass when the app is unservable.
+      audit.incident("gateway", "circuit open at patrol start; failing closed code=6");
+      terminal("EXHAUSTED", { runId, why: "gateway-circuit-open", code: 6 });
+      console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "model-unavailable", code: 6 })}`);
+      return 6;
     }
 
     trigger = process.env.FLEET_TRIGGER || "manual";
@@ -307,7 +326,7 @@ export async function main() {
         prompt: buildPrompt(digest),
         timeoutMs: 480000,
         env: process.env,
-        sessionId: undefined,
+        sessionId: loadPatrolSession() || undefined,
         // Contributor tier: high thinking effort, never the max variant.
         preferVariantMax: false,
       });
@@ -315,23 +334,37 @@ export async function main() {
       audit.note("model", `mode=${modelMode} complete=${modelResult.complete} attempts=${JSON.stringify(modelResult.attempts)} session=${modelResult.sessionId ? "captured" : "none"}`);
       if (modelResult.sessionId) {
         const sessions = readJson(sessionsPath(), {});
-        sessions[runId] = { sessionId: modelResult.sessionId, updatedAt: new Date().toISOString() };
+        const row = { sessionId: modelResult.sessionId, updatedAt: new Date().toISOString() };
+        sessions[runId] = row;
+        sessions["patrol-latest"] = row;
         writeFileSync(sessionsPath(), JSON.stringify(sessions, null, 2));
       }
       if (!modelResult.complete || !modelResult.reply) {
         throw Object.assign(new Error("MODEL_UNAVAILABLE after resume attempts"), { code: 6, reason: "MODEL_UNAVAILABLE" });
       }
       let validation = validateDirectives(modelResult.reply);
-      if (!validation.ok && modelResult.sessionId) {
-        audit.note("validator", "repair round requested");
+      // Finish-loop: session-id capture + auto-resume up to 3 repair rounds.
+      // Each round reuses the captured sessionId so caps/revision stay
+      // consistent; every round is audited and the session is persisted.
+      let resumeSid = modelResult.sessionId || "";
+      for (let round = 1; round <= 3 && !validation.ok && resumeSid; round++) {
+        audit.note("validator", `repair round ${round}/3 requested`);
         const repair = await askModel({
           prompt: "Your previous reply was rejected because it was not a bare JSON array matching the directive schema. Re-output ONLY the strict JSON array now — no prose, no fences, no code.",
-          sessionId: modelResult.sessionId,
+          sessionId: resumeSid,
           timeoutMs: 300000,
           env: process.env,
           preferVariantMax: false,
         });
-        audit.note("repair", `complete=${repair.complete} gotReply=${Boolean(repair.reply)}`);
+        audit.note("repair", `round=${round} complete=${repair.complete} gotReply=${Boolean(repair.reply)}`);
+        if (repair.sessionId) {
+          resumeSid = repair.sessionId;
+          const sessions = readJson(sessionsPath(), {});
+          const row = { sessionId: resumeSid, updatedAt: new Date().toISOString(), repairRound: round };
+          sessions[runId] = row;
+          sessions["patrol-latest"] = row;
+          writeFileSync(sessionsPath(), JSON.stringify(sessions, null, 2));
+        }
         if (repair.complete && repair.reply) validation = validateDirectives(repair.reply);
       }
       if (!validation.ok) {
@@ -360,9 +393,12 @@ export async function main() {
       }
     }
 
+    // Heartbeat + revision persistence: model chain revision and caps travel
+    // with the heartbeat so resume/retry rounds stay consistent.
+    const chainRev = readJson(path.join(REPO_ROOT, "state", "model-chain.json"), {});
     writeFileSync(
       heartbeatPath(),
-      JSON.stringify({ lastRunUtc: new Date().toISOString(), runId, modelMode, reposSeen: signals.length, mutations }, null, 2),
+      JSON.stringify({ lastRunUtc: new Date().toISOString(), runId, modelMode, reposSeen: signals.length, mutations, chainUpdatedAt: chainRev.updatedAt || null, caps: "xhigh-contributor-cap" }, null, 2),
     );
 
     const auditFileRel = path.relative(REPO_ROOT, audit.writeMarkdown(AUDIT_DIR, runId, "Patrol run", "ok"));
@@ -420,10 +456,11 @@ export async function main() {
       try {
         const { gatewayDown } = await import("./lib/gateway-health.mjs");
         if (gatewayDown(gwRoot)) {
-          audit.note("outage-skip", "circuit open; recording STALLED");
-          terminal("STALLED", { runId, why: "gateway-circuit-open", trigger });
-          console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "skipped-gateway-down" })}`);
-          return 0;
+          // Surfaced, not hidden: outage still exits 6 so watchdog/alerts fire.
+          audit.note("outage-skip", "circuit open; recording EXHAUSTED code=6");
+          terminal("EXHAUSTED", { runId, why: "gateway-circuit-open", code: 6, trigger });
+          console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "model-unavailable", code: 6 })}`);
+          return 6;
         }
       } catch {}
     }

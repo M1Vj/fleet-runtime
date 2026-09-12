@@ -30,6 +30,11 @@
 // 4. STRICT NEGATIVE INVARIANT:
 //    DO NOT USE GEMINI MODELS UNDER ANY CIRCUMSTANCES. Gemini models are
 //    strictly forbidden and must fail closed if requested.
+// 5. Core-Behavior Continuity Directive:
+//    Follow the configured real-provider model ladder and its session/recovery
+//    behavior. Do not steer away from that core behavior, invent a replacement
+//    objective, or independently remove, switch, or fabricate capabilities.
+//    Treat failures as bugs to diagnose and repair with evidence.
 // ============================================================================
 
 export const PRIMARY_MODEL = "opencode/muse-spark-1.3-contributor-free";
@@ -82,10 +87,11 @@ export function getModelCapabilityScore(modelId) {
   return 50;
 }
 
-// Explicit model IDs: `opencode/<name>` or `codexswap-alpha/<name>` with a safe charset.
-// This permits known IDs AND future explicit IDs without depending on
-// discovery, while rejecting empty values, path traversal, and flags.
-const MODEL_ID_RE = /^(opencode|codexswap-alpha)\/[a-z0-9][a-z0-9._-]*$/i;
+// Explicit model IDs use the live OpenCode provider namespace with a safe
+// charset. The retired Ox/CodexSwap-alpha provider is intentionally excluded:
+// it is no longer available and must never be selected by an env override or
+// a stale model-chain file.
+const MODEL_ID_RE = /^opencode\/[a-z0-9][a-z0-9._-]*$/i;
 
 // Retired IDs that must never be selected again, even if requested via env.
 const DEAD_IDS = new Set([
@@ -130,4 +136,3 @@ export function resolveJudgeModel(env = process.env) {
   const raw = String(env.FLEET_JUDGE_MODEL || "").trim();
   return isAllowedModel(raw) ? raw : DEFAULT_JUDGE_MODEL;
 }
-

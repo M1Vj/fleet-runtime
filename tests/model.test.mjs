@@ -331,3 +331,52 @@ test("chain override file: stale/invalid fall through to code default", async ()
   const emptyRoot = mkdtempSync(path.join(tmpdir(), "fleetchain-"));
   assert.deepEqual(resolveModelChain({ FLEET_STATE_ROOT: emptyRoot }), [...DEFAULT_MODEL_CHAIN].slice(0, 5));
 });
+
+test("askModel with failing modelOverride does not trip the global gateway circuit breaker", async () => {
+  const { askModel } = await import("../scripts/lib/model.mjs");
+  const { gatewayCircuitOpen } = await import("../scripts/lib/gateway-health.mjs");
+  const dir = mkdtempSync(path.join(tmpdir(), "fleetfail-"));
+  const bin = path.join(dir, "opencode");
+  writeFileSync(bin, `#!/usr/bin/env node\nprocess.exit(1);\n`);
+  chmodSync(bin, 0o755);
+  const stateRoot = mkdtempSync(path.join(tmpdir(), "fleetgw-"));
+  const env = {
+    ...process.env,
+    PATH: `${dir}:${process.env.PATH}`,
+    FLEET_STATE_ROOT: stateRoot,
+  };
+  const res = await askModel({
+    prompt: "hi",
+    timeoutMs: 5000,
+    env,
+    maxRounds: 1,
+    modelOverride: "opencode/muse-spark-1.3-contributor-free",
+  });
+  assert.equal(res.complete, false);
+  assert.equal(gatewayCircuitOpen(stateRoot), false);
+});
+
+test("askModel failing whole chain does trip the global gateway circuit breaker", async () => {
+  const { askModel } = await import("../scripts/lib/model.mjs");
+  const { gatewayCircuitOpen } = await import("../scripts/lib/gateway-health.mjs");
+  const dir = mkdtempSync(path.join(tmpdir(), "fleetfail2-"));
+  const bin = path.join(dir, "opencode");
+  writeFileSync(bin, `#!/usr/bin/env node\nprocess.exit(1);\n`);
+  chmodSync(bin, 0o755);
+  const stateRoot = mkdtempSync(path.join(tmpdir(), "fleetgw2-"));
+  const env = {
+    ...process.env,
+    PATH: `${dir}:${process.env.PATH}`,
+    FLEET_STATE_ROOT: stateRoot,
+    FLEET_MODEL_CHAIN: "opencode/mimo-v2.5-free",
+  };
+  const res = await askModel({
+    prompt: "hi",
+    timeoutMs: 5000,
+    env,
+    maxRounds: 1,
+  });
+  assert.equal(res.complete, false);
+  assert.equal(gatewayCircuitOpen(stateRoot), true);
+});
+

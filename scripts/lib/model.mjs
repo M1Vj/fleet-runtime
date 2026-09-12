@@ -421,7 +421,11 @@ export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.s
     }
     logModelAudit(stateRoot, { event: "model_failover", model: chain[ci], nextModel: chain[ci + 1] || null, attempts: r.attempts?.length });
   }
-  try { markGatewayDown(stateRoot, allAttempts.map((x) => x.errTail || "").join(" ").slice(-200), { attempts: allAttempts.length, modelMode: lastMode, chain }); } catch {}
+  // Only mark gateway down when the entire resolved model chain fails.
+  // A single modelOverride must not trip the global circuit breaker for all workflows.
+  if (!modelOverride) {
+    try { markGatewayDown(stateRoot, allAttempts.map((x) => x.errTail || "").join(" ").slice(-200), { attempts: allAttempts.length, modelMode: lastMode, chain }); } catch {}
+  }
   logModelAudit(stateRoot, { event: "chain_failed", attempts: allAttempts.length, chain });
   return { reply: "", sessionId: lastSid, modelMode: lastMode, attempts: allAttempts, complete: false, ...(chainExhausted ? { degraded: true, exhausted: true } : {}) };
 }

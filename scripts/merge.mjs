@@ -11,6 +11,7 @@ import { extractJsonObject } from "./lib/directives.mjs";
 import { verifyCommit } from "./lib/verify.mjs";
 import { findSuperseded, isStale } from "./lib/pr-hygiene.mjs";
 import { verifyPullAuthor, verifyCommentAuthor } from "./lib/verify.mjs";
+import { recordHumanReview, reconcileHumanReviewQueue, tagPrNeedsHumanReview } from "./lib/human-review.mjs";
 
 const REPO_ROOT = process.cwd();
 const STATE_ROOT = process.env.FLEET_STATE_ROOT || REPO_ROOT;
@@ -399,6 +400,12 @@ async function main() {
         audit.incident("child", `${item.repo}#${item.number}: ${err.message}`);
       }
     }
+    try {
+      const reconciledCount = await reconcileHumanReviewQueue(STATE_ROOT, process.env);
+      audit.note("human-review-reconcile", `reconciled ${reconciledCount} human review items`);
+    } catch (err) {
+      audit.incident("human-review-reconcile", `failed reconciling human review queue: ${err.message}`);
+    }
     await runHygiene(identity, audit);
 
     audit.writeMarkdown(AUDIT_DIR, runId, "Merge gate scan", "ok");
@@ -451,6 +458,7 @@ async function main() {
 
   let visualEvidence = "not-applicable";
   let visualOk = true;
+  let visualData = null;
   if (cls.uiTouched) {
     const visDir = "/tmp/visual-out";
     mkdirSync(visDir, { recursive: true });
@@ -474,6 +482,7 @@ async function main() {
     const evTxt = path.join(visDir, "visual-evidence.txt");
     if (existsSync(evJson)) {
       const ve = JSON.parse(readFileSync(evJson, "utf8"));
+      visualData = ve;
       visualOk = !(ve.verdict && ve.verdict.consoleBlocker) && !(ve.verdict && ve.verdict.a11yBlocker);
       if (ve.verdict && ve.verdict.vlm) {
         riskCommentBits.push(`vision judge (advisory): ${ve.verdict.vlm.verdict} (${ve.verdict.vlm.score}) regressions=${JSON.stringify(ve.verdict.vlm.regressions || []).slice(0, 200)}`);
@@ -486,23 +495,8 @@ async function main() {
     if (!visualOk) riskCommentBits.push("visual gate: console errors or critical a11y violations present");
   }
 
-  // Depth-3 (large/destructive diffs) always needs a human — the old
-  // cls.risk === "HIGH" string is dead (classify emits depth-N), so gate on
-  // depth with the HIGH string kept as a backstop. Depth-1/2 judge flow
-  // below is unchanged.
-  if (cls.depth === 3 || cls.risk === "HIGH") {
-    await postComment(
-      TARGET_REPO,
-      PR_NUMBER,
-      "⚖️ **fleet merge-gate**: classified HIGH RISK (depth-3) — human review required.\n\nReasons:\n" +
-        riskCommentBits.map((r) => `- ${r}`).join("\n") +
-        "\n\nThe fleet will keep this PR as a draft. A maintainer can merge manually once satisfied.",
-      audit,
-    );
-    await terminal("BLOCKED", { why: "high-risk paths require human" });
-    return finish(audit, runId, "BLOCKED");
-  }
-
+  // Multi-Agent Adversarial & Critique Gauntlet
+  // 1. Deterministic checks (npm install, build, test)
   const det = await runDeterministicChecks(TARGET_REPO, pr.head.sha, audit);
   if (!det.ok) {
     await postComment(TARGET_REPO, PR_NUMBER, "🧪 **fleet merge-gate**: deterministic checks FAILED.\n\n```\n" + det.evidence.slice(-1500) + "\n```", audit);
@@ -511,37 +505,48 @@ async function main() {
   }
   audit.note("deterministic", "passed (L1/L2)");
 
-  if (cls.uiTouched && !visualOk) {
-    await postComment(TARGET_REPO, PR_NUMBER, "👁 **fleet merge-gate**: visual verification FAILED.\n\n```\n" + visualEvidence.slice(-1200) + "\n```\n\nScreenshots attached to the workflow artifacts for human review.", audit);
-    await terminal("BLOCKED", { why: "visual gate failed" });
-    return finish(audit, runId, "BLOCKED");
-  }
-
   const combinedEvidence = [
     det.evidence,
     visualEvidence === "not-applicable" ? "" : "VISUAL:\n" + visualEvidence,
   ].filter(Boolean).join("\n\n");
 
-  const threshold = cls.depth >= 3 ? 95 : cls.depth >= 2 ? 90 : 80;
+  // 2. Multi-Agent Adversarial Panel
   const correctness = await judge({ repo: TARGET_REPO, prNumber: PR_NUMBER, title: pr.title, body: pr.body, files, extraEvidence: combinedEvidence, lens: "correctness-and-security", audit });
   const standards = await judge({ repo: TARGET_REPO, prNumber: PR_NUMBER, title: pr.title, body: pr.body, files, extraEvidence: combinedEvidence, lens: "industry-standards-and-maintainability", audit });
+  
   let security = null;
-  if (cls.depth >= 3) {
+  const needsSecurity = cls.depth >= 2 || (cls.reasons && cls.reasons.some((r) => r.includes("sensitive path") || r.includes("workflow")));
+  if (needsSecurity) {
     security = await judge({ repo: TARGET_REPO, prNumber: PR_NUMBER, title: pr.title, body: pr.body, files, extraEvidence: combinedEvidence, lens: "security-and-supply-chain", audit });
   }
 
-  const allJudges = security ? [correctness, standards, security] : [correctness, standards];
-  const approved = allJudges.every((j) => j.verdict === "approve" && j.score >= threshold);
+  let ux = null;
+  if (cls.uiTouched) {
+    ux = await judge({ repo: TARGET_REPO, prNumber: PR_NUMBER, title: pr.title, body: pr.body, files, extraEvidence: combinedEvidence, lens: "ux-and-visual-integrity", audit });
+  }
+
+  const judgesList = [correctness, standards];
+  if (security) judgesList.push(security);
+  if (ux) judgesList.push(ux);
+
+  // Thresholds: depth 1: 80, depth 2: 85, depth 3 (YOLO): 90 with security judge >= 90. 0 blockers required across all judges.
+  const baseThreshold = cls.depth >= 3 ? 90 : cls.depth >= 2 ? 85 : 80;
+  const allJudgesApprove = judgesList.every((j) => j.verdict === "approve" && j.score >= baseThreshold && (!j.blockers || j.blockers.length === 0));
+  const securityPasses = !security || (cls.depth >= 3 ? security.score >= 90 : security.score >= baseThreshold);
+  const consensusApproved = allJudgesApprove && securityPasses;
 
   const judgeRows = [
     `| correctness+security | ${correctness.verdict.toUpperCase()} | ${correctness.score} |`,
     `| standards+maintainability | ${standards.verdict.toUpperCase()} | ${standards.score} |`,
   ];
   if (security) judgeRows.push(`| security+supply-chain | ${security.verdict.toUpperCase()} | ${security.score} |`);
-  const allBlockers = [...correctness.blockers, ...standards.blockers, ...(security ? security.blockers : [])];
-  const allReasons = [...correctness.reasons, ...standards.reasons, ...(security ? security.reasons : [])];
+  if (ux) judgeRows.push(`| ux+visual-integrity | ${ux.verdict.toUpperCase()} | ${ux.score} |`);
+
+  const allBlockers = judgesList.flatMap((j) => j.blockers || []);
+  const allReasons = judgesList.flatMap((j) => j.reasons || []);
+
   const verdictBody =
-    "🔍 **fleet judge panel** (independent maker-checker review)\n\n" +
+    "🔍 **fleet multi-agent audit panel** (adversarial critique gauntlet)\n\n" +
     `| lens | verdict | score |\n| --- | --- | --- |\n${judgeRows.join("\n")}\n\n` +
     (allBlockers.length
       ? "**Blockers:**\n" + allBlockers.map((b) => `- ${b}`).join("\n") + "\n\n"
@@ -552,7 +557,22 @@ async function main() {
 
   await postComment(TARGET_REPO, PR_NUMBER, verdictBody, audit);
 
-  if (!approved) {
+  // Compute visual metrics for decision
+  let maxDiffPct = -1;
+  let totalConsoleErrors = 0;
+  let hasA11yBlocker = false;
+  if (visualData && Array.isArray(visualData.results)) {
+    const afterResults = visualData.results.filter((r) => r.label === "after");
+    for (const r of afterResults) {
+      if (r.diffPct !== undefined && r.diffPct > maxDiffPct) maxDiffPct = r.diffPct;
+      if (r.consoleErrors) totalConsoleErrors += r.consoleErrors;
+      if (r.a11yCritical && r.a11yCritical > 0) hasA11yBlocker = true;
+    }
+  }
+
+  const scoresSummary = judgesList.map((j) => ({ lens: j.lens || "judge", score: j.score, verdict: j.verdict }));
+
+  if (!consensusApproved) {
     const fleetAuthored = String(pr.head && pr.head.ref || "").startsWith("fleet/");
     if (fleetAuthored) {
       const { readFileSync: rf, existsSync: es } = await import("node:fs");
@@ -561,11 +581,25 @@ async function main() {
         ? rf(revPath, "utf8").split("\n").filter(Boolean).map((l) => { try { const r = JSON.parse(l); return r.repo === TARGET_REPO && r.pr === PR_NUMBER ? r : null; } catch { return null; } }).filter(Boolean).length
         : 0;
       if (revCount >= 2) {
-        await postComment(TARGET_REPO, PR_NUMBER, "🛡️ **fleet merge-gate**: maximum revisions reached and judges still reject. Auto-closing this draft — the improvement lane will propose a fresh approach informed by this feedback.", audit);
-        gh(["api", "-X", "PATCH", `/repos/${TARGET_REPO}/pulls/${PR_NUMBER}`, "-f", "state=closed"], process.env);
-        await recordTerminalState("EXHAUSTED", { repo: TARGET_REPO, pr: PR_NUMBER, sha: evalSha, why: "max revisions; still rejected", scores: [correctness.score, standards.score] });
-        console.log("MERGE_TERMINAL_STATE=EXHAUSTED");
-        return finish(audit, runId, "EXHAUSTED");
+        // Instead of auto-closing, route to recordHumanReview category: judge-deadlock
+        const deadlockReason = `Maximum revisions reached (${revCount}) and multi-agent panel still rejected PR (scores: ${judgesList.map((j) => j.score).join(", ")}). Requires human eyes to unblock.`;
+        recordHumanReview(STATE_ROOT, {
+          repo: TARGET_REPO,
+          prNumber: PR_NUMBER,
+          title: pr.title,
+          headSha: evalSha,
+          author: pr.user ? pr.user.login : "M1Vj",
+          branch: pr.head ? pr.head.ref : "",
+          category: "judge-deadlock",
+          why: deadlockReason,
+          scores: scoresSummary,
+          deterministic: det.ok,
+          visual: visualData ? { diffPct: maxDiffPct, consoleErrors: totalConsoleErrors, a11yBlocker: hasA11yBlocker, vlm: visualData.verdict && visualData.verdict.vlm } : null,
+        });
+        await tagPrNeedsHumanReview(TARGET_REPO, PR_NUMBER, "judge-deadlock", deadlockReason, audit, process.env);
+        await recordTerminalState("NEEDS_HUMAN_REVIEW", { repo: TARGET_REPO, pr: PR_NUMBER, sha: evalSha, why: deadlockReason, category: "judge-deadlock" });
+        console.log("MERGE_TERMINAL_STATE=NEEDS_HUMAN_REVIEW");
+        return finish(audit, runId, "NEEDS_HUMAN_REVIEW");
       }
     }
     if (fleetAuthored && process.env.GITHUB_OUTPUT) {
@@ -578,10 +612,70 @@ async function main() {
       console.log("MERGE_TERMINAL_STATE=REVISION_QUEUED");
       return finish(audit, runId, "REVISION_QUEUED");
     }
-    await terminal("BLOCKED", { why: "judges rejected", scores: [correctness.score, standards.score] });
+    await terminal("BLOCKED", { why: "judges rejected", scores: judgesList.map((j) => j.score) });
     return finish(audit, runId, "BLOCKED");
   }
 
+  // Consensus Approved! Check autonomous merge conditions or human review routing.
+  if (cls.uiTouched) {
+    const isSubjectiveRedesign = ux && (
+      (ux.reasons && ux.reasons.some((r) => /subjective|redesign|human review|layout overhaul|design change/i.test(r))) ||
+      (ux.blockers && ux.blockers.some((b) => /subjective|redesign|human review/i.test(b)))
+    );
+    const pixelDiffHigh = maxDiffPct > 10;
+    const visualIssues = totalConsoleErrors > 0 || hasA11yBlocker;
+
+    if (pixelDiffHigh || isSubjectiveRedesign || (ux && ux.score < 90) || visualIssues) {
+      const whyReasons = [];
+      if (pixelDiffHigh) whyReasons.push(`Pixel diff (${maxDiffPct.toFixed(2)}%) exceeds 10% threshold`);
+      if (isSubjectiveRedesign) whyReasons.push("UX judge flagged subjective redesign needing human review");
+      if (ux && ux.score < 90) whyReasons.push(`UX judge score (${ux.score}) is below autonomous merge threshold 90`);
+      if (totalConsoleErrors > 0) whyReasons.push(`Visual check detected ${totalConsoleErrors} console error(s)`);
+      if (hasA11yBlocker) whyReasons.push("Critical accessibility violations detected");
+
+      const whyStr = whyReasons.join("; ");
+      recordHumanReview(STATE_ROOT, {
+        repo: TARGET_REPO,
+        prNumber: PR_NUMBER,
+        title: pr.title,
+        headSha: evalSha,
+        author: pr.user ? pr.user.login : "M1Vj",
+        branch: pr.head ? pr.head.ref : "",
+        category: "ui-ux",
+        why: whyStr,
+        scores: scoresSummary,
+        deterministic: det.ok,
+        visual: { diffPct: maxDiffPct, consoleErrors: totalConsoleErrors, a11yBlocker: hasA11yBlocker, vlm: visualData ? visualData.verdict && visualData.verdict.vlm : null },
+      });
+      await tagPrNeedsHumanReview(TARGET_REPO, PR_NUMBER, "ui-ux", whyStr, audit, process.env);
+      await recordTerminalState("NEEDS_HUMAN_REVIEW", { repo: TARGET_REPO, pr: PR_NUMBER, sha: evalSha, why: whyStr, category: "ui-ux" });
+      console.log("MERGE_TERMINAL_STATE=NEEDS_HUMAN_REVIEW");
+      return finish(audit, runId, "NEEDS_HUMAN_REVIEW");
+    }
+  } else {
+    if (cls.wfDeletions) {
+      const whyStr = `Workflow deletion detected in PR (${cls.reasons.join(", ")}). Sensitive risk requires human review.`;
+      recordHumanReview(STATE_ROOT, {
+        repo: TARGET_REPO,
+        prNumber: PR_NUMBER,
+        title: pr.title,
+        headSha: evalSha,
+        author: pr.user ? pr.user.login : "M1Vj",
+        branch: pr.head ? pr.head.ref : "",
+        category: "risk-sensitive",
+        why: whyStr,
+        scores: scoresSummary,
+        deterministic: det.ok,
+        visual: null,
+      });
+      await tagPrNeedsHumanReview(TARGET_REPO, PR_NUMBER, "risk-sensitive", whyStr, audit, process.env);
+      await recordTerminalState("NEEDS_HUMAN_REVIEW", { repo: TARGET_REPO, pr: PR_NUMBER, sha: evalSha, why: whyStr, category: "risk-sensitive" });
+      console.log("MERGE_TERMINAL_STATE=NEEDS_HUMAN_REVIEW");
+      return finish(audit, runId, "NEEDS_HUMAN_REVIEW");
+    }
+  }
+
+  // If approved and not routed to human review: Proceed with Autonomous Merge!
   // Pre-merge gates on the exact evaluated SHA: kill-switch, SHA stability
   // (PR must not have moved under us while judges ran), then CI green.
   if (killSwitchEngaged()) {
@@ -724,6 +818,7 @@ async function judge({ repo, prNumber, title, body, files, extraEvidence, lens, 
   try {
     const v = extractJsonObject(result.reply);
     return {
+      lens,
       verdict: v.verdict === "approve" ? "approve" : "reject",
       score: Math.max(0, Math.min(100, Number(v.score) || 0)),
       reasons: Array.isArray(v.reasons) ? v.reasons.map(String).slice(0, 6) : [],

@@ -393,10 +393,11 @@ export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.s
   if (!skipCircuitCheck && !sessionId && gatewayCircuitOpen(stateRoot)) {
     return { reply: "", sessionId: "", modelMode: "circuit-open", attempts: [{ round: 0, skipped: "circuit-open" }], complete: false, circuitOpen: true };
   }
-  // An explicit override narrows to one model; a disallowed/stale override
-  // falls back to the full chain so judging can never break on a bad value.
-  const chain = modelOverride
-    ? (isAllowedModel(modelOverride) ? [modelOverride] : resolveModelChain(env))
+  // An explicit override prioritizes that model as the chain head, while
+  // preserving failover to the resolved chain so single-model outages or rate
+  // limits never stall judging, revisions, or audits.
+  const chain = modelOverride && isAllowedModel(modelOverride)
+    ? [modelOverride, ...resolveModelChain(env).filter((m) => m !== modelOverride)]
     : resolveModelChain(env);
   logModelAudit(stateRoot, { event: "chain_start", chain, sessionId: sessionId || null });
   const allAttempts = [];

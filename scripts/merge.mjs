@@ -571,6 +571,8 @@ async function main() {
     if (fleetAuthored && process.env.GITHUB_OUTPUT) {
       try {
         appendFileSync(process.env.GITHUB_OUTPUT, "revision_needed=true\n");
+        appendFileSync(process.env.GITHUB_OUTPUT, `target_repo=${TARGET_REPO}\n`);
+        appendFileSync(process.env.GITHUB_OUTPUT, `pr_number=${PR_NUMBER}\n`);
       } catch {}
       await recordTerminalState("REVISION_QUEUED", { repo: TARGET_REPO, pr: PR_NUMBER, sha: evalSha, why: "judges rejected; revision queued" });
       console.log("MERGE_TERMINAL_STATE=REVISION_QUEUED");

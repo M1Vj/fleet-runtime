@@ -77,6 +77,6 @@ jobs:
           FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
           FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
           OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
-          FLEET_REPO: ${{ github.event.inputs.repo }}
-          FLEET_PR_NUMBER: ${{ github.event.inputs.pr }}
+          FLEET_REPO: ${{ steps.gate.outputs.target_repo || github.event.inputs.repo }}
+          FLEET_PR_NUMBER: ${{ steps.gate.outputs.pr_number || github.event.inputs.pr }}
         run: node scripts/revise.mjs

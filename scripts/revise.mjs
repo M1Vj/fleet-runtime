@@ -108,6 +108,11 @@ async function main() {
   configureIdentity(REPO_ROOT, identity);
   const repo = process.env.FLEET_REPO;
   const prNumber = Number(process.env.FLEET_PR_NUMBER || 0);
+  if (!repo || !prNumber) {
+    audit.note("skip", "missing FLEET_REPO or FLEET_PR_NUMBER");
+    console.log("REVISE_STATE=SKIPPED reason=missing_repo_or_pr");
+    return 0;
+  }
   const max = Number(process.env.FLEET_MAX_REVISIONS || 2);
   const used = countFor(repo, prNumber);
   audit.note("quota", `revisions used=${used}/${max}`);

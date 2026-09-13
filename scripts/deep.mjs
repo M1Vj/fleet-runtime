@@ -9,10 +9,21 @@ import { scrub, gh, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, conf
 import { askModel } from "./lib/model.mjs";
 import { verifyCommit } from "./lib/verify.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
-import { makeTerminal } from "./lib/terminal.mjs";
+import {
+  isPublicDataClass,
+  publicModelEnv,
+  publicRepository,
+  privateRepository,
+  PRIVATE_REPOSITORY_ENV,
+  resolveArtifactDir,
+  resolveStateRoot,
+  makeExecutionTerminal,
+  writeExecutionAudit,
+  writePublicArtifact,
+} from "./lib/private-state.mjs";
 
 const CODE_ROOT = process.cwd();
-const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
+const REPO_ROOT = resolveStateRoot(process.env, CODE_ROOT);
 const QUEUE_PATH = path.join(REPO_ROOT, "state", "queue.jsonl");
 
 function loadQueue() {
@@ -472,6 +483,7 @@ export function applyPlannedArtifacts(queue, plan, artifacts = [], options = {})
 }
 
 function persistSession(repo, kind, result, repairRound = 0) {
+  if (isPublicDataClass(process.env)) return;
   if (!result?.sessionId) return;
   try {
     const sp = path.join(REPO_ROOT, "state", "sessions.json");
@@ -487,6 +499,7 @@ function persistSession(repo, kind, result, repairRound = 0) {
 }
 
 function loadPersistedSession(repo, kind) {
+  if (isPublicDataClass(process.env)) return null;
   try {
     const sp = path.join(REPO_ROOT, "state", "sessions.json");
     const data = existsSync(sp) ? JSON.parse(readFileSync(sp, "utf8")) : {};
@@ -506,7 +519,7 @@ export async function analyzeOne(repo, kind, workdir, audit) {
     workspace: workdir,
     sessionId: prior?.sessionId,
     timeoutMs: 540000,
-    env: process.env,
+    env: isPublicDataClass(process.env) ? publicModelEnv(process.env) : process.env,
     preferVariantMax: true,
     maxRounds: 4,
   });
@@ -518,7 +531,7 @@ export async function analyzeOne(repo, kind, workdir, audit) {
       workspace: workdir,
       sessionId,
       timeoutMs: 300000,
-      env: process.env,
+      env: isPublicDataClass(process.env) ? publicModelEnv(process.env) : process.env,
       preferVariantMax: true,
       maxRounds: 2,
     });
@@ -540,7 +553,14 @@ function workerClaimMetadata(env = process.env) {
   return metadata;
 }
 
-function mainPlan() {
+async function mainPlan() {
+  if (isPublicDataClass(process.env)) {
+    await runGate(process.env);
+    const repo = publicRepository(process.env);
+    process.stdout.write(`matrix=${JSON.stringify({ worker: [{ repo, kind: process.env.FLEET_KIND || "public-audit" }] })}\n`);
+    process.stdout.write("max_parallel=1\n");
+    return 0;
+  }
   const queue = loadQueue();
   const runId = String(process.env.FLEET_DEEP_RUN_ID || process.env.GITHUB_RUN_ID || `local-${Date.now()}`);
   const plan = planTasks(queue, process.env.FLEET_MAX_WORKERS, { runId });
@@ -556,17 +576,18 @@ async function mainWorker() {
   const identity = await runGate(process.env);
   configureIdentity(REPO_ROOT, identity);
   audit.note("gate", `worker identity=${identity.login}`);
-  const repo = process.env.FLEET_REPO;
-  const kind = process.env.FLEET_KIND;
+  const publicMode = isPublicDataClass(process.env);
+  const repo = publicMode ? publicRepository(process.env) : process.env.FLEET_REPO;
+  const kind = process.env.FLEET_KIND || (publicMode ? "public-audit" : "general-audit");
   audit.note("task", `${repo} ${kind}`);
-  const artifactDir = process.env.FLEET_ARTIFACT_DIR || ".";
-  mkdirSync(artifactDir, { recursive: true });
-  const outPath = path.join(artifactDir, reportArtifactName(repo, kind));
+  const artifactDir = publicMode ? resolveArtifactDir(process.env, ".") : (process.env.FLEET_ARTIFACT_DIR || ".");
+  if (!publicMode) mkdirSync(artifactDir, { recursive: true });
+  const outPath = publicMode ? null : path.join(artifactDir, reportArtifactName(repo, kind));
   const claimMetadata = workerClaimMetadata();
   const writeFailureArtifact = (err, detail) => {
     const code = err?.code === 5 ? 5 : 6;
     const modelMode = code === 6 ? "model-unavailable" : "output-rejected";
-    writeFileSync(outPath, JSON.stringify({
+    const payload = {
       repo,
       kind,
       ...claimMetadata,
@@ -576,17 +597,21 @@ async function mainWorker() {
       sessionId: err?.sessionId || "",
       finishedUtc: new Date().toISOString(),
       exitCode: code,
-    }, null, 2));
+    };
+    if (publicMode) writePublicArtifact(process.env, payload, { kind: "deep", status: code === 6 ? "deferred" : "rejected", repository: repo, runId });
+    else writeFileSync(outPath, JSON.stringify(payload, null, 2));
   };
   const { gatewayDown } = await import("./lib/gateway-health.mjs");
-  if (gatewayDown(process.env.FLEET_STATE_ROOT || process.cwd())) {
+  if (gatewayDown(REPO_ROOT)) {
     // Surfaced, not hidden: outage exits 6 with an explicit artifact so the
     // commit lane and watchdog can see MODEL_UNAVAILABLE. No exit-0 skip.
     const stamp0 = new Date().toISOString();
-    writeFileSync(outPath, JSON.stringify({ repo, kind, ...claimMetadata, findings: [], verdict: "Deferred: model unavailable while the gateway circuit is open.", modelMode: "model-unavailable", sessionId: "", finishedUtc: stamp0, exitCode: 6 }, null, 2));
+    const payload = { repo, kind, ...claimMetadata, findings: [], verdict: "Deferred: model unavailable while the gateway circuit is open.", modelMode: "model-unavailable", sessionId: "", finishedUtc: stamp0, exitCode: 6 };
+    if (publicMode) writePublicArtifact(process.env, payload, { kind: "deep", status: "deferred", repository: repo, runId });
+    else writeFileSync(outPath, JSON.stringify(payload, null, 2));
     console.log(`DEEP_BLOCKED=circuit-open ${repo} code=6`);
-    console.log(`DEEP_RESULT_FILE=${outPath}`);
-    makeTerminal(REPO_ROOT, { lane: "deep-worker" })("EXHAUSTED", { runId, repo, kind, code: 6 });
+    console.log(`DEEP_RESULT_FILE=${outPath || process.env.FLEET_PUBLIC_ARTIFACT_MANIFEST}`);
+    makeExecutionTerminal(process.env, REPO_ROOT, { lane: "deep-worker" })("EXHAUSTED", { runId, repo, kind, code: 6 });
     return 6;
   }
   const cloneRoot = mkdtempSync(path.join(tmpdir(), "fleet-deep-"));
@@ -594,8 +619,10 @@ async function mainWorker() {
   try {
     gh(["repo", "clone", repo, cloneDir, "--", "--depth", "1"], process.env);
     const analysis = await analyzeOne(repo, kind, cloneDir, audit);
-    writeFileSync(outPath, JSON.stringify({ repo, kind, ...claimMetadata, ...analysis, exitCode: 0, finishedUtc: new Date().toISOString() }, null, 2));
-    console.log(`DEEP_RESULT_FILE=${outPath}`);
+    const payload = { repo, kind, ...claimMetadata, ...analysis, exitCode: 0, finishedUtc: new Date().toISOString() };
+    if (publicMode) writePublicArtifact(process.env, payload, { kind: "deep", status: "ok", repository: repo, runId });
+    else writeFileSync(outPath, JSON.stringify(payload, null, 2));
+    console.log(`DEEP_RESULT_FILE=${outPath || process.env.FLEET_PUBLIC_ARTIFACT_MANIFEST}`);
     return 0;
   } catch (err) {
     if (err.code === 5 || err.code === 6 || /MODEL_UNAVAILABLE/.test(err.message)) {
@@ -603,8 +630,8 @@ async function mainWorker() {
       writeFailureArtifact(err, code === 5
         ? "Deferred: model output stayed invalid after three same-session repair rounds."
         : "Deferred: model unavailable; retry when provider health recovers.");
-      console.log(`DEEP_RESULT_FILE=${outPath}`);
-      makeTerminal(REPO_ROOT, { lane: "deep-worker" })(code === 6 ? "EXHAUSTED" : "REVISION_QUEUED", { runId, repo, kind, code });
+      console.log(`DEEP_RESULT_FILE=${outPath || process.env.FLEET_PUBLIC_ARTIFACT_MANIFEST}`);
+      makeExecutionTerminal(process.env, REPO_ROOT, { lane: "deep-worker" })(code === 6 ? "EXHAUSTED" : "REVISION_QUEUED", { runId, repo, kind, code });
       return code;
     }
     throw err;
@@ -618,6 +645,11 @@ async function mainCommit() {
   const audit = new AuditBuffer(scrub(process.env));
   const identity = await runGate(process.env);
   configureIdentity(REPO_ROOT, identity);
+  if (isPublicDataClass(process.env)) {
+    writePublicArtifact(process.env, { mode: "commit", status: "blocked", reason: "public-read-only" }, { kind: "deep-commit", status: "blocked", repository: publicRepository(process.env), runId });
+    console.log("DEEP_COMMIT_BLOCKED=public-read-only");
+    return 4;
+  }
   audit.note("gate", `committer identity=${identity.login}`);
   const analyzeResult = String(process.env.FLEET_ANALYZE_RESULT || "").trim();
   const analyzeFailed = Boolean(analyzeResult && !["success", "skipped"].includes(analyzeResult));
@@ -724,11 +756,11 @@ async function mainCommit() {
     gitCommit(REPO_ROOT, `[fleet] deep reports ${runId}`, identity);
     gitPush(REPO_ROOT, "main", process.env);
     const sha = gitRevParse(REPO_ROOT, "HEAD");
-    await verifyCommit("M1Vj/fleet-control", sha, identity, process.env.FLEET_GH_TOKEN);
+    await verifyCommit(privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control), sha, identity, process.env.FLEET_GH_TOKEN);
     audit.note("push-verify", `attribution verified sha=${sha.slice(0, 10)}`);
   }
   const terminalStatus = runFailed ? "EXHAUSTED" : "SUCCESS";
-  makeTerminal(REPO_ROOT, { lane: "deep-commit" })(terminalStatus, {
+  makeExecutionTerminal(process.env, REPO_ROOT, { lane: "deep-commit" })(terminalStatus, {
     runId,
     reportsCommitted: processed,
     missing: missingClaims.missing,
@@ -736,13 +768,13 @@ async function mainCommit() {
     blocked: blockedSelected,
     skippedClaims,
   });
-  audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Deep commit", runFailed ? "partial" : "ok", { lane: "deep-commit" });
+  writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Deep commit", runFailed ? "partial" : "ok", { lane: "deep-commit" });
   console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: runFailed ? "partial" : "ok", reportsCommitted: processed, retryable: retryableSelected, blocked: blockedSelected, skippedClaims })}`);
   return runFailed ? 6 : 0;
 }
 
 if (process.argv[1] && import.meta.url.endsWith(path.basename(process.argv[1]))) {
   const mode = process.env.FLEET_DEEP_MODE;
-  if (mode === "plan") mainPlan();
+  if (mode === "plan") process.exit(await mainPlan());
   else process.exit(mode === "commit" ? await mainCommit() : await mainWorker());
 }

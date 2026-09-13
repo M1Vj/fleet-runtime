@@ -108,17 +108,17 @@ test("artifacts for no-longer-queued work are ignored", () => {
 });
 
 test("artifact identities stay within the GitHub repo and audit-kind shape", () => {
-  assert.equal(isValidArtifactIdentity("M1Vj/fleet-control", "security-audit"), true);
+  assert.equal(isValidArtifactIdentity("M1Vj/fleet-fixture", "security-audit"), true);
   assert.equal(isValidArtifactIdentity("../../outside", "code-review"), false);
-  assert.equal(isValidArtifactIdentity("M1Vj/fleet-control/extra", "code-review"), false);
-  assert.equal(isValidArtifactIdentity("M1Vj/fleet-control", "../reports"), false);
+  assert.equal(isValidArtifactIdentity("M1Vj/fleet-fixture/extra", "code-review"), false);
+  assert.equal(isValidArtifactIdentity("M1Vj/fleet-fixture", "../reports"), false);
   assert.equal(isValidArtifactIdentity("../evil", "code-review"), false);
   assert.equal(isValidArtifactIdentity("M1Vj/..", "code-review"), false);
 });
 
 test("artifact documents reject malformed findings before publication", () => {
   const base = {
-    repo: "M1Vj/fleet-control",
+    repo: "M1Vj/fleet-fixture",
     kind: "code-review",
     findings: [],
     verdict: "verified",

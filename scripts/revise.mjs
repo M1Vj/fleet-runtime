@@ -11,9 +11,18 @@ import { askModel } from "./lib/model.mjs";
 import { isSafeRepoPath, harvestFencedFiles } from "./lib/directives.mjs";
 import { verifyCommentAuthor, verifyCommit } from "./lib/verify.mjs";
 import { makeTerminal } from "./lib/terminal.mjs";
+import {
+  isPublicDataClass,
+  makeExecutionTerminal,
+  privateRepository,
+  PRIVATE_REPOSITORY_ENV,
+  publicRepository,
+  resolveStateRoot,
+  writePublicArtifact,
+} from "./lib/private-state.mjs";
 
 const REPO_ROOT = process.cwd();
-const STATE_ROOT = process.env.FLEET_STATE_ROOT || REPO_ROOT;
+const STATE_ROOT = resolveStateRoot(process.env, REPO_ROOT);
 const REVISIONS_PATH = path.join(STATE_ROOT, "state", "revisions.jsonl");
 
 export function killSwitchEngaged() {
@@ -104,6 +113,16 @@ function countFor(repo, pr) {
 async function main() {
   const audit = new AuditBuffer(scrub(process.env));
   const identity = await runGate(process.env);
+  if (isPublicDataClass(process.env)) {
+    try {
+      const repository = publicRepository(process.env);
+      writePublicArtifact(process.env, { mode: "revise", status: "blocked", repository, reason: "public-read-only" }, { kind: "revise", status: "blocked", repository });
+      makeExecutionTerminal(process.env, STATE_ROOT, { lane: "revise" })("BLOCKED", { repository, reason: "public-read-only" });
+    } catch {}
+    audit.note("public-read-only", "revision mutations are disabled in public mode");
+    console.log("REVISE_STATE=BLOCKED reason=public-read-only");
+    return 4;
+  }
   if (process.env.FLEET_GH_TOKEN && !process.env.GH_TOKEN) process.env.GH_TOKEN = process.env.FLEET_GH_TOKEN;
   configureIdentity(REPO_ROOT, identity);
   const repo = process.env.FLEET_REPO;
@@ -261,7 +280,7 @@ async function main() {
       if (gitCommit(STATE_ROOT, `[fleet] revise ${repo}#${prNumber} round ${used + 1}`, identity) === "committed") {
         gitPush(STATE_ROOT, "main", process.env);
         const shaAfter = gitRevParse(STATE_ROOT, "HEAD");
-        await verifyCommit("M1Vj/fleet-control", shaAfter, identity, process.env.FLEET_GH_TOKEN);
+        await verifyCommit(privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control), shaAfter, identity, process.env.FLEET_GH_TOKEN);
         audit.note("push-verify", `sha=${shaAfter.slice(0, 10)}`);
       }
     }

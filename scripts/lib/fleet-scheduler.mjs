@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 /**
  * Pure scheduling helpers for the repository fleet.
  *
@@ -19,6 +21,19 @@ const DEFAULT_REVIEW_ROLES = [
 
 const DEFAULT_ALLOWED_OWNER = "M1Vj";
 const OWNER_NAME_RE = /^[A-Za-z0-9_.-]+$/;
+const RECOVERABLE_STATES = new Set([
+  "unknown_effect",
+  "recovering",
+  "waiting_for_capacity",
+  "blocked",
+  "expired",
+  "escalated",
+]);
+const TERMINAL_STATES = new Set(["completed"]);
+
+function stateKey(value) {
+  return key(value).replace(/-/g, "_");
+}
 
 function finiteNumber(value, fallback = 0) {
   const number = typeof value === "number" ? value : Number(value);
@@ -274,6 +289,120 @@ function historyPullRequest(entry) {
   if (candidate === undefined || candidate === null || candidate === "") return undefined;
   const number = finiteNumber(candidate, Number.NaN);
   return Number.isFinite(number) ? number : text(candidate);
+}
+
+function taskType(value) {
+  const source = value?.task && typeof value.task === "object" ? { ...value.task, ...value } : value;
+  const normalized = key(firstValue(source?.type, source?.kind));
+  return normalized === "pull_request" ? "review" : normalized;
+}
+
+function taskRole(value) {
+  const source = value?.task && typeof value.task === "object" ? { ...value.task, ...value } : value;
+  return key(firstValue(source?.role, source?.reviewRole, taskType(source)));
+}
+
+function taskWorkIdentity(value) {
+  const source = value?.task && typeof value.task === "object" ? { ...value.task, ...value } : value;
+  const type = taskType(source);
+  const repo = repositoryName(source);
+  const pr = type === "review" ? historyPullRequest(source) : undefined;
+  return `${type}|${repo}|${pr === undefined ? "repo" : pr}|${taskRole(source)}`;
+}
+
+function taskWorkKey(value) {
+  const supplied = String(value?.workKey || "").trim();
+  if (supplied && /^[A-Za-z0-9_.:-]{1,180}$/.test(supplied)) return supplied;
+  return `work-v1-${createHash("sha256").update(taskWorkIdentity(value)).digest("hex")}`;
+}
+
+function desiredEntries(value) {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== "object") return [];
+  const candidates = firstValue(value.tasks, value.desired, value.entries, value.items, value.work);
+  if (Array.isArray(candidates)) return candidates;
+  if (candidates && typeof candidates === "object") return desiredEntries(candidates);
+  return Object.entries(value)
+    .filter(([name, entry]) => entry && typeof entry === "object" && name !== "targets")
+    .map(([name, entry]) => ({
+      ...entry,
+      ...(entry.repo || entry.repository || entry.workKey ? {} : { repo: name }),
+      ...(entry.workKey || !String(name).startsWith("work-v1-") ? {} : { workKey: name }),
+    }));
+}
+
+function observedRows(value) {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== "object") return [];
+  return desiredEntries(value);
+}
+
+/**
+ * Reconcile desired work with the latest durable observations.  This function
+ * is pure: it emits bounded, public-classified task descriptors and never
+ * performs a dispatch.  Interrupted or unknown effects are returned so the
+ * caller can advance a new generation instead of replaying a stale receipt.
+ */
+export function reconcileDesiredState(input = {}, maybeObserved = []) {
+  const options = Array.isArray(input) ? { desiredState: input, observedState: maybeObserved } : (input || {});
+  const desired = desiredEntries(firstValue(options.desiredState, options.desired, options.desiredTasks, options.recoverable));
+  const observed = observedRows(firstValue(options.observedState, options.observed, options.records, options.state));
+  const latest = new Map();
+  for (const row of observed) {
+    const keyValue = taskWorkKey(row);
+    if (keyValue) latest.set(keyValue, row);
+    const computed = taskWorkKey({ ...row, workKey: undefined });
+    if (computed) latest.set(computed, row);
+    const identity = taskWorkIdentity(row);
+    if (identity) latest.set(identity, row);
+  }
+  const output = [];
+  const seen = new Set();
+  for (const entry of desired) {
+    if (!entry || typeof entry !== "object") continue;
+    const classification = key(firstValue(entry.dataClass, entry.data_class, entry.classification, entry.visibility, "public"));
+    if (classification && !new Set(["public", "opaque", "public-classified"]).has(classification)) continue;
+    const type = taskType(entry);
+    if (type !== "review" && type !== "upgrade") continue;
+    const repo = repositoryName(entry);
+    if (!ownerPathAllowed(repo, options) || isExcludedRepository({ ...entry, full_name: repo }, options)) continue;
+    const pr = type === "review" ? historyPullRequest(entry) : undefined;
+    if (type === "review" && !Number.isFinite(Number(pr))) continue;
+    const identity = taskWorkIdentity({ ...entry, repo, pr, type });
+    const work = taskWorkKey({ ...entry, repo, pr, type });
+    if (seen.has(work)) continue;
+    seen.add(work);
+    const current = latest.get(work) || latest.get(identity);
+    const currentState = stateKey(firstValue(current?.state, current?.status));
+    const desiredState = stateKey(firstValue(entry.desiredState, entry.desiredStatus, entry.state, entry.status, "active"));
+    if (TERMINAL_STATES.has(currentState) || ["completed", "satisfied", "disabled", "cancelled"].includes(desiredState)) continue;
+    if (current && !RECOVERABLE_STATES.has(currentState) && currentState) continue;
+    const retryTimestamp = parseTime(current?.retryAt);
+    const now = resolveNow(options.now);
+    if (currentState === "waiting_for_capacity" && Number.isFinite(retryTimestamp) && retryTimestamp > now) continue;
+    const role = taskRole(entry) || (type === "review" ? "review" : "upgrade");
+    const safe = {
+      type,
+      kind: type === "review" ? "pull_request" : "upgrade",
+      action: type === "review" ? "review" : "upgrade",
+      role,
+      reviewRole: role,
+      repo,
+      repository: repo,
+      repoFullName: repo,
+      pr: type === "review" ? Number(pr) : null,
+      number: type === "review" ? Number(pr) : null,
+      workKey: work,
+      recoverable: true,
+      reconciled: true,
+      recoveryRequested: true,
+      priorState: currentState || null,
+      desiredState: desiredState || "active",
+      ...(currentState === "waiting_for_capacity" ? { retryEligible: true } : {}),
+    };
+    output.push(safe);
+  }
+  return output;
 }
 
 function historyTime(entry) {
@@ -644,6 +773,8 @@ function taskForPullRequest(pullRequest, score, factors, role, triggered) {
     score: boundedScore(score),
     scoreFactors: factors,
     triggered: Boolean(triggered),
+    ...(pullRequest.workKey ? { workKey: pullRequest.workKey } : {}),
+    ...(pullRequest.reconciled ? { reconciled: true, recoverable: true } : {}),
   };
 }
 
@@ -660,6 +791,7 @@ function taskForUpgrade(repository, score, factors) {
     repoFullName: repo,
     score: boundedScore(score),
     scoreFactors: factors,
+    ...(repository.workKey ? { workKey: repository.workKey } : {}),
   };
 }
 
@@ -676,6 +808,11 @@ export function buildFleetPlan(input = {}) {
   const history = Array.isArray(input.history) ? input.history : [];
   const now = resolveNow(input.now);
   const options = { ...input, history, now };
+  const desiredRecoveries = reconcileDesiredState({
+    ...input,
+    desiredState: firstValue(input.desiredState, input.desired, input.desiredTasks),
+    observedState: firstValue(input.observedState, input.records, input.state),
+  });
   const repositoryMap = repositoryMetadataMap(repositories);
   const eligibleRepositories = [];
   const seenRepositories = new Set();
@@ -686,7 +823,16 @@ export function buildFleetPlan(input = {}) {
     eligibleRepositories.push(repository);
   }
   const triggeredPull = triggerPullRequest(input);
-  const allPulls = triggeredPull ? [...pulls, triggeredPull] : pulls;
+  const desiredPulls = desiredRecoveries
+    .filter((entry) => entry.type === "review")
+    .map((entry) => ({
+      ...entry,
+      state: "open",
+      created_at: entry.created_at || new Date(now).toISOString(),
+      repository: { full_name: entry.repo },
+      base: { repo: { full_name: entry.repo } },
+    }));
+  const allPulls = [...pulls, ...desiredPulls, ...(triggeredPull ? [triggeredPull] : [])];
   const uniquePulls = [];
   const seenPulls = new Set();
   for (let index = 0; index < allPulls.length; index += 1) {
@@ -698,7 +844,8 @@ export function buildFleetPlan(input = {}) {
     if (!pullRepositoryEligible(pullRequest, repositoryMap, options)) continue;
     const details = pullRequestScoreDetails(pullRequest, options);
     if (details.score <= 0) continue;
-    uniquePulls.push({ pullRequest, details, triggered: triggerMatchesPullRequest(input.trigger, pullRequest) });
+    const reconciled = Boolean(pullRequest.reconciled || pullRequest.recoverable);
+    uniquePulls.push({ pullRequest, details, triggered: reconciled || triggerMatchesPullRequest(input.trigger, pullRequest), reconciled });
   }
   uniquePulls.sort((a, b) => {
     if (a.triggered !== b.triggered) return a.triggered ? -1 : 1;
@@ -719,7 +866,14 @@ export function buildFleetPlan(input = {}) {
   // Give every triggered PR a small multi-role burst before ordinary work.
   for (const entry of eventPulls) {
     for (let roleIndex = 0; roleIndex < Math.min(agentsPerPr, roles.length) && eventTasks.length < maxAgents; roleIndex += 1) {
-      eventTasks.push(taskForPullRequest(entry.pullRequest, entry.details.score, entry.details.factors, roles[roleIndex], true));
+      eventTasks.push({
+        ...taskForPullRequest(entry.pullRequest, entry.details.score, entry.details.factors, roles[roleIndex], true),
+        ...(entry.reconciled ? {
+          recoverable: true,
+          reconciled: true,
+          ...(entry.pullRequest.retryEligible ? { retryEligible: true } : {}),
+        } : {}),
+      });
     }
   }
   // One lane per other PR preserves breadth and keeps old open PRs eligible.
@@ -753,10 +907,27 @@ export function buildFleetPlan(input = {}) {
     upgradeSlotLimit,
     Math.max(0, Math.floor(finiteNumber(minimumUpgradeInput, 3))),
   );
+  const desiredUpgrades = desiredRecoveries
+    .filter((entry) => entry.type === "upgrade")
+    .map((entry) => ({
+      repository: { full_name: entry.repo, name: entry.repo.split("/").at(-1), workKey: entry.workKey || taskWorkKey(entry) },
+      score: MAX_SCORE,
+      factors: { reconciled: true, recoverable: true },
+      desired: entry,
+      retryEligible: entry.retryEligible === true,
+    }));
   const sampledUpgrades = weightedSampleWithoutReplacement(upgradeRows, upgradeSlotLimit, input.rng);
-  const upgrades = sampledUpgrades
+  const upgrades = desiredUpgrades
+    .slice(0, Math.max(0, maxAgents - eventTasks.length))
+    .map((row) => ({
+      ...taskForUpgrade(row.repository, row.score, row.factors),
+      recoverable: true,
+      reconciled: true,
+      ...(row.retryEligible ? { retryEligible: true } : {}),
+    }))
+    .concat(sampledUpgrades
     .slice(0, minimumUpgradeSlots)
-    .map((row) => taskForUpgrade(row.repository, row.score, row.factors));
+    .map((row) => taskForUpgrade(row.repository, row.score, row.factors)));
 
   const ordinaryTasks = [];
   const ordinaryCapacity = Math.max(0, maxAgents - eventTasks.length - upgrades.length);

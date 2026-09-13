@@ -2,12 +2,20 @@
 import process from "node:process";
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { privateRepository, PRIVATE_REPOSITORY_ENV } from "./lib/private-state.mjs";
+
+if (process.env.FLEET_DATA_CLASS === "public") {
+  process.stderr.write("REFRESH_AUTH_SECRET_BLOCKED=public-data-class\n");
+  process.exit(4);
+}
 
 const usage = "usage: node scripts/refresh-auth-secret.mjs [--token] <file>\n  default file is auth.json -> secret FLEET_OPENCODE_AUTH\n  --token file -> secret FLEET_GH_TOKEN";
 
-const REPOS = ["M1Vj/fleet-runtime", "M1Vj/fleet-control"];
+function repositoryTargets() {
+  return ["M1Vj/fleet-runtime", privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control)];
+}
 function setSecret(name, value) {
-  for (const repo of REPOS) {
+  for (const repo of repositoryTargets()) {
     const res = spawnSync("gh", ["secret", "set", name, "-R", repo], {
       input: value,
       encoding: "utf8",

@@ -1,13 +1,18 @@
 name: fleet-emergency-stop
-run-name: "fleet emergency stop ${{ github.run_id }}"
+run-name: "fleet public stop guard ${{ github.run_id }}"
 
 on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: 'type STOP to confirm full halt'
+        description: "type STOP to confirm a public execution halt"
         type: string
         required: true
+        default: ""
+      repo:
+        description: "allowlisted public owner/name (empty uses this repository)"
+        type: string
+        required: false
         default: ""
 
 permissions:
@@ -18,33 +23,46 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 6
     env:
-      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
-      FLEET_CONFIRM: ${{ github.event.inputs.confirm }}
-      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
-      FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
+      FLEET_DATA_CLASS: public
+      FLEET_PUBLIC_OWNER: M1Vj
+      FLEET_PUBLIC_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
+      FLEET_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
     steps:
-      - name: confirm guard
+      - name: validate public target
+        id: public-target
+        env:
+          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ inputs.repo || github.event.inputs.repo || '' }}
+          FLEET_PUBLIC_OWNER: M1Vj
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          if [ "$FLEET_CONFIRM" != "STOP" ]; then
-            echo "refusing to run without confirm=STOP"
-            exit 1
-          fi
-      - name: checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          persist-credentials: false
-          fetch-depth: 1
-      - name: checkout private state repo
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          repository: M1Vj/fleet-control
-          token: ${{ secrets.FLEET_GH_TOKEN }}
-          persist-credentials: false
-          fetch-depth: 1
-          path: state-control
-      - name: setup node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: "20"
-      - name: emergency stop
-        run: node scripts/emergency-stop.mjs
+          set -euo pipefail
+          target="${FLEET_PUBLIC_REPOSITORY_INPUT:-${GITHUB_REPOSITORY}}"
+          [[ "$target" == */* && "$target" != *$'\n'* && "$target" != *$'\r'* ]]
+          owner="${target%%/*}"
+          name="${target#*/}"
+          [[ "$owner" == "$FLEET_PUBLIC_OWNER" && "$name" != "$target" && "$name" != */* ]]
+          [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]
+          metadata="$RUNNER_TEMP/public-repository.json"
+          error_log="$RUNNER_TEMP/public-target-error.log"
+          curl --fail --silent --show-error --location --retry 1 \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${owner}/${name}" >"$metadata" 2>"$error_log"
+          node --input-type=module - "$metadata" <<'NODE'
+          import { readFileSync } from "node:fs";
+          const metadata = JSON.parse(readFileSync(process.argv[2], "utf8"));
+          if (metadata.private !== false || metadata.visibility !== "public" || metadata.owner?.login !== process.env.FLEET_PUBLIC_OWNER || metadata.archived === true) process.exit(1);
+          NODE
+          printf 'repository=%s\n' "$target" >>"$GITHUB_OUTPUT"
+      - name: confirm guard
+        env:
+          FLEET_CONFIRM: ${{ inputs.confirm || github.event.inputs.confirm || '' }}
+        run: |
+          set -euo pipefail
+          [[ "$FLEET_CONFIRM" == "STOP" ]]
+      - name: record public stop request
+        run: |
+          printf '%s\n' '{"dataClass":"public","status":"stop-requested"}' > "$FLEET_PUBLIC_STATE_ROOT/public-stop.json"

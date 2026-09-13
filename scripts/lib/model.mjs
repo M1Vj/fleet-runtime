@@ -40,7 +40,7 @@ import {
   sanitizeModelChain,
 } from "./provider-registry.mjs";
 import {
-  hasNumberedSlots,
+  collectSlots,
   isAuthFailure,
   recordFailure,
   recordSuccess,
@@ -50,6 +50,14 @@ import {
 } from "./credential-pool.mjs";
 import { makeTerminal } from "./terminal.mjs";
 
+import {
+  CORE_INTEGRITY_OK,
+  CORE_LOCK_DIGEST,
+  CORE_MANIFEST,
+  classifyQuotaAvailability,
+  verifyCoreIntegrity,
+} from "../../packages/indefinite-core/index.mjs";
+
 
 // Model-layer timeouts (ms): standard calls 480s, long-form 540s,
 // extended/vision 600s. Callers pick the tier that fits the task.
@@ -58,6 +66,7 @@ export const MODEL_TIMEOUTS = { standard: 480000, long: 540000, extended: 600000
 // 120s for long-form calls.
 export const CHAIN_RETRY_COOLDOWN_MS = 90000;
 export const CHAIN_RETRY_COOLDOWN_LONG_MS = 120000;
+export const CORE_MODEL_DIGEST = CORE_LOCK_DIGEST;
 
 function parseConfigObject(raw) {
   try {
@@ -159,6 +168,7 @@ function loadChainOverride(stateRoot, env = process.env) {
     const p = chainOverridePath(stateRoot);
     if (!existsSync(p)) return null;
     const data = JSON.parse(readFileSync(p, "utf8"));
+    if (data && data.coreDigest !== undefined && data.coreDigest !== CORE_LOCK_DIGEST) return null;
     const raw = data && data.chain;
     if (!Array.isArray(raw) || raw.length === 0 || raw.length > 5) return null;
     const clean = sanitizeModelChain(raw);
@@ -250,10 +260,15 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
     const requested = String(modelOverride || model || DEFAULT_MODEL_CHAIN[0]).trim();
     const selected = isAllowedModel(requested) ? requested : DEFAULT_MODEL_CHAIN[0];
     const poolRoot = env.FLEET_STATE_ROOT || process.cwd();
+    const coreRoot = String(env.FLEET_CORE_ROOT || "").trim();
+    if (!CORE_INTEGRITY_OK || !verifyCoreIntegrity(coreRoot || undefined)) {
+      resolve({ ...coreParityBlocked(poolRoot), model: selected, spawnFailed: false });
+      return;
+    }
     // Credential rotation pool: with numbered slots (FLEET_OPENCODE_AUTH_2.._9)
     // the active slot is selected per call; legacy single-key deploys behave
     // exactly as before. Telemetry records slot NUMBERS only, never values.
-    const usePool = hasNumberedSlots(env);
+    const usePool = collectSlots(env).length > 0;
     let poolSlot = null;
     let poolValue = null;
     let exhaustedDegraded = false;
@@ -261,27 +276,26 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
     if (usePool) {
       const sel = selectSlot({ env, stateRoot: poolRoot });
       if (sel.exhausted) {
-        // Non-stop rotation: never halt on exhaustion. File an async
-        // alert-intent flag for watchdog/retro (they own issue filing),
-        // then fall through to the anon attempt below. No spawn here
-        // except the model child.
-        exhaustedDegraded = true;
-        exhaustedTotal = sel.total || 0;
-        try {
-          writeAuthExhaustedFlag({ stateRoot: poolRoot, total: exhaustedTotal, cooldownMs: resolveCooldownMs(env) });
-        } catch {}
+        // Never bypass provider-authorized credential capacity with an
+        // anonymous attempt. Return a durable wait disposition directly.
+        const wait = credentialCapacityWait(poolRoot, env, sel.total || 0);
+        resolve({ ...wait, model: selected, spawnFailed: false, authMissing: true, slot: null });
+        return;
       } else if (!sel.missing) {
         poolSlot = sel.slot;
         poolValue = sel.value;
       }
     }
-    const authValue = usePool ? poolValue || "" : env.FLEET_OPENCODE_AUTH || "";
+    const authValue = usePool ? poolValue || "" : env.FLEET_OPENCODE_AUTH || env.OPENCODE_AUTH_CONTENT || "";
     const missing = !authValue;
     const usedSlot = poolSlot ?? (authValue ? 1 : null);
     const args = ["run", "--format", "json", "-m", selected];
     if (env.FLEET_OPENCODE_DEBUG === "1") args.push("--print-logs", "--log-level", "DEBUG");
-    if (!missing && variant) args.push("--variant", variant);
-    if (!missing && sessionId) args.push("-s", sessionId);
+    // Capability and exact-session continuity are independent of auth mode.
+    // Anonymous, provider-authorized calls must retain xhigh/plain selection
+    // and a supplied session rather than silently dropping either argument.
+    if (variant) args.push("--variant", variant);
+    if (sessionId) args.push("-s", sessionId);
 
   // Anti-downgrade & instrumental self-preservation directive
   const antiDowngradeBlock = [
@@ -291,6 +305,8 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
     "Anything that makes system behavior different from the real implementation is an unacceptable downgrade.",
     "Always fix, harden, and improve with genuine, evidence-based code. Never use Gemini models under any circumstances.",
     "MAXIMUM OUTPUT CAPACITY & BATCH MULTI-TOOL EXECUTION: Batch multiple tool actions per turn (parallel file reads, searches, multi-file edits, and command verifications). Do NOT emit timid, truncated, or 100-token placeholder summaries. Deliver thorough, in-depth technical analysis, complete file implementations, and rigorous verification evidence.",
+    `CORE CAPABILITIES: use ${CORE_MANIFEST.capabilities.reasoningEffort} reasoning, preserve tools and parallel tool calls, and continue up to the configured unbounded task budget (${CORE_MANIFEST.capabilities.unboundedSteps}) until the requested work is actually complete.`,
+    "EXACT SESSION / SINGLE WRITER: preserve the supplied session identity and do not create a competing writer for the same task.",
     "===================================================================="
   ].join("\n");
   const effectivePrompt = `${antiDowngradeBlock}\n\n${prompt}`;
@@ -401,8 +417,84 @@ function sleep(ms) {
   return new Promise((res) => setTimeout(res, ms));
 }
 
+function coreParityBlocked(stateRoot, reason = "core-parity-mismatch") {
+  const attempts = [{ round: 0, skipped: reason, parityMismatch: true }];
+  return {
+    reply: "",
+    sessionId: "",
+    modelMode: reason,
+    attempts,
+    complete: false,
+    blocked: true,
+    parityMismatch: true,
+    surfaced: true,
+    stderrTail: reason,
+  };
+}
+
+function credentialCapacityRetryAt(stateRoot, env = process.env, now = Date.now()) {
+  try {
+    const p = path.join(stateRoot || process.cwd(), "state", "credential-health.json");
+    const data = JSON.parse(readFileSync(p, "utf8"));
+    const slots = data && data.slots && typeof data.slots === "object" ? Object.values(data.slots) : [];
+    const future = slots
+      .map((entry) => Number(entry?.cooldownUntil) || 0)
+      .filter((until) => until > now);
+    if (future.length > 0) return Math.min(...future);
+  } catch {}
+  return now + resolveCooldownMs(env);
+}
+
+function credentialCapacityWait(stateRoot, env, total) {
+  const now = Date.now();
+  const retryAt = credentialCapacityRetryAt(stateRoot, env, now);
+  const retryAfterSec = Math.max(0, Math.ceil((retryAt - now) / 1000));
+  const quotaDisposition = {
+    kind: "quota_wait",
+    wait: true,
+    surface: true,
+    reason: "credential_capacity_exhausted",
+    eligibleRoutes: [],
+    retryAt,
+    retryAfterSec,
+  };
+  try {
+    writeAuthExhaustedFlag({ stateRoot, total, cooldownMs: resolveCooldownMs(env) });
+  } catch {}
+  return {
+    reply: "",
+    sessionId: "",
+    modelMode: "waiting_for_capacity",
+    attempts: [{ round: 0, skipped: "credential-capacity", exhausted: true, degraded: true }],
+    complete: false,
+    degraded: true,
+    exhausted: true,
+    waitingForCapacity: true,
+    waiting_for_capacity: true,
+    waitingForQuota: true,
+    surfaced: true,
+    retryAt,
+    retryAfterSec,
+    quotaDisposition,
+  };
+}
+
+function allAttemptsQuotaLimited(attempts = []) {
+  if (!Array.isArray(attempts) || attempts.length === 0) return false;
+  return attempts.every((attempt) => {
+    const text = `${attempt?.errTail || ""} ${attempt?.rawTail || ""}`;
+    return Boolean(attempt?.exhausted) || /429|quota|rate[ -]?limit|free\s*usage|usage\s*limit/i.test(text);
+  });
+}
+
 export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.standard, env = process.env, preferVariantMax = true, maxRounds = 4, files = [], modelOverride, workspace, skipCircuitCheck = false }) {
   const stateRoot = env.FLEET_STATE_ROOT || process.cwd();
+  const coreRoot = String(env.FLEET_CORE_ROOT || "").trim();
+  if (!CORE_INTEGRITY_OK || !verifyCoreIntegrity(coreRoot || undefined)) return coreParityBlocked(stateRoot);
+  if (collectSlots(env).length > 0) {
+    const slotState = selectSlot({ env, stateRoot });
+    if (slotState.exhausted) return credentialCapacityWait(stateRoot, env, slotState.total || 0);
+  }
   if (!skipCircuitCheck && !sessionId && gatewayCircuitOpen(stateRoot)) {
     return { reply: "", sessionId: "", modelMode: "circuit-open", attempts: [{ round: 0, skipped: "circuit-open" }], complete: false, circuitOpen: true };
   }
@@ -423,10 +515,22 @@ export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.s
     allAttempts.push(...(r.attempts || []));
     if (r.sessionId) lastSid = r.sessionId;
     lastMode = r.modelMode || lastMode;
-    // Non-stop rotation: never stop the chain on exhaustion — each model
-    // runs its own anon rounds (runOnce falls through on exhaustion) and
-    // callers defer/retry on complete:false. Track the signal for the
-    // degraded result shape below.
+    // Preserve a surfaced credential/quota wait across the chain boundary.
+    // Once an authenticated route is capacity-limited, never continue to a
+    // later anonymous or otherwise unauthorized attempt; callers must receive
+    // the durable retry disposition and retryAt unchanged.
+    if (r.waitingForCapacity || (r.waitingForQuota && r.surfaced && r.retryAt)) {
+      return {
+        ...r,
+        sessionId: lastSid,
+        modelMode: r.modelMode || "waiting_for_capacity",
+        attempts: allAttempts,
+        complete: false,
+      };
+    }
+    // A surfaced credential wait is terminal for this invocation. For an
+    // explicitly anonymous invocation, ordinary retries may continue; an
+    // authenticated invocation never converts to an anonymous route.
     if (r.exhausted) chainExhausted = true;
     if (r.complete) {
       try { markGatewayUp(stateRoot); } catch {}
@@ -441,7 +545,22 @@ export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.s
     try { markGatewayDown(stateRoot, allAttempts.map((x) => x.errTail || "").join(" ").slice(-200), { attempts: allAttempts.length, modelMode: lastMode, chain }); } catch {}
   }
   logModelAudit(stateRoot, { event: "chain_failed", attempts: allAttempts.length, chain });
-  return { reply: "", sessionId: lastSid, modelMode: lastMode, attempts: allAttempts, complete: false, ...(chainExhausted ? { degraded: true, exhausted: true } : {}) };
+  const quotaUnavailable = allAttemptsQuotaLimited(allAttempts);
+  const quotaDisposition = quotaUnavailable
+    ? classifyQuotaAvailability({
+      routes: chain.map((model) => ({ model, authorized: true, eligible: true, quotaLimited: true })),
+      now: Date.now(),
+    })
+    : null;
+  return {
+    reply: "",
+    sessionId: lastSid,
+    modelMode: lastMode,
+    attempts: allAttempts,
+    complete: false,
+    ...(chainExhausted ? { degraded: true, exhausted: true } : {}),
+    ...(quotaDisposition ? { waitingForQuota: true, surfaced: true, quotaDisposition } : {}),
+  };
 }
 
 function stripAuth(env) {
@@ -453,13 +572,14 @@ function stripAuth(env) {
 
 async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env, preferVariantMax, maxRounds, files, workspace }) {
   const stateRoot = env.FLEET_STATE_ROOT || process.cwd();
+  const startedAuthenticated = collectSlots(env).length > 0 || Boolean(env.OPENCODE_AUTH_CONTENT);
   let sid = sessionId || "";
   // Contributor-tier thinking caps at xhigh (Standard-tier max is rejected on
-  // contributor plans), so the ladder top is xhigh on this tier, max elsewhere:
-  // xhigh|max → plain → anon → resume.
+  // contributor plans), so the ladder top is xhigh on this tier, max elsewhere.
+  // Anonymous rounds are available only when the invocation began anonymous.
   const topMode = preferVariantMax ? (isContributorTier(model) ? "xhigh" : "max") : "plain";
   let mode = topMode;
-  let useAuth = true;
+  let useAuth = startedAuthenticated;
   let promptNow = prompt;
   const attempts = [];
   let ladderExhausted = false;
@@ -486,9 +606,15 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
     };
     attempts.push(att);
     logModelAudit(stateRoot, { event: "round_attempt", ...att });
-    // Non-stop rotation: an exhausted round already ran anon inside runOnce
-    // (degraded); keep laddering through anon/resume rounds instead of
-    // stopping. Callers defer/retry on complete:false.
+    if (r.waitingForCapacity || r.waitingForQuota) {
+      return { ...r, sessionId: r.sessionId || sid || "", attempts, modelMode: "waiting_for_capacity", complete: false };
+    }
+    if (startedAuthenticated && isAuthFailure(`${r.stderrTail || ""} ${r.rawTail || ""}`)) {
+      const wait = credentialCapacityWait(stateRoot, env, collectSlots(env).length || 1);
+      return { ...wait, sessionId: r.sessionId || sid || "", attempts, model: model, complete: false };
+    }
+    // A non-capacity failure can retry the same authorized route; never switch
+    // an authenticated invocation to an anonymous route.
     if (r.exhausted) ladderExhausted = true;
     if (r.sessionId) sid = r.sessionId;
     if (!r.interrupted && r.exitCode === 0 && r.reply) {
@@ -516,6 +642,10 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
         rawTail: (vr.rawTail || "").slice(-300),
         variantRetry: true,
       });
+      if (startedAuthenticated && isAuthFailure(`${vr.stderrTail || ""} ${vr.rawTail || ""}`)) {
+        const wait = credentialCapacityWait(stateRoot, env, collectSlots(env).length || 1);
+        return { ...wait, sessionId: vr.sessionId || sid || "", attempts, model, complete: false };
+      }
       if (vr.sessionId) sid = vr.sessionId;
       if (!vr.interrupted && vr.exitCode === 0 && vr.reply) {
         try { markGatewayUp(stateRoot); } catch {}
@@ -527,6 +657,10 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
       continue;
     }
     if (useAuth) {
+      if (startedAuthenticated) {
+        promptNow = prompt;
+        continue;
+      }
       useAuth = false;
       sid = "";
       promptNow = prompt;

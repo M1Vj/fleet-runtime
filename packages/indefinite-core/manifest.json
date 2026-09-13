@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "name": "opencode-indefinite-core",
+  "coreVersion": "1.0.0",
+  "policyVersion": "1.0.0",
+  "capabilities": {
+    "primaryModel": "opencode/muse-spark-1.3-contributor-free",
+    "paidFallbackModel": null,
+    "defaultModelChain": [
+      "opencode/muse-spark-1.3-contributor-free",
+      "opencode/nemotron-3-ultra-free",
+      "opencode/muse-spark-1.2-contributor-free",
+      "opencode/nemotron-3.5-lightning-free",
+      "opencode/mimo-v2.5-free"
+    ],
+    "dynamicModelPool": [
+      "opencode/muse-spark-1.3-contributor-free",
+      "opencode/muse-spark-1.2-contributor-free",
+      "opencode/nemotron-3-ultra-free",
+      "opencode/nemotron-3.5-lightning-free",
+      "opencode/mimo-v2.5-free",
+      "opencode/ling-3.0-flash-fin-free"
+    ],
+    "variant": "xhigh",
+    "reasoningEffort": "xhigh",
+    "tools": true,
+    "parallelToolCalls": true,
+    "unboundedSteps": 9007199254740991,
+    "minOutputTokens": 16384,
+    "minMaxTokens": 16384,
+    "compactionPruning": {
+      "compaction": true,
+      "pruning": true
+    },
+    "exactSession": true,
+    "singleWriter": true,
+    "authorizedFailover": true,
+    "routeFailover": true,
+    "quotaWaitWhenNoEligibleRoute": true,
+    "noIdentitySpoofing": true,
+    "noLimitCircumvention": true,
+    "retryAfterParsing": true,
+    "circuitBreaker": true
+  },
+  "modelPolicy": {
+    "idPattern": "^opencode/[a-z0-9][a-z0-9._-]*$",
+    "contributorTierPattern": "contributor",
+    "forbiddenPatterns": ["gemini", "google"],
+    "deadModelIds": [
+      "opencode/x-preview-f-free",
+      "opencode/minimax-m3-free",
+      "codexswap-alpha/x-preview-f-free",
+      "opencode/deepseek-v4-flash-free"
+    ]
+  },
+  "retryPolicy": {
+    "defaultRetryAfterMs": 180000,
+    "maxErrorBodyBytes": 16384
+  },
+  "circuitPolicy": {
+    "openMs": 1800000
+  },
+  "goldenVectorsFile": "golden-vectors.json",
+  "schemaFile": "schema.json"
+}

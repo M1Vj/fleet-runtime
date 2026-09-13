@@ -8,8 +8,11 @@ export function decideStale(lastRunUtc, nowMs = Date.now(), thresholdMs = 90 * 6
 
 const WATCHDOG_WORKFLOWS = ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml"];
 
-export function planWatchdogActions(heartbeat, nowMs = Date.now(), thresholdMs = 90 * 60 * 1000) {
+export function planWatchdogActions(heartbeat, nowMs = Date.now(), thresholdMs = 90 * 60 * 1000, options = {}) {
   const decision = decideStale(heartbeat && heartbeat.lastRunUtc, nowMs, thresholdMs);
+  if (String(options?.dataClass || "").toLowerCase() === "public") {
+    return { ...decision, actions: [], alertIssue: false, dataClass: "public", readOnly: true };
+  }
   if (!decision.stale) {
     return { ...decision, actions: [], alertIssue: false };
   }

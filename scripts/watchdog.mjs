@@ -7,10 +7,19 @@ import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
 import { verifyCommit, verifyIssueAuthor } from "./lib/verify.mjs";
 import { planWatchdogActions } from "./lib/watchdog-decide.mjs";
-import { makeTerminal } from "./lib/terminal.mjs";
+import {
+  isPublicDataClass,
+  makeExecutionTerminal,
+  publicRepository,
+  privateRepository,
+  PRIVATE_REPOSITORY_ENV,
+  resolveStateRoot,
+  writeExecutionAudit,
+  writePublicArtifact,
+} from "./lib/private-state.mjs";
 
 const CODE_ROOT = process.cwd();
-const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
+const REPO_ROOT = resolveStateRoot(process.env, CODE_ROOT);
 
 // Stale thresholds: a task stuck in_progress longer than this with attempts
 // remaining is resumed (requeued to pending); one that already exhausted its
@@ -82,13 +91,24 @@ export async function main() {
     configureIdentity(REPO_ROOT, identity);
     audit.note("gate", `identity=${identity.login}`);
 
+    if (isPublicDataClass(process.env)) {
+      const repo = publicRepository(process.env);
+      const synthetic = { lastRunUtc: new Date().toISOString() };
+      const plan = planWatchdogActions(synthetic, Date.now(), 90 * 60 * 1000, { dataClass: "public" });
+      writePublicArtifact(process.env, { mode: "watchdog", status: "ok", repository: repo, reason: "public-read-only", checks: { stale: plan.stale, actions: plan.actions.length } }, { kind: "watchdog", status: "ok", repository: repo, runId });
+      audit.note("public", `actions=${plan.actions.length}`);
+      writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Watchdog", "ok");
+      console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "public-read-only", actions: 0 })}`);
+      return 0;
+    }
+
     if (process.env.FLEET_WATCHDOG_DRY_RUN === "1") {
       const synthetic = { lastRunUtc: new Date(Date.now() - 4 * 3600 * 1000).toISOString() };
       const plan = planWatchdogActions(synthetic, Date.now());
       const enables = plan.actions.filter((a) => a.kind === "enable-workflow").length;
       audit.note("dry-run", `stale=${plan.stale} enables=${enables} alert=${plan.alertIssue}`);
       for (const a of plan.actions) console.log(`WOULD ${a.kind} ${a.workflow || ""}`.trim());
-      audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Watchdog dry-run", "ok");
+      writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Watchdog dry-run", "ok");
       console.log(`WATCHDOG_DRY_RUN_OK stale=${plan.stale} enables=${enables}`);
       return 0;
     }
@@ -103,10 +123,10 @@ export async function main() {
     }
     const plan = planWatchdogActions(heartbeat, Date.now());
     audit.note("heartbeat", `decision=${plan.reason} ageMinutes=${plan.ageMinutes}`);
-    const terminal = makeTerminal(REPO_ROOT, { lane: "watchdog" });
+    const terminal = makeExecutionTerminal(process.env, REPO_ROOT, { lane: "watchdog" });
 
     if (!plan.stale) {
-      audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Watchdog", "ok-fresh");
+      writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Watchdog", "ok-fresh");
       console.log("FLEET_RUN_RESULT=" + JSON.stringify({ runId, status: "fresh", action: "none" }));
       return 0;
     }
@@ -117,8 +137,9 @@ export async function main() {
 
     const enablePlan = {
       "M1Vj/fleet-runtime": ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml"],
-      "M1Vj/fleet-control": ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml"],
+      [privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control)]: ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml"],
     };
+    const controlRepository = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control);
     for (const [repoFullName, workflows] of Object.entries(enablePlan)) {
       for (const wf of workflows) {
         try {
@@ -147,26 +168,26 @@ export async function main() {
       }
     }
 
-    const recentRuns = gh(["api", "/repos/M1Vj/fleet-control/actions/runs?per_page=5"], process.env);
+    const recentRuns = gh(["api", `/repos/${controlRepository}/actions/runs?per_page=5`], process.env);
     const runsList = (recentRuns.workflow_runs || [])
       .map((r) => `- ${r.name} ${r.status}/${r.conclusion} ${r.html_url}`)
       .join("\n");
     let issueNumber = null;
     try {
-      const openIssues = gh(["api", "/repos/M1Vj/fleet-control/issues?state=open&per_page=50"], process.env) || [];
+      const openIssues = gh(["api", `/repos/${controlRepository}/issues?state=open&per_page=50`], process.env) || [];
       const dupe = recentWatchdogAlert(openIssues, Date.now());
       if (dupe) {
         audit.note("alert-dedupe", `open watchdog alert #${dupe.number} already exists, skipping new issue`);
       } else {
         const issue = gh(
           [
-            "api", "-X", "POST", "/repos/M1Vj/fleet-control/issues",
+            "api", "-X", "POST", `/repos/${controlRepository}/issues`,
             "-f", `title=${plan.actions.find((a) => a.kind === "file-alert-issue").title}`,
             "-f", `body=Patrol heartbeat is stale (${plan.ageMinutes} minutes).\nRe-enable was attempted. Recent runs:\n${runsList}\n\nCheck model auth secret freshness and Actions quota.`,
           ],
           process.env,
         );
-        await verifyIssueAuthor("M1Vj/fleet-control", issue.number, identity, process.env.FLEET_GH_TOKEN);
+        await verifyIssueAuthor(controlRepository, issue.number, identity, process.env.FLEET_GH_TOKEN);
         audit.note("alert-issue", `#${issue.number}`);
         issueNumber = issue.number;
       }
@@ -174,13 +195,13 @@ export async function main() {
       audit.incident("alert-issue", `alert filing skipped: ${String(err.message).slice(0, 140)}`);
     }
 
-    audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Watchdog", "ok-stale-recovered");
+    writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Watchdog", "ok-stale-recovered");
     if (gitHasChanges(REPO_ROOT, ["state", "audit"])) {
       gitAdd(REPO_ROOT, ["state", "audit"]);
       gitCommit(REPO_ROOT, `[fleet] watchdog ${runId}`, identity);
       gitPush(REPO_ROOT, "main", process.env);
       const sha = gitRevParse(REPO_ROOT, "HEAD");
-      await verifyCommit("M1Vj/fleet-control", sha, identity, process.env.FLEET_GH_TOKEN);
+      await verifyCommit(controlRepository, sha, identity, process.env.FLEET_GH_TOKEN);
       audit.note("push-verify", `attribution verified sha=${sha.slice(0, 10)}`);
     }
     console.log("FLEET_RUN_RESULT=" + JSON.stringify({ runId, status: "stale-recovered", issue: issueNumber, queue: queueStats }));
@@ -189,7 +210,7 @@ export async function main() {
   } catch (err) {
     const code = err.code && Number.isInteger(err.code) ? err.code : 1;
     audit.incident("fatal", err.message);
-    audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Watchdog", `failed(${err.reason || code})`);
+    writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Watchdog", `failed(${err.reason || code})`);
     console.error(`WATCHDOG_FAILED code=${code} reason=${err.reason || err.message}`);
     return code;
   }

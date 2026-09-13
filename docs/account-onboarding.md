@@ -16,7 +16,7 @@ The pool selects the least-recently-healthy non-cooldown slot per model call.
 ## Add account N+1 locally (Mac first)
 
 > Mac scope: this MacBook is staging/authoring only — not part of the fleet.
-> Fleet runtime = GH Actions + fleet-control state; no runtime dependency on
+> Fleet runtime = GH Actions + private control-repository state; no runtime dependency on
 > Mac paths, Mac auth files, or the LaunchAgent keepalive (Mac-only helper).
 
 1. Sign the new account in (normal owner OAuth flow) and locate that account's
@@ -34,8 +34,9 @@ The pool selects the least-recently-healthy non-cooldown slot per model call.
 
 ## Mirror to GitHub Actions (second)
 
-1. Add secret `FLEET_OPENCODE_AUTH_2` (…`_3`, …) on **both** repos
-   (`M1Vj/fleet-runtime` and `M1Vj/fleet-control`), same as slot 1 today.
+1. Add secret `FLEET_OPENCODE_AUTH_2` (…`_3`, …) on **both** the runtime
+   repository and the private control repository named by
+   `FLEET_CONTROL_REPOSITORY`, same as slot 1 today.
 2. Map each secret into the jobs that call models — add one env line next to
    the existing `FLEET_OPENCODE_AUTH` entries in `.github/workflows/*.yml`:
 
@@ -58,13 +59,14 @@ The pool selects the least-recently-healthy non-cooldown slot per model call.
   first ("go back to account 1").
 - All slots cooling down: the run records `STALLED` (`why:
   credential-pool-exhausted`) and files — or comment-updates — the
-  `[FLEET-AUTH] credential pool exhausted — add account N+1` issue on
-  `M1Vj/fleet-control`. Add the account, or wait out the cooldown.
+  `[FLEET-AUTH] credential pool exhausted — add account N+1` issue on the
+  private control repository named by `FLEET_CONTROL_REPOSITORY`. Add the
+  account, or wait out the cooldown.
 
 ## Reading pool health
 
 Pool health lives at `state/credential-health.json` under `FLEET_STATE_ROOT`
-(the fleet-control checkout on runners / the owner Mac) — slot numbers only,
+(the private control-repository checkout on runners / the owner Mac) — slot numbers only,
 never key material:
 
     {"updatedUtc":"<iso>","slots":{"1":{"cooldownUntil":0,"consecutiveErrors":0,

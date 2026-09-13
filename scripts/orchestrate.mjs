@@ -17,11 +17,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   chmodSync,
+  closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
   realpathSync,
   renameSync,
+  statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { createHash } from "node:crypto";
@@ -47,6 +52,54 @@ const MAX_METADATA_CHARS = 16_000;
 const MAX_ANALYSIS_CHARS = 12_000;
 const MAX_STATE_FILE_BYTES = 1_024 * 1_024;
 const MAX_HISTORY_ROWS = 10_000;
+const MAX_STATE_ROWS = 20_000;
+const STATE_LOCK_WAIT_MS = 25;
+const STATE_LOCK_TIMEOUT_MS = 5_000;
+const STATE_LOCK_STALE_MS = 60_000;
+
+/**
+ * Durable task lifecycle.  The state machine is intentionally monotonic for
+ * completed work: a late or replayed receipt can never move a completed task
+ * backwards.  Recovery states are explicit so a scheduler can reconcile an
+ * interrupted effect instead of silently replaying it.
+ */
+export const WORK_STATES = Object.freeze([
+  "registered",
+  "leased",
+  "executing",
+  "awaiting_receipt",
+  "verifying",
+  "completed",
+  "blocked",
+  "recovering",
+  "escalated",
+  "expired",
+  "waiting_for_capacity",
+  "unknown_effect",
+]);
+
+export const WORK_TRANSITIONS = Object.freeze({
+  registered: Object.freeze(["leased", "waiting_for_capacity", "blocked", "expired"]),
+  leased: Object.freeze(["executing", "waiting_for_capacity", "recovering", "blocked", "expired"]),
+  executing: Object.freeze(["awaiting_receipt", "unknown_effect", "recovering", "blocked"]),
+  awaiting_receipt: Object.freeze(["verifying", "unknown_effect", "recovering", "waiting_for_capacity", "expired"]),
+  verifying: Object.freeze(["completed", "blocked", "recovering", "unknown_effect"]),
+  completed: Object.freeze([]),
+  blocked: Object.freeze(["recovering", "escalated"]),
+  recovering: Object.freeze(["registered", "leased", "awaiting_receipt", "waiting_for_capacity", "blocked", "escalated", "expired"]),
+  escalated: Object.freeze(["recovering"]),
+  expired: Object.freeze(["recovering"]),
+  waiting_for_capacity: Object.freeze(["registered", "leased", "expired", "blocked"]),
+  unknown_effect: Object.freeze(["recovering", "awaiting_receipt", "blocked", "escalated"]),
+});
+
+const RECOVERABLE_STATES = new Set(["unknown_effect", "recovering", "waiting_for_capacity", "blocked", "expired", "escalated"]);
+const TERMINAL_STATES = new Set(["completed", "blocked", "expired", "escalated"]);
+export const UNKNOWN_EFFECT_STATE = "unknown_effect";
+
+function stateKey(value) {
+  return key(value).replace(/-/g, "_");
+}
 
 const REVIEW_ROLES = Object.freeze(["review", "tests", "security", "quality", "maintainer"]);
 const PULL_REQUEST_ACTIONS = new Set([
@@ -95,6 +148,94 @@ function text(value, maximum = MAX_EVENT_STRING) {
 
 function key(value) {
   return String(value ?? "").trim().toLowerCase();
+}
+
+function assertPublicClassification(value) {
+  if (!value || typeof value !== "object") return;
+  const classification = key(firstValue(value.dataClass, value.data_class, value.classification, value.visibility, "public"));
+  if (classification && !new Set(["public", "opaque", "public-classified"]).has(classification)) {
+    throw new Error("public data classification is required");
+  }
+}
+
+function positiveGeneration(value, fallback = 0) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 0) throw new Error("generation is invalid");
+  return number;
+}
+
+function comparableGeneration(value, fallback = -1) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
+}
+
+function taskIdentity(task) {
+  if (!task || typeof task !== "object" || Array.isArray(task)) throw new Error("task is invalid");
+  const type = key(firstValue(task.type, task.kind));
+  if (!new Set(["review", "upgrade"]).has(type)) throw new Error("task type is invalid");
+  const repo = normalizeRepo(firstValue(task.repo, task.repository, task.repoFullName));
+  const pr = type === "review"
+    ? String(parsePositivePr(firstValue(task.pr, task.number), { optional: false }))
+    : "repo";
+  const role = key(firstValue(task.role, task.reviewRole, type));
+  if (!role || role.length > MAX_EVENT_STRING || /[|\u0000-\u001f\u007f]/.test(role)) throw new Error("task role is invalid");
+  return { type, repo, pr, role };
+}
+
+/** Stable opaque identity for one logical unit of work. */
+export function stableWorkKey(task) {
+  const identity = taskIdentity(task);
+  const material = `${identity.type}|${identity.repo}|${identity.pr}|${identity.role}`;
+  return `work-v1-${createHash("sha256").update(material).digest("hex")}`;
+}
+
+/** Stable effect identity, fenced to a work generation. */
+export function stableEffectKey(input, effect = "dispatch") {
+  const task = input && typeof input === "object" ? input : { type: "upgrade", role: "upgrade", repo: input };
+  const suppliedWork = typeof task.workKey === "string" ? task.workKey.trim() : "";
+  const work = suppliedWork && /^[A-Za-z0-9_.:-]{1,180}$/.test(suppliedWork)
+    ? suppliedWork
+    : stableWorkKey(task);
+  const kind = key(firstValue(task.effect, task.effectKind, task.effect_type, effect)) || "dispatch";
+  if (!/^[a-z0-9_.:-]{1,80}$/.test(kind)) throw new Error("effect kind is invalid");
+  const generation = positiveGeneration(task.generation, 0);
+  const material = `${work}|${kind}|${generation}`;
+  return `effect-v1-${createHash("sha256").update(material).digest("hex")}`;
+}
+
+export const workKey = stableWorkKey;
+export const effectKey = stableEffectKey;
+
+export function canTransition(from, to) {
+  const source = stateKey(from);
+  const target = stateKey(to);
+  return WORK_STATES.includes(source) && WORK_STATES.includes(target) && (source === target || WORK_TRANSITIONS[source].includes(target));
+}
+
+/** Return a new state record or throw on an illegal lifecycle transition. */
+export function transitionWorkState(record, nextState, patch = {}) {
+  if (!record || typeof record !== "object" || Array.isArray(record)) throw new Error("state record is invalid");
+  const current = stateKey(firstValue(record.state, record.status));
+  const next = stateKey(nextState);
+  if (!WORK_STATES.includes(current)) throw new Error("current state is invalid");
+  if (!WORK_STATES.includes(next)) throw new Error("next state is invalid");
+  if (current !== next && !canTransition(current, next)) throw new Error(`illegal state transition ${current}->${next}`);
+  const now = firstValue(patch.updatedAt, patch.at, new Date().toISOString());
+  const generation = positiveGeneration(
+    patch.generation,
+    next === "recovering" && current !== "recovering" ? positiveGeneration(record.generation, 0) + 1 : positiveGeneration(record.generation, 0),
+  );
+  const updated = {
+    ...record,
+    ...patch,
+    state: next,
+    status: next,
+    generation,
+    updatedAt: now,
+  };
+  if (current !== next || !record.stateEnteredAt) updated.stateEnteredAt = now;
+  return updated;
 }
 
 function truthyFlag(value) {
@@ -232,6 +373,7 @@ function triggerPayloadCandidate(input) {
  */
 export function validateTrigger(input) {
   const payload = triggerPayloadCandidate(input);
+  assertPublicClassification(payload);
   const eventRaw = firstValue(payload.event, payload.event_name, payload.type, payload.kind);
   const event = key(eventRaw);
   if (!EVENT_NAMES.has(event)) throw new Error("event is invalid");
@@ -377,7 +519,472 @@ function parseStateFile(filePath) {
   return historyRows(parseJson(raw, null, MAX_STATE_FILE_BYTES));
 }
 
+function statePaths(stateRoot) {
+  if (stateRoot === undefined || stateRoot === null || stateRoot === "") return null;
+  if (typeof stateRoot !== "string" || /[\u0000-\u001f\u007f]/.test(stateRoot)) throw new Error("state root is invalid");
+  const root = path.resolve(stateRoot);
+  const state = path.join(root, "state");
+  return {
+    root,
+    state,
+    lock: path.join(state, ".orchestrate.lock"),
+    outbox: path.join(state, "orchestrate-outbox.jsonl"),
+    history: path.join(state, "orchestrate-history.jsonl"),
+    records: path.join(state, "orchestrate-state.jsonl"),
+    transactions: path.join(state, "orchestrate-transactions.jsonl"),
+    desired: path.join(state, "orchestrate-desired.json"),
+  };
+}
+
+export function orchestrationStatePaths(stateRoot) {
+  const paths = statePaths(stateRoot);
+  return paths ? { ...paths } : null;
+}
+
+function parseJsonlBounded(filePath, maximumRows = MAX_STATE_ROWS) {
+  const raw = readBoundedFile(filePath);
+  if (raw === null) return [];
+  const rows = [];
+  for (const line of raw.split("\n").slice(-maximumRows)) {
+    const parsed = parseJson(line, null, 128 * 1024);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) rows.push(parsed);
+  }
+  return rows;
+}
+
+function latestRecords(rows) {
+  const latest = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const work = String(row?.workKey || "").trim();
+    if (!work) continue;
+    latest.set(work, row);
+  }
+  return [...latest.values()];
+}
+
+function readOrchestrationFiles(paths) {
+  if (!paths) return { outbox: [], history: [], records: [], transactions: [], desired: null };
+  const desiredRaw = parseJson(readBoundedFile(paths.desired), null, MAX_STATE_FILE_BYTES);
+  const outbox = parseJsonlBounded(paths.outbox);
+  const history = parseJsonlBounded(paths.history);
+  const persistedRecords = parseJsonlBounded(paths.records);
+  const transactions = parseJsonlBounded(paths.transactions);
+  const committedTxIds = new Set(transactions.filter((row) => row.phase === "committed").map((row) => row.txId).filter(Boolean));
+  const recoveredByWork = new Map(persistedRecords.map((row) => [String(row?.workKey || ""), row]).filter(([work]) => Boolean(work)));
+  // If a runner crashed after the outbox append but before the state row was
+  // flushed, retain the effect as unknown rather than planning it again.  A
+  // later schedule can reconcile this explicit state and fence its receipt.
+  for (const row of [...outbox, ...history]) {
+    const work = String(row?.workKey || "");
+    if (!work) continue;
+    const partial = !row.txId || !committedTxIds.has(row.txId);
+    if (!partial && recoveredByWork.has(work)) continue;
+    const task = row.task && typeof row.task === "object" ? row.task : {};
+    const state = row.event === "effect_prepared" || row.operation === "dispatch"
+      ? "unknown_effect"
+      : key(firstValue(row.state, row.status, "registered"));
+    if (!WORK_STATES.includes(state)) continue;
+    const prior = recoveredByWork.get(work);
+    if (prior && prior.state === "completed") continue;
+    if (prior && row.event !== "effect_prepared" && prior.state !== "registered") continue;
+    if (prior && row.event === "effect_prepared" && !partial) continue;
+    recoveredByWork.set(work, {
+      workKey: work,
+      effectKey: row.effectKey,
+      generation: comparableGeneration(row.generation, 0),
+      state,
+      status: state,
+      task,
+      repo: row.repo || task.repo,
+      pr: row.pr ?? task.pr ?? null,
+      action: row.action || (task.type === "review" ? "review" : "upgrade"),
+      updatedAt: row.updatedAt || row.timestamp || new Date().toISOString(),
+      recoveredFrom: "partial-transaction",
+    });
+  }
+  return {
+    outbox,
+    history,
+    records: latestRecords([...recoveredByWork.values()]),
+    transactions,
+    desired: desiredRaw && typeof desiredRaw === "object" && !Array.isArray(desiredRaw) ? desiredRaw : null,
+  };
+}
+
+function acquireStateLock(paths) {
+  mkdirSync(paths.state, { recursive: true, mode: 0o700 });
+  const started = Date.now();
+  while (true) {
+    try {
+      const fd = openSync(paths.lock, "wx", 0o600);
+      try {
+        writeFileSync(paths.lock, `${process.pid} ${new Date().toISOString()}\n`, { encoding: "utf8", mode: 0o600 });
+        fsyncSync(fd);
+      } catch {}
+      return fd;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      let stale = false;
+      try {
+        stale = Date.now() - statSync(paths.lock).mtimeMs > STATE_LOCK_STALE_MS;
+      } catch {
+        stale = false;
+      }
+      if (stale) {
+        try { unlinkSync(paths.lock); } catch {}
+        continue;
+      }
+      if (Date.now() - started >= STATE_LOCK_TIMEOUT_MS) throw new Error("orchestration state lock timeout");
+      // Synchronous bounded wait keeps cross-process append operations serialized
+      // without introducing a dependency or yielding a half-written transaction.
+      const wait = new Int32Array(new SharedArrayBuffer(4));
+      Atomics.wait(wait, 0, 0, STATE_LOCK_WAIT_MS);
+    }
+  }
+}
+
+function releaseStateLock(paths, fd) {
+  try { fsyncSync(fd); } catch {}
+  try { closeSync(fd); } catch {}
+  try { unlinkSync(paths.lock); } catch {}
+}
+
+function appendDurableLine(filePath, value) {
+  const serialized = `${JSON.stringify(value)}\n`;
+  const fd = openSync(filePath, "a", 0o600);
+  try {
+    writeFileSync(fd, serialized, { encoding: "utf8" });
+    fsyncSync(fd);
+  } finally {
+    try { closeSync(fd); } catch {}
+  }
+}
+
+function withStateLock(stateRoot, callback) {
+  const paths = statePaths(stateRoot);
+  if (!paths) return callback(null, null);
+  const fd = acquireStateLock(paths);
+  try {
+    return callback(paths, readOrchestrationFiles(paths));
+  } finally {
+    releaseStateLock(paths, fd);
+  }
+}
+
+function transactionRows({ workKey: work, effectKey: effect, generation, task, trigger, state, reason, now, source = "orchestrate" }) {
+  const at = now || new Date().toISOString();
+  const identity = taskIdentity(task);
+  const taskFields = {
+    type: identity.type,
+    role: identity.role,
+    repo: identity.repo,
+    pr: identity.pr === "repo" ? null : Number(identity.pr),
+  };
+  return {
+    workKey: work,
+    effectKey: effect,
+    generation,
+    state,
+    status: state,
+    task: taskFields,
+    repo: identity.repo,
+    pr: taskFields.pr,
+    action: identity.type === "review" ? "review" : "upgrade",
+    delivery: trigger?.delivery || trigger?.deliveryId || trigger?.eventId || undefined,
+    event: trigger?.event || trigger?.event_name || undefined,
+    reason: reason || undefined,
+    source,
+    updatedAt: at,
+    timestamp: at,
+  };
+}
+
+function recordTransactionUnlocked(paths, files, { record, outboxEvent, historyEvent }) {
+  const now = record.updatedAt || new Date().toISOString();
+  const txId = `tx-v1-${createHash("sha256").update(`${record.workKey}|${record.effectKey}|${now}|${process.pid}`).digest("hex")}`;
+  const envelope = {
+    schema: "fleet-orchestrate-transaction-v1",
+    txId,
+    workKey: record.workKey,
+    effectKey: record.effectKey,
+    generation: record.generation,
+    at: now,
+  };
+  // The outbox and history are both durable before the caller performs the
+  // external effect.  The transaction marker lets a later schedule repair a
+  // process crash between the two appends without replaying the effect.
+  appendDurableLine(paths.transactions, { ...envelope, phase: "prepared" });
+  appendDurableLine(paths.outbox, { ...envelope, ...outboxEvent, schema: "fleet-orchestrate-outbox-v1" });
+  appendDurableLine(paths.history, { ...envelope, ...historyEvent, schema: "fleet-orchestrate-history-v1" });
+  appendDurableLine(paths.records, { ...record, txId, schema: "fleet-orchestrate-state-v1" });
+  appendDurableLine(paths.transactions, { ...envelope, phase: "committed" });
+  files.outbox.push({ ...envelope, ...outboxEvent });
+  files.history.push({ ...envelope, ...historyEvent });
+  files.records = latestRecords([...files.records, record]);
+  files.transactions.push({ ...envelope, phase: "committed" });
+  return { txId, record };
+}
+
+function currentRecord(files, work) {
+  return (files?.records || []).find((row) => row.workKey === work) || null;
+}
+
+function duplicateState(record, effect) {
+  if (!record) return false;
+  if (record.state === "completed") return true;
+  if (record.effectKey && record.effectKey === effect && !RECOVERABLE_STATES.has(record.state)) return true;
+  return ["registered", "leased", "executing", "awaiting_receipt", "verifying"].includes(record.state);
+}
+
+/** Read the durable orchestration transaction surface for tests and callers. */
+export function loadOrchestrationState(stateRoot) {
+  const paths = statePaths(stateRoot);
+  if (!paths) return { outbox: [], history: [], records: [], transactions: [], desired: null };
+  return readOrchestrationFiles(paths);
+}
+
+function appendPlanBatch(stateRoot, tasks, trigger, now) {
+  if (!stateRoot || !Array.isArray(tasks) || tasks.length === 0) return { accepted: tasks || [], suppressed: [] };
+  const accepted = [];
+  const suppressed = [];
+  withStateLock(stateRoot, (paths, files) => {
+    for (const task of tasks) {
+      const work = stableWorkKey(task);
+      const existing = currentRecord(files, work);
+      const generation = existing ? positiveGeneration(existing.generation, 0) : 0;
+      const effect = stableEffectKey({ ...task, workKey: work, generation, effect: "dispatch" });
+      const explicitRecovery = task.recoveryRequested === true || task.reconciled === true;
+      const recovering = explicitRecovery;
+      if (existing && duplicateState(existing, effect) && !(explicitRecovery && RECOVERABLE_STATES.has(existing.state))) {
+        suppressed.push({ task, reason: "duplicate-work" });
+        continue;
+      }
+      if (existing?.state === "unknown_effect" && !explicitRecovery) {
+        suppressed.push({ task, reason: "unknown-effect-requires-explicit-reconciliation" });
+        continue;
+      }
+      const resumeCapacity = existing?.state === "waiting_for_capacity" && task.retryEligible === true;
+      const nextGeneration = existing && recovering && !resumeCapacity ? generation + 1 : generation;
+      const nextEffect = stableEffectKey({ ...task, workKey: work, generation: nextGeneration, effect: "dispatch" });
+      const at = new Date(now).toISOString();
+      const record = transactionRows({
+        workKey: work,
+        effectKey: nextEffect,
+        generation: nextGeneration,
+        task,
+        trigger,
+        state: "registered",
+        reason: resumeCapacity ? "capacity-resume" : recovering ? "schedule-reconciliation" : "planned",
+        now: at,
+      });
+      record.reconciled = recovering;
+      record.desired = true;
+      if (resumeCapacity) record.retryEligible = true;
+      recordTransactionUnlocked(paths, files, {
+        record,
+        outboxEvent: { event: "plan", operation: "prepare", state: "registered", task: record.task },
+        historyEvent: {
+          event: "planned",
+          operation: "plan",
+          state: "registered",
+          repo: record.repo,
+          pr: record.pr,
+          action: record.action,
+          delivery: record.delivery,
+          receivedAt: at,
+          scheduledAt: at,
+          lastScheduledAt: at,
+        },
+      });
+      accepted.push({ ...task, workKey: work, effectKey: nextEffect, generation: nextGeneration });
+    }
+  });
+  return { accepted, suppressed };
+}
+
+function prepareEffect(stateRoot, task, trigger, effect = "dispatch") {
+  if (!stateRoot) return { accepted: true, task, workKey: stableWorkKey(task), generation: positiveGeneration(task.generation, 0), effectKey: stableEffectKey({ ...task, effect }) };
+  let outcome;
+  withStateLock(stateRoot, (paths, files) => {
+    const work = stableWorkKey(task);
+    const existing = currentRecord(files, work);
+    const generation = positiveGeneration(task.generation, existing ? positiveGeneration(existing.generation, 0) : 0);
+    const effectKeyValue = String(task.effectKey || (existing?.effectKey && existing.generation === generation ? existing.effectKey : stableEffectKey({ ...task, workKey: work, generation, effect })));
+    if (existing && existing.state === "completed") {
+      outcome = { accepted: false, duplicate: true, reason: "already-completed", task, workKey: work, generation, effectKey: effectKeyValue, record: existing };
+      return;
+    }
+    if (existing && existing.effectKey === effectKeyValue && ["leased", "executing", "awaiting_receipt", "verifying"].includes(existing.state)) {
+      outcome = { accepted: false, duplicate: true, reason: "effect-in-flight", task, workKey: work, generation, effectKey: effectKeyValue, record: existing };
+      return;
+    }
+    if (existing && RECOVERABLE_STATES.has(existing.state) && !(task.recoveryRequested === true || task.reconciled === true)) {
+      outcome = { accepted: false, duplicate: true, reason: "unknown-effect-requires-reconciliation", task, workKey: work, generation, effectKey: effectKeyValue, record: existing };
+      return;
+    }
+    let record = existing || transactionRows({
+      workKey: work,
+      effectKey: effectKeyValue,
+      generation,
+      task,
+      trigger,
+      state: "registered",
+      reason: "effect-requested",
+    });
+    if (record.state === "unknown_effect" || record.state === "recovering" || record.state === "blocked" || record.state === "expired" || record.state === "escalated") {
+      record = transitionWorkState(record, "recovering", { generation: Math.max(generation, positiveGeneration(record.generation, 0) + 1) });
+      record.effectKey = stableEffectKey({ ...task, workKey: work, generation: record.generation, effect });
+      record = transitionWorkState(record, "awaiting_receipt");
+    } else {
+      if (record.state === "registered") record = transitionWorkState(record, "leased");
+      if (record.state === "leased") record = transitionWorkState(record, "executing");
+      record = transitionWorkState(record, "awaiting_receipt", { effectKey: effectKeyValue });
+    }
+    record.effectKey = record.effectKey || effectKeyValue;
+    record.task = transactionRows({ workKey: work, effectKey: record.effectKey, generation: record.generation, task, trigger, state: record.state }).task;
+    recordTransactionUnlocked(paths, files, {
+      record,
+      outboxEvent: { event: "effect_prepared", operation: effect, state: "awaiting_receipt", task: record.task },
+      historyEvent: { event: "effect_prepared", operation: effect, state: "awaiting_receipt", repo: record.repo, pr: record.pr, action: record.action, delivery: record.delivery },
+    });
+    outcome = { accepted: true, task, workKey: work, generation: record.generation, effectKey: record.effectKey, record };
+  });
+  return outcome;
+}
+
+function markUnknownEffect(stateRoot, receipt, reason = "effect-ack-unknown") {
+  if (!stateRoot) return { accepted: false, reason: "state-root-unset" };
+  let outcome;
+  withStateLock(stateRoot, (paths, files) => {
+    const current = currentRecord(files, String(receipt?.workKey || ""));
+    if (!current || current.effectKey !== receipt?.effectKey || comparableGeneration(current.generation) !== comparableGeneration(receipt?.generation)) {
+      outcome = { accepted: false, reason: "late-receipt" };
+      return;
+    }
+    if (!["executing", "awaiting_receipt", "verifying"].includes(current.state)) {
+      outcome = { accepted: false, reason: "state-not-awaiting-receipt" };
+      return;
+    }
+    const record = transitionWorkState(current, "unknown_effect", { reason, effectKey: current.effectKey });
+    recordTransactionUnlocked(paths, files, {
+      record,
+      outboxEvent: { event: "effect_unknown", operation: "unknown", state: "unknown_effect", reason },
+      historyEvent: { event: "effect_unknown", operation: "unknown", state: "unknown_effect", repo: current.repo, pr: current.pr, action: current.action, reason },
+    });
+    outcome = { accepted: true, reason, record };
+  });
+  return outcome;
+}
+
+function markWaitingForCapacity(stateRoot, receipt, retryAt) {
+  if (!stateRoot) return { accepted: false, reason: "state-root-unset" };
+  let outcome;
+  withStateLock(stateRoot, (paths, files) => {
+    const current = currentRecord(files, String(receipt?.workKey || ""));
+    if (!current || current.effectKey !== receipt?.effectKey || comparableGeneration(current.generation) !== comparableGeneration(receipt?.generation)) {
+      outcome = { accepted: false, reason: "late-receipt" };
+      return;
+    }
+    if (!["executing", "awaiting_receipt", "verifying"].includes(current.state)) {
+      outcome = { accepted: false, reason: "state-not-awaiting-receipt" };
+      return;
+    }
+    const retry = String(retryAt || new Date(Date.now() + 5 * 60 * 1000).toISOString());
+    const record = transitionWorkState(current, "waiting_for_capacity", { retryAt: retry, reason: "capacity-exhausted" });
+    recordTransactionUnlocked(paths, files, {
+      record,
+      outboxEvent: { event: "capacity_wait", operation: "capacity", state: "waiting_for_capacity", retryAt: retry },
+      historyEvent: { event: "capacity_wait", operation: "capacity", state: "waiting_for_capacity", repo: current.repo, pr: current.pr, action: current.action, retryAt: retry },
+    });
+    outcome = { accepted: true, reason: "capacity-exhausted", retryAt: retry, record };
+  });
+  return outcome;
+}
+
+function receiptEvidence(receipt) {
+  if (!receipt || typeof receipt !== "object") return null;
+  const goal = String(firstValue(receipt.goal, receipt.goalId, "")).trim();
+  const session = String(firstValue(receipt.session, receipt.sessionId, "")).trim();
+  const artifact = String(firstValue(receipt.artifact, receipt.artifactRevision, receipt.artifactId, "")).trim();
+  const verifier = String(firstValue(receipt.verifier, receipt.verifierId, "")).trim();
+  const checks = Array.isArray(receipt.checks)
+    ? receipt.checks.map((check) => String(check ?? "").trim()).filter(Boolean)
+    : (receipt.check ? [String(receipt.check).trim()] : []);
+  if (!goal || !session || !artifact || !verifier || checks.length === 0) return null;
+  if ([goal, session, artifact, verifier].some((value) => value.length > MAX_EVENT_STRING)) return null;
+  return { goal, session, artifact, verifier, checks: checks.slice(0, 32).map((check) => check.slice(0, MAX_EVENT_STRING)) };
+}
+
+/** Record that a dispatch API accepted a request; this is not completion. */
+export function recordDispatchAcceptance(stateRoot, receipt = {}) {
+  if (!stateRoot || !receipt || typeof receipt !== "object") return { accepted: false, reason: "receipt-invalid" };
+  let outcome;
+  withStateLock(stateRoot, (paths, files) => {
+    const current = currentRecord(files, String(receipt.workKey || ""));
+    if (!current || current.effectKey !== receipt.effectKey || comparableGeneration(current.generation) !== comparableGeneration(receipt.generation)) {
+      outcome = { accepted: false, reason: "late-receipt" };
+      return;
+    }
+    if (current.state !== "awaiting_receipt") {
+      outcome = { accepted: false, reason: "state-not-awaiting-receipt" };
+      return;
+    }
+    const dispatchId = String(firstValue(receipt.runId, receipt.dispatchId, "")).trim();
+    const record = {
+      ...current,
+      dispatchAcceptedAt: new Date().toISOString(),
+      ...(dispatchId ? { dispatchId: dispatchId.slice(0, MAX_EVENT_STRING) } : {}),
+      state: "awaiting_receipt",
+      status: "awaiting_receipt",
+    };
+    recordTransactionUnlocked(paths, files, {
+      record,
+      outboxEvent: { event: "dispatch_accepted", operation: "dispatch", state: "awaiting_receipt", ...(dispatchId ? { dispatchId } : {}) },
+      historyEvent: { event: "dispatch_accepted", operation: "dispatch", state: "awaiting_receipt", repo: current.repo, pr: current.pr, action: current.action, ...(dispatchId ? { dispatchId } : {}) },
+    });
+    outcome = { accepted: true, record };
+  });
+  return outcome;
+}
+
+/** Apply an acknowledgement only to the current work generation. */
+export function applyEffectReceipt(stateRoot, receipt = {}) {
+  if (!stateRoot || !receipt || typeof receipt !== "object") return { accepted: false, reason: "receipt-invalid" };
+  let outcome;
+  withStateLock(stateRoot, (paths, files) => {
+    const work = String(receipt.workKey || "");
+    const current = currentRecord(files, work);
+    if (!current || current.effectKey !== receipt.effectKey || comparableGeneration(current.generation) !== comparableGeneration(receipt.generation)) {
+      outcome = { accepted: false, reason: "late-receipt" };
+      return;
+    }
+    if (current.state !== "awaiting_receipt") {
+      outcome = { accepted: false, reason: "state-not-awaiting-receipt" };
+      return;
+    }
+    const evidence = receiptEvidence(receipt);
+    if (!evidence) {
+      outcome = { accepted: false, reason: "receipt-evidence-missing" };
+      return;
+    }
+    let record = transitionWorkState(current, "verifying", { receiptId: receipt.receiptId || undefined });
+    record = transitionWorkState(record, "completed", {
+      acknowledgedAt: new Date().toISOString(),
+      resultStatus: key(firstValue(receipt.status, "acknowledged")) || "acknowledged",
+      evidence,
+    });
+    recordTransactionUnlocked(paths, files, {
+      record,
+      outboxEvent: { event: "effect_acknowledged", operation: "ack", state: "completed", receiptId: receipt.receiptId || undefined },
+      historyEvent: { event: "effect_acknowledged", operation: "ack", state: "completed", repo: current.repo, pr: current.pr, action: current.action, receiptId: receipt.receiptId || undefined },
+    });
+    outcome = { accepted: true, record };
+  });
+  return outcome;
+}
+
 export function loadSchedulingState(stateRoot) {
+  const durable = loadOrchestrationState(stateRoot);
   const targetsNames = ["targets.json", "config/targets.json"];
   let targets = null;
   for (const candidate of statePathCandidates(stateRoot, targetsNames)) {
@@ -393,6 +1000,7 @@ export function loadSchedulingState(stateRoot) {
     "orchestration-history.json",
     "fleet-history.json",
     "history.json",
+    "orchestrate-history.jsonl",
     "events.jsonl",
     "ledger.jsonl",
     "improve-state.json",
@@ -404,7 +1012,10 @@ export function loadSchedulingState(stateRoot) {
   }
   return {
     targets: targets || { tier1: [], priority: [], excluded: [], observeAll: true, allOwned: true },
-    history: history.slice(0, MAX_HISTORY_ROWS),
+    history: history.slice(-MAX_HISTORY_ROWS),
+    desired: durable.desired,
+    records: durable.records,
+    outbox: durable.outbox,
   };
 }
 
@@ -652,6 +1263,7 @@ function stableTaskId(task) {
 /** Validate a scheduler task and return its canonical owner-scoped shape. */
 export function validateTask(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("task is invalid");
+  assertPublicClassification(input);
   const type = key(firstValue(input.type, input.kind));
   if (!new Set(["review", "upgrade"]).has(type)) throw new Error("task type is invalid");
   const repo = normalizeRepo(firstValue(input.repo, input.repository, input.repoFullName));
@@ -702,6 +1314,9 @@ export function validateTask(input) {
 
 function matrixTask(task) {
   const candidate = validateTask({ ...task, id: task.id || stableTaskId(task) });
+  const generation = positiveGeneration(task.generation, 0);
+  const work = stableWorkKey(candidate);
+  const effect = stableEffectKey({ ...candidate, workKey: work, generation, effect: "dispatch" });
   const output = {
     id: candidate.id,
     type: candidate.type,
@@ -713,8 +1328,11 @@ function matrixTask(task) {
     repoFullName: candidate.repo,
     pr: candidate.pr,
     number: candidate.number,
+    workKey: work,
+    effectKey: effect,
+    generation,
   };
-  for (const field of ["triggered", "score", "scoreFactors", "reviewRole", "roles", "reviewRoles"]) {
+  for (const field of ["triggered", "score", "scoreFactors", "reviewRole", "roles", "reviewRoles", "reconciled", "recoverable", "recoveryRequested", "retryEligible", "desiredState", "priorState"]) {
     if (candidate[field] !== undefined) output[field] = candidate[field];
   }
   return output;
@@ -742,6 +1360,8 @@ async function buildPlan({ env = process.env, ghClient = defaultGh, now = Date.n
     pulls,
     history: state.history,
     targets: state.targets,
+    desiredState: state.desired,
+    observedState: state.records,
     now,
     trigger: planningTrigger(trigger),
     maxAgents,
@@ -766,8 +1386,10 @@ async function buildPlan({ env = process.env, ghClient = defaultGh, now = Date.n
     seen.add(candidate.id);
     include.push(candidate);
   }
-  logger(`planned ${include.length} task(s) from ${repos.length} repo(s) and ${pulls.length} open PR(s)`);
-  return { include };
+  const durable = appendPlanBatch(env.FLEET_STATE_ROOT, include, trigger, now);
+  const accepted = durable.accepted.map((task) => matrixTask(task));
+  logger(`planned ${accepted.length} task(s) from ${repos.length} repo(s) and ${pulls.length} open PR(s)`);
+  return { include: accepted };
 }
 
 export async function planFleet(options = {}) {
@@ -987,6 +1609,7 @@ async function executeReviewTask(task, { env = process.env, ghClient = defaultGh
       defaultBranch,
       analysis: reply ? redactText(reply, env) : "",
       error: redactText(modelResult?.error || "no model reply", env).slice(0, 240),
+      retryAt: firstValue(modelResult?.retryAt, env.FLEET_RETRY_AT, new Date(Date.now() + 5 * 60 * 1000).toISOString()),
       readOnly: true,
       postedComment: false,
       checkedOutPullRequest: false,
@@ -1022,14 +1645,18 @@ async function executeUpgradeTask(task, { env = process.env, ghClient = defaultG
     return { ...result, artifact };
   }
   try {
-    await ghClient(["workflow", "run", workflowName, "-R", RUNTIME_REPO, "-f", `repo=${task.repo}`], env);
+    const dispatchResponse = await ghClient(["workflow", "run", workflowName, "-R", RUNTIME_REPO, "-f", `repo=${task.repo}`], env);
+    const runId = dispatchResponse && typeof dispatchResponse === "object"
+      ? firstValue(dispatchResponse.runId, dispatchResponse.run_id, dispatchResponse.id)
+      : undefined;
     const result = {
       status: "dispatched",
       observedAt,
       workflow: workflowName,
       repo: task.repo,
       dispatchAttempted: true,
-      dispatchConfirmed: true,
+      dispatchConfirmed: Boolean(runId),
+      ...(runId !== undefined && runId !== null && String(runId).trim() ? { runId: String(runId).trim().slice(0, MAX_EVENT_STRING) } : {}),
     };
     const artifact = writeTaskArtifact(task, result, env);
     return { ...result, artifact };
@@ -1051,8 +1678,80 @@ async function executeUpgradeTask(task, { env = process.env, ghClient = defaultG
 
 export async function executeTask(task, options = {}) {
   const normalized = validateTask(task);
-  if (normalized.type === "review") return executeReviewTask(normalized, options);
-  return executeUpgradeTask(normalized, options);
+  const env = options.env || process.env;
+  const stateRoot = options.stateRoot || env.FLEET_STATE_ROOT;
+  let prepared;
+  try {
+    prepared = prepareEffect(stateRoot, normalized, options.trigger, normalized.type === "upgrade" ? "dispatch" : "review");
+  } catch (error) {
+    return {
+      status: "deferred",
+      reason: "transaction-prepare-failed",
+      effectState: "unknown_effect",
+      error: redactText(error?.message || error, env),
+    };
+  }
+  if (!prepared.accepted) {
+    return {
+      status: "duplicate",
+      reason: prepared.reason,
+      effectState: prepared.record?.state || "completed",
+      workKey: prepared.workKey,
+      effectKey: prepared.effectKey,
+      generation: prepared.generation,
+    };
+  }
+  const executionOptions = { ...options, env, prepared };
+  const result = normalized.type === "review"
+    ? await executeReviewTask(normalized, executionOptions)
+    : await executeUpgradeTask(normalized, executionOptions);
+  let stateResult;
+  if (result.status === "completed") {
+    const observedReceipt = options.receipt && typeof options.receipt === "object"
+      ? {
+        ...options.receipt,
+        workKey: prepared.workKey,
+        effectKey: prepared.effectKey,
+        generation: prepared.generation,
+      }
+      : null;
+    stateResult = observedReceipt
+      ? applyEffectReceipt(stateRoot, observedReceipt)
+      : { accepted: false, reason: "receipt-evidence-required" };
+  } else if (result.status === "dispatched") {
+    const dispatchReceipt = {
+      workKey: prepared.workKey,
+      effectKey: prepared.effectKey,
+      generation: prepared.generation,
+      runId: result.runId,
+      dispatchId: result.runId,
+    };
+    stateResult = result.runId
+      ? recordDispatchAcceptance(stateRoot, dispatchReceipt)
+      : markUnknownEffect(stateRoot, dispatchReceipt, "dispatch-accepted-without-run-id");
+  } else if (stateRoot) {
+    const receipt = {
+      workKey: prepared.workKey,
+      effectKey: prepared.effectKey,
+      generation: prepared.generation,
+    };
+    const capacityReason = key(result.reason).includes("model-unavailable")
+      || key(result.reason).includes("quota")
+      || key(result.reason).includes("capacity")
+      || key(result.reason).includes("rate-limit");
+    stateResult = capacityReason
+      ? markWaitingForCapacity(stateRoot, receipt, result.retryAt)
+      : markUnknownEffect(stateRoot, receipt, result.reason || "effect-ack-unknown");
+  }
+  return {
+    ...result,
+    workKey: prepared.workKey,
+    effectKey: prepared.effectKey,
+    generation: prepared.generation,
+    effectState: stateResult?.record?.state
+      || (stateResult?.accepted ? "completed" : stateResult?.reason === "receipt-evidence-required" ? "awaiting_receipt" : stateResult?.reason === "late-receipt" ? "unknown_effect" : undefined),
+    ...(stateResult?.retryAt ? { retryAt: stateResult.retryAt } : {}),
+  };
 }
 
 export async function main(argv = process.argv.slice(2), env = process.env, dependencies = {}) {

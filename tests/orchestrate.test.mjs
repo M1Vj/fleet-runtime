@@ -1,17 +1,29 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import * as orchestrate from "../scripts/orchestrate.mjs";
 import { buildFleetPlan } from "../scripts/lib/fleet-scheduler.mjs";
 
-const { validateTrigger, normalizeRepo, validateTask, shouldScheduleImmediate } = orchestrate;
+const {
+  validateTrigger,
+  normalizeRepo,
+  validateTask,
+  shouldScheduleImmediate,
+  stableWorkKey,
+  stableEffectKey,
+  loadOrchestrationState,
+  applyEffectReceipt,
+  canTransition,
+  transitionWorkState,
+} = orchestrate;
 
 const MINUTE_MS = 60 * 1000;
 const DAY_MS = 24 * 60 * MINUTE_MS;
 const NOW = Date.parse("2026-09-13T00:00:00.000Z");
-const OWNER_REPO = "M1Vj/fleet-control";
+const OWNER_REPO = "M1Vj/fleet-fixture";
 
 function iso(at) {
   return new Date(at).toISOString();
@@ -108,8 +120,8 @@ function pullRequest(repo, number, ageDays = 2, overrides = {}) {
 
 test("normalizeRepo prefixes bare repository names and rejects non-owner paths", () => {
   assert.equal(normalizeRepo("fleet-runtime"), "M1Vj/fleet-runtime");
-  assert.equal(normalizeRepo("M1Vj/fleet-control"), "M1Vj/fleet-control");
-  assert.throws(() => normalizeRepo("octocat/fleet-control"));
+  assert.equal(normalizeRepo("M1Vj/fleet-fixture"), "M1Vj/fleet-fixture");
+  assert.throws(() => normalizeRepo("octocat/fleet-fixture"));
   assert.throws(() => normalizeRepo("M1Vj/../outside"));
 });
 
@@ -150,7 +162,7 @@ test("validateTrigger accepts schedule, manual, and valid repository_dispatch pa
     client_payload: {
       event: "pull_request",
       action: "opened",
-      repo: "fleet-control",
+      repo: "fleet-fixture",
       pr: 18,
       delivery: "dispatch-1",
     },
@@ -163,7 +175,7 @@ test("validateTrigger accepts schedule, manual, and valid repository_dispatch pa
 });
 
 test("validateTrigger rejects foreign repositories, invalid PR numbers, unknown actions, and oversized strings", () => {
-  assert.throws(() => validateTrigger(triggerPayload({ repo: "octocat/fleet-control" })));
+  assert.throws(() => validateTrigger(triggerPayload({ repo: "octocat/fleet-fixture" })));
 
   for (const pr of [0, -1, 1.5, "not-a-number"]) {
     assert.throws(() => validateTrigger(triggerPayload({ pr })));
@@ -182,7 +194,7 @@ test("validateTask normalizes valid review and upgrade tasks and enforces the ta
     id: "review-1",
     type: "review",
     role: "security",
-    repo: "fleet-control",
+    repo: "fleet-fixture",
     pr: 42,
   });
   assert.equal(review.id, "review-1");
@@ -458,6 +470,382 @@ test("planFleet reserves three upgrades for scans and one for repository-dispatc
       }),
       1,
     );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("durable planning suppresses duplicate delivery across separate processes", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-dedupe-"));
+  const repository = {
+    full_name: "M1Vj/dedupe-target",
+    name: "dedupe-target",
+    archived: false,
+    fork: false,
+  };
+  const ghClient = (args) => {
+    const endpoint = String(args.at(-1) ?? "");
+    if (endpoint.includes("/user/repos")) return [repository];
+    if (endpoint.includes("/repos/M1Vj/dedupe-target/pulls")) return [];
+    return null;
+  };
+  const env = {
+    FLEET_STATE_ROOT: root,
+    FLEET_EVENT_NAME: "repository_dispatch",
+    FLEET_EVENT_ACTION: "fleet-pr",
+    FLEET_EVENT_PAYLOAD: JSON.stringify({
+      event: "pull_request",
+      action: "opened",
+      repo: "dedupe-target",
+      pr: 7,
+      delivery: "duplicate-delivery-7",
+    }),
+  };
+  try {
+    const first = await orchestrate.planFleet({ env, ghClient, logger: () => {} });
+    const modulePath = path.join(process.cwd(), "scripts", "orchestrate.mjs");
+    const childSource = `
+      import * as orchestrate from ${JSON.stringify(modulePath)};
+      const env = ${JSON.stringify(env)};
+      const repository = ${JSON.stringify(repository)};
+      const ghClient = (args) => {
+        const endpoint = String(args.at(-1) ?? "");
+        if (endpoint.includes("/user/repos")) return [repository];
+        if (endpoint.includes("/repos/M1Vj/dedupe-target/pulls")) return [];
+        return null;
+      };
+      const result = await orchestrate.planFleet({ env, ghClient, logger: () => {} });
+      process.stdout.write(JSON.stringify(result));
+    `;
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", childSource], {
+      cwd: process.cwd(),
+      env: { ...process.env, FLEET_STATE_ROOT: root },
+      encoding: "utf8",
+    });
+    assert.equal(child.status, 0, child.stderr);
+    const second = JSON.parse(child.stdout);
+    assert.ok(first.include.length > 0, "the first delivery must be planned");
+    assert.deepEqual(second.include, [], "the same delivery must be suppressed after a separate process run");
+    const state = loadOrchestrationState(root);
+    assert.equal(new Set(state.outbox.map((row) => row.effectKey).filter(Boolean)).size, first.include.length);
+    assert.equal(state.history.filter((row) => row.event === "planned").length, first.include.length);
+    assert.equal(first.include[0].workKey, stableWorkKey(first.include[0]));
+    assert.equal(first.include[0].effectKey, stableEffectKey(first.include[0]));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("work lifecycle rejects downgrades and exposes explicit unknown-effect recovery", () => {
+  const base = {
+    workKey: "work-v1-test",
+    effectKey: "effect-v1-test",
+    generation: 0,
+    state: "awaiting_receipt",
+  };
+  assert.equal(canTransition("awaiting_receipt", "unknown_effect"), true);
+  assert.equal(canTransition("completed", "executing"), false);
+  const unknown = transitionWorkState(base, "unknown_effect", { reason: "runner-crash" });
+  assert.equal(unknown.status, "unknown_effect");
+  assert.throws(() => transitionWorkState(unknown, "executing"), /illegal state transition/);
+  const recovered = transitionWorkState(unknown, "recovering");
+  assert.equal(recovered.generation, 1);
+});
+
+test("effect acknowledgement is durable-before-dispatch and stale receipts are rejected", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-crash-"));
+  const workflowPath = path.join(root, "improve.yml");
+  writeFileSync(workflowPath, [
+    "on:",
+    "  workflow_dispatch:",
+    "    inputs:",
+    "      repo:",
+    "        type: string",
+  ].join("\n"));
+  const calls = [];
+  const task = { id: "crash-target", type: "upgrade", role: "upgrade", repo: OWNER_REPO };
+  try {
+    const result = await orchestrate.executeTask(task, {
+      workflowPath,
+      env: {
+        FLEET_STATE_ROOT: root,
+        RUNNER_TEMP: root,
+        FLEET_ARTIFACT_DIR: path.join(root, "fleet-task-results"),
+      },
+      ghClient(args) {
+        const state = loadOrchestrationState(root);
+        calls.push({ args, state });
+        throw new Error("receipt lost after dispatch attempt");
+      },
+    });
+    assert.equal(result.status, "deferred");
+    assert.equal(result.effectState, "unknown_effect");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].state.outbox.length, 1, "outbox must be committed before dispatch");
+    assert.equal(calls[0].state.history.some((row) => row.event === "effect_prepared"), true);
+    const current = loadOrchestrationState(root).records.find((row) => row.workKey === stableWorkKey(task));
+    assert.equal(current.state, "unknown_effect");
+    const receipt = applyEffectReceipt(root, {
+      workKey: current.workKey,
+      effectKey: current.effectKey,
+      generation: current.generation - 1,
+      status: "acknowledged",
+    });
+    assert.equal(receipt.accepted, false);
+    assert.equal(receipt.reason, "late-receipt");
+    assert.equal(loadOrchestrationState(root).records.find((row) => row.workKey === current.workKey).state, "unknown_effect");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("accepted workflow dispatch remains awaiting receipt until goal-bound evidence arrives", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-dispatch-receipt-"));
+  const workflowPath = path.join(root, "improve.yml");
+  writeFileSync(workflowPath, [
+    "on:",
+    "  workflow_dispatch:",
+    "    inputs:",
+    "      repo:",
+    "        type: string",
+  ].join("\n"));
+  const task = { id: "receipt-target", type: "upgrade", role: "upgrade", repo: OWNER_REPO };
+  try {
+    const result = await orchestrate.executeTask(task, {
+      workflowPath,
+      env: {
+        FLEET_STATE_ROOT: root,
+        RUNNER_TEMP: root,
+        FLEET_ARTIFACT_DIR: path.join(root, "fleet-task-results"),
+      },
+      ghClient() {
+        return { runId: "run-123" };
+      },
+    });
+    assert.equal(result.status, "dispatched");
+    assert.equal(result.effectState, "awaiting_receipt");
+    const replay = await orchestrate.executeTask(task, {
+      workflowPath,
+      env: {
+        FLEET_STATE_ROOT: root,
+        RUNNER_TEMP: root,
+        FLEET_ARTIFACT_DIR: path.join(root, "fleet-task-results"),
+      },
+      ghClient() {
+        throw new Error("duplicate dispatch must be suppressed");
+      },
+    });
+    assert.equal(replay.status, "duplicate");
+    assert.equal(replay.reason, "effect-in-flight");
+    const current = loadOrchestrationState(root).records.find((row) => row.workKey === stableWorkKey(task));
+    assert.equal(current.state, "awaiting_receipt");
+    const incomplete = applyEffectReceipt(root, {
+      workKey: current.workKey,
+      effectKey: current.effectKey,
+      generation: current.generation,
+      status: "completed",
+    });
+    assert.equal(incomplete.accepted, false);
+    assert.equal(incomplete.reason, "receipt-evidence-missing");
+    const complete = applyEffectReceipt(root, {
+      workKey: current.workKey,
+      effectKey: current.effectKey,
+      generation: current.generation,
+      status: "completed",
+      receiptId: "receipt-123",
+      goal: "upgrade M1Vj/fleet-fixture",
+      session: "session-123",
+      artifact: "artifact-123",
+      checks: ["run-status:success"],
+      verifier: "fleet-verifier-1",
+    });
+    assert.equal(complete.accepted, true);
+    assert.equal(loadOrchestrationState(root).records.find((row) => row.workKey === current.workKey).state, "completed");
+
+    const noRunTask = { id: "no-run-id-target", type: "upgrade", role: "upgrade", repo: "M1Vj/no-run-id" };
+    const noRun = await orchestrate.executeTask(noRunTask, {
+      workflowPath,
+      env: {
+        FLEET_STATE_ROOT: root,
+        RUNNER_TEMP: root,
+        FLEET_ARTIFACT_DIR: path.join(root, "fleet-task-results"),
+      },
+      ghClient() {
+        return null;
+      },
+    });
+    assert.equal(noRun.status, "dispatched");
+    assert.equal(noRun.effectState, "unknown_effect");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("unknown effect is not replayed until an explicit desired recovery is provided", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-reconcile-"));
+  const workflowPath = path.join(root, "improve.yml");
+  writeFileSync(workflowPath, [
+    "on:",
+    "  workflow_dispatch:",
+    "    inputs:",
+    "      repo:",
+    "        type: string",
+  ].join("\n"));
+  const task = { id: "unknown-recovery-target", type: "upgrade", role: "upgrade", repo: OWNER_REPO };
+  const env = {
+    FLEET_STATE_ROOT: root,
+    RUNNER_TEMP: root,
+    FLEET_ARTIFACT_DIR: path.join(root, "fleet-task-results"),
+  };
+  const ghClient = (args) => {
+    const endpoint = String(args.at(-1) ?? "");
+    if (endpoint.includes("/user/repos")) return [{ full_name: OWNER_REPO, name: OWNER_REPO.split("/").at(-1), archived: false, fork: false }];
+    if (endpoint.includes(`/repos/${OWNER_REPO}/pulls`)) return [];
+    throw new Error("dispatch-effect-uncertain");
+  };
+  try {
+    const first = await orchestrate.executeTask(task, { workflowPath, env, ghClient });
+    assert.equal(first.effectState, "unknown_effect");
+    const before = loadOrchestrationState(root).records.find((row) => row.workKey === stableWorkKey(task));
+    assert.equal(before.state, "unknown_effect");
+    const planned = await orchestrate.planFleet({
+      env: {
+        ...env,
+        FLEET_EVENT_NAME: "schedule",
+        FLEET_EVENT_ACTION: "schedule",
+        FLEET_EVENT_PAYLOAD: "{}",
+      },
+      ghClient,
+      logger: () => {},
+    });
+    assert.deepEqual(planned.include, [], "schedule must not replay an unknown external effect");
+    const stillUnknown = loadOrchestrationState(root).records.find((row) => row.workKey === stableWorkKey(task));
+    assert.equal(stillUnknown.state, "unknown_effect");
+
+    const stateDirectory = path.join(root, "state");
+    writeFileSync(path.join(stateDirectory, "orchestrate-desired.json"), JSON.stringify({ tasks: [{ ...task, desiredState: "active" }] }));
+    const recoveredPlan = await orchestrate.planFleet({
+      env: {
+        ...env,
+        FLEET_EVENT_NAME: "schedule",
+        FLEET_EVENT_ACTION: "schedule",
+        FLEET_EVENT_PAYLOAD: "{}",
+      },
+      ghClient,
+      logger: () => {},
+    });
+    assert.ok(recoveredPlan.include.length > 0);
+    const recovered = loadOrchestrationState(root).records.find((row) => row.workKey === stableWorkKey(task));
+    assert.equal(recovered.state, "registered");
+    assert.equal(recovered.generation, before.generation + 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("model capacity exhaustion waits durably and resumes the same generation after retryAt", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-capacity-"));
+  const task = { id: "capacity-target", type: "review", role: "tests", repo: OWNER_REPO, pr: 9 };
+  const retryAt = "2026-09-13T00:01:00.000Z";
+  const env = {
+    FLEET_STATE_ROOT: root,
+    RUNNER_TEMP: root,
+    FLEET_ARTIFACT_DIR: path.join(root, "fleet-task-results"),
+  };
+  try {
+    const exhausted = await orchestrate.executeTask(task, {
+      env,
+      ghClient(args) {
+        const endpoint = String(args.at(-1) ?? "");
+        if (endpoint.includes("/pulls/9")) return { number: 9, state: "open", base: { ref: "main" } };
+        return { default_branch: "main" };
+      },
+      modelRunner: async () => ({ complete: false, error: "quota exhausted", retryAt }),
+    });
+    assert.equal(exhausted.effectState, "waiting_for_capacity");
+    const waiting = loadOrchestrationState(root).records.find((row) => row.workKey === stableWorkKey(task));
+    assert.equal(waiting.state, "waiting_for_capacity");
+    assert.equal(waiting.retryAt, retryAt);
+
+    writeFileSync(path.join(root, "state", "orchestrate-desired.json"), JSON.stringify({ tasks: [{ ...task, desiredState: "active" }] }));
+    const beforeDue = await orchestrate.planFleet({
+      env: {
+        ...env,
+        FLEET_EVENT_NAME: "schedule",
+        FLEET_EVENT_ACTION: "schedule",
+        FLEET_EVENT_PAYLOAD: "{}",
+        FLEET_NOW: "2026-09-13T00:00:30.000Z",
+      },
+      now: Date.parse("2026-09-13T00:00:30.000Z"),
+      ghClient(args) {
+        const endpoint = String(args.at(-1) ?? "");
+        if (endpoint.includes("/user/repos")) return [{ full_name: OWNER_REPO, name: OWNER_REPO.split("/").at(-1), archived: false, fork: false }];
+        return [];
+      },
+      logger: () => {},
+    });
+    assert.equal(beforeDue.include.some((entry) => entry.workKey === waiting.workKey), false);
+
+    const afterDue = await orchestrate.planFleet({
+      env: {
+        ...env,
+        FLEET_EVENT_NAME: "schedule",
+        FLEET_EVENT_ACTION: "schedule",
+        FLEET_EVENT_PAYLOAD: "{}",
+      },
+      now: Date.parse("2026-09-13T00:02:00.000Z"),
+      ghClient(args) {
+        const endpoint = String(args.at(-1) ?? "");
+        if (endpoint.includes("/user/repos")) return [{ full_name: OWNER_REPO, name: OWNER_REPO.split("/").at(-1), archived: false, fork: false }];
+        return [];
+      },
+      logger: () => {},
+    });
+    assert.ok(afterDue.include.length > 0);
+    const resumed = loadOrchestrationState(root).records.find((row) => row.workKey === stableWorkKey(task));
+    assert.equal(resumed.generation, waiting.generation);
+    assert.equal(resumed.state, "registered");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("completed local analysis does not complete durable work without an observed receipt", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-analysis-receipt-"));
+  const task = { id: "analysis-target", type: "review", role: "review", repo: OWNER_REPO, pr: 12 };
+  const env = {
+    FLEET_STATE_ROOT: root,
+    RUNNER_TEMP: root,
+    FLEET_ARTIFACT_DIR: path.join(root, "fleet-task-results"),
+  };
+  try {
+    const result = await orchestrate.executeTask(task, {
+      env,
+      ghClient(args) {
+        const endpoint = String(args.at(-1) ?? "");
+        if (endpoint.includes("/pulls/12")) return { number: 12, state: "open", base: { ref: "main" } };
+        return { default_branch: "main" };
+      },
+      modelRunner: async () => ({ complete: true, reply: "evidence-backed analysis", modelMode: "test" }),
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(result.effectState, "awaiting_receipt");
+    const record = loadOrchestrationState(root).records.find((row) => row.workKey === stableWorkKey(task));
+    assert.equal(record.state, "awaiting_receipt");
+    const receipt = applyEffectReceipt(root, {
+      workKey: record.workKey,
+      effectKey: record.effectKey,
+      generation: record.generation,
+      receiptId: "review-receipt-12",
+      goal: "review M1Vj/fleet-fixture#12",
+      session: "review-session-12",
+      artifact: result.artifact,
+      checks: ["analysis-artifact-present"],
+      verifier: "review-verifier",
+      status: "completed",
+    });
+    assert.equal(receipt.accepted, true);
+    assert.equal(loadOrchestrationState(root).records.find((row) => row.workKey === record.workKey).state, "completed");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

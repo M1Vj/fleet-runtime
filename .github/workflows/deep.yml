@@ -7,12 +7,17 @@ on:
   workflow_dispatch:
     inputs:
       workers:
-        description: "max parallel sub-agents"
+        description: "max parallel public workers"
         type: string
         default: "6"
+      repo:
+        description: "allowlisted public owner/name (empty uses this repository)"
+        type: string
+        required: false
+        default: ""
 
 concurrency:
-  group: fleet-deep
+  group: fleet-deep-public
   cancel-in-progress: false
 
 permissions:
@@ -20,52 +25,85 @@ permissions:
 
 jobs:
   plan:
+    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       max_parallel: ${{ steps.plan.outputs.max_parallel }}
     env:
-      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
-      FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
-      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      FLEET_DATA_CLASS: public
+      FLEET_PUBLIC_OWNER: M1Vj
+      FLEET_PUBLIC_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
+      FLEET_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
+      FLEET_PUBLIC_ARTIFACT_MANIFEST: ${{ runner.temp }}/fleet-public-state/public-artifact.json
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
       FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
     steps:
-      - name: checkout
+      - name: validate public target
+        id: public-target
+        env:
+          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ inputs.repo || github.event.inputs.repo || '' }}
+          FLEET_PUBLIC_OWNER: M1Vj
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${FLEET_PUBLIC_REPOSITORY_INPUT:-${GITHUB_REPOSITORY}}"
+          [[ "$target" == */* && "$target" != *$'\n'* && "$target" != *$'\r'* ]]
+          owner="${target%%/*}"
+          name="${target#*/}"
+          [[ "$owner" == "$FLEET_PUBLIC_OWNER" && "$name" != "$target" && "$name" != */* ]]
+          [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]
+          metadata="$RUNNER_TEMP/public-repository.json"
+          error_log="$RUNNER_TEMP/public-target-error.log"
+          curl --fail --silent --show-error --location --retry 1 \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${owner}/${name}" >"$metadata" 2>"$error_log"
+          node --input-type=module - "$metadata" <<'NODE'
+          import { readFileSync } from "node:fs";
+          const metadata = JSON.parse(readFileSync(process.argv[2], "utf8"));
+          if (metadata.private !== false || metadata.visibility !== "public" || metadata.owner?.login !== process.env.FLEET_PUBLIC_OWNER || metadata.archived === true) {
+            process.exit(1);
+          }
+          NODE
+          printf 'repository=%s\n' "$target" >>"$GITHUB_OUTPUT"
+      - name: checkout runtime
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           fetch-depth: 1
-      - name: checkout private state repo
+      - name: checkout public target
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          repository: M1Vj/fleet-control
-          token: ${{ secrets.FLEET_GH_TOKEN }}
+          repository: ${{ steps.public-target.outputs.repository }}
+          token: ${{ github.token }}
           persist-credentials: false
           fetch-depth: 1
-          path: state-control
-      - name: setup node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: "20"
+          path: public-target
       - name: sanitize workers input
         env:
-          FLEET_WORKERS_INPUT: ${{ github.event.inputs.workers || '' }}
+          FLEET_WORKERS_INPUT: ${{ inputs.workers || github.event.inputs.workers || '' }}
         run: |
           FLEET_MAX_WORKERS=$(node --input-type=module <<'NODE'
           import { sanitizeMaxWorkers } from "./scripts/deep.mjs";
           process.stdout.write(String(sanitizeMaxWorkers(process.env.FLEET_WORKERS_INPUT)));
           NODE
           )
-          echo "FLEET_MAX_WORKERS=$FLEET_MAX_WORKERS" >> "$GITHUB_ENV"
-      - name: plan tasks
+          printf 'FLEET_MAX_WORKERS=%s\n' "$FLEET_MAX_WORKERS" >> "$GITHUB_ENV"
+      - name: plan public tasks
         id: plan
-        run: |
-          FLEET_DEEP_MODE=plan node scripts/deep.mjs >> "$GITHUB_OUTPUT"
+        env:
+          FLEET_PUBLIC_REPOSITORY: ${{ steps.public-target.outputs.repository }}
+          FLEET_DEEP_MODE: plan
+        run: node scripts/deep.mjs >> "$GITHUB_OUTPUT"
 
   analyze:
     needs: plan
+    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 65
     strategy:
@@ -73,108 +111,149 @@ jobs:
       max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
-      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
-      FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
-      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      FLEET_DATA_CLASS: public
+      FLEET_PUBLIC_OWNER: M1Vj
+      FLEET_PUBLIC_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
+      FLEET_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
+      FLEET_PUBLIC_ARTIFACT_MANIFEST: ${{ runner.temp }}/fleet-public-state/public-artifact.json
+      GH_TOKEN: ${{ github.token }}
       FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
-      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
-      FLEET_OPENCODE_AUTH_2: ${{ secrets.FLEET_OPENCODE_AUTH_2 }}
-      FLEET_OPENCODE_AUTH_3: ${{ secrets.FLEET_OPENCODE_AUTH_3 }}
-      FLEET_OPENCODE_AUTH_4: ${{ secrets.FLEET_OPENCODE_AUTH_4 }}
-      FLEET_OPENCODE_AUTH_5: ${{ secrets.FLEET_OPENCODE_AUTH_5 }}
-      FLEET_OPENCODE_AUTH_6: ${{ secrets.FLEET_OPENCODE_AUTH_6 }}
-      FLEET_OPENCODE_AUTH_7: ${{ secrets.FLEET_OPENCODE_AUTH_7 }}
-      FLEET_OPENCODE_AUTH_8: ${{ secrets.FLEET_OPENCODE_AUTH_8 }}
-      FLEET_OPENCODE_AUTH_9: ${{ secrets.FLEET_OPENCODE_AUTH_9 }}
       FLEET_REPO: ${{ matrix.worker.repo || matrix.repo }}
       FLEET_KIND: ${{ matrix.worker.kind || matrix.kind }}
       FLEET_TASK_ID: ${{ matrix.worker.taskId || matrix.taskId }}
       FLEET_CLAIM_RUN_ID: ${{ matrix.worker.claimRunId || matrix.claimRunId }}
       FLEET_CLAIM_ATTEMPT: ${{ matrix.worker.claimAttempt || matrix.claimAttempt }}
     steps:
-      - name: skip-empty
-        if: ${{ env.FLEET_REPO == '' }}
-        run: echo "no claimable tasks" && exit 0
-      - name: checkout
-        if: ${{ env.FLEET_REPO != '' }}
+      - name: validate public target
+        id: public-target
+        env:
+          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ matrix.worker.repo || matrix.repo || github.repository }}
+          FLEET_PUBLIC_OWNER: M1Vj
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${FLEET_PUBLIC_REPOSITORY_INPUT:-${GITHUB_REPOSITORY}}"
+          [[ "$target" == */* && "$target" != *$'\n'* && "$target" != *$'\r'* ]]
+          owner="${target%%/*}"
+          name="${target#*/}"
+          [[ "$owner" == "$FLEET_PUBLIC_OWNER" && "$name" != "$target" && "$name" != */* ]]
+          [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]
+          metadata="$RUNNER_TEMP/public-repository.json"
+          error_log="$RUNNER_TEMP/public-target-error.log"
+          curl --fail --silent --show-error --location --retry 1 \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${owner}/${name}" >"$metadata" 2>"$error_log"
+          node --input-type=module - "$metadata" <<'NODE'
+          import { readFileSync } from "node:fs";
+          const metadata = JSON.parse(readFileSync(process.argv[2], "utf8"));
+          if (metadata.private !== false || metadata.visibility !== "public" || metadata.owner?.login !== process.env.FLEET_PUBLIC_OWNER || metadata.archived === true) process.exit(1);
+          NODE
+          printf 'repository=%s\n' "$target" >>"$GITHUB_OUTPUT"
+      - name: checkout runtime
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           fetch-depth: 1
-      - name: checkout private state repo
+      - name: checkout public target
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          repository: M1Vj/fleet-control
-          token: ${{ secrets.FLEET_GH_TOKEN }}
+          repository: ${{ steps.public-target.outputs.repository }}
+          token: ${{ github.token }}
           persist-credentials: false
           fetch-depth: 1
-          path: state-control
+          path: public-target
       - name: setup node
-        if: ${{ env.FLEET_REPO != '' }}
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
       - name: install pinned opencode cli
-        if: ${{ env.FLEET_REPO != '' }}
-        run: npm install -g opencode-ai@1.18.21
-      - name: analyze as sub-agent
-        if: ${{ env.FLEET_REPO != '' }}
-        run: |
-          mkdir -p artifacts
-          FLEET_ARTIFACT_DIR=artifacts node scripts/deep.mjs
-      - name: dump opencode logs on failure
-        if: failure()
-        run: tail -n 60 $HOME/.local/share/opencode/log/*.log 2>/dev/null || true
-      - name: upload findings
-        if: ${{ env.FLEET_REPO != '' && hashFiles('artifacts/report-*.json') != '' }}
+        run: npm install -g opencode-ai@1.18.30
+      - name: analyze public task
+        env:
+          FLEET_PUBLIC_REPOSITORY: ${{ steps.public-target.outputs.repository }}
+          FLEET_PUBLIC_ARTIFACT_MANIFEST: ${{ runner.temp }}/fleet-public-state/public-artifact.json
+          FLEET_ARTIFACT_DIR: ${{ runner.temp }}/fleet-public-artifacts
+        run: node scripts/deep.mjs
+      - name: upload public result manifest
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: reports-${{ strategy.job-index }}
-          path: artifacts/
+          name: public-result
+          path: ${{ runner.temp }}/fleet-public-state/public-artifact.json
+          if-no-files-found: ignore
 
   commit:
     needs: [plan, analyze]
-    if: ${{ always() }}
+    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' && always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 8
-    concurrency:
-      group: fleet-state-writer
-      cancel-in-progress: false
     env:
-      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
-      FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
-      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      FLEET_DATA_CLASS: public
+      FLEET_PUBLIC_OWNER: M1Vj
+      FLEET_PUBLIC_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
+      FLEET_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
+      FLEET_PUBLIC_ARTIFACT_MANIFEST: ${{ runner.temp }}/fleet-public-state/public-artifact.json
+      GH_TOKEN: ${{ github.token }}
       FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
       FLEET_ANALYZE_RESULT: ${{ needs.analyze.result }}
       FLEET_PLAN_MATRIX: ${{ needs.plan.outputs.matrix }}
     steps:
-      - name: checkout
+      - name: validate public target
+        id: public-target
+        env:
+          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ github.repository }}
+          FLEET_PUBLIC_OWNER: M1Vj
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$FLEET_PUBLIC_REPOSITORY_INPUT"
+          owner="${target%%/*}"
+          name="${target#*/}"
+          [[ "$owner" == "$FLEET_PUBLIC_OWNER" && "$name" != "$target" && "$name" != */* ]]
+          metadata="$RUNNER_TEMP/public-repository.json"
+          error_log="$RUNNER_TEMP/public-target-error.log"
+          curl --fail --silent --show-error --location --retry 1 \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${owner}/${name}" >"$metadata" 2>"$error_log"
+          node --input-type=module - "$metadata" <<'NODE'
+          import { readFileSync } from "node:fs";
+          const metadata = JSON.parse(readFileSync(process.argv[2], "utf8"));
+          if (metadata.private !== false || metadata.visibility !== "public" || metadata.owner?.login !== process.env.FLEET_PUBLIC_OWNER || metadata.archived === true) process.exit(1);
+          NODE
+          printf 'repository=%s\n' "$target" >>"$GITHUB_OUTPUT"
+      - name: checkout runtime
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           fetch-depth: 1
-      - name: checkout private state repo
+      - name: checkout public target
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          repository: M1Vj/fleet-control
-          token: ${{ secrets.FLEET_GH_TOKEN }}
+          repository: ${{ steps.public-target.outputs.repository }}
+          token: ${{ github.token }}
           persist-credentials: false
           fetch-depth: 1
-          path: state-control
+          path: public-target
       - name: setup node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
-      - name: download all findings
+      - name: download public result manifest
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          pattern: reports-*
-          merge-multiple: true
-          path: artifacts
+          name: public-result
+          path: ${{ runner.temp }}/public-result-download
         continue-on-error: true
-      - name: ensure artifacts dir
-        run: mkdir -p artifacts
-      - name: commit reports as M1Vj
-        run: FLEET_ARTIFACT_DIR=artifacts FLEET_DEEP_MODE=commit node scripts/deep.mjs
+      - name: commit public result
+        env:
+          FLEET_PUBLIC_REPOSITORY: ${{ steps.public-target.outputs.repository }}
+          FLEET_PUBLIC_ARTIFACT_MANIFEST: ${{ runner.temp }}/fleet-public-state/public-artifact.json
+          FLEET_ARTIFACT_DIR: ${{ runner.temp }}/fleet-public-state
+          FLEET_DEEP_MODE: commit
+        run: node scripts/deep.mjs

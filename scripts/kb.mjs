@@ -7,10 +7,20 @@ import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, ghInput, putFileContent, ensureBranch, findExistingOpenPr, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, sha256, configureIdentity } from "./lib/util.mjs";
 import { askModel, askModelResilient } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor } from "./lib/verify.mjs";
+import {
+  isPublicDataClass,
+  publicModelEnv,
+  publicRepository,
+  privateRepository,
+  PRIVATE_REPOSITORY_ENV,
+  resolveStateRoot,
+  writeExecutionAudit,
+  writePublicArtifact,
+} from "./lib/private-state.mjs";
 
 const CODE_ROOT = process.cwd();
-const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
-export const KB_REPO = "M1Vj/vj-knowledge-base";
+const REPO_ROOT = resolveStateRoot(process.env, CODE_ROOT);
+export const KB_REPO = process.env[PRIVATE_REPOSITORY_ENV.kb] || undefined;
 
 const KB_DOMAINS = ["identity", "projects", "knowledge-conversations", "skills", "places", "devices", "work", "education", "interests", "people"];
 const FORBIDDEN_PREFIXES = [".okf/", "raw/", "raw-vault/", ".github/"];
@@ -36,11 +46,11 @@ function hasValidFrontmatter(content) {
   return true;
 }
 
-function listKbTree() {
-  const meta = gh(["api", `/repos/${KB_REPO}`], process.env);
+function listKbTree(repo = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.kb), env = process.env) {
+  const meta = gh(["api", `/repos/${repo}`], env);
   const branch = meta.default_branch;
-  const ref = gh(["api", `/repos/${KB_REPO}/git/ref/heads/${branch}`], process.env);
-  const tree = gh(["api", `/repos/${KB_REPO}/git/trees/${ref.object.sha}?recursive=1`], process.env) || {};
+  const ref = gh(["api", `/repos/${repo}/git/ref/heads/${branch}`], env);
+  const tree = gh(["api", `/repos/${repo}/git/trees/${ref.object.sha}?recursive=1`], env) || {};
   return {
     defaultBranch: branch,
     baseSha: ref.object.sha,
@@ -48,13 +58,13 @@ function listKbTree() {
   };
 }
 
-function fetchKeyKbText(paths) {
+function fetchKeyKbText(paths, repo = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.kb), env = process.env) {
   const priority = ["index.md", ...KB_DOMAINS.map((d) => `${d}/index.md`), ".okf/HANDOFF.md", ".okf/completeness-audit.md"];
   const chosen = priority.filter((p) => paths.includes(p)).slice(0, 14);
   const out = [];
   for (const p of chosen) {
     try {
-      const raw = gh(["api", "-H=Accept: application/vnd.github.raw", `/repos/${KB_REPO}/contents/${p}`], process.env);
+      const raw = gh(["api", "-H=Accept: application/vnd.github.raw", `/repos/${repo}/contents/${p}`], env);
       out.push(`===== ${p} =====\n${String(raw).slice(0, 10000)}`);
     } catch {}
   }
@@ -62,8 +72,39 @@ function fetchKeyKbText(paths) {
 }
 
 async function modeInventory(audit) {
-  await runGate(process.env);
-  { const { gatewayDown } = await import("./lib/gateway-health.mjs"); if (gatewayDown(process.env.FLEET_STATE_ROOT || process.cwd())) { console.log("KB_SKIPPED=circuit-open"); return 0; } }
+  const identity = await runGate(process.env);
+  if (isPublicDataClass(process.env)) {
+    const repo = publicRepository(process.env);
+    const treeInfo = listKbTree(repo, process.env);
+    const digest = [
+      `Public repository inventory (${treeInfo.files.length} files):`,
+      treeInfo.files.join("\n").slice(0, 24000),
+      "",
+      "Key public excerpts:",
+      fetchKeyKbText(treeInfo.files, repo, process.env),
+    ].join("\n");
+    const result = await askModel({
+      prompt: [
+        `Review the public GitHub repository ${repo} using only the supplied public inventory and excerpts.`,
+        "Return ONLY strict JSON {\"findings\":\"...\",\"opportunities\":[{\"title\":\"...\",\"kind\":\"improve-file|crosslink|docs\",\"target_path\":\"...\",\"plan\":\"...\"}]} max 10.",
+        digest,
+      ].join("\n"),
+      timeoutMs: 600000,
+      env: publicModelEnv(process.env),
+      preferVariantMax: true,
+      maxRounds: 4,
+    });
+    writePublicArtifact(process.env, {
+      mode: "inventory",
+      status: result.complete && result.reply ? "ok" : "deferred",
+      repository: repo,
+      count: treeInfo.files.length,
+      summary: result.complete && result.reply ? "public inventory reviewed" : "model unavailable",
+    }, { kind: "kb", status: result.complete && result.reply ? "ok" : "deferred", repository: repo });
+    audit.note("inventory", `public files=${treeInfo.files.length} complete=${result.complete}`);
+    return result.complete && result.reply ? 0 : 6;
+  }
+  { const { gatewayDown } = await import("./lib/gateway-health.mjs"); if (gatewayDown(REPO_ROOT)) { console.log("KB_SKIPPED=circuit-open"); return 0; } }
   const treeInfo = listKbTree();
   const digest = [
     `KB markdown inventory (${treeInfo.files.length} files):`,
@@ -141,10 +182,16 @@ async function gdriveFetchIfConfigured(audit) {
 
 async function modeSynthesize(audit) {
   await runGate(process.env);
+  if (isPublicDataClass(process.env)) {
+    // Public jobs are intentionally read-only and have no Drive/private KB
+    // context.  Inventory is the safe synthesis input and emits the same
+    // allow-listed manifest without persisting generated prose locally.
+    return modeInventory(audit);
+  }
   await gdriveFetchIfConfigured(audit);
   {
     const { gatewayDown } = await import("./lib/gateway-health.mjs");
-    if (gatewayDown(process.env.FLEET_STATE_ROOT || process.cwd())) {
+    if (gatewayDown(REPO_ROOT)) {
       console.log("KB_SKIPPED=circuit-open");
       return 0;
     }
@@ -296,6 +343,12 @@ import * as fsModule from "node:fs";
 async function modeShip(audit) {
   const identity = await runGate(process.env);
   configureIdentity(REPO_ROOT, identity);
+  if (isPublicDataClass(process.env)) {
+    const repo = publicRepository(process.env);
+    writePublicArtifact(process.env, { mode: "ship", status: "blocked", reason: "public-read-only" }, { kind: "kb", status: "blocked", repository: repo });
+    audit.note("ship", "public mode cannot create branches, pull requests, or private KB mirrors");
+    return 4;
+  }
   const dir = process.env.FLEET_ARTIFACT_DIR || ".";
   const pkgPath = path.join(dir, "kb-package.json");
   if (!existsSync(pkgPath)) {
@@ -309,9 +362,11 @@ async function modeShip(audit) {
   }
   const treeInfo = listKbTree();
   const branch = `fleet/kb-${sha256(files.map((f) => f.path).join(",")).slice(0, 8)}`;
-  ensureBranch(KB_REPO, branch, treeInfo.baseSha, process.env);
+  const kbRepository = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.kb);
+  const controlRepository = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control);
+  ensureBranch(kbRepository, branch, treeInfo.baseSha, process.env);
   for (const f of files) {
-    putFileContent(KB_REPO, f.path, f.content, branch, `[fleet-kb] add ${f.path}`, process.env);
+    putFileContent(kbRepository, f.path, f.content, branch, `[fleet-kb] add ${f.path}`, process.env);
   }
   const body = [
     "## fleet-kb synthesis package",
@@ -320,23 +375,23 @@ async function modeShip(audit) {
     "",
     "_Autonomous OKF-compliant synthesis by the M1Vj fleet KB agent. All KB guardrails respected (.okf untouched, no raw/, frontmatter validated). Review before merging._",
   ].join("\n");
-  let pr = findExistingOpenPr(KB_REPO, branch, process.env);
+  let pr = findExistingOpenPr(kbRepository, branch, process.env);
   if (!pr) {
     try {
       pr = ghInput(
-        ["api", "-X", "POST", `/repos/${KB_REPO}/pulls`],
+        ["api", "-X", "POST", `/repos/${kbRepository}/pulls`],
         { title: `[fleet-kb] synthesis package: ${files[0].path}`, body, head: branch, base: treeInfo.defaultBranch, draft: true },
         process.env,
       );
     } catch (err) {
-      pr = findExistingOpenPr(KB_REPO, branch, process.env);
+      pr = findExistingOpenPr(kbRepository, branch, process.env);
       if (!pr) throw err;
     }
   }
-  await verifyPullAuthor(KB_REPO, pr.number, identity, process.env.FLEET_GH_TOKEN);
+  await verifyPullAuthor(kbRepository, pr.number, identity, process.env.FLEET_GH_TOKEN);
   const headSha = pr.head && pr.head.sha ? pr.head.sha : null;
   if (!headSha) throw new Error("PR head sha unavailable");
-  await verifyCommit(KB_REPO, headSha, identity, process.env.FLEET_GH_TOKEN);
+  await verifyCommit(kbRepository, headSha, identity, process.env.FLEET_GH_TOKEN);
   audit.note("ship", `pr=#${pr.number} files=${files.length}`);
 
   const labDir = path.join(REPO_ROOT, "docs", "kb-lab");
@@ -350,7 +405,7 @@ async function modeShip(audit) {
     gitCommit(REPO_ROOT, `[fleet] kb-lab mirror ${stamp} PR#${pr.number}`, identity);
     gitPush(REPO_ROOT, "main", process.env);
     const sha = gitRevParse(REPO_ROOT, "HEAD");
-    await verifyCommit("M1Vj/fleet-control", sha, identity, process.env.FLEET_GH_TOKEN);
+    await verifyCommit(controlRepository, sha, identity, process.env.FLEET_GH_TOKEN);
   }
   console.log(`FLEET_RUN_RESULT=${JSON.stringify({ mode: "ship", pr: pr.number, files: files.length })}`);
   return 0;
@@ -367,12 +422,12 @@ if (process.argv[1] && import.meta.url.endsWith(path.basename(process.argv[1])))
   }
   try {
     const code = await MODES[mode](audit);
-    audit.writeMarkdown(path.join(REPO_ROOT, "audit"), `kb-${mode}-${Date.now()}`, `KB ${mode}`, code === 0 ? "ok" : "failed");
+    writeExecutionAudit(audit, process.env, REPO_ROOT, `kb-${mode}-${Date.now()}`, `KB ${mode}`, code === 0 ? "ok" : "failed");
     if (code !== 0) for (const e of [...audit.entries, ...audit.incidents]) console.log(`AUDIT ${JSON.stringify(e)}`);
     process.exit(code);
   } catch (err) {
     audit.incident("fatal", err.message);
-    audit.writeMarkdown(path.join(REPO_ROOT, "audit"), `kb-${mode}-${Date.now()}`, `KB ${mode}`, `failed(${err.code || 1})`);
+    writeExecutionAudit(audit, process.env, REPO_ROOT, `kb-${mode}-${Date.now()}`, `KB ${mode}`, `failed(${err.code || 1})`);
     console.error(`KB_FAILED mode=${mode} reason=${err.reason || err.message}`);
     for (const e of [...audit.entries, ...audit.incidents]) console.log(`AUDIT ${JSON.stringify(e)}`);
     process.exit(err.code && Number.isInteger(err.code) ? err.code : 1);

@@ -1,5 +1,5 @@
 name: fleet-thesis
-run-name: "fleet thesis ${{ github.run_id }}"
+run-name: "fleet public thesis pass ${{ github.run_id }}"
 
 on:
   schedule:
@@ -7,217 +7,272 @@ on:
   workflow_dispatch:
     inputs:
       top_files:
-        description: "max survey excerpt files"
+        description: "max public survey excerpt files"
         type: string
+        default: ""
+      repo:
+        description: "allowlisted public owner/name (empty uses this repository)"
+        type: string
+        required: false
         default: ""
 
 concurrency:
-  group: fleet-thesis
+  group: fleet-thesis-public
   cancel-in-progress: false
 
 permissions:
   contents: read
 
+env:
+  FLEET_DATA_CLASS: public
+  FLEET_PUBLIC_OWNER: M1Vj
+  FLEET_PUBLIC_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
+  FLEET_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
+  FLEET_PUBLIC_ARTIFACT_MANIFEST: ${{ runner.temp }}/fleet-public-state/public-artifact.json
+  GH_TOKEN: ${{ github.token }}
+  GITHUB_TOKEN: ${{ github.token }}
+  FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
+  FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
+
 jobs:
   survey:
+    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
-      FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
-      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
-      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
-      FLEET_OPENCODE_AUTH_2: ${{ secrets.FLEET_OPENCODE_AUTH_2 }}
-      FLEET_OPENCODE_AUTH_3: ${{ secrets.FLEET_OPENCODE_AUTH_3 }}
-      FLEET_OPENCODE_AUTH_4: ${{ secrets.FLEET_OPENCODE_AUTH_4 }}
-      FLEET_OPENCODE_AUTH_5: ${{ secrets.FLEET_OPENCODE_AUTH_5 }}
-      FLEET_OPENCODE_AUTH_6: ${{ secrets.FLEET_OPENCODE_AUTH_6 }}
-      FLEET_OPENCODE_AUTH_7: ${{ secrets.FLEET_OPENCODE_AUTH_7 }}
-      FLEET_OPENCODE_AUTH_8: ${{ secrets.FLEET_OPENCODE_AUTH_8 }}
-      FLEET_OPENCODE_AUTH_9: ${{ secrets.FLEET_OPENCODE_AUTH_9 }}
-      FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
-      FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
     steps:
+      - name: validate public target
+        id: public-target
+        env:
+          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ inputs.repo || github.event.inputs.repo || '' }}
+          FLEET_PUBLIC_OWNER: M1Vj
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${FLEET_PUBLIC_REPOSITORY_INPUT:-${GITHUB_REPOSITORY}}"; owner="${target%%/*}"; name="${target#*/}"
+          [[ "$target" == */* && "$owner" == "$FLEET_PUBLIC_OWNER" && "$name" != "$target" && "$name" != */* && "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]
+          metadata="$RUNNER_TEMP/public-repository.json"
+          curl --fail --silent --show-error --location --retry 1 -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/${owner}/${name}" >"$metadata" 2>"$RUNNER_TEMP/public-target-error.log"
+          node --input-type=module - "$metadata" <<'NODE'
+          import { readFileSync } from "node:fs";
+          const m = JSON.parse(readFileSync(process.argv[2], "utf8"));
+          if (m.private !== false || m.visibility !== "public" || m.owner?.login !== process.env.FLEET_PUBLIC_OWNER || m.archived === true) process.exit(1);
+          NODE
+          printf 'repository=%s\n' "$target" >> "$GITHUB_OUTPUT"
       - name: checkout runtime
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           fetch-depth: 1
-      - name: checkout private state repo
+      - name: checkout public target
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          repository: M1Vj/fleet-control
-          token: ${{ secrets.FLEET_GH_TOKEN }}
+          repository: ${{ steps.public-target.outputs.repository }}
+          token: ${{ github.token }}
           persist-credentials: false
           fetch-depth: 1
-          path: state-control
+          path: public-target
       - name: setup node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
       - name: install pinned opencode cli
-        run: npm install -g opencode-ai@1.18.21
-      - name: survey sub-agent
-        run: |
-          mkdir -p artifacts
-          FLEET_THESIS_MODE=survey FLEET_ARTIFACT_DIR=artifacts node scripts/thesis.mjs
-      - name: upload survey
-        if: hashFiles('artifacts/thesis-survey.json') != ''
+        run: npm install -g opencode-ai@1.18.30
+      - name: survey public target
+        env:
+          FLEET_PUBLIC_REPOSITORY: ${{ steps.public-target.outputs.repository }}
+          FLEET_THESIS_MODE: survey
+          FLEET_ARTIFACT_DIR: ${{ runner.temp }}/fleet-public-artifacts
+        run: node scripts/thesis.mjs
+      - name: upload public survey manifest
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: thesis-survey
-          path: artifacts/thesis-survey.json
+          name: public-thesis-survey
+          path: ${{ runner.temp }}/fleet-public-state/public-artifact.json
+          if-no-files-found: error
 
   draft:
     needs: survey
+    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 75
-    env:
-      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
-      FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
-      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
-      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
-      FLEET_OPENCODE_AUTH_2: ${{ secrets.FLEET_OPENCODE_AUTH_2 }}
-      FLEET_OPENCODE_AUTH_3: ${{ secrets.FLEET_OPENCODE_AUTH_3 }}
-      FLEET_OPENCODE_AUTH_4: ${{ secrets.FLEET_OPENCODE_AUTH_4 }}
-      FLEET_OPENCODE_AUTH_5: ${{ secrets.FLEET_OPENCODE_AUTH_5 }}
-      FLEET_OPENCODE_AUTH_6: ${{ secrets.FLEET_OPENCODE_AUTH_6 }}
-      FLEET_OPENCODE_AUTH_7: ${{ secrets.FLEET_OPENCODE_AUTH_7 }}
-      FLEET_OPENCODE_AUTH_8: ${{ secrets.FLEET_OPENCODE_AUTH_8 }}
-      FLEET_OPENCODE_AUTH_9: ${{ secrets.FLEET_OPENCODE_AUTH_9 }}
-      FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
-      FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
     steps:
+      - name: validate public target
+        id: public-target
+        env:
+          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ github.repository }}
+          FLEET_PUBLIC_OWNER: M1Vj
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$FLEET_PUBLIC_REPOSITORY_INPUT"; owner="${target%%/*}"; name="${target#*/}"
+          [[ "$owner" == "$FLEET_PUBLIC_OWNER" && "$name" != "$target" && "$name" != */* ]]
+          metadata="$RUNNER_TEMP/public-repository.json"
+          curl --fail --silent --show-error --location --retry 1 -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/${owner}/${name}" >"$metadata" 2>"$RUNNER_TEMP/public-target-error.log"
+          node --input-type=module - "$metadata" <<'NODE'
+          import { readFileSync } from "node:fs";
+          const m = JSON.parse(readFileSync(process.argv[2], "utf8"));
+          if (m.private !== false || m.visibility !== "public" || m.owner?.login !== process.env.FLEET_PUBLIC_OWNER || m.archived === true) process.exit(1);
+          NODE
+          printf 'repository=%s\n' "$target" >> "$GITHUB_OUTPUT"
       - name: checkout runtime
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           fetch-depth: 1
-      - name: checkout private state repo
+      - name: checkout public target
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          repository: M1Vj/fleet-control
-          token: ${{ secrets.FLEET_GH_TOKEN }}
+          repository: ${{ steps.public-target.outputs.repository }}
+          token: ${{ github.token }}
           persist-credentials: false
           fetch-depth: 1
-          path: state-control
+          path: public-target
       - name: setup node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
       - name: install pinned opencode cli
-        run: npm install -g opencode-ai@1.18.21
-      - name: download survey
+        run: npm install -g opencode-ai@1.18.30
+      - name: download public survey manifest
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: thesis-survey
-          path: artifacts
-      - name: draft sub-agent
-        run: |
-          mkdir -p artifacts
-          FLEET_THESIS_MODE=draft FLEET_ARTIFACT_DIR=artifacts node scripts/thesis.mjs
-      - name: upload draft
-        if: hashFiles('artifacts/thesis-draft.json') != ''
+          name: public-thesis-survey
+          path: ${{ runner.temp }}/public-thesis-survey
+        continue-on-error: true
+      - name: draft public thesis result
+        env:
+          FLEET_PUBLIC_REPOSITORY: ${{ steps.public-target.outputs.repository }}
+          FLEET_THESIS_MODE: draft
+          FLEET_ARTIFACT_DIR: ${{ runner.temp }}/public-thesis-survey
+        run: node scripts/thesis.mjs
+      - name: upload public draft manifest
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: thesis-draft
-          path: artifacts/thesis-draft.json
+          name: public-thesis-draft
+          path: ${{ runner.temp }}/fleet-public-state/public-artifact.json
+          if-no-files-found: error
 
   refine:
     needs: [survey, draft]
-    if: needs.draft.result == 'success'
+    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' && needs.draft.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 75
-    env:
-      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
-      FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
-      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
-      FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
-      FLEET_OPENCODE_AUTH_2: ${{ secrets.FLEET_OPENCODE_AUTH_2 }}
-      FLEET_OPENCODE_AUTH_3: ${{ secrets.FLEET_OPENCODE_AUTH_3 }}
-      FLEET_OPENCODE_AUTH_4: ${{ secrets.FLEET_OPENCODE_AUTH_4 }}
-      FLEET_OPENCODE_AUTH_5: ${{ secrets.FLEET_OPENCODE_AUTH_5 }}
-      FLEET_OPENCODE_AUTH_6: ${{ secrets.FLEET_OPENCODE_AUTH_6 }}
-      FLEET_OPENCODE_AUTH_7: ${{ secrets.FLEET_OPENCODE_AUTH_7 }}
-      FLEET_OPENCODE_AUTH_8: ${{ secrets.FLEET_OPENCODE_AUTH_8 }}
-      FLEET_OPENCODE_AUTH_9: ${{ secrets.FLEET_OPENCODE_AUTH_9 }}
-      FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
-      FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
     steps:
+      - name: validate public target
+        id: public-target
+        env:
+          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ github.repository }}
+          FLEET_PUBLIC_OWNER: M1Vj
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$FLEET_PUBLIC_REPOSITORY_INPUT"; owner="${target%%/*}"; name="${target#*/}"
+          [[ "$owner" == "$FLEET_PUBLIC_OWNER" && "$name" != "$target" && "$name" != */* ]]
+          metadata="$RUNNER_TEMP/public-repository.json"
+          curl --fail --silent --show-error --location --retry 1 -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/${owner}/${name}" >"$metadata" 2>"$RUNNER_TEMP/public-target-error.log"
+          node --input-type=module - "$metadata" <<'NODE'
+          import { readFileSync } from "node:fs";
+          const m = JSON.parse(readFileSync(process.argv[2], "utf8"));
+          if (m.private !== false || m.visibility !== "public" || m.owner?.login !== process.env.FLEET_PUBLIC_OWNER || m.archived === true) process.exit(1);
+          NODE
+          printf 'repository=%s\n' "$target" >> "$GITHUB_OUTPUT"
       - name: checkout runtime
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           fetch-depth: 1
-      - name: checkout private state repo
+      - name: checkout public target
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          repository: M1Vj/fleet-control
-          token: ${{ secrets.FLEET_GH_TOKEN }}
+          repository: ${{ steps.public-target.outputs.repository }}
+          token: ${{ github.token }}
           persist-credentials: false
           fetch-depth: 1
-          path: state-control
+          path: public-target
       - name: setup node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
       - name: install pinned opencode cli
-        run: npm install -g opencode-ai@1.18.21
-      - name: download draft
+        run: npm install -g opencode-ai@1.18.30
+      - name: download public draft manifest
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: thesis-draft
-          path: artifacts
-      - name: refine sub-agent
-        run: FLEET_THESIS_MODE=refine FLEET_ARTIFACT_DIR=artifacts node scripts/thesis.mjs
-      - name: upload final
-        if: hashFiles('artifacts/thesis-final.json') != ''
+          name: public-thesis-draft
+          path: ${{ runner.temp }}/public-thesis-draft
+        continue-on-error: true
+      - name: refine public thesis result
+        env:
+          FLEET_PUBLIC_REPOSITORY: ${{ steps.public-target.outputs.repository }}
+          FLEET_THESIS_MODE: refine
+          FLEET_ARTIFACT_DIR: ${{ runner.temp }}/public-thesis-draft
+        run: node scripts/thesis.mjs
+      - name: upload public final manifest
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: thesis-final
-          path: artifacts/thesis-final.json
+          name: public-thesis-final
+          path: ${{ runner.temp }}/fleet-public-state/public-artifact.json
+          if-no-files-found: error
 
   ship:
     needs: [draft, refine]
-    if: ${{ always() && needs.draft.result == 'success' }}
+    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' && always() && needs.draft.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    concurrency:
-      group: fleet-state-writer
-      cancel-in-progress: false
-    env:
-      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
-      FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
-      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
     steps:
+      - name: validate public target
+        id: public-target
+        env:
+          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ github.repository }}
+          FLEET_PUBLIC_OWNER: M1Vj
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$FLEET_PUBLIC_REPOSITORY_INPUT"; owner="${target%%/*}"; name="${target#*/}"
+          [[ "$owner" == "$FLEET_PUBLIC_OWNER" && "$name" != "$target" && "$name" != */* ]]
+          metadata="$RUNNER_TEMP/public-repository.json"
+          curl --fail --silent --show-error --location --retry 1 -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/${owner}/${name}" >"$metadata" 2>"$RUNNER_TEMP/public-target-error.log"
+          node --input-type=module - "$metadata" <<'NODE'
+          import { readFileSync } from "node:fs";
+          const m = JSON.parse(readFileSync(process.argv[2], "utf8"));
+          if (m.private !== false || m.visibility !== "public" || m.owner?.login !== process.env.FLEET_PUBLIC_OWNER || m.archived === true) process.exit(1);
+          NODE
+          printf 'repository=%s\n' "$target" >> "$GITHUB_OUTPUT"
       - name: checkout runtime
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           fetch-depth: 1
-      - name: checkout private state repo
+      - name: checkout public target
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          repository: M1Vj/fleet-control
-          token: ${{ secrets.FLEET_GH_TOKEN }}
+          repository: ${{ steps.public-target.outputs.repository }}
+          token: ${{ github.token }}
           persist-credentials: false
           fetch-depth: 1
-          path: state-control
+          path: public-target
       - name: setup node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
-      - name: download final (or draft fallback)
+      - name: install pinned opencode cli
+        run: npm install -g opencode-ai@1.18.30
+      - name: download public final manifest
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          pattern: "{thesis-final,thesis-draft}"
-          merge-multiple: true
-          path: artifacts
+          name: public-thesis-final
+          path: ${{ runner.temp }}/public-thesis-final
         continue-on-error: true
-      - name: normalize artifact name
-        run: |
-          mkdir -p shipdir
-          if [ -f artifacts/thesis-final.json ]; then cp artifacts/thesis-final.json shipdir/thesis-final.json;
-          elif [ -f artifacts/thesis-draft.json ]; then cp artifacts/thesis-draft.json shipdir/thesis-final.json; fi
-      - name: ship draft PR as M1Vj
-        run: FLEET_THESIS_MODE=ship FLEET_ARTIFACT_DIR=shipdir node scripts/thesis.mjs
+      - name: ship public thesis result
+        env:
+          FLEET_PUBLIC_REPOSITORY: ${{ steps.public-target.outputs.repository }}
+          FLEET_THESIS_MODE: ship
+          FLEET_ARTIFACT_DIR: ${{ runner.temp }}/public-thesis-final
+        run: node scripts/thesis.mjs

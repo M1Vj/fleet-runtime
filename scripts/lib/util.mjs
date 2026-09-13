@@ -3,6 +3,11 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import {
+  assertMutationAllowed,
+  isPublicDataClass,
+  publicStateRoot,
+} from "./private-state.mjs";
 
 export function sha256(s) {
   return createHash("sha256").update(String(s)).digest("hex");
@@ -58,6 +63,19 @@ export function retry(fn, { tries = 3, baseMs = 500 } = {}, onAttempt = () => {}
 }
 
 function childEnv(env) {
+  if (isPublicDataClass(env)) {
+    const stateRoot = publicStateRoot(env);
+    const out = {
+      PATH: env.PATH || "/usr/bin:/bin:/usr/local/bin",
+      // Keep gh from consulting a user's private config/token store.
+      HOME: path.join(stateRoot, "home"),
+      TMPDIR: env.TMPDIR || tmpdir(),
+      GH_TOKEN: env.GITHUB_TOKEN || "",
+      GH_HOST: "github.com",
+      GH_CONFIG_DIR: path.join(stateRoot, "gh-config"),
+    };
+    return out;
+  }
   return {
     PATH: env.PATH || "/usr/bin:/bin:/usr/local/bin",
     HOME: env.HOME || process.env.HOME || "/tmp",
@@ -68,6 +86,7 @@ function childEnv(env) {
 }
 
 export function gh(args, env = process.env, { input } = {}) {
+  if (isPublicDataClass(env)) assertPublicGhReadOnly(args);
   const redact = scrub(env);
   const res = spawnSync("gh", args, {
     env: childEnv(env),
@@ -87,7 +106,34 @@ export function gh(args, env = process.env, { input } = {}) {
   }
 }
 
+function assertPublicGhReadOnly(args = []) {
+  const values = args.map((value) => String(value));
+  const methodIndex = values.findIndex((value) => /^-X$|^--method$|^-X=/.test(value));
+  if (methodIndex >= 0) {
+    const method = values[methodIndex].includes("=")
+      ? values[methodIndex].split("=").at(-1)
+      : values[methodIndex + 1];
+    if (String(method || "GET").toUpperCase() !== "GET") {
+      throw new Error(`PUBLIC_WRITE_BLOCKED: gh ${method}`);
+    }
+  }
+  const explicitGet = methodIndex >= 0 && String(values[methodIndex].includes("=") ? values[methodIndex].split("=").at(-1) : values[methodIndex + 1] || "GET").toUpperCase() === "GET";
+  if (!explicitGet && values.some((value) => /^--?(?:raw-)?field$|^-F$|^-f$|^--input$/.test(value))) {
+    throw new Error("PUBLIC_WRITE_BLOCKED: gh request body");
+  }
+  if (methodIndex < 0 && values.some((value) => /^--?(?:raw-)?field$|^-F$|^-f$|^--input$/.test(value))) {
+    throw new Error("PUBLIC_WRITE_BLOCKED: gh request body");
+  }
+  if (values[0] === "pr" && values.some((value) => /^(merge|ready|close|reopen|edit|comment|review|create)$/.test(value))) {
+    throw new Error("PUBLIC_WRITE_BLOCKED: gh pr mutation");
+  }
+  if (values[0] === "workflow" && values.some((value) => /^(run|enable|disable|cancel)$/.test(value))) {
+    throw new Error("PUBLIC_WRITE_BLOCKED: gh workflow mutation");
+  }
+}
+
 export function putFileContent(repo, filePath, contentUtf8, branch, message, env = process.env) {
+  assertMutationAllowed(env, `put file ${repo}/${filePath}`);
   let sha;
   try {
     const existing = gh(["api", `/repos/${repo}/contents/${filePath}?ref=${branch}`], env);
@@ -108,6 +154,7 @@ export function putFileContent(repo, filePath, contentUtf8, branch, message, env
 }
 
 export function ensureBranch(repo, branch, baseSha, env = process.env) {
+  assertMutationAllowed(env, `create branch ${repo}:${branch}`);
   try {
     gh(["api", "-X", "POST", `/repos/${repo}/git/refs`, "-f", `ref=refs/heads/${branch}`, "-f", `sha=${baseSha}`], env);
     return "created";
@@ -118,6 +165,7 @@ export function ensureBranch(repo, branch, baseSha, env = process.env) {
 }
 
 export function ghInput(prefixArgs, bodyObj, env = process.env) {
+  assertMutationAllowed(env, `gh input ${prefixArgs.join(" ")}`);
   const tmp = path.join(mkdtempSync(path.join(tmpdir(), "ghin-")), "body.json");
   writeFileSync(tmp, JSON.stringify(bodyObj), "utf8");
   try {
@@ -128,6 +176,7 @@ export function ghInput(prefixArgs, bodyObj, env = process.env) {
 }
 
 export function gitPush(repoDir, branch, env = process.env, { retries = 3 } = {}) {
+  assertMutationAllowed(env, `git push ${branch}`);
   const redact = scrub(env);
   const dir = mkdtempSync(path.join(tmpdir(), "fleetcred-"));
   const helper = path.join(dir, "helper.sh");
@@ -174,6 +223,7 @@ export function gitPush(repoDir, branch, env = process.env, { retries = 3 } = {}
 }
 
 export function gitCommit(repoDir, message, identity) {
+  assertMutationAllowed(process.env, "git commit");
   const status = spawnSync("git", ["status", "--porcelain"], { cwd: repoDir, encoding: "utf8" });
   if (!(status.stdout || "").trim()) {
     return "no-changes";
@@ -190,12 +240,14 @@ export function gitCommit(repoDir, message, identity) {
 }
 
 export function gitAdd(repoDir, paths) {
+  assertMutationAllowed(process.env, "git add");
   const res = spawnSync("git", ["add", ...paths], { cwd: repoDir, encoding: "utf8" });
   if (res.status !== 0) throw new Error(`git add failed: ${res.stderr || res.stdout}`);
   return true;
 }
 
 export function configureIdentity(repoDir, identity) {
+  if (isPublicDataClass(process.env)) return false;
   const probe = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], { cwd: repoDir, encoding: "utf8" });
   if (probe.status !== 0) return false;
   for (const [k, v] of [["user.name", identity.name], ["user.email", identity.noreply]]) {
@@ -225,6 +277,7 @@ export function findExistingOpenPr(repoFullName, branch, env = process.env) {
 }
 
 export function safeCommitState(repoDir, subpaths, message, identity, pushEnv = process.env) {
+  assertMutationAllowed(pushEnv, "commit state");
   const existing = subpaths.filter((p2) => existsSync(path.join(repoDir, p2)));
   const changed = existing.filter((p2) => {
     const res = spawnSync("git", ["status", "--porcelain", "--", p2], { cwd: repoDir, encoding: "utf8" });
@@ -238,6 +291,7 @@ export function safeCommitState(repoDir, subpaths, message, identity, pushEnv = 
 }
 
 export function installCredentialHelper(repoDir, env = process.env) {
+  assertMutationAllowed(env, "install git credential helper");
   const helperPath = path.join(mkdtempSync(path.join(tmpdir(), "fleetcred2-")), "helper.sh");
   writeFileSync(
     helperPath,

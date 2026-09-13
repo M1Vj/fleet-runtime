@@ -11,9 +11,19 @@ import { validateDirectives } from "./lib/directives.mjs";
 import { eventKey, loadLedger, has, append } from "./lib/ledger.mjs";
 import { expectUser, verifyCommit } from "./lib/verify.mjs";
 import { decideStale, planWatchdogActions } from "./lib/watchdog-decide.mjs";
+import {
+  isPublicDataClass,
+  publicRepository,
+  privateRepository,
+  PRIVATE_REPOSITORY_ENV,
+  resolveStateRoot,
+  makeExecutionTerminal,
+  writeExecutionAudit,
+  writePublicArtifact,
+} from "./lib/private-state.mjs";
 
 const CODE_ROOT = process.cwd();
-const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
+const REPO_ROOT = resolveStateRoot(process.env, CODE_ROOT);
 
 function fakeFetch(user) {
   return async () => ({
@@ -30,6 +40,25 @@ export async function main() {
   let failed = false;
 
   try {
+    if (isPublicDataClass(process.env)) {
+      const identity = await runGate(process.env);
+      const repository = publicRepository(process.env);
+      writePublicArtifact(process.env, {
+        mode: "selftest",
+        status: "ok",
+        repository,
+        checks: {
+          target: "public-visible",
+          identity: identity.login,
+          privateState: "not-read",
+          privateWrites: "blocked",
+        },
+      }, { kind: "selftest", status: "ok", repository, runId });
+      audit.note("public", `target=${repository} private-state=not-read`);
+      writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Selftest", "PASSED");
+      console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "passed", dataClass: "public" })}`);
+      return 0;
+    }
     const badEnv = { ...process.env, FLEET_EXPECT_LOGIN: "M1Vj-wrong" };
     try {
       await runGate(badEnv);
@@ -222,7 +251,7 @@ export async function main() {
       const childEnv = {
         ...process.env,
         FLEET_WATCHDOG_DRY_RUN: "1",
-        FLEET_STATE_ROOT: process.env.FLEET_STATE_ROOT || path.join(runtimeRoot, "state-control"),
+        FLEET_STATE_ROOT: REPO_ROOT || path.join(runtimeRoot, "state-control"),
       };
       const r = spawnSync(process.execPath, [scriptPath], {
         encoding: "utf8",
@@ -241,9 +270,9 @@ export async function main() {
 
     // T12 (lane B): terminal accepts the full 7-state set incl. merge-gate states.
     try {
-      const { makeTerminal, TERMINAL_STATES } = await import("./lib/terminal.mjs");
+      const { TERMINAL_STATES } = await import("./lib/terminal.mjs");
       const tdir = mkdtempSync(path.join(tmpdir(), "fleetterm-"));
-      const term = makeTerminal(tdir, { lane: "selftest" });
+      const term = makeExecutionTerminal(process.env, tdir, { lane: "selftest" });
       const got = [term("REVISION_QUEUED", { probe: 1 }), term("SCAN-DONE", { probe: 1 }), term("BOGUS-STATE", { probe: 1 })];
       const lines = (await import("node:fs")).readFileSync(path.join(tdir, "state", "events.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l).state);
       if (
@@ -351,7 +380,7 @@ export async function main() {
       if (commitOutcome === "committed") {
         gitPush(REPO_ROOT, "main", process.env);
         const sha = gitRevParse(REPO_ROOT, "HEAD");
-        await verifyCommit("M1Vj/fleet-control", sha, identity, process.env.FLEET_GH_TOKEN);
+        await verifyCommit(privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control), sha, identity, process.env.FLEET_GH_TOKEN);
         t7Note = `PASS end-to-end M1Vj attribution verified sha=${sha.slice(0, 10)}`;
       } else {
         await expectUser(identity, process.env.FLEET_GH_TOKEN);
@@ -363,7 +392,7 @@ export async function main() {
     }
     audit.note("T7", t7Note);
 
-    const evidenceFile = audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Selftest", failed ? "FAILED" : "PASSED");
+    const evidenceFile = writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Selftest", failed ? "FAILED" : "PASSED");
     try {
       gitAdd(REPO_ROOT, ["audit"]);
       if (gitCommit(REPO_ROOT, `[fleet] selftest-evidence ${runId}`, identity) === "committed") {
@@ -378,7 +407,7 @@ export async function main() {
   } catch (err) {
     const code = err.code && Number.isInteger(err.code) ? err.code : 1;
     audit.incident("fatal", err.message);
-    audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Selftest", `failed(${code})`);
+    writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Selftest", `failed(${code})`);
     console.error(`SELFTEST_FAILED code=${code} reason=${err.reason || err.message}`);
     return code;
   }

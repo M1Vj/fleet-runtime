@@ -12,13 +12,22 @@ import { verifyCommit } from "./lib/verify.mjs";
 import { findSuperseded, isStale } from "./lib/pr-hygiene.mjs";
 import { verifyPullAuthor, verifyCommentAuthor } from "./lib/verify.mjs";
 import { recordHumanReview, reconcileHumanReviewQueue, tagPrNeedsHumanReview } from "./lib/human-review.mjs";
+import {
+  isPublicDataClass,
+  publicRepository,
+  privateRepository,
+  PRIVATE_REPOSITORY_ENV,
+  resolveStateRoot,
+  writeExecutionAudit,
+  writePublicArtifact,
+} from "./lib/private-state.mjs";
 
-const REPO_ROOT = process.cwd();
-const STATE_ROOT = process.env.FLEET_STATE_ROOT || REPO_ROOT;
+const REPO_ROOT = resolveStateRoot(process.env, process.cwd());
+const STATE_ROOT = resolveStateRoot(process.env, REPO_ROOT);
 const AUDIT_DIR = path.join(STATE_ROOT, "audit");
 const MERGES_PATH = path.join(STATE_ROOT, "state", "merges.jsonl");
 const TARGETS_PATH = path.join(STATE_ROOT, "state", "targets.json");
-const RAW_TARGET_REPO = process.env.FLEET_TARGET_REPO;
+const RAW_TARGET_REPO = isPublicDataClass(process.env) ? process.env.FLEET_PUBLIC_REPOSITORY : process.env.FLEET_TARGET_REPO;
 const RAW_PR_NUMBER = process.env.FLEET_PR_NUMBER;
 
 const UI_EXTENSIONS = /\.(html|htm|css|scss|less|jsx|tsx|vue|svelte|astro|mdx)$/i;
@@ -349,6 +358,7 @@ export function sanitizedExecEnv(env = process.env) {
 // Kill-switch re-check before every mutation: runGate enforces it at startup,
 // but a STOP may land while judges/checks are running.
 export function killSwitchEngaged() {
+  if (isPublicDataClass(process.env)) return false;
   const p = process.env.FLEET_KILL_SWITCH_PATH || path.join(STATE_ROOT, "state", "KILL_SWITCH");
   try {
     return existsSync(p);
@@ -465,7 +475,7 @@ export async function postCommentOnce(repo, number, marker, body, audit, env = p
 }
 
 // Attributable state push: commit + push as M1Vj, then verify the SHA landed
-// under M1Vj in fleet-control. Bookkeeping only — never throws; the merge
+// under the configured owner in the private control repository. Bookkeeping only — never throws; the merge
 // outcome itself is enforced separately via verifyCommit on the merge commit.
 export async function commitPushVerify(repoDir, subpaths, message, identity, audit, env = process.env) {
   try {
@@ -477,7 +487,7 @@ export async function commitPushVerify(repoDir, subpaths, message, identity, aud
     if (outcome !== "committed") return outcome;
     gitPush(repoDir, "main", env);
     const sha = gitRevParse(repoDir, "HEAD");
-    await verifyCommit("M1Vj/fleet-control", sha, identity, env.FLEET_GH_TOKEN);
+    await verifyCommit(privateRepository(env, PRIVATE_REPOSITORY_ENV.control), sha, identity, env.FLEET_GH_TOKEN);
     audit.note("push-verify", `state committed+verified sha=${sha.slice(0, 10)}`);
     return outcome;
   } catch (err) {
@@ -619,6 +629,19 @@ async function runHygiene(identity, audit) {
 }
 
 export async function discoverFleetPRs(limit = process.env.FLEET_MERGE_SCAN_CAP || DEFAULT_SCAN_CAP, options = {}) {
+  if (isPublicDataClass(process.env)) {
+    const repository = publicRepository(process.env);
+    const pulls = collectScanPages(
+      (page, perPage) => gh(["api", buildScanPageEndpoint(`/repos/${repository}/pulls?state=open&sort=created&direction=asc`, page, perPage)], process.env),
+      { maxPages: normalizeScanPages(options.maxPages ?? process.env.FLEET_MERGE_SCAN_MAX_PAGES), perPage: Math.min(100, Math.max(1, Math.floor(Number(options.perPage || SCAN_PAGE_SIZE) || SCAN_PAGE_SIZE))) },
+    ).map((pull) => ({ ...pull, repo: repository }));
+    return selectScanPullRequests(pulls, {
+      targets: { tier1: [repository], excluded: [] },
+      limit: normalizeScanCap(limit),
+      history: options.history || [],
+      repositories: [{ full_name: repository, private: false, visibility: "public" }],
+    });
+  }
   const targets = options.targets || readTargets();
   const scanCap = normalizeScanCap(limit);
   const maxPages = normalizeScanPages(options.maxPages ?? process.env.FLEET_MERGE_SCAN_MAX_PAGES);
@@ -658,6 +681,20 @@ async function main() {
   try {
     identity = await runGate(process.env);
     configureIdentity(REPO_ROOT, identity);
+    if (isPublicDataClass(process.env)) {
+      const repository = publicRepository(process.env);
+      audit.note("public", "merge gate is read-only; no PR, review, state, or workflow mutation is permitted");
+      writePublicArtifact(process.env, {
+        mode: "merge",
+        status: "blocked",
+        repository,
+        reason: "public-read-only",
+        checks: { targetVisibility: "public", privateState: "not-read", externalWrites: "blocked" },
+      }, { kind: "merge", status: "blocked", repository, runId });
+      writeExecutionAudit(audit, process.env, REPO_ROOT, runId, `Merge gate ${repository}`, "blocked");
+      console.log("MERGE_TERMINAL_STATE=BLOCKED");
+      return 4;
+    }
   if (process.env.FLEET_GH_TOKEN) {
     if (!process.env.GH_TOKEN) process.env.GH_TOKEN = process.env.FLEET_GH_TOKEN;
     if (!process.env.FLEET_GH_USER) process.env.FLEET_GH_USER = identity.login;
@@ -706,7 +743,7 @@ async function main() {
     }
     await runHygiene(identity, audit);
 
-    audit.writeMarkdown(AUDIT_DIR, runId, "Merge gate scan", "ok");
+    writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Merge gate scan", "ok");
     await commitPushVerify(STATE_ROOT, ["state", "audit"], `[fleet] merge-gate scan ${runId}`, identity, audit, process.env);
     console.log("MERGE_TERMINAL_STATE=SCAN-DONE");
     return;
@@ -874,7 +911,7 @@ async function main() {
     const fleetAuthored = String(pr.head && pr.head.ref || "").startsWith("fleet/");
     if (fleetAuthored) {
       const { readFileSync: rf, existsSync: es } = await import("node:fs");
-      const revPath = path.join(process.env.FLEET_STATE_ROOT || REPO_ROOT, "state", "revisions.jsonl");
+      const revPath = path.join(REPO_ROOT, "state", "revisions.jsonl");
       const revCount = es(revPath)
         ? rf(revPath, "utf8").split("\n").filter(Boolean).map((l) => { try { const r = JSON.parse(l); return r.repo === TARGET_REPO && r.pr === PR_NUMBER ? r : null; } catch { return null; } }).filter(Boolean).length
         : 0;
@@ -1068,8 +1105,8 @@ async function main() {
   }
 
   async function finish(a, rid, stateName) {
-    a.writeMarkdown(AUDIT_DIR, rid, `Merge gate ${TARGET_REPO}#${PR_NUMBER}`, stateName);
-    // Durable state (merges.jsonl) + audit live in fleet-control; commit and
+    writeExecutionAudit(a, process.env, REPO_ROOT, rid, `Merge gate ${TARGET_REPO}#${PR_NUMBER}`, stateName);
+    // Durable state (merges.jsonl) + audit live in the private control repository; commit and
     // push as M1Vj with attribution verify. Best-effort: the terminal state
     // above is already recorded locally.
     try {

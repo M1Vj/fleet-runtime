@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://m1vj.github.io/fleet-runtime/indefinite-core/1.0.0/schema.json",
+  "title": "OpenCode indefinite runtime core manifest",
+  "type": "object",
+  "required": ["name", "coreVersion", "policyVersion", "capabilities", "modelPolicy", "retryPolicy", "circuitPolicy"],
+  "properties": {
+    "name": { "const": "opencode-indefinite-core" },
+    "coreVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "policyVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "capabilities": {
+      "type": "object",
+      "required": [
+        "primaryModel", "defaultModelChain", "variant", "reasoningEffort", "tools",
+        "parallelToolCalls", "unboundedSteps", "minOutputTokens", "compactionPruning",
+        "exactSession", "singleWriter", "authorizedFailover", "quotaWaitWhenNoEligibleRoute"
+      ],
+      "properties": {
+        "primaryModel": { "type": "string" },
+        "paidFallbackModel": { "type": ["string", "null"], "const": null },
+        "defaultModelChain": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "dynamicModelPool": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "variant": { "const": "xhigh" },
+        "reasoningEffort": { "const": "xhigh" },
+        "tools": { "const": true },
+        "parallelToolCalls": { "const": true },
+        "unboundedSteps": { "type": "integer", "minimum": 9007199254740991 },
+        "minOutputTokens": { "type": "integer", "minimum": 16384 },
+        "minMaxTokens": { "type": "integer", "minimum": 16384 },
+        "compactionPruning": {
+          "type": "object",
+          "required": ["compaction", "pruning"],
+          "properties": {
+            "compaction": { "const": true },
+            "pruning": { "const": true }
+          }
+        },
+        "exactSession": { "const": true },
+        "singleWriter": { "const": true },
+        "authorizedFailover": { "const": true },
+        "routeFailover": { "const": true },
+        "quotaWaitWhenNoEligibleRoute": { "const": true },
+        "noIdentitySpoofing": { "const": true },
+        "noLimitCircumvention": { "const": true },
+        "retryAfterParsing": { "const": true },
+        "circuitBreaker": { "const": true }
+      }
+    },
+    "modelPolicy": {
+      "type": "object",
+      "required": ["idPattern", "forbiddenPatterns", "deadModelIds"],
+      "properties": {
+        "idPattern": { "type": "string" },
+        "contributorTierPattern": { "type": "string" },
+        "forbiddenPatterns": { "type": "array", "items": { "type": "string" } },
+        "deadModelIds": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "retryPolicy": {
+      "type": "object",
+      "required": ["defaultRetryAfterMs", "maxErrorBodyBytes"],
+      "properties": {
+        "defaultRetryAfterMs": { "type": "integer", "minimum": 0 },
+        "maxErrorBodyBytes": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "circuitPolicy": {
+      "type": "object",
+      "required": ["openMs"],
+      "properties": { "openMs": { "type": "integer", "minimum": 1 } }
+    }
+  }
+}

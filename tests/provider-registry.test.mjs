@@ -11,11 +11,12 @@ import {
   resolveJudgeModel,
 } from "../scripts/lib/provider-registry.mjs";
 
-test("defaults pin muse-spark contributor-free primary with paid fallback known", () => {
+test("defaults pin muse-spark contributor-free primary with no paid fallback", () => {
   assert.equal(PRIMARY_MODEL, "opencode/muse-spark-1.3-contributor-free");
-  assert.equal(PAID_FALLBACK_MODEL, "opencode/muse-spark-1.3");
+  assert.equal(PAID_FALLBACK_MODEL, null);
   assert.ok(DEFAULT_MODEL_CHAIN.includes(PRIMARY_MODEL));
-  assert.ok(isAllowedModel(PAID_FALLBACK_MODEL));
+  assert.equal(isAllowedModel("opencode/muse-spark-1.3"), false);
+  assert.equal(isAllowedModel("opencode/muse-spark-1.3", { allowPaid: true, authorizedPaidOptIn: true }), true);
   assert.equal(DEFAULT_JUDGE_MODEL, PRIMARY_MODEL);
 });
 
@@ -23,7 +24,7 @@ test("explicit IDs allowed without discovery, Gemini models strictly rejected", 
   // Upstream #47120: discovery omits models — any well-formed explicit ID passes.
   assert.equal(isAllowedModel("opencode/muse-spark-1.3-contributor-free"), true);
   assert.equal(isAllowedModel("opencode/nemotron-3.5-lightning-free"), true);
-  assert.equal(isAllowedModel("opencode/some-future-model-9"), true);
+  assert.equal(isAllowedModel("opencode/some-future-model-9"), false);
   // STRICT NEGATIVE INVARIANT: Gemini/Google models strictly forbidden
   assert.equal(isAllowedModel("opencode/gemini-3-flash"), false);
   assert.equal(isAllowedModel("google/antigravity-gemini-3"), false);

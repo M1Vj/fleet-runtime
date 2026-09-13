@@ -41,11 +41,13 @@ import {
   sanitizeModelChain,
   getModelCapabilityScore,
 } from "./lib/provider-registry.mjs";
+import { CORE_INTEGRITY_OK, CORE_LOCK_DIGEST, CORE_MANIFEST } from "../packages/indefinite-core/index.mjs";
 import { makeTerminal } from "./lib/terminal.mjs";
 
 export const ZEN_DEFAULT_URL = "https://opencode.ai/zen/v1/models";
 export const CHAIN_TTL_MS_DEFAULT = 7 * 24 * 3600 * 1000;
 export const MAX_CHAIN = 5;
+export const CORE_REFRESH_DIGEST = CORE_LOCK_DIGEST;
 
 export function resolveWriterTtlMs(env = process.env) {
   const raw = Number.parseInt(String(env.FLEET_CHAIN_TTL_MS || ""), 10);
@@ -136,7 +138,8 @@ export function rankChain(candidates) {
   const free = [];
   for (const { id, entry } of candidates) {
     const fullId = id.includes("/") ? id : `opencode/${id}`;
-    if (!isAllowedModel(fullId)) continue;
+    if (!isAllowedModel(fullId, { free: isFreeTier(fullId, entry) })) continue;
+    if (entry && (entry.authorized === false || entry.providerAuthorized === false || entry.routeEligible === false)) continue;
     if (entry && entry.status === "deprecated") continue;
     if (!isFreeTier(fullId, entry)) continue;
     free.push({ id: fullId, entry });
@@ -186,6 +189,10 @@ async function loadCatalog(env) {
 
 export async function main(env = process.env) {
   const stateRoot = env.FLEET_STATE_ROOT || process.cwd();
+  if (!CORE_INTEGRITY_OK) {
+    console.error(`MODEL_REFRESH_FAILED reason=core-parity-mismatch digest=${CORE_LOCK_DIGEST}`);
+    return 1;
+  }
   const ttlMs = resolveWriterTtlMs(env);
   let json;
   try {
@@ -218,6 +225,8 @@ export async function main(env = process.env) {
     updatedAt: new Date().toISOString(),
     source: resolveCatalogUrl(env),
     ttlMs,
+    coreVersion: CORE_MANIFEST.coreVersion,
+    coreDigest: CORE_LOCK_DIGEST,
   };
   try {
     const p = chainOutputPath(stateRoot);

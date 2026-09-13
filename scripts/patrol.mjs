@@ -9,11 +9,21 @@ import { eventKey, append } from "./lib/ledger.mjs";
 import { validateDirectives } from "./lib/directives.mjs";
 import { askModel } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor, verifyCommentAuthor, verifyIssueAuthor } from "./lib/verify.mjs";
-import { makeTerminal } from "./lib/terminal.mjs";
 import { shouldCoalesce } from "./lib/watchdog-decide.mjs";
+import {
+  isPublicDataClass,
+  makeExecutionTerminal,
+  publicModelEnv,
+  publicRepository,
+  privateRepository,
+  PRIVATE_REPOSITORY_ENV,
+  resolveStateRoot,
+  writeExecutionAudit,
+  writePublicArtifact,
+} from "./lib/private-state.mjs";
 
 const CODE_ROOT = process.cwd();
-const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
+const REPO_ROOT = resolveStateRoot(process.env, CODE_ROOT);
 const AUDIT_DIR = path.join(REPO_ROOT, "audit");
 const STATE_DIR = path.join(REPO_ROOT, "state");
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -40,6 +50,7 @@ function sessionsPath() {
 }
 
 function loadPatrolSession() {
+  if (isPublicDataClass(process.env)) return "";
   const data = readJson(sessionsPath(), {});
   const row = data?.["patrol-latest"];
   if (!row || typeof row !== "object") return "";
@@ -158,6 +169,7 @@ function pullPriority(item, seen, key, now, revisitTtlMs) {
 // mid-run. All GitHub API mutations must consult this first; state/audit
 // bookkeeping commits remain allowed so the halt itself is observable.
 function killSwitchEngaged() {
+  if (isPublicDataClass(process.env)) return false;
   const p = process.env.FLEET_KILL_SWITCH_PATH || path.join(REPO_ROOT, "state", "KILL_SWITCH");
   try {
     return existsSync(p);
@@ -167,11 +179,13 @@ function killSwitchEngaged() {
 }
 
 async function collectSignals(env, audit) {
-  const repos = gh(["api", "/user/repos?affiliation=owner&per_page=100&sort=pushed"], env);
+  const repos = isPublicDataClass(env)
+    ? [gh(["api", `/repos/${publicRepository(env)}`], env)]
+    : gh(["api", "/user/repos?affiliation=owner&per_page=100&sort=pushed"], env);
   audit.note("enumerate", `owned repos=${repos.length}`);
   const signals = [];
   for (const repo of repos) {
-    const full = repo.full_name;
+    const full = repo.full_name || (isPublicDataClass(env) ? publicRepository(env) : "");
     try {
       const pulls = gh(["api", `/repos/${full}/pulls?state=open&per_page=20`], env) || [];
       const since = readJson(heartbeatPath(), {}).lastRunUtc || new Date(Date.now() - 26 * 3600 * 1000).toISOString();
@@ -494,6 +508,15 @@ export async function executeDirectives(env, identity, directives, targets, audi
       results: scoped.errors.map((error) => ({ kind: "scope", ok: false, error })),
     };
   }
+  if (isPublicDataClass(env)) {
+    const results = scoped.directives.map((directive) => ({
+      kind: directive?.kind || "unknown",
+      ok: true,
+      skipped: "public-read-only",
+    }));
+    if (typeof audit?.note === "function") audit.note("public-read-only", `suppressed ${results.length} directive mutations`);
+    return { mutations: 0, results };
+  }
   let mutations = 0;
   const results = [];
   for (const d of scoped.directives) {
@@ -506,8 +529,9 @@ export async function executeDirectives(env, identity, directives, targets, audi
           results.push({ kind: d.kind, ok: true, skipped: "kill-switch" });
           continue;
         }
-        const created = gh(["api", "-X", "POST", "/repos/M1Vj/fleet-control/issues", "-f", `title=${d.title}`, "-f", `body=${d.body}`], env);
-        await verifyIssueAuthor("M1Vj/fleet-control", created.number, identity, env.FLEET_GH_TOKEN);
+        const controlRepository = privateRepository(env, PRIVATE_REPOSITORY_ENV.control);
+        const created = gh(["api", "-X", "POST", `/repos/${controlRepository}/issues`, "-f", `title=${d.title}`, "-f", `body=${d.body}`], env);
+        await verifyIssueAuthor(controlRepository, created.number, identity, env.FLEET_GH_TOKEN);
         mutations += 1;
         results.push({ kind: d.kind, ok: true, issue: created.number });
       } else if (d.kind === "comment" || d.kind === "label") {
@@ -586,15 +610,15 @@ export async function main() {
   const audit = new AuditBuffer(redact);
   let identity = null;
   let status = "failed";
-  const terminal = makeTerminal(REPO_ROOT, { lane: "patrol" });
+  const terminal = makeExecutionTerminal(process.env, REPO_ROOT, { lane: "patrol" });
   let trigger = "manual";
-  let gwRoot = process.env.FLEET_STATE_ROOT || REPO_ROOT;
+  let gwRoot = REPO_ROOT;
   let auditFileRel = "";
   let statePushAttempted = false;
   let statePushVerified = false;
   const writePatrolAudit = (outcome) => {
-    const file = audit.writeMarkdown(AUDIT_DIR, runId, "Patrol run", outcome);
-    auditFileRel = path.relative(REPO_ROOT, file);
+    const file = writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Patrol run", outcome);
+    auditFileRel = file ? path.relative(REPO_ROOT, file) : (process.env.FLEET_PUBLIC_ARTIFACT_MANIFEST || "");
     return file;
   };
   try {
@@ -602,7 +626,35 @@ export async function main() {
     configureIdentity(REPO_ROOT, identity);
     audit.note("gate", `identity=${identity.login} id=${identity.id} scopes=${identity.scopes.join(",")}`);
 
-    gwRoot = process.env.FLEET_STATE_ROOT || REPO_ROOT;
+    gwRoot = REPO_ROOT;
+
+    if (isPublicDataClass(process.env)) {
+      const repo = publicRepository(process.env);
+      const signals = await collectSignals(process.env, audit);
+      const digest = buildDigest(signals, new Map());
+      let modelStatus = "skipped-empty-digest";
+      let directives = [];
+      if (digest !== "[]") {
+        const modelResult = await askModel({
+          prompt: buildPrompt(digest),
+          timeoutMs: 480000,
+          env: publicModelEnv(process.env),
+          preferVariantMax: true,
+          maxRounds: 3,
+        });
+        modelStatus = modelResult.modelMode || (modelResult.complete ? "model" : "model-unavailable");
+        if (modelResult.complete && modelResult.reply) {
+          const validation = validateDirectives(modelResult.reply);
+          if (validation.ok) directives = validation.directives;
+          else audit.note("validator", "public directive output rejected; no mutations attempted");
+        }
+      }
+      const result = await executeDirectives(process.env, identity, directives, { tier1: [repo], excluded: [] }, audit);
+      writePublicArtifact(process.env, { mode: "patrol", status: "ok", repository: repo, count: signals.length, results: result.results, checks: { model: modelStatus, digestBytes: digest.length } }, { kind: "patrol", status: "ok", repository: repo, runId });
+      writePatrolAudit("ok-public-read-only");
+      console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "public-read-only", directives: directives.length, mutations: 0 })}`);
+      return 0;
+    }
     const { gatewayDown } = await import("./lib/gateway-health.mjs");
     if (gatewayDown(gwRoot)) {
       // Finish-loop: gateway outage is MODEL_UNAVAILABLE (exit 6), surfaced
@@ -732,11 +784,11 @@ export async function main() {
       statePushAttempted = true;
       gitPush(REPO_ROOT, "main", process.env);
       const sha = gitRevParse(REPO_ROOT, "HEAD");
-      await verifyCommit("M1Vj/fleet-control", sha, identity, process.env.FLEET_GH_TOKEN);
+      await verifyCommit(privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control), sha, identity, process.env.FLEET_GH_TOKEN);
       statePushVerified = true;
       audit.note("push-verify", `attribution verified sha=${sha.slice(0, 10)}`);
       try {
-        gh(["workflow", "run", "deep.yml", "-R", "M1Vj/fleet-control", "-f", "workers=3"], process.env);
+          gh(["workflow", "run", "deep.yml", "-R", privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control), "-f", "workers=3"], process.env);
         audit.note("deep-dispatch", "deep.yml dispatched");
       } catch (err) {
         audit.note("deep-dispatch", `dispatch skipped: ${err.message.slice(0, 120)}`);
@@ -795,7 +847,7 @@ export async function main() {
         statePushAttempted = true;
         gitPush(REPO_ROOT, "main", process.env);
         const failSha = gitRevParse(REPO_ROOT, "HEAD");
-        await verifyCommit("M1Vj/fleet-control", failSha, identity, process.env.FLEET_GH_TOKEN);
+        await verifyCommit(privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control), failSha, identity, process.env.FLEET_GH_TOKEN);
         statePushVerified = true;
         audit.note("push-verify", `failure audit attribution verified sha=${failSha.slice(0, 10)}`);
       } catch (pushErr) {

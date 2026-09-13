@@ -4,7 +4,7 @@
 // Slot convention: FLEET_OPENCODE_AUTH (slot 1, legacy) plus
 // FLEET_OPENCODE_AUTH_2..FLEET_OPENCODE_AUTH_9 (numbered slots, probed in
 // order; empty values ignored). Pool health persists at
-// <FLEET_STATE_ROOT>/state/credential-health.json — private fleet-control
+// <FLEET_STATE_ROOT>/state/credential-health.json — private control-repository state
 // state, never committed to the public runtime repo. Per-slot shape:
 // { cooldownUntil, consecutiveErrors, lastOk, lastAuthError }.
 //

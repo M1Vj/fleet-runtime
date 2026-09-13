@@ -1,182 +1,116 @@
-# RUNBOOK — fleet-runtime operations
+# RUNBOOK — fleet-runtime public operations
 
-All commands assume `gh` authenticated as M1Vj on the owner Mac. Workflows live in
-`M1Vj/fleet-runtime`; durable state lives in private `M1Vj/fleet-control`. Use
-`-R M1Vj/fleet-runtime` for every lane below.
+This repository is the public execution shell. Its workflows are secretless,
+read-only, and limited to live-verified public repositories owned by `M1Vj`.
+The private controller is the only place that may retain credentials, private
+repository content, durable queue/state, model sessions, or write authority.
+Do not move those responsibilities into this repository.
 
-## 0. Governance: Local-to-Fleet Cascading Rule (Approval Required)
+## 1. Public target contract
 
-- **Mandatory Alignment**: Any architectural, configuration, prompt, model variant, sanitizer, proxy, or tooling improvements proven locally must always have an explicit cascade pathway to the fleet (`M1Vj/fleet-runtime` and `M1Vj/fleet-control`).
-- **CRITICAL APPROVAL GATE**: Cascading changes to the fleet MUST ONLY be pushed or deployed with the explicit prior approval of the owner (Vj). Agents must prepare, test, and present the proposed cascade changes, and wait for direct confirmation before executing the push or dispatch.
+Each operational workflow starts with a `validate public target` step. A target
+is accepted only when all of the following hold:
 
-## 1. Secrets setup and rotation
+- it is a single `owner/name` value with a conservative repository-name regex;
+- `owner` is exactly `M1Vj`;
+- `GET /repos/{owner}/{name}` succeeds with the built-in read token (or an
+  anonymous public request);
+- the response says `private: false` and `visibility: public`;
+- the API owner matches the allowlist; and
+- the repository is not archived.
 
-Required secrets on BOTH repos: `FLEET_GH_TOKEN` (PAT with `repo` + `workflow` scopes;
-the gate exits 4 without them) and `FLEET_OPENCODE_AUTH`.
+The target is rejected before checkout, model execution, and task execution on
+any validation or API error. Scheduled runs use the current public repository
+when no input is supplied. Manual runs may supply `repo` for another public
+target. Pull-request numbers and routes are accepted only after the target has
+passed the same check.
 
-Refresh model auth (values never displayed; helper targets fleet-control only):
+Public state is ephemeral below `${{ runner.temp }}/fleet-public-state`.
+`FLEET_PUBLIC_ARTIFACT_MANIFEST` points to one exact JSON file. A missing,
+invalid, or incomplete manifest is not a successful result. No workflow uploads
+a directory, recursive glob, prompt, provider trace, private path, or failure
+log.
 
-    node scripts/refresh-auth-secret.mjs ~/.local/share/opencode/auth.json
+## 2. Running a public workflow
 
-Refresh the GitHub token:
+The hosted workflows are intentionally kept disabled until the owner approves
+the release gates. A local operator can inspect or dispatch a workflow without
+changing its permissions:
 
-    gh auth token > /tmp/t && node scripts/refresh-auth-secret.mjs --token /tmp/t && rm /tmp/t
+```bash
+gh workflow list -R M1Vj/fleet-runtime
+gh workflow run fleet-patrol.yml -R M1Vj/fleet-runtime -f repo=M1Vj/fleet-runtime
+gh workflow run fleet-deep.yml -R M1Vj/fleet-runtime -f repo=M1Vj/fleet-runtime -f workers=3
+gh workflow run fleet-merge-gate.yml -R M1Vj/fleet-runtime -f repo=M1Vj/fleet-runtime -f pr=1
+gh run list -R M1Vj/fleet-runtime --limit 10
+gh run watch <run-id> -R M1Vj/fleet-runtime
+```
 
-The helper writes only to `M1Vj/fleet-control`; mirror manually for the runtime repo:
+Do not pass private repository names, private task identifiers, prompts, source
+excerpts, session identifiers, or credentials as inputs. Public workflow event
+payloads are treated as untrusted and are never copied into run metadata.
 
-    gh secret set FLEET_OPENCODE_AUTH -R M1Vj/fleet-runtime < ~/.local/share/opencode/auth.json
-    gh auth token | gh secret set FLEET_GH_TOKEN -R M1Vj/fleet-runtime
+The `fleet-public` repository-dispatch type carries no target data; an empty
+dispatch causes the workflow to use its own public repository. A controller
+that needs to process a private target must use its private execution plane.
 
-Optional KB ingestion: set `GDRIVE_REFRESH_TOKEN`, `GDRIVE_CLIENT_ID`,
-`GDRIVE_CLIENT_SECRET` (+ optional `GDRIVE_FOLDER_ID` var, default `root`) on fleet-runtime.
+## 3. Public workflow capabilities
 
-Auth freshness: `scripts/install-keepalive.sh` installs LaunchAgent
-`com.m1vj.fleet-auth-refresh`, refreshing `FLEET_OPENCODE_AUTH` every 30 minutes while the
-Mac is on. Uninstall:
+- `fleet-patrol`, `fleet-watchdog`, and `fleet-retro` perform public liveness,
+  signal, and telemetry checks.
+- `fleet-deep` and `fleet-improve` preserve bounded fan-out, research,
+  planning, implementation proposals, and independent review for public data.
+- `fleet-merge-gate` performs read-only risk, deterministic, and visual checks
+  for a public pull request. It cannot merge, comment, label, or push.
+- `fleet-kb` and `fleet-thesis` preserve their multi-stage public pipelines;
+  each stage exchanges only the exact public manifest.
+- `fleet-model-refresh` ranks the public free-model catalog into ephemeral
+  state. Model adapters retain their configured capability and waiting behavior;
+  no provider credential is placed in a public job.
+- `ci-diag` runs anonymous CLI and catalog probes only.
+- `fleet-emergency-stop` validates a stop request and records a local,
+  ephemeral marker. Durable halt/re-arm actions belong to the private plane.
 
-    launchctl unload ~/Library/LaunchAgents/com.m1vj.fleet-auth-refresh.plist && rm ~/Library/LaunchAgents/com.m1vj.fleet-auth-refresh.plist
+## 4. Model and capacity policy
 
-## 2. Manual runs and monitoring
+Model selection is adapter-owned. Workflows provide the public data class and
+the public target; adapters preserve the contributor-free primary, configured
+effort, tool access, parallelism, continuation, compaction, and output floors.
+When all compliant free capacity is unavailable, the task enters a durable
+waiting state and resumes after the provider reset/cooldown. It never switches
+to paid capacity, fabricates progress, or bypasses provider limits.
 
-    gh workflow run fleet-patrol.yml        -R M1Vj/fleet-runtime
-    gh workflow run fleet-deep.yml          -R M1Vj/fleet-runtime -f workers=3
-    gh workflow run fleet-selftest.yml      -R M1Vj/fleet-runtime
-    gh run list -R M1Vj/fleet-runtime --limit 10
-    gh run watch <run-id> -R M1Vj/fleet-runtime
+## 5. Verification and incident handling
 
-Monitoring surfaces: per-run evidence in `audit/<YYYY-MM-DD>/<runId>.md`; terminal states
-in `state/events.jsonl`; merge decisions in `state/merges.jsonl`; the `docs/status.md`
-digest (7-day per-lane matrix, heartbeat, queue depth, kill-switch state), regenerated by
-each fleet-retro run.
+Run the focused airlock checks before any review:
 
-## 3. Emergency stop and re-arm
+```bash
+node --test tests/public-airlock.test.mjs
+```
 
-Stop (requires exact confirmation string):
+The suite verifies that every workflow has no private-control references,
+secrets, unsafe event contexts, broad artifacts, or failure-log dumps; uses only
+the built-in token; declares `FLEET_DATA_CLASS=public`; validates targets before
+work; and parses YAML with Ruby/Psych when available.
 
-    gh workflow run fleet-emergency-stop.yml -R M1Vj/fleet-runtime -f confirm=STOP
+For a failed validation or provider response, preserve the run and its exact
+error status. Do not retry with another credential, alter visibility, disable
+the guard, or delete logs/artifacts. Record the run identifier and hand the
+private details to the controller through its approved channel.
 
-Effects: commits `state/KILL_SWITCH` to fleet-control, disables patrol/watchdog/selftest/
-deep/improve/thesis/kb/retro on BOTH repos, opens an `[EMERGENCY STOP]` issue.
-Caveat: `fleet-merge-gate` and `ci-diag` are NOT disabled; for a full halt also run:
+## 6. Release gates
 
-    gh api -X PUT repos/M1Vj/fleet-runtime/actions/workflows/merge.yml/disable
+Before enabling any hosted workflow, the owner must verify:
 
-Re-arm (from a local clone of fleet-control):
+1. all public taint sentinels stay out of logs, metadata, artifacts, and model
+   requests;
+2. every target is rechecked for public visibility at execution time;
+3. public jobs use only the built-in read token and immutable action pins;
+4. manifests reject unknown fields, private identifiers, prompts, paths, and
+   secret-shaped values;
+5. runtime, controller, and adapter manifests agree on capability and data
+   class; and
+6. rollback preserves active sessions and does not replay uncertain effects.
 
-    git rm state/KILL_SWITCH && git commit -m "[fleet] re-arm" && git push
-    for wf in patrol.yml watchdog.yml selftest.yml deep.yml improve.yml thesis.yml kb.yml retro.yml; do gh api -X PUT repos/M1Vj/fleet-runtime/actions/workflows/$wf/enable; gh api -X PUT repos/M1Vj/fleet-control/actions/workflows/$wf/enable; done
-
-## 4. Scope changes (targets.json)
-
-Edit `state/targets.json` in fleet-control and push to `main`:
-
-    { "tier1": ["M1Vj/SomeRepo"], "excluded": ["M1Vj/Ignored"], "allOwned": false }
-
-Only `tier1` repos receive comments, labels, or draft PRs (`eligible()` in
-`scripts/patrol.mjs`). Non-tier1 owned repos are observe-only: their findings surface as
-issues in fleet-control. `fleet_issue` directives always target fleet-control; changes
-apply on the next patrol.
-
-## 5. Audit log interpretation
-
-Each run writes `audit/<YYYY-MM-DD>/<runId>.md` with YAML frontmatter (`lane`, `outcome`,
-`retries`, `wall_ms`) plus timestamped steps and incidents; values are secret-scrubbed.
-A failed lane still commits its failure audit when identity was already verified.
-
-Exit codes: 0 success/intentional skip; 1 generic failure; 2 kill switch engaged (test-only
-path today); 3 identity mismatch; 4 scope mismatch; 5 rejected model output; 6 model
-unavailable after the full ladder.
-
-Named terminal states (`SUCCESS`, `NO-OP`, `BLOCKED`, `STALLED`, `EXHAUSTED`) land in
-`state/events.jsonl`; the merge gate also records decisions in `state/merges.jsonl` and
-prints `MERGE_TERMINAL_STATE=<STATE>` (`REVISION_QUEUED` when a revision round is
-dispatched, `SCAN-DONE` for scan mode). `STALLED` means skipped-by-design (circuit open,
-superseded/stale PR) — not a failure signal.
-
-## 6. Session resume
-
-Model session ids are captured per run in `state/sessions.json`
-(`runId -> { sessionId }`). To continue a reasoning thread manually on any machine with
-opencode installed:
-
-    OPENCODE_AUTH_CONTENT="$(cat ~/.local/share/opencode/auth.json)" \
-      opencode run -s <sessionId> "follow-up prompt"
-
-## 7. Model fallback chain configuration
-
-Set repo variable `FLEET_MODEL_CHAIN` (comma-separated, priority order):
-
-    opencode/muse-spark-1.3-contributor-free, opencode/muse-spark-1.2-contributor-free, opencode/mimo-v2.5-free, opencode/deepseek-v4-flash-free
-
-Semantics (`scripts/lib/model.mjs`): each entry gets its own ladder — variant `max`, then
-plain, then anonymous (auth stripped), then resume rounds (default 4; thesis/KB drafts 5)
-with 20-35 s spacing; first complete reply wins; on whole-chain failure a second ladder runs
-after a 90 s cooldown (120 s for long-form lanes). Per-call timeouts: 480 s default, 540 s
-deep analysis, 600 s thesis/KB/revision. The breaker opens (30 min) only after the entire
-chain fails. Judges can route to a different model via `FLEET_JUDGE_MODEL`. All four
-defaults are verified-live free IDs (Zen catalog 2026-09-10); retired IDs
-(`opencode/x-preview-f-free`, `opencode/minimax-m3-free`, paid `opencode/gemini-3-flash`)
-are rejected by the allowlist even when set via env. Paid fallback
-`opencode/muse-spark-1.3` stays known to the registry but out of the default chain. Known upstream behavior: on API errors like 429,
-`opencode run` may hang silently (opencode issues #8203/#22243/#29134); countermeasures are
-hard timeouts, failure-time log dumps (`~/.local/share/opencode/log/*.log` tails), and
-`max-parallel` limits on model-heavy matrices. If hangs become chronic, pin another model id
-in `scripts/lib/model.mjs`; gating and attribution are model-independent.
-
-### Credential rotation pool
-
-Auth slots: `FLEET_OPENCODE_AUTH` (slot 1, legacy) plus `FLEET_OPENCODE_AUTH_2`..`_9`.
-`scripts/lib/model.mjs` picks the least-recently-healthy non-cooldown slot per call
-(`scripts/lib/credential-pool.mjs`); auth/quota/429-class failures cool a slot down for
-15 min (`FLEET_AUTH_COOLDOWN_MS` overrides), successes clear it, and expired cooldowns
-rejoin automatically — back to slot 1 first. All slots down emits `STALLED` plus a
-`[FLEET-AUTH]` onboarding alert on `M1Vj/fleet-control` (add account N+1, then it
-rejoins on its own). Pool health (slot numbers only, never key material) lives at
-`state/credential-health.json` in fleet-control. Full steps: `docs/account-onboarding.md`.
-
-### Non-stop rotation + self-tuning chain
-
-Exhaustion never halts: all-slots-cooldown writes `state/auth-exhausted.json`
-(timestamp + slot count + cooldown floor) + `STALLED`, then continues degraded
-with anon rounds and returns `{complete:false, degraded:true, exhausted:true}`
-for normal caller retry/next-scan; watchdog/retro own issue filing, never the
-model call. Chain self-tunes via `state/model-chain.json`
-(`{chain, updatedAt, source, ttlMs}`): explicit `FLEET_MODEL_CHAIN` env >
-fresh file (TTL 7d, `FLEET_CHAIN_TTL_MS`) > code default; stale/invalid falls
-back, never stuck. Refresh: `scripts/model-refresh.mjs` (weekly
-`.github/workflows/model-refresh.yml`) re-ranks the live Zen catalog,
-free-tier + allowlisted, primary pinned first (per-model success/latency is
-phase 2).
-
-## 8. PR lifecycle hygiene rules
-
-- Fleet PRs are always drafts on `fleet/<kebab>` branches; direct pushes to default
-  branches of target repos are never performed. Scan mode gates the oldest 3 open
-  fleet-authored drafts per cycle.
-- Hygiene pass closes (with an explanatory comment, STALLED recorded in `merges.jsonl`):
-  fleet drafts >=3 days old overlapped file-wise by a newer fleet draft ("superseded"), and
-  fleet drafts open >14 days untouched ("stale").
-- Auto-merge requires: no diff secret hits; deterministic install+build passing; visual gate
-  clear (if UI touched); both judges approving at >=80 (LOW risk) or >=90 (MEDIUM); HIGH-risk
-  PRs stay drafts for human review. Approved drafts are marked ready, merge-committed,
-  branch deleted.
-- Rejected fleet-authored PRs enter the revision sub-lane (fixes pushed to the branch; cap intended at 2 rounds, currently unenforced — see README).
-
-## 9. Quota notes
-
-Public-repo Actions minutes are free, so all scheduled lanes run here. Private
-`M1Vj/fleet-control` is metered (~2000 min/month free) and kept dispatch-only plus state
-storage. The practical constraint is the free model gateway (429s at peak); the breaker
-converts outages into STALLED skips. If pressure grows, raise cron spacing in this repo.
-
-## 10. Hardening backlog
-
-- Wire `FLEET_KILL_SWITCH_PATH=state/KILL_SWITCH` into every lane workflow so the file alone halts mid-run (exit 2 is unwired outside selftest).
-- Include `merge.yml` in the emergency-stop disable set (or document the exception).
-- Fix watchdog alert body (`ageMs` undefined) so stale alerts actually get filed.
-- Fix `revise.mjs` persistence (import `appendFileSync`/`mkdirSync`) and propagate its return code through `main().then`.
-- Make target-repo test suites blocking or explicitly justify non-blocking per repo.
-- Consume or remove unused dispatch inputs (`top_files` in fleet-thesis, `gdrive` in
-  fleet-kb).
-- Consider environment protection rules requiring owner review for workflow dispatches.
-- Third-party actions are SHA-pinned today; review pins periodically for rotation.
+Keep hosted workflows disabled when any gate is unverified. Historical logs and
+artifacts are preserved; cleanup requires a separate owner decision.

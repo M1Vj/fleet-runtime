@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, chmodSync, existsSync, mkdirSync } from "node:fs";
+import { cpSync, mkdtempSync, writeFileSync, readFileSync, chmodSync, existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -31,6 +31,10 @@ test("default chain is the verified-live free chain (muse-spark primary)", () =>
 test("FLEET_MODEL_CHAIN override honored", () => {
   const chain = resolveModelChain({ FLEET_MODEL_CHAIN: "opencode/nemotron-3.5-lightning-free,opencode/mimo-v2.5-free" });
   assert.deepEqual(chain, ["opencode/nemotron-3.5-lightning-free", "opencode/mimo-v2.5-free"]);
+});
+
+test("paid explicit chain values are rejected without an authorized paid opt-in", () => {
+  assert.deepEqual(resolveModelChain({ FLEET_MODEL_CHAIN: "opencode/muse-spark-1.3" }), EXPECTED_CHAIN);
 });
 
 test("dead model id can never be selected", () => {
@@ -65,6 +69,57 @@ test("model timeout tiers are 480/540/600s", () => {
   assert.deepEqual(MODEL_TIMEOUTS, { standard: 480000, long: 540000, extended: 600000 });
 });
 
+test("askModel waits for cooling credential capacity without spawning anonymous OpenCode", async () => {
+  const { askModel } = await import("../scripts/lib/model.mjs");
+  const pool = await import("../scripts/lib/credential-pool.mjs");
+  const { dir, capture } = makeFakeOpencode();
+  const stateRoot = mkdtempSync(path.join(tmpdir(), "fleet-capacity-"));
+  const now = Date.now();
+  pool.recordFailure(stateRoot, 1, "429 rate limit", { nowMs: now, cooldownMs: 60_000 });
+  pool.recordFailure(stateRoot, 2, "429 rate limit", { nowMs: now, cooldownMs: 120_000 });
+  const env = {
+    ...process.env,
+    PATH: `${dir}:${process.env.PATH}`,
+    FLEET_STATE_ROOT: stateRoot,
+    FLEET_OPENCODE_AUTH: "test-slot-1",
+    FLEET_OPENCODE_AUTH_2: "test-slot-2",
+    FLEET_MODEL_CHAIN: PRIMARY_MODEL,
+  };
+  const result = await askModel({ prompt: "must wait", timeoutMs: 15_000, env, maxRounds: 1, skipCircuitCheck: true });
+  assert.equal(result.complete, false);
+  assert.equal(result.waitingForCapacity, true);
+  assert.equal(result.waiting_for_capacity, true);
+  assert.equal(result.waitingForQuota, true);
+  assert.equal(result.surfaced, true);
+  assert.equal(result.quotaDisposition.kind, "quota_wait");
+  assert.equal(result.quotaDisposition.reason, "credential_capacity_exhausted");
+  assert.ok(result.retryAt >= now + 60_000);
+  assert.equal(existsSync(capture), false);
+});
+
+test("askModel fails closed on a tampered core before spawning OpenCode", async () => {
+  const { askModel, runOnce } = await import("../scripts/lib/model.mjs");
+  const { dir, capture } = makeFakeOpencode();
+  const coreRoot = mkdtempSync(path.join(tmpdir(), "fleet-parity-core-"));
+  for (const file of ["manifest.json", "schema.json", "golden-vectors.json", "core.lock.json"]) {
+    cpSync(path.join("packages", "indefinite-core", file), path.join(coreRoot, file));
+  }
+  writeFileSync(path.join(coreRoot, "manifest.json"), Buffer.from("{}\n"));
+  const stateRoot = mkdtempSync(path.join(tmpdir(), "fleet-parity-"));
+  const env = { ...process.env, PATH: `${dir}:${process.env.PATH}`, FLEET_STATE_ROOT: stateRoot, FLEET_CORE_ROOT: coreRoot, FLEET_OPENCODE_AUTH: "test-auth" };
+  const result = await askModel({ prompt: "must block", timeoutMs: 15_000, env, maxRounds: 1, skipCircuitCheck: true });
+  assert.equal(result.complete, false);
+  assert.equal(result.blocked, true);
+  assert.equal(result.parityMismatch, true);
+  assert.equal(result.surfaced, true);
+  assert.equal(existsSync(capture), false);
+  const direct = await runOnce({ prompt: "must also block direct invocation", timeoutMs: 15_000, env, model: PRIMARY_MODEL });
+  assert.equal(direct.complete, false);
+  assert.equal(direct.blocked, true);
+  assert.equal(direct.parityMismatch, true);
+  assert.equal(existsSync(capture), false);
+});
+
 // Behavioral test for the fixed hardcode: runOnce must pass the requested
 // model to `opencode -m` (via allowlist) instead of a hardcoded ID. Uses a
 // fake `opencode` executable first on PATH — no network, no credentials.
@@ -96,6 +151,71 @@ test("runOnce honors the requested model param", async () => {
   const i = args.indexOf("-m");
   assert.notEqual(i, -1);
   assert.equal(args[i + 1], "opencode/nemotron-3.5-lightning-free");
+});
+
+test("anonymous provider-authorized calls preserve variant and exact session args", async () => {
+  const { runOnce } = await import("../scripts/lib/model.mjs");
+  const { dir, capture } = makeFakeOpencode();
+  const env = { ...process.env, PATH: `${dir}:${process.env.PATH}` };
+  delete env.OPENCODE_AUTH_CONTENT;
+  for (let n = 1; n <= 9; n++) delete env[n === 1 ? "FLEET_OPENCODE_AUTH" : `FLEET_OPENCODE_AUTH_${n}`];
+  const r = await runOnce({
+    prompt: "continue",
+    sessionId: "sess-anonymous-1",
+    variant: "xhigh",
+    timeoutMs: 15000,
+    env,
+    model: PRIMARY_MODEL,
+  });
+  assert.equal(r.reply, "hello-test");
+  const args = await lastArgs(capture);
+  assert.equal(args[args.indexOf("--variant") + 1], "xhigh");
+  assert.equal(args[args.indexOf("-s") + 1], "sess-anonymous-1");
+});
+
+test("authenticated retries preserve a returned exact session", async () => {
+  const { askModel } = await import("../scripts/lib/model.mjs");
+  const dir = mkdtempSync(path.join(tmpdir(), "fleet-session-"));
+  const capture = path.join(dir, "args.jsonl");
+  const bin = path.join(dir, "opencode");
+  writeFileSync(
+    bin,
+    `#!/usr/bin/env node
+const fs = require("fs");
+fs.appendFileSync(${JSON.stringify(capture)}, JSON.stringify(process.argv.slice(2)) + "\\n");
+console.log(JSON.stringify({ type: "error", error: { message: "provider unavailable" }, sessionID: "exact-session-1" }));
+process.exitCode = 1;
+`,
+  );
+  chmodSync(bin, 0o755);
+  const stateRoot = mkdtempSync(path.join(tmpdir(), "fleet-session-state-"));
+  const env = {
+    ...process.env,
+    PATH: `${dir}:${process.env.PATH}`,
+    FLEET_STATE_ROOT: stateRoot,
+    FLEET_OPENCODE_AUTH: "authorized-slot",
+    FLEET_MODEL_CHAIN: PRIMARY_MODEL,
+  };
+  const originalSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, ms, ...args) => originalSetTimeout(fn, Number(ms) >= 20_000 ? 0 : ms, ...args);
+  let result;
+  try {
+    result = await askModel({
+      prompt: "preserve session",
+      timeoutMs: 15000,
+      env,
+      maxRounds: 2,
+      preferVariantMax: false,
+      skipCircuitCheck: true,
+    });
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
+  assert.equal(result.complete, false);
+  assert.equal(result.sessionId, "exact-session-1");
+  const args = readFileSync(capture, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  assert.equal(args.length, 2);
+  assert.equal(args[1][args[1].indexOf("-s") + 1], "exact-session-1");
 });
 
 test("runOnce maps dead/override requests to the chain primary", async () => {
@@ -225,10 +345,10 @@ test("runOnce selects pooled slot, strips slot keys, records slot number", async
   assert.ok(health.slots["1"].lastOk);
 });
 
-test("runOnce degrades on exhaustion: anon attempt, no throw, alert-intent flag", async () => {
+test("runOnce waits on exhaustion without anonymous bypass, preserving alert intent", async () => {
   const { runOnce } = await import("../scripts/lib/model.mjs");
   const pool = await import("../scripts/lib/credential-pool.mjs");
-  const { dir } = makeFakeOpencode();
+  const { dir, capture } = makeFakeOpencode();
   const stateRoot = mkdtempSync(path.join(tmpdir(), "fleetpool-"));
   const now = Date.now();
   pool.recordFailure(stateRoot, 1, "429 rate limit", { nowMs: now });
@@ -250,7 +370,12 @@ test("runOnce degrades on exhaustion: anon attempt, no throw, alert-intent flag"
   assert.equal(r.exhausted, true);
   assert.equal(r.degraded, true);
   assert.equal(r.slot, null);
-  assert.equal(r.reply, "hello-test");
+  assert.equal(r.reply, "");
+  assert.equal(r.waitingForCapacity, true);
+  assert.equal(r.waiting_for_capacity, true);
+  assert.equal(r.waitingForQuota, true);
+  assert.equal(r.quotaDisposition.reason, "credential_capacity_exhausted");
+  assert.equal(existsSync(capture), false);
   const flagPath = path.join(stateRoot, "state", "auth-exhausted.json");
   assert.equal(existsSync(flagPath), true);
   const flag = JSON.parse(readFileSync(flagPath, "utf8"));
@@ -261,6 +386,54 @@ test("runOnce degrades on exhaustion: anon attempt, no throw, alert-intent flag"
   assert.ok(events.includes("STALLED"));
   assert.ok(!events.includes("test-slot-"));
   assert.ok(!JSON.stringify(flag).includes("test-slot-"));
+});
+
+test("authenticated 429 never falls back to an anonymous OpenCode attempt", async () => {
+  const { askModel } = await import("../scripts/lib/model.mjs");
+  const dir = mkdtempSync(path.join(tmpdir(), "fleet-auth-429-"));
+  const capture = path.join(dir, "attempts.jsonl");
+  const bin = path.join(dir, "opencode");
+  writeFileSync(
+    bin,
+    `#!/usr/bin/env node
+const fs = require("fs");
+const authenticated = Boolean(process.env.OPENCODE_AUTH_CONTENT);
+fs.appendFileSync(${JSON.stringify(capture)}, JSON.stringify({ authenticated }) + "\\n");
+if (authenticated) {
+  console.log(JSON.stringify({ type: "error", error: { message: "429 rate limit" } }));
+  process.exitCode = 1;
+} else {
+  console.log(JSON.stringify({ text: "anonymous-success", sessionID: "anon-session" }));
+}
+`,
+  );
+  chmodSync(bin, 0o755);
+  const stateRoot = mkdtempSync(path.join(tmpdir(), "fleet-auth-429-state-"));
+  const env = {
+    ...process.env,
+    PATH: `${dir}:${process.env.PATH}`,
+    FLEET_STATE_ROOT: stateRoot,
+    FLEET_OPENCODE_AUTH: "authorized-slot",
+    FLEET_AUTH_COOLDOWN_MS: "60000",
+    FLEET_MODEL_CHAIN: PRIMARY_MODEL,
+  };
+  const result = await askModel({
+    prompt: "must preserve authenticated route",
+    timeoutMs: 15000,
+    env,
+    maxRounds: 2,
+    preferVariantMax: false,
+    skipCircuitCheck: true,
+  });
+  assert.equal(result.complete, false);
+  assert.equal(result.waitingForCapacity, true);
+  assert.equal(result.waitingForQuota, true);
+  assert.equal(result.surfaced, true);
+  assert.ok(result.retryAt > Date.now());
+  const attempts = readFileSync(capture, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  assert.deepEqual(attempts, [{ authenticated: true }]);
+  const health = JSON.parse(readFileSync(path.join(stateRoot, "state", "credential-health.json"), "utf8"));
+  assert.ok(Number(health.slots["1"].cooldownUntil) > Date.now());
 });
 
 test("askModel attempts record slot numbers, never key material", async () => {
@@ -379,4 +552,3 @@ test("askModel failing whole chain does trip the global gateway circuit breaker"
   assert.equal(res.complete, false);
   assert.equal(gatewayCircuitOpen(stateRoot), true);
 });
-

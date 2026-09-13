@@ -5,6 +5,7 @@ import {
   weightedSampleWithoutReplacement,
   scorePullRequest,
   buildFleetPlan,
+  reconcileDesiredState,
 } from "../scripts/lib/fleet-scheduler.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -262,4 +263,35 @@ test("buildFleetPlan reserves upgrade capacity when an old PR backlog exceeds ma
   assert.ok(plan.upgrades.length >= 3, "old PR backlog must not starve upgrades");
   assert.equal(new Set(plan.upgrades.map((task) => taskRepo(task))).size, plan.upgrades.length);
   assert.ok(plan.upgrades.every((task) => taskRepo(task).startsWith("M1Vj/")));
+});
+
+test("reconcileDesiredState requeues unknown effects while suppressing completed desired work", () => {
+  const desired = [
+    { type: "upgrade", role: "upgrade", repo: "M1Vj/recoverable" },
+    { type: "review", role: "security", repo: "M1Vj/finished", pr: 4 },
+  ];
+  const observed = [
+    { type: "upgrade", role: "upgrade", repo: "M1Vj/recoverable", state: "unknown_effect", workKey: "upgrade|m1vj/recoverable|repo|upgrade" },
+    { type: "review", role: "security", repo: "M1Vj/finished", pr: 4, state: "completed" },
+  ];
+  const rows = reconcileDesiredState({ desiredState: desired, observedState: observed });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].repo, "M1Vj/recoverable");
+  assert.equal(rows[0].reconciled, true);
+  assert.equal(rows[0].recoverable, true);
+
+  const plan = buildFleetPlan({
+    repos: [repository("M1Vj/recoverable")],
+    pulls: [],
+    desiredState: desired,
+    observedState: observed,
+    history: [],
+    now: NOW,
+    trigger: "schedule",
+    maxAgents: 2,
+    upgradeSlots: 0,
+    minimumUpgradeSlots: 0,
+  });
+  assert.ok(plan.allTasks.some((task) => task.repo === "M1Vj/recoverable" && task.reconciled));
+  assert.ok(!plan.allTasks.some((task) => task.repo === "M1Vj/finished"));
 });

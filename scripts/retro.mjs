@@ -8,9 +8,19 @@ import { scrub, gh } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";
 import { verifyIssueAuthor } from "./lib/verify.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
-import { makeTerminal } from "./lib/terminal.mjs";
+import {
+  isPublicDataClass,
+  makeExecutionTerminal,
+  publicModelEnv,
+  publicRepository,
+  privateRepository,
+  PRIVATE_REPOSITORY_ENV,
+  resolveStateRoot,
+  writeExecutionAudit,
+  writePublicArtifact,
+} from "./lib/private-state.mjs";
 
-const REPO_ROOT = process.env.FLEET_STATE_ROOT || process.cwd();
+const REPO_ROOT = resolveStateRoot(process.env, process.cwd());
 
 function readEvents() {
   const p = path.join(REPO_ROOT, "state", "events.jsonl");
@@ -31,13 +41,37 @@ function readEvents() {
 
 async function modePropose(audit) {
   const identity = await runGate(process.env);
+  if (isPublicDataClass(process.env)) {
+    const repo = publicRepository(process.env);
+    const recentIssues = gh(["api", `/repos/${repo}/issues?state=all&per_page=20`], process.env) || [];
+    const events = readEvents();
+    const counts = {};
+    for (const e of events) counts[e.state] = (counts[e.state] || 0) + 1;
+    const result = await askModel({
+      prompt: `Review public telemetry for ${repo}. Return ONLY strict JSON {"health_summary":"...","proposals":[{"title":"...","impact":"high|medium|low","effort":"small|medium|large","detail":"..."}]} with 3 to 6 proposals.\nCounts: ${JSON.stringify(counts)}\nRecent public issue titles: ${recentIssues.map((i) => i.title).filter(Boolean).slice(0, 20).join("; ")}`,
+      timeoutMs: 480000,
+      env: publicModelEnv(process.env),
+      preferVariantMax: true,
+      maxRounds: 3,
+    });
+    writePublicArtifact(process.env, {
+      mode: "retro",
+      status: result.complete && result.reply ? "ok" : "deferred",
+      repository: repo,
+      summary: result.complete && result.reply ? "public retrospective completed" : "model unavailable",
+      count: events.length,
+    }, { kind: "retro", status: result.complete && result.reply ? "ok" : "deferred", repository: repo });
+    audit.note("public", `repo=${repo} events=${events.length} complete=${result.complete}`);
+    return result.complete && result.reply ? 0 : 6;
+  }
   const today = new Date().toISOString().slice(0, 10);
   const dedupeKey = `[RETRO] ${today}`;
-  const recentIssues = gh(["api", `/repos/M1Vj/fleet-control/issues?since=${today}T00:00:00Z&state=all&per_page=50`], process.env) || [];
+  const controlRepository = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control);
+  const recentIssues = gh(["api", `/repos/${controlRepository}/issues?since=${today}T00:00:00Z&state=all&per_page=50`], process.env) || [];
   if (recentIssues.some((i) => i.title && i.title.startsWith("[RETRO]"))) {
     audit.note("dedupe", "retro already filed today");
     try {
-      makeTerminal(REPO_ROOT, { lane: "retro" })("NO-OP", { why: "retro-already-filed" });
+      makeExecutionTerminal(process.env, REPO_ROOT, { lane: "retro" })("NO-OP", { why: "retro-already-filed" });
     } catch {}
     console.log("RETRO_STATE=NO-OP");
     return 0;
@@ -112,12 +146,12 @@ async function modePropose(audit) {
     "",
     `_telemetry basis: ${events.length} terminal events; auto-filed by fleet-retro_`,
   ];
-  const issue = gh(["api", "-X", "POST", "/repos/M1Vj/fleet-control/issues", "-f", `title=${dedupeKey}`, "-F", `body=${bodyLines.join("\n")}`], process.env);
+  const issue = gh(["api", "-X", "POST", `/repos/${controlRepository}/issues`, "-f", `title=${dedupeKey}`, "-F", `body=${bodyLines.join("\n")}`], process.env);
   void identity;
-  await verifyIssueAuthor("M1Vj/fleet-control", issue.number, identity, process.env.FLEET_GH_TOKEN);
+  await verifyIssueAuthor(controlRepository, issue.number, identity, process.env.FLEET_GH_TOKEN);
   audit.note("issue", `#${issue.number}`);
   try {
-    makeTerminal(REPO_ROOT, { lane: "retro" })("SUCCESS", { issue: issue.number, proposals: parsed.proposals.length });
+    makeExecutionTerminal(process.env, REPO_ROOT, { lane: "retro" })("SUCCESS", { issue: issue.number, proposals: parsed.proposals.length });
   } catch {}
   console.log(`RETRO_STATE=SUCCESS issue=${issue.number}`);
   return 0;
@@ -140,11 +174,11 @@ if (process.argv[1] && import.meta.url.endsWith(path.basename(process.argv[1])))
   const audit = new AuditBuffer(scrub(process.env));
   try {
     const code = await MODES[mode](audit);
-    audit.writeMarkdown(path.join(REPO_ROOT, "audit"), `retro-${Date.now()}`, "Fleet retrospective", code === 0 ? "ok" : "failed");
+    writeExecutionAudit(audit, process.env, REPO_ROOT, `retro-${Date.now()}`, "Fleet retrospective", code === 0 ? "ok" : "failed");
     process.exit(code);
   } catch (err) {
     audit.incident("fatal", err.message);
-    audit.writeMarkdown(path.join(REPO_ROOT, "audit"), `retro-${Date.now()}`, "Fleet retrospective", `failed(${err.code || 1})`);
+    writeExecutionAudit(audit, process.env, REPO_ROOT, `retro-${Date.now()}`, "Fleet retrospective", `failed(${err.code || 1})`);
     console.error(`RETRO_FAILED reason=${err.reason || err.message}`);
     process.exit(err.code && Number.isInteger(err.code) ? err.code : 1);
   }

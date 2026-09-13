@@ -6,6 +6,7 @@ import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, gitAdd, gitCommit, gitPush, gitRevParse, configureIdentity } from "./lib/util.mjs";
 import { verifyCommit, verifyIssueAuthor } from "./lib/verify.mjs";
+import { isPublicDataClass, privateRepository, PRIVATE_REPOSITORY_ENV, publicRepository, writePublicArtifact } from "./lib/private-state.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
@@ -34,6 +35,15 @@ export async function main() {
       throw new Error("CONFIRM_REQUIRED set FLEET_CONFIRM=STOP");
     }
     const identity = await runGate(process.env);
+    if (isPublicDataClass(process.env)) {
+      try {
+        const repository = publicRepository(process.env);
+        writePublicArtifact(process.env, { mode: "emergency-stop", status: "blocked", repository, reason: "public-read-only" }, { kind: "emergency-stop", status: "blocked", repository });
+      } catch {}
+      audit.note("public-read-only", "emergency stop cannot mutate public repositories");
+      console.log("FLEET_RUN_RESULT=" + JSON.stringify({ runId, status: "blocked", reason: "public-read-only" }));
+      return 4;
+    }
     configureIdentity(REPO_ROOT, identity);
     audit.note("gate", `identity=${identity.login}`);
 
@@ -42,10 +52,11 @@ export async function main() {
     gitCommit(REPO_ROOT, `[fleet] EMERGENCY STOP ${runId}`, identity);
     gitPush(REPO_ROOT, "main", process.env);
     const sha = gitRevParse(REPO_ROOT, "HEAD");
-    await verifyCommit("M1Vj/fleet-control", sha, identity, process.env.FLEET_GH_TOKEN);
+    const controlRepository = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control);
+    await verifyCommit(controlRepository, sha, identity, process.env.FLEET_GH_TOKEN);
     audit.note("kill-switch", `committed sha=${sha.slice(0, 10)}`);
 
-    for (const repoFullName of ["M1Vj/fleet-runtime", "M1Vj/fleet-control"]) {
+    for (const repoFullName of ["M1Vj/fleet-runtime", controlRepository]) {
       for (const wf of STOP_WORKFLOWS) {
         try {
           gh(["api", "-X", "PUT", `/repos/${repoFullName}/actions/workflows/${wf}/disable`], process.env);
@@ -61,13 +72,13 @@ export async function main() {
 
     const issue = gh(
       [
-        "api", "-X", "POST", "/repos/M1Vj/fleet-control/issues",
+        "api", "-X", "POST", `/repos/${controlRepository}/issues`,
         "-f", `title=[EMERGENCY STOP] engaged run ${runId}`,
         "-f", `body=Kill switch committed (${sha.slice(0, 10)}). Disabled workflows: ${STOP_WORKFLOWS.join(", ")} (on both repositories).\nRe-arm procedure is in docs/RUNBOOK.md.`,
       ],
       process.env,
     );
-    await verifyIssueAuthor("M1Vj/fleet-control", issue.number, identity, process.env.FLEET_GH_TOKEN);
+    await verifyIssueAuthor(controlRepository, issue.number, identity, process.env.FLEET_GH_TOKEN);
     audit.note("confirmation-issue", `#${issue.number}`);
 
     audit.writeMarkdown(path.join(REPO_ROOT, "audit"), runId, "Emergency stop", "ok");

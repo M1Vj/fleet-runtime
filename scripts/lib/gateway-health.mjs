@@ -2,9 +2,17 @@ import { existsSync, readFileSync, writeFileSync, utimesSync, mkdirSync } from "
 import * as fs from "node:fs";
 import path from "node:path";
 
+import {
+  CIRCUIT_OPEN_MS as CORE_CIRCUIT_OPEN_MS,
+  CORE_LOCK_DIGEST,
+  CORE_INTEGRITY_OK,
+} from "../../packages/indefinite-core/index.mjs";
+
 // Circuit breaker: the gateway stays open for 30 minutes after the last
 // recorded failure, then closes itself on the next check.
-export const CIRCUIT_OPEN_MS = 30 * 60 * 1000;
+export const CIRCUIT_OPEN_MS = CORE_CIRCUIT_OPEN_MS;
+export const CORE_GATEWAY_DIGEST = CORE_LOCK_DIGEST;
+export { CORE_INTEGRITY_OK };
 
 function filePath(root) {
   return path.join(root || process.cwd(), "state", "gateway-health.json");

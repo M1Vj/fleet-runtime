@@ -8,18 +8,28 @@ import { scrub, gh, ghInput, putFileContent, ensureBranch, findExistingOpenPr, g
 import { askModel, askModelResilient } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor } from "./lib/verify.mjs";
 import { sanitizeControlChars, harvestFencedFiles } from "./lib/directives.mjs";
+import {
+  isPublicDataClass,
+  publicModelEnv,
+  publicRepository,
+  privateRepository,
+  PRIVATE_REPOSITORY_ENV,
+  resolveStateRoot,
+  writeExecutionAudit,
+  writePublicArtifact,
+} from "./lib/private-state.mjs";
 
 const CODE_ROOT = process.cwd();
-const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
-export const THESIS_REPO = "M1Vj/THESIS";
+const REPO_ROOT = resolveStateRoot(process.env, CODE_ROOT);
+export const THESIS_REPO = process.env[PRIVATE_REPOSITORY_ENV.thesis] || undefined;
 const V2_PREFIX = "v2/";
 const ALLOWED_EXT = /\.(md|markdown|tex|txt|bib|yml|yaml)$/i;
 
-function listThesisTree() {
-  const meta = gh(["api", `/repos/${THESIS_REPO}`], process.env);
+function listThesisTree(repo = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.thesis), env = process.env) {
+  const meta = gh(["api", `/repos/${repo}`], env);
   const branch = meta.default_branch;
-  const ref = gh(["api", `/repos/${THESIS_REPO}/git/ref/heads/${branch}`], process.env);
-  const tree = gh(["api", `/repos/${THESIS_REPO}/git/trees/${ref.object.sha}?recursive=1`], process.env) || {};
+  const ref = gh(["api", `/repos/${repo}/git/ref/heads/${branch}`], env);
+  const tree = gh(["api", `/repos/${repo}/git/trees/${ref.object.sha}?recursive=1`], env) || {};
   return {
     defaultBranch: branch,
     baseSha: ref.object.sha,
@@ -27,11 +37,11 @@ function listThesisTree() {
   };
 }
 
-function fetchTextFiles(paths, maxBytesPerFile = 12000, maxFiles = 25) {
+function fetchTextFiles(paths, maxBytesPerFile = 12000, maxFiles = 25, repo = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.thesis), env = process.env) {
   const out = [];
   for (const p of paths.filter((x) => /\.(md|markdown|tex|txt)$/i.test(x)).slice(0, maxFiles)) {
     try {
-      const raw = gh(["api", "-H=Accept: application/vnd.github.raw", `/repos/${THESIS_REPO}/contents/${p}`], process.env);
+      const raw = gh(["api", "-H=Accept: application/vnd.github.raw", `/repos/${repo}/contents/${p}`], env);
       out.push(`===== ${p} =====\n${String(raw).slice(0, maxBytesPerFile)}`);
     } catch {}
   }
@@ -40,14 +50,15 @@ function fetchTextFiles(paths, maxBytesPerFile = 12000, maxFiles = 25) {
 
 async function modeSurvey(audit) {
   await runGate(process.env);
-  { const { gatewayDown } = await import("./lib/gateway-health.mjs"); if (gatewayDown(process.env.FLEET_STATE_ROOT || process.cwd())) { console.log("THESIS_SKIPPED=circuit-open"); return 0; } }
-  const treeInfo = listThesisTree();
+  const targetRepo = isPublicDataClass(process.env) ? publicRepository(process.env) : privateRepository(process.env, PRIVATE_REPOSITORY_ENV.thesis);
+  { const { gatewayDown } = await import("./lib/gateway-health.mjs"); if (gatewayDown(REPO_ROOT)) { console.log("THESIS_SKIPPED=circuit-open"); return 0; } }
+  const treeInfo = listThesisTree(targetRepo, process.env);
   const digest = [
     `THESIS repo file inventory (${treeInfo.files.length} files):`,
     treeInfo.files.join("\n"),
     "",
     "Key text excerpts:",
-    fetchTextFiles(treeInfo.files),
+      fetchTextFiles(treeInfo.files, 12000, 25, targetRepo, process.env),
   ].join("\n");
   const prompt = [
     "You are the dedicated THESIS improvement agent for Vj. Survey the thesis repository snapshot below.",
@@ -56,12 +67,16 @@ async function modeSurvey(audit) {
     "Snapshot:",
     digest,
   ].join("\n");
-  const result = await askModelResilient({ prompt, timeoutMs: 600000, env: process.env, preferVariantMax: true, maxRounds: 4 });
+  const result = await askModelResilient({ prompt, timeoutMs: 600000, env: isPublicDataClass(process.env) ? publicModelEnv(process.env) : process.env, preferVariantMax: true, maxRounds: 4 });
   audit.note("survey", `complete=${result.complete} ladders=${result.ladders}`);
   if (!result.complete || !result.reply) throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });
-  const dir = process.env.FLEET_ARTIFACT_DIR || ".";
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(path.join(dir, "thesis-survey.json"), JSON.stringify({ reply: result.reply }, null, 2));
+  if (isPublicDataClass(process.env)) {
+    writePublicArtifact(process.env, { mode: "survey", status: "ok", repository: targetRepo, count: treeInfo.files.length, summary: "public thesis survey completed" }, { kind: "thesis", status: "ok", repository: targetRepo });
+  } else {
+    const dir = process.env.FLEET_ARTIFACT_DIR || ".";
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, "thesis-survey.json"), JSON.stringify({ reply: result.reply }, null, 2));
+  }
   console.log("THESIS_DONE=survey");
   return 0;
 }
@@ -102,7 +117,13 @@ function validateV2(files) {
 
 async function modeDraft(audit) {
   await runGate(process.env);
-  { const { gatewayDown } = await import("./lib/gateway-health.mjs"); if (gatewayDown(process.env.FLEET_STATE_ROOT || process.cwd())) { console.log("THESIS_SKIPPED=circuit-open"); return 0; } }
+  if (isPublicDataClass(process.env)) {
+    const repo = publicRepository(process.env);
+    writePublicArtifact(process.env, { mode: "draft", status: "blocked", reason: "public-read-only-multi-step" }, { kind: "thesis", status: "blocked", repository: repo });
+    audit.note("draft", "public mode does not read private survey artifacts or emit local thesis files");
+    return 4;
+  }
+  { const { gatewayDown } = await import("./lib/gateway-health.mjs"); if (gatewayDown(REPO_ROOT)) { console.log("THESIS_SKIPPED=circuit-open"); return 0; } }
   const dir = process.env.FLEET_ARTIFACT_DIR || ".";
   const surveyPath = path.join(dir, "thesis-survey.json");
   if (!existsSync(surveyPath)) throw new Error("thesis-survey.json missing");
@@ -170,6 +191,12 @@ async function modeDraft(audit) {
 
 async function modeRefine(audit) {
   await runGate(process.env);
+  if (isPublicDataClass(process.env)) {
+    const repo = publicRepository(process.env);
+    writePublicArtifact(process.env, { mode: "refine", status: "blocked", reason: "public-read-only-multi-step" }, { kind: "thesis", status: "blocked", repository: repo });
+    audit.note("refine", "public mode does not read or persist private draft state");
+    return 4;
+  }
   const dir = process.env.FLEET_ARTIFACT_DIR || ".";
   const draftPath = path.join(dir, "thesis-draft.json");
   if (!existsSync(draftPath)) throw new Error("thesis-draft.json missing");
@@ -208,6 +235,12 @@ async function modeRefine(audit) {
 async function modeShip(audit) {
   const identity = await runGate(process.env);
   configureIdentity(REPO_ROOT, identity);
+  if (isPublicDataClass(process.env)) {
+    const repo = publicRepository(process.env);
+    writePublicArtifact(process.env, { mode: "ship", status: "blocked", reason: "public-read-only" }, { kind: "thesis", status: "blocked", repository: repo });
+    audit.note("ship", "public mode cannot create branches, pull requests, or private thesis mirrors");
+    return 4;
+  }
   const dir = process.env.FLEET_ARTIFACT_DIR || ".";
   const finalPath = path.join(dir, "thesis-final.json");
   if (!existsSync(finalPath)) {
@@ -221,9 +254,11 @@ async function modeShip(audit) {
   }
   const treeInfo = listThesisTree();
   const branch = `fleet/thesis-v2-${sha256(files.map((f) => f.path).join(",")).slice(0, 8)}`;
-  ensureBranch(THESIS_REPO, branch, treeInfo.baseSha, process.env);
+  const thesisRepository = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.thesis);
+  const controlRepository = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control);
+  ensureBranch(thesisRepository, branch, treeInfo.baseSha, process.env);
   for (const f of files) {
-    putFileContent(THESIS_REPO, f.path, f.content, branch, `[fleet-thesis] add ${f.path}`, process.env);
+    putFileContent(thesisRepository, f.path, f.content, branch, `[fleet-thesis] add ${f.path}`, process.env);
   }
   const body = [
     "## fleet-thesis v2 package",
@@ -234,23 +269,23 @@ async function modeShip(audit) {
     "",
     "_Generated autonomously by the M1Vj fleet THESIS agent. Review before merging._",
   ].join("\n");
-  let pr = findExistingOpenPr(THESIS_REPO, branch, process.env);
+  let pr = findExistingOpenPr(thesisRepository, branch, process.env);
   if (!pr) {
     try {
       pr = ghInput(
-        ["api", "-X", "POST", `/repos/${THESIS_REPO}/pulls`],
+        ["api", "-X", "POST", `/repos/${thesisRepository}/pulls`],
         { title: `[fleet-thesis] v2 package: ${files[0].path}`, body, head: branch, base: treeInfo.defaultBranch, draft: true },
         process.env,
       );
     } catch (err) {
-      pr = findExistingOpenPr(THESIS_REPO, branch, process.env);
+      pr = findExistingOpenPr(thesisRepository, branch, process.env);
       if (!pr) throw err;
     }
   }
-  await verifyPullAuthor(THESIS_REPO, pr.number, identity, process.env.FLEET_GH_TOKEN);
+  await verifyPullAuthor(thesisRepository, pr.number, identity, process.env.FLEET_GH_TOKEN);
   const headSha = pr.head && pr.head.sha ? pr.head.sha : null;
   if (!headSha) throw new Error("PR head sha unavailable");
-  await verifyCommit(THESIS_REPO, headSha, identity, process.env.FLEET_GH_TOKEN);
+  await verifyCommit(thesisRepository, headSha, identity, process.env.FLEET_GH_TOKEN);
   audit.note("ship", `pr=#${pr.number} branch=${branch} files=${files.length}`);
 
   const labDir = path.join(REPO_ROOT, "docs", "thesis-lab");
@@ -265,7 +300,7 @@ async function modeShip(audit) {
     gitCommit(REPO_ROOT, `[fleet] thesis-lab mirror ${stamp} PR#${pr.number}`, identity);
     gitPush(REPO_ROOT, "main", process.env);
     const sha = gitRevParse(REPO_ROOT, "HEAD");
-    await verifyCommit("M1Vj/fleet-control", sha, identity, process.env.FLEET_GH_TOKEN);
+    await verifyCommit(controlRepository, sha, identity, process.env.FLEET_GH_TOKEN);
   }
   console.log(`FLEET_RUN_RESULT=${JSON.stringify({ mode: "ship", pr: pr.number, files: files.length })}`);
   return 0;
@@ -282,12 +317,12 @@ if (process.argv[1] && import.meta.url.endsWith(path.basename(process.argv[1])))
   }
   try {
     const code = await MODES[mode](audit);
-    audit.writeMarkdown(path.join(REPO_ROOT, "audit"), `thesis-${mode}-${Date.now()}`, `Thesis ${mode}`, code === 0 ? "ok" : "failed");
+    writeExecutionAudit(audit, process.env, REPO_ROOT, `thesis-${mode}-${Date.now()}`, `Thesis ${mode}`, code === 0 ? "ok" : "failed");
     if (code !== 0) for (const e of [...audit.entries, ...audit.incidents]) console.log(`AUDIT ${JSON.stringify(e)}`);
     process.exit(code);
   } catch (err) {
     audit.incident("fatal", err.message);
-    audit.writeMarkdown(path.join(REPO_ROOT, "audit"), `thesis-${mode}-${Date.now()}`, `Thesis ${mode}`, `failed(${err.code || 1})`);
+    writeExecutionAudit(audit, process.env, REPO_ROOT, `thesis-${mode}-${Date.now()}`, `Thesis ${mode}`, `failed(${err.code || 1})`);
     console.error(`THESIS_FAILED mode=${mode} reason=${err.reason || err.message}`);
     for (const e of [...audit.entries, ...audit.incidents]) console.log(`AUDIT ${JSON.stringify(e)}`);
     process.exit(err.code && Number.isInteger(err.code) ? err.code : 1);

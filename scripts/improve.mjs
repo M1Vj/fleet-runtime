@@ -8,12 +8,24 @@ import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, ghInput, putFileContent, ensureBranch, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, sha256, configureIdentity } from "./lib/util.mjs";
 import { askModel, askModelResilient } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor, verifyCommentAuthor } from "./lib/verify.mjs";
-import { makeTerminal } from "./lib/terminal.mjs";
 import { isSafeRepoPath, sanitizeControlChars, extractJsonObject, firstBalancedObject, harvestFencedFiles } from "./lib/directives.mjs";
 import { scoreRepository, weightedSampleWithoutReplacement } from "./lib/fleet-scheduler.mjs";
+import {
+  isPublicDataClass,
+  makeExecutionTerminal,
+  publicModelEnv,
+  publicRepository,
+  privateRepository,
+  PRIVATE_REPOSITORY_ENV,
+  resolveArtifactDir,
+  resolveStateRoot,
+  writeExecutionArtifact,
+  writeExecutionAudit,
+  writePublicArtifact,
+} from "./lib/private-state.mjs";
 
 const CODE_ROOT = process.cwd();
-const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
+const REPO_ROOT = resolveStateRoot(process.env, CODE_ROOT);
 const STATE_PATH = path.join(REPO_ROOT, "state", "improve-state.json");
 const MAX_SELECTION_HISTORY = 300;
 const MAX_TOP_K = 15;
@@ -21,6 +33,43 @@ const DEFAULT_REPO_OWNER = "M1Vj";
 const REPO_REF_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const IDEA_MAX_COUNT = 5;
 const IDEA_IMPACTS = new Set(["high", "medium", "low"]);
+const DEFAULT_RETRY_DELAY_MS = 30 * 60 * 1000;
+
+function executionModelEnv() {
+  return isPublicDataClass(process.env) ? publicModelEnv(process.env) : process.env;
+}
+
+function artifactDir(fallback = ".") {
+  return isPublicDataClass(process.env) ? resolveArtifactDir(process.env, fallback) : (process.env.FLEET_ARTIFACT_DIR || fallback);
+}
+
+export function researchCapacityOutcome(dataClass, nowMs = Date.now(), retryDelayMs = DEFAULT_RETRY_DELAY_MS) {
+  const delay = Math.max(60_000, Number(retryDelayMs) || DEFAULT_RETRY_DELAY_MS);
+  return {
+    status: "waiting_for_capacity",
+    retryAt: new Date(nowMs + delay).toISOString(),
+    exitCode: String(dataClass).toLowerCase() === "public" ? 0 : 6,
+  };
+}
+
+function recordResearchCapacityWait(audit, repo, reason = "gateway-circuit-open") {
+  const outcome = researchCapacityOutcome(isPublicDataClass(process.env) ? "public" : "private", Date.now(), process.env.FLEET_GATEWAY_RETRY_MS || DEFAULT_RETRY_DELAY_MS);
+  const retryAt = outcome.retryAt;
+  audit.note("research", `waiting_for_capacity repo=${repo} retryAt=${retryAt} reason=${reason}`);
+  if (isPublicDataClass(process.env)) {
+    writePublicArtifact(process.env, {
+      mode: "research",
+      status: "deferred",
+      repository: repo,
+      reason: "waiting_for_capacity",
+      checks: { retryAt, externalWrites: "blocked" },
+    }, { kind: "improve", status: "deferred", repository: repo });
+    console.log(`IMPROVE_DEFERRED=waiting_for_capacity retryAt=${retryAt}`);
+    return outcome.exitCode;
+  }
+  console.log(`IMPROVE_WAITING_FOR_CAPACITY=1 retryAt=${retryAt}`);
+  return outcome.exitCode;
+}
 
 function readJson(p, fallback) {
   if (!existsSync(p)) return fallback;
@@ -79,9 +128,10 @@ export function resolveRequestedRepo(repos, requestedRepo, owner = DEFAULT_REPO_
   if (!target) return null;
   if (!REPO_REF_RE.test(target)) throw new Error("invalid repo target");
   const expectedOwner = String(owner || DEFAULT_REPO_OWNER).trim();
+  const configuredControl = String(process.env[PRIVATE_REPOSITORY_ENV.control] || "").trim();
   if (target.split("/")[0] !== expectedOwner) throw new Error("foreign repo target");
   const match = (Array.isArray(repos) ? repos : []).find((repo) => repoName(repo) === target);
-  if (!match || match.archived === true || match.fork === true || target === expectedOwner + "/fleet-control") {
+  if (!match || match.archived === true || match.fork === true || (configuredControl && target === configuredControl)) {
     throw new Error("repo target unavailable");
   }
   return match;
@@ -109,11 +159,24 @@ export function selectImprovementRepos(repos, options = {}) {
 async function modePick(audit) {
   const identity = await runGate(process.env);
   configureIdentity(REPO_ROOT, identity);
+  if (isPublicDataClass(process.env)) {
+    const repo = publicRepository(process.env);
+    const selection = {
+      runId: process.env.GITHUB_RUN_ID || process.env.GITHUB_RUN_NUMBER || undefined,
+      selectedAt: new Date().toISOString(),
+      selected: [{ repo, score: 1 }],
+    };
+    writePublicArtifact(process.env, { mode: "pick", status: "ok", ...selection }, { kind: "improve", status: "ok", repository: repo, runId: selection.runId });
+    audit.note("pick", repo);
+    console.log(`IMPROVE_MATRIX=${JSON.stringify({ repo: [repo] })}`);
+    return 0;
+  }
   const repos = gh(["api", "/user/repos?affiliation=owner&per_page=100&sort=pushed"], process.env) || [];
   const state = readJson(STATE_PATH, { runs: [], selectionHistory: [] });
   const history = selectionHistoryFromState(state);
   const topK = Math.min(MAX_TOP_K, Math.max(0, Number(process.env.FLEET_TOP_K || 2) || 0));
-  const candidates = repos.filter((r) => r.full_name !== "M1Vj/fleet-control");
+  const controlRepository = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control);
+  const candidates = repos.filter((r) => r.full_name !== controlRepository);
   const selected = selectImprovementRepos(candidates, {
     history,
     topK,
@@ -160,13 +223,11 @@ function buildResearchPrompt(repo, workdir) {
 async function modeResearch(audit) {
   const identity = await runGate(process.env);
   configureIdentity(REPO_ROOT, identity);
-  const repo = process.env.FLEET_REPO;
+  const repo = isPublicDataClass(process.env) ? publicRepository(process.env) : process.env.FLEET_REPO;
   {
     const { gatewayDown } = await import("./lib/gateway-health.mjs");
-    if (gatewayDown(process.env.FLEET_STATE_ROOT || process.cwd())) {
-      audit.note("research", "gateway circuit open; skipping wave");
-      console.log("IMPROVE_SKIPPED=circuit-open");
-      return 0;
+    if (gatewayDown(REPO_ROOT)) {
+      return recordResearchCapacityWait(audit, repo, "gateway-circuit-open");
     }
   }
   let workdir;
@@ -179,7 +240,7 @@ async function modeResearch(audit) {
   const result = await askModelResilient({
     prompt: buildResearchPrompt(repo),
     timeoutMs: 480000,
-    env: process.env,
+    env: executionModelEnv(),
     preferVariantMax: true,
     maxRounds: 4,
     workspace: workdir,
@@ -192,10 +253,8 @@ async function modeResearch(audit) {
   }
   if (!result.complete || !result.reply) {
     const { gatewayDown } = await import("./lib/gateway-health.mjs");
-    if (gatewayDown(process.env.FLEET_STATE_ROOT || process.cwd())) {
-      audit.note("research", "probe confirmed outage; skipping gracefully");
-      console.log("IMPROVE_SKIPPED=circuit-still-open");
-      return 0;
+    if (gatewayDown(REPO_ROOT)) {
+      return recordResearchCapacityWait(audit, repo, "gateway-circuit-still-open");
     }
     throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });
   }
@@ -207,12 +266,16 @@ async function modeResearch(audit) {
     console.log(`IMPROVE_SKIPPED=invalid-ideas:${repo}`);
     return 0;
   }
-  const outDir = process.env.FLEET_ARTIFACT_DIR || ".";
-  mkdirSync(outDir, { recursive: true });
-  writeFileSync(
-    path.join(outDir, `ideas-${repo.replace("/", "__")}.json`),
-    JSON.stringify({ repo, ideas, reply: result.reply, validatedAt: new Date().toISOString() }, null, 2),
-  );
+  if (isPublicDataClass(process.env)) {
+    writePublicArtifact(process.env, { mode: "research", status: "ok", repo, ideas, validatedAt: new Date().toISOString() }, { kind: "improve", status: "ok", repository: repo });
+  } else {
+    const outDir = process.env.FLEET_ARTIFACT_DIR || ".";
+    mkdirSync(outDir, { recursive: true });
+    writeFileSync(
+      path.join(outDir, `ideas-${repo.replace("/", "__")}.json`),
+      JSON.stringify({ repo, ideas, reply: result.reply, validatedAt: new Date().toISOString() }, null, 2),
+    );
+  }
   console.log(`IMPROVE_DONE=research:${repo}`);
   return 0;
 }
@@ -700,6 +763,12 @@ export function salvagePartialPlan(replyText, fallbackTitle) {
 async function modePlan(audit) {
   const identity = await runGate(process.env);
   configureIdentity(REPO_ROOT, identity);
+  if (isPublicDataClass(process.env)) {
+    const repo = publicRepository(process.env);
+    writePublicArtifact(process.env, { mode: "plan", status: "blocked", reason: "public-read-only-plan-artifacts" }, { kind: "improve", status: "blocked", repository: repo });
+    audit.note("plan", "public mode does not read private multi-step artifacts");
+    return 4;
+  }
   const dir = process.env.FLEET_ARTIFACT_DIR || ".";
   const ideaFiles = existsSync(dir) ? readdirSync(dir).filter((f) => f.startsWith("ideas-") && f.endsWith(".json")) : [];
   let plans = 0;
@@ -848,6 +917,12 @@ async function modePlan(audit) {
 async function modeImplement(audit) {
   const identity = await runGate(process.env);
   configureIdentity(REPO_ROOT, identity);
+  if (isPublicDataClass(process.env)) {
+    const repo = publicRepository(process.env);
+    writePublicArtifact(process.env, { mode: "implement", status: "blocked", reason: "public-read-only" }, { kind: "improve", status: "blocked", repository: repo });
+    audit.note("implement", "public mode cannot create branches, commits, or pull requests");
+    return 4;
+  }
   const dir = process.env.FLEET_ARTIFACT_DIR || ".";
   const repo = process.env.FLEET_REPO;
   const planFile = path.join(dir, `plan-${repo.replace("/", "__")}.json`);
@@ -870,7 +945,7 @@ async function modeImplement(audit) {
   for (const f of plan.files) {
     putFileContent(repo, f.path, f.content, branch, `[fleet-improve] ${plan.title}`, process.env);
   }
-  const body = [plan.prBody, "", "---", `**Summary:** ${plan.summary}`, "", `**Risks:** ${plan.risks}`, "", "_Generated autonomously by M1Vj fleet-control improve pipeline; review before merge._"].join("\n");
+  const body = [plan.prBody, "", "---", `**Summary:** ${plan.summary}`, "", `**Risks:** ${plan.risks}`, "", "_Generated autonomously by the private control-repository improve pipeline; review before merge._"].join("\n");
   const pr = ghInput(
     ["api", "-X", "POST", `/repos/${repo}/pulls`],
     { title: `[fleet-improve] ${plan.title}`, body, head: branch, base, draft: true },
@@ -895,6 +970,12 @@ const LENSES = {
 async function modeReview(audit) {
   const identity = await runGate(process.env);
   configureIdentity(REPO_ROOT, identity);
+  if (isPublicDataClass(process.env)) {
+    const repo = publicRepository(process.env);
+    writePublicArtifact(process.env, { mode: "review", status: "blocked", reason: "public-read-only" }, { kind: "improve", status: "blocked", repository: repo });
+    audit.note("review", "public mode does not consume private PR metadata");
+    return 4;
+  }
   const dir = process.env.FLEET_ARTIFACT_DIR || ".";
   const lens = process.env.FLEET_LENS;
   const requestedRepo = process.env.FLEET_REPO;
@@ -991,6 +1072,12 @@ export function mergeSelectionHistory(state, selections, now = Date.now()) {
 async function modeFinalize(audit) {
   const identity = await runGate(process.env);
   configureIdentity(REPO_ROOT, identity);
+  if (isPublicDataClass(process.env)) {
+    const repo = publicRepository(process.env);
+    writePublicArtifact(process.env, { mode: "finalize", status: "blocked", reason: "public-read-only" }, { kind: "improve", status: "blocked", repository: repo });
+    audit.note("finalize", "public mode cannot post comments or commit durable state");
+    return 4;
+  }
   const revDir = process.env.FLEET_REVIEW_DIR;
   const metas = [];
   const artDir = process.env.FLEET_ARTIFACT_DIR || ".";
@@ -1039,7 +1126,7 @@ async function modeFinalize(audit) {
     gitCommit(REPO_ROOT, `[fleet] improve finalize ${new Date().toISOString().slice(0, 16)}`, identity);
     gitPush(REPO_ROOT, "main", process.env);
     const sha = gitRevParse(REPO_ROOT, "HEAD");
-    await verifyCommit("M1Vj/fleet-control", sha, identity, process.env.FLEET_GH_TOKEN);
+    await verifyCommit(privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control), sha, identity, process.env.FLEET_GH_TOKEN);
     audit.note("push-verify", `attribution verified sha=${sha.slice(0, 10)}`);
   }
   console.log(`IMPROVE_DONE=finalize`);
@@ -1062,13 +1149,13 @@ if (process.argv[1] && import.meta.url.endsWith(path.basename(process.argv[1])))
   };
   try {
     const code = await MODES[mode](audit);
-    makeTerminal(REPO_ROOT)(code === 0 ? "SUCCESS" : "BLOCKED", { mode });
-    audit.writeMarkdown(path.join(REPO_ROOT, "audit"), `improve-${mode}-${Date.now()}`, `Improve ${mode}`, code === 0 ? "ok" : "failed");
+    makeExecutionTerminal(process.env, REPO_ROOT)(code === 0 ? "SUCCESS" : "BLOCKED", { mode });
+    writeExecutionAudit(audit, process.env, REPO_ROOT, `improve-${mode}-${Date.now()}`, `Improve ${mode}`, code === 0 ? "ok" : "failed");
     if (code !== 0) dumpAudit();
     process.exit(code);
   } catch (err) {
     audit.incident("fatal", err.message);
-    audit.writeMarkdown(path.join(REPO_ROOT, "audit"), `improve-${mode}-${Date.now()}`, `Improve ${mode}`, `failed(${err.code || 1})`);
+    writeExecutionAudit(audit, process.env, REPO_ROOT, `improve-${mode}-${Date.now()}`, `Improve ${mode}`, `failed(${err.code || 1})`);
     console.error(`IMPROVE_FAILED mode=${mode} code=${err.code || 1} reason=${err.reason || err.message}`);
     dumpAudit();
     process.exit(err.code && Number.isInteger(err.code) ? err.code : 1);

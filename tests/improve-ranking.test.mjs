@@ -6,6 +6,7 @@ import {
   selectImprovementRepos,
   validateIdeasObject,
   resolveRequestedRepo,
+  researchCapacityOutcome,
 } from "../scripts/improve.mjs";
 
 const NOW = Date.parse("2026-09-13T00:00:00.000Z");
@@ -56,6 +57,14 @@ test("foreign or missing exact repo targets fail closed", () => {
   assert.throws(() => resolveRequestedRepo([target], "Other/target"));
   assert.throws(() => resolveRequestedRepo([target], "M1Vj/missing"));
   assert.throws(() => selectImprovementRepos([target], { requestedRepo: "not-a-repo", topK: 1 }));
+});
+
+test("private research circuit outage remains waiting for capacity", () => {
+  const outcome = researchCapacityOutcome("private", Date.parse("2026-09-13T00:00:00.000Z"), 30 * 60 * 1000);
+  assert.equal(outcome.status, "waiting_for_capacity");
+  assert.equal(outcome.exitCode, 6);
+  assert.equal(outcome.retryAt, "2026-09-13T00:30:00.000Z");
+  assert.notEqual(outcome.exitCode, 0);
 });
 
 test("selection history merge is idempotent per run and preserves fairness records", () => {

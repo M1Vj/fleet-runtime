@@ -1,5 +1,5 @@
 name: fleet-model-refresh
-run-name: "fleet model refresh ${{ github.run_id }}"
+run-name: "fleet public model refresh ${{ github.run_id }}"
 
 on:
   schedule:
@@ -10,51 +10,68 @@ permissions:
   contents: read
 
 concurrency:
-  group: fleet-model-refresh
+  group: fleet-model-refresh-public
   cancel-in-progress: false
+
+env:
+  FLEET_DATA_CLASS: public
+  FLEET_PUBLIC_OWNER: M1Vj
+  FLEET_PUBLIC_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
+  FLEET_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
+  FLEET_PUBLIC_ARTIFACT_MANIFEST: ${{ runner.temp }}/fleet-public-state/public-artifact.json
+  GH_TOKEN: ${{ github.token }}
+  GITHUB_TOKEN: ${{ github.token }}
+  ZEN_MODELS_URL: https://opencode.ai/zen/v1/models
+  FLEET_CHAIN_TTL_MS: ${{ vars.FLEET_CHAIN_TTL_MS || '604800000' }}
 
 jobs:
   refresh:
+    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    concurrency:
-      group: fleet-state-writer
-      cancel-in-progress: false
-    env:
-      FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
-      FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
-      ZEN_MODELS_URL: https://opencode.ai/zen/v1/models
-      FLEET_CHAIN_TTL_MS: ${{ vars.FLEET_CHAIN_TTL_MS || '604800000' }}
     steps:
-      - name: checkout
+      - name: validate public target
+        id: public-target
+        env:
+          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ github.repository }}
+          FLEET_PUBLIC_OWNER: M1Vj
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$FLEET_PUBLIC_REPOSITORY_INPUT"; owner="${target%%/*}"; name="${target#*/}"
+          [[ "$owner" == "$FLEET_PUBLIC_OWNER" && "$name" != "$target" && "$name" != */* ]]
+          metadata="$RUNNER_TEMP/public-repository.json"
+          curl --fail --silent --show-error --location --retry 1 -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/${owner}/${name}" >"$metadata" 2>"$RUNNER_TEMP/public-target-error.log"
+          node --input-type=module - "$metadata" <<'NODE'
+          import { readFileSync } from "node:fs";
+          const m = JSON.parse(readFileSync(process.argv[2], "utf8"));
+          if (m.private !== false || m.visibility !== "public" || m.owner?.login !== process.env.FLEET_PUBLIC_OWNER || m.archived === true) process.exit(1);
+          NODE
+          printf 'repository=%s\n' "$target" >> "$GITHUB_OUTPUT"
+      - name: checkout runtime
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
           fetch-depth: 1
-      - name: checkout private state repo
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          repository: M1Vj/fleet-control
-          token: ${{ secrets.FLEET_GH_TOKEN }}
-          persist-credentials: false
-          fetch-depth: 1
-          path: state-control
       - name: setup node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
-      - name: refresh model chain
+      - name: refresh public model catalog
+        env:
+          FLEET_PUBLIC_REPOSITORY: ${{ steps.public-target.outputs.repository }}
         run: node scripts/model-refresh.mjs
-      - name: commit chain override to fleet-control
+      - name: materialize public model manifest
+        if: always()
         run: |
-          node --input-type=module <<'NODE'
-          import { safeCommitState } from "./scripts/lib/util.mjs";
-          const outcome = safeCommitState(
-            "state-control",
-            ["state/model-chain.json", "state/events.jsonl"],
-            "[fleet] model chain refresh",
-            { name: "M1Vj", noreply: "M1Vj@users.noreply.github.com" },
-            process.env,
-          );
-          console.log(`model refresh state=${outcome}`);
-          NODE
+          if [ -f "$FLEET_PUBLIC_STATE_ROOT/state/model-chain.json" ]; then
+            cp "$FLEET_PUBLIC_STATE_ROOT/state/model-chain.json" "$FLEET_PUBLIC_ARTIFACT_MANIFEST"
+          fi
+      - name: publish public model manifest
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: public-model-chain
+          path: ${{ runner.temp }}/fleet-public-state/public-artifact.json
+          if-no-files-found: ignore

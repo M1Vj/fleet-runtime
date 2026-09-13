@@ -13,7 +13,7 @@ Accepted
 Fleet must find and process new pull requests across the enrolled `M1Vj`
 repositories, revisit older open pull requests, and dispatch upgrade work. The
 runtime repository is public; durable queue and audit state live in the private
-`M1Vj/fleet-control` repository. A single repository workflow cannot receive
+control repository configured by `FLEET_CONTROL_REPOSITORY`. A single repository workflow cannot receive
 pull-request events from every repository without an external ingress service.
 
 The current `orchestrate.yml` workflow plans a matrix from repository and open-PR
@@ -24,8 +24,9 @@ pure and samples upgrade work without replacement.
 ## Decision
 
 1. **Use public GitHub Actions as the execution plane.** Standard
-   GitHub-hosted runners in public repositories are free, while private
-   `fleet-control` remains the state and audit store. The workflow uses
+   GitHub-hosted runners in public repositories are free, while the private
+   control repository configured by `FLEET_CONTROL_REPOSITORY` remains the
+   state and audit store. The workflow uses
    `repository_dispatch`, `schedule`, and manual dispatch; payloads remain
    untrusted input and are validated before planning.
 

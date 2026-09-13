@@ -6,7 +6,7 @@
 // and writes the runtime override file:
 //
 //   <FLEET_STATE_ROOT>/state/model-chain.json
-//   {chain:[ids], updatedAt, source, ttlMs}
+//   {chain:[ids], updatedAt, source:<safe public category>, ttlMs}
 //
 // Precedence (scripts/lib/model.mjs resolveModelChain):
 //   explicit FLEET_MODEL_CHAIN env > fresh+valid override file > code DEFAULT.
@@ -48,6 +48,35 @@ export const ZEN_DEFAULT_URL = "https://opencode.ai/zen/v1/models";
 export const CHAIN_TTL_MS_DEFAULT = 7 * 24 * 3600 * 1000;
 export const MAX_CHAIN = 5;
 export const CORE_REFRESH_DIGEST = CORE_LOCK_DIGEST;
+
+// Public artifacts must never carry the catalog URL or a local fallback path.
+// Keep the source field categorical and accept only exact, public HTTPS
+// catalog endpoints that this workflow is allowed to query.
+const PUBLIC_CATALOG_ORIGINS = new Map([
+  [ZEN_DEFAULT_URL, "zen-public"],
+  ["https://models.dev/api.json", "models-dev-public"],
+]);
+
+function isPublicExecution(env = process.env) {
+  return String(env?.FLEET_DATA_CLASS || "").trim().toLowerCase() === "public";
+}
+
+function refreshFailureLine(reason, error, env = process.env, maxDetail = 160) {
+  if (isPublicExecution(env)) return `MODEL_REFRESH_FAILED reason=${reason}`;
+  const detail = String((error && error.message) || error).slice(0, maxDetail);
+  return `MODEL_REFRESH_FAILED reason=${reason} detail=${detail}`;
+}
+
+export function publicCatalogOrigin(env = process.env) {
+  const raw = resolveCatalogUrl(env);
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return "unknown";
+    return PUBLIC_CATALOG_ORIGINS.get(url.toString()) || "unknown";
+  } catch {
+    return "unknown";
+  }
+}
 
 export function resolveWriterTtlMs(env = process.env) {
   const raw = Number.parseInt(String(env.FLEET_CHAIN_TTL_MS || ""), 10);
@@ -198,7 +227,7 @@ export async function main(env = process.env) {
   try {
     json = await loadCatalog(env);
   } catch (err) {
-    console.error(`MODEL_REFRESH_FAILED reason=catalog-unavailable detail=${String((err && err.message) || err).slice(0, 160)}`);
+    console.error(refreshFailureLine("catalog-unavailable", err, env));
     return 1;
   }
   const cands = extractCandidates(json);
@@ -223,7 +252,7 @@ export async function main(env = process.env) {
   const payload = {
     chain,
     updatedAt: new Date().toISOString(),
-    source: resolveCatalogUrl(env),
+    source: publicCatalogOrigin(env),
     ttlMs,
     coreVersion: CORE_MANIFEST.coreVersion,
     coreDigest: CORE_LOCK_DIGEST,
@@ -233,7 +262,7 @@ export async function main(env = process.env) {
     mkdirSync(path.dirname(p), { recursive: true });
     writeFileSync(p, JSON.stringify(payload, null, 2) + "\n");
   } catch (err) {
-    console.error(`MODEL_REFRESH_FAILED reason=write-failed detail=${String((err && err.message) || err).slice(0, 120)}`);
+    console.error(refreshFailureLine("write-failed", err, env, 120));
     return 1;
   }
   try {

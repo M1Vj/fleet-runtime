@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import {
   publicRepository as runtimePublicRepository,
   publicTargetDecision as runtimePublicTargetDecision,
+  publicArtifactPayload as runtimePublicArtifactPayload,
   publicStateRoot as runtimePublicStateRoot,
   resolveArtifactManifest as runtimeResolveArtifactManifest,
 } from "../scripts/lib/private-state.mjs";
@@ -309,6 +310,156 @@ test("workflow inputs and metadata never interpolate untrusted payloads into run
   }
 });
 
+test("public workflow dispatch cannot accept a raw repository identifier", () => {
+  for (const name of WORKFLOW_FILES) {
+    const text = workflowText(name);
+    assert.doesNotMatch(text, /(?:inputs|github\.event\.inputs)\.repo\b/, `${name} interpolates a raw repository input`);
+    assert.doesNotMatch(text, /FLEET_PUBLIC_REPOSITORY_INPUT\b/, `${name} exposes a raw repository input environment variable`);
+
+    const dispatch = text.match(/\n  workflow_dispatch:\n([\s\S]*?)(?=\n  [A-Za-z0-9_-]+:|\n\n|$)/)?.[1] || "";
+    assert.doesNotMatch(dispatch, /^\s+repo:\s*$/m, `${name} declares a repository workflow input`);
+  }
+});
+
+test("public workflow dispatch inputs are typed, bounded, and never copied from raw event payloads", () => {
+  const expectedInputs = {
+    "ci-diag.yml": {},
+    "deep.yml": { workers: "number" },
+    "emergency-stop.yml": { confirm: "boolean" },
+    "improve.yml": { top_k: "number" },
+    "kb.yml": {},
+    "merge.yml": { pr: "number" },
+    "model-refresh.yml": {},
+    "orchestrate.yml": { pr: "number", max_agents: "number" },
+    "patrol.yml": {},
+    "retro.yml": {},
+    "selftest.yml": {},
+    "thesis.yml": {},
+    "watchdog.yml": {},
+  };
+  for (const name of WORKFLOW_FILES) {
+    const text = workflowText(name);
+    const dispatchStart = text.indexOf("\n  workflow_dispatch:");
+    assert.ok(dispatchStart >= 0, `${name} must declare workflow_dispatch`);
+    const remainder = text.slice(dispatchStart + 1);
+    const nextTopLevel = remainder.search(/\n  (?:concurrency|permissions|env|jobs):/);
+    const dispatch = remainder.slice(0, nextTopLevel >= 0 ? nextTopLevel : remainder.length);
+    const inputs = {};
+    const inputsStart = dispatch.indexOf("\n    inputs:");
+    if (inputsStart >= 0) {
+      const inputSection = dispatch.slice(inputsStart + "\n    inputs:".length);
+      const blocks = [...inputSection.matchAll(/\n      ([A-Za-z0-9_-]+):\n([\s\S]*?)(?=\n      [A-Za-z0-9_-]+:\n|$)/g)];
+      for (const match of blocks) {
+        const type = match[2].match(/^\s+type:\s*([^\s#]+)/m)?.[1];
+        inputs[match[1]] = type || "missing";
+      }
+    }
+    assert.deepEqual(inputs, expectedInputs[name] || {}, `${name} exposes an unapproved workflow input`);
+    assert.doesNotMatch(dispatch, /type:\s*string\b/, `${name} accepts arbitrary string dispatch input`);
+    assert.doesNotMatch(text, /github\.event\.inputs\./, `${name} copies raw workflow input payload data`);
+    assert.doesNotMatch(text, /github\.event\.client_payload/, `${name} copies raw repository-dispatch payload data`);
+  }
+  const merge = workflowText("merge.yml");
+  assert.match(merge, /FLEET_UI_ROUTES:\s*["']?\/["']?\s*$/m, "merge routes must use a fixed public-safe default");
+  assert.doesNotMatch(merge, /FLEET_UI_ROUTES:.*\$\{\{/, "merge routes must not receive workflow input text");
+  const stop = workflowText("emergency-stop.yml");
+  assert.match(stop, /FLEET_CONFIRM:\s*\$\{\{\s*inputs\.confirm\s*\|\|\s*false\s*\}\}/);
+  assert.match(stop, /\[\[\s*\"\$FLEET_CONFIRM\"\s*==\s*\"true\"\s*\]\]/);
+});
+
+test("public target validators use trusted context only and never echo rejected identifiers", () => {
+  const temporaryRoot = mkdtempSync(path.join(tmpdir(), "fleet-public-target-privacy-"));
+  const mockBin = path.join(temporaryRoot, "bin");
+  const mockCurl = path.join(mockBin, "curl");
+  const outputPath = path.join(temporaryRoot, "github-output");
+  const originalPath = process.env.PATH || "";
+  const privateIdentifier = ["M1Vj", ["fleet", "control"].join("-")].join("/");
+  try {
+    mkdirSync(mockBin);
+    writeFileSync(mockCurl, [
+      "#!/bin/sh",
+      "target=\"${FLEET_PUBLIC_TARGET:-${GITHUB_REPOSITORY:-}}\"",
+      "name=\"${target#*/}\"",
+      "case \"$name\" in",
+      "  public-repo) printf '%s\\n' '{\"name\":\"public-repo\",\"private\":false,\"visibility\":\"public\",\"archived\":false,\"owner\":{\"login\":\"M1Vj\"}}' ;;",
+      "  *) printf '%s\\n' '{\"name\":\"public-repo\",\"private\":true,\"visibility\":\"private\",\"archived\":false,\"owner\":{\"login\":\"M1Vj\"}}' ;;",
+      "esac",
+      "",
+    ].join("\n"));
+    chmodSync(mockCurl, 0o755);
+    let validatorCount = 0;
+    for (const name of WORKFLOW_FILES) {
+      if (name === "ci-diag.yml") continue;
+      for (const script of publicTargetRuns(workflowText(name))) {
+        validatorCount += 1;
+        rmSync(outputPath, { force: true });
+        const result = spawnSync("bash", ["-c", script], {
+          encoding: "utf8",
+          env: {
+            PATH: `${mockBin}:${originalPath}`,
+            FLEET_PUBLIC_TARGET: privateIdentifier,
+            GITHUB_REPOSITORY: "M1Vj/public-repo",
+            FLEET_PUBLIC_OWNER: "M1Vj",
+            RUNNER_TEMP: temporaryRoot,
+            GITHUB_OUTPUT: outputPath,
+            GH_TOKEN: "test-token",
+          },
+        });
+        assert.notEqual(result.status, 0, `${name} accepted an untrusted private target`);
+        assert.equal(`${result.stdout || ""}${result.stderr || ""}`.includes(privateIdentifier), false, `${name} echoed the rejected identifier`);
+        assert.equal(existsSync(outputPath), false, `${name} emitted a manifest target before validation`);
+      }
+    }
+    assert.equal(validatorCount, 26, "all operational public target validators must reject untrusted identifiers");
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("self-repo public canary resolves from GitHub context without a dispatch target", () => {
+  const temporaryRoot = mkdtempSync(path.join(tmpdir(), "fleet-public-self-canary-"));
+  const mockBin = path.join(temporaryRoot, "bin");
+  const mockCurl = path.join(mockBin, "curl");
+  const outputPath = path.join(temporaryRoot, "github-output");
+  try {
+    mkdirSync(mockBin);
+    writeFileSync(mockCurl, [
+      "#!/bin/sh",
+      "printf '%s\\n' '{\"name\":\"public-repo\",\"private\":false,\"visibility\":\"public\",\"archived\":false,\"owner\":{\"login\":\"M1Vj\"}}'",
+      "",
+    ].join("\n"));
+    chmodSync(mockCurl, 0o755);
+    const [script] = publicTargetRuns(workflowText("patrol.yml"));
+    const result = spawnSync("bash", ["-c", script], {
+      encoding: "utf8",
+      env: {
+        PATH: `${mockBin}:${process.env.PATH || ""}`,
+        GITHUB_REPOSITORY: "M1Vj/public-repo",
+        FLEET_PUBLIC_OWNER: "M1Vj",
+        RUNNER_TEMP: temporaryRoot,
+        GITHUB_OUTPUT: outputPath,
+        GH_TOKEN: "test-token",
+      },
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(readFileSync(outputPath, "utf8"), "repository=M1Vj/public-repo\n");
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("public target and artifact validation errors redact untrusted identifiers", () => {
+  const privateIdentifier = `${["M1Vj", ["fleet", "control"].join("-")].join("/")}?secret=redact-me`;
+  assert.throws(
+    () => runtimePublicRepository({ FLEET_PUBLIC_OWNER: "M1Vj", FLEET_PUBLIC_REPOSITORY: privateIdentifier }),
+    (error) => !String(error?.message || "").includes(privateIdentifier),
+  );
+  assert.throws(
+    () => runtimePublicArtifactPayload({}, { kind: "privacy", status: "ok", repository: privateIdentifier }),
+    (error) => !String(error?.message || "").includes(privateIdentifier),
+  );
+});
+
 test("public target visibility contract fails closed for unknown, private, and malformed metadata", () => {
   assert.deepEqual(
     publicTargetDecision({ name: "public-repo", owner: { login: "M1Vj" }, private: false, visibility: "public" }),
@@ -405,7 +556,7 @@ test("every public target validator executes with a mocked public API response",
             encoding: "utf8",
             env: {
               PATH: `${mockBin}:${originalPath}`,
-              FLEET_PUBLIC_REPOSITORY_INPUT: "M1Vj/public-repo",
+              FLEET_PUBLIC_TARGET: "M1Vj/public-repo",
               FLEET_PUBLIC_OWNER: "M1Vj",
               GITHUB_REPOSITORY: "M1Vj/public-repo",
               RUNNER_TEMP: temporaryRoot,

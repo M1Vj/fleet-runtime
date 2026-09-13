@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -126,5 +126,83 @@ test("main writes valid state/model-chain.json using mock catalog", async () => 
   assert.ok(Array.isArray(data.chain));
   assert.ok(data.chain.length > 0);
   assert.ok(data.updatedAt);
-  assert.equal(data.source, env.ZEN_MODELS_URL);
+  assert.equal(data.source, "unknown");
+  assert.equal(/(?:https?:|file:|[\\/](?:Users|home|private|tmp)[\\/])/.test(String(data.source)), false);
+});
+
+test("public catalog failures do not expose provider error details", async () => {
+  const stateRoot = mkdtempSync(path.join(tmpdir(), "refresh-public-catalog-error-"));
+  const originalCwd = process.cwd();
+  const originalFetch = globalThis.fetch;
+  const originalError = console.error;
+  const sentinel = "/Users/vjmabansag/private/session-prompt-catalog-error";
+  const errors = [];
+  try {
+    process.chdir(stateRoot);
+    globalThis.fetch = async () => {
+      throw new Error(`catalog failed at ${sentinel}`);
+    };
+    console.error = (...args) => errors.push(args.join(" "));
+    const exitCode = await main({
+      FLEET_DATA_CLASS: "public",
+      FLEET_STATE_ROOT: stateRoot,
+      ZEN_MODELS_URL: "https://catalog.invalid/models",
+    });
+    assert.equal(exitCode, 1);
+    const output = errors.join("\n");
+    assert.match(output, /MODEL_REFRESH_FAILED reason=catalog-unavailable/);
+    assert.equal(output.includes(sentinel), false);
+  } finally {
+    process.chdir(originalCwd);
+    globalThis.fetch = originalFetch;
+    console.error = originalError;
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
+test("public write failures do not expose filesystem error details", async () => {
+  const temporaryRoot = mkdtempSync(path.join(tmpdir(), "refresh-public-write-error-"));
+  const blocker = path.join(temporaryRoot, "private-session-write-error");
+  const stateRoot = path.join(blocker, "state-root");
+  const originalError = console.error;
+  const sentinel = "private-session-write-error";
+  const errors = [];
+  try {
+    writeFileSync(blocker, "not a directory");
+    console.error = (...args) => errors.push(args.join(" "));
+    const exitCode = await main({
+      FLEET_DATA_CLASS: "public",
+      FLEET_STATE_ROOT: stateRoot,
+      ZEN_MODELS_URL: `file://${path.resolve("config/models.json")}`,
+    });
+    assert.equal(exitCode, 1);
+    const output = errors.join("\n");
+    assert.match(output, /MODEL_REFRESH_FAILED reason=write-failed/);
+    assert.equal(output.includes(sentinel), false);
+  } finally {
+    console.error = originalError;
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("private catalog failures retain bounded diagnostic detail", async () => {
+  const temporaryRoot = mkdtempSync(path.join(tmpdir(), "refresh-private-catalog-error-"));
+  const originalError = console.error;
+  const sentinel = path.join(temporaryRoot, "private-catalog-error");
+  const errors = [];
+  try {
+    console.error = (...args) => errors.push(args.join(" "));
+    const exitCode = await main({
+      FLEET_DATA_CLASS: "private",
+      FLEET_STATE_ROOT: temporaryRoot,
+      ZEN_MODELS_URL: `file://${sentinel}`,
+    });
+    assert.equal(exitCode, 1);
+    const output = errors.join("\n");
+    assert.match(output, /MODEL_REFRESH_FAILED reason=catalog-unavailable/);
+    assert.equal(output.includes(sentinel), true);
+  } finally {
+    console.error = originalError;
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
 });

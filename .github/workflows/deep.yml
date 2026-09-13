@@ -8,13 +8,8 @@ on:
     inputs:
       workers:
         description: "max parallel public workers"
-        type: string
-        default: "6"
-      repo:
-        description: "allowlisted public owner/name (empty uses this repository)"
-        type: string
-        required: false
-        default: ""
+        type: number
+        default: 6
 
 concurrency:
   group: fleet-deep-public
@@ -42,13 +37,13 @@ jobs:
       - name: validate public target
         id: public-target
         env:
-          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ inputs.repo || github.event.inputs.repo || '' }}
+          FLEET_PUBLIC_TARGET: ${{ github.repository }}
           FLEET_PUBLIC_OWNER: M1Vj
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          target="${FLEET_PUBLIC_REPOSITORY_INPUT:-${GITHUB_REPOSITORY}}"
+          target="${FLEET_PUBLIC_TARGET:-${GITHUB_REPOSITORY}}"
           [[ "$target" == */* && "$target" != *$'\n'* && "$target" != *$'\r'* ]]
           owner="${target%%/*}"
           name="${target#*/}"
@@ -94,7 +89,7 @@ jobs:
           path: public-target
       - name: sanitize workers input
         env:
-          FLEET_WORKERS_INPUT: ${{ inputs.workers || github.event.inputs.workers || '' }}
+          FLEET_WORKERS_INPUT: ${{ inputs.workers || 6 }}
         run: |
           FLEET_MAX_WORKERS=$(node --input-type=module <<'NODE'
           import { sanitizeMaxWorkers } from "./scripts/deep.mjs";
@@ -133,13 +128,13 @@ jobs:
       - name: validate public target
         id: public-target
         env:
-          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ matrix.worker.repo || matrix.repo || github.repository }}
+          FLEET_PUBLIC_TARGET: ${{ matrix.worker.repo || matrix.repo || github.repository }}
           FLEET_PUBLIC_OWNER: M1Vj
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          target="${FLEET_PUBLIC_REPOSITORY_INPUT:-${GITHUB_REPOSITORY}}"
+          target="${FLEET_PUBLIC_TARGET:-${GITHUB_REPOSITORY}}"
           [[ "$target" == */* && "$target" != *$'\n'* && "$target" != *$'\r'* ]]
           owner="${target%%/*}"
           name="${target#*/}"
@@ -218,13 +213,13 @@ jobs:
       - name: validate public target
         id: public-target
         env:
-          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ github.repository }}
+          FLEET_PUBLIC_TARGET: ${{ github.repository }}
           FLEET_PUBLIC_OWNER: M1Vj
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          target="$FLEET_PUBLIC_REPOSITORY_INPUT"
+          target="$FLEET_PUBLIC_TARGET"
           owner="${target%%/*}"
           name="${target#*/}"
           [[ "$owner" == "$FLEET_PUBLIC_OWNER" && "$name" != "$target" && "$name" != */* ]]

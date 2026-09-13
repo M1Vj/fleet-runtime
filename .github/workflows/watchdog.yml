@@ -5,12 +5,6 @@ on:
   schedule:
     - cron: "9,24,39,54 * * * *"
   workflow_dispatch:
-    inputs:
-      repo:
-        description: "allowlisted public owner/name (empty uses this repository)"
-        type: string
-        required: false
-        default: ""
 
 permissions:
   contents: read
@@ -36,13 +30,13 @@ jobs:
       - name: validate public target
         id: public-target
         env:
-          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ inputs.repo || github.event.inputs.repo || '' }}
+          FLEET_PUBLIC_TARGET: ${{ github.repository }}
           FLEET_PUBLIC_OWNER: M1Vj
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          target="${FLEET_PUBLIC_REPOSITORY_INPUT:-${GITHUB_REPOSITORY}}"; owner="${target%%/*}"; name="${target#*/}"
+          target="${FLEET_PUBLIC_TARGET:-${GITHUB_REPOSITORY}}"; owner="${target%%/*}"; name="${target#*/}"
           [[ "$target" == */* && "$owner" == "$FLEET_PUBLIC_OWNER" && "$name" != "$target" && "$name" != */* && "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]
           metadata="$RUNNER_TEMP/public-repository.json"
           curl --fail --silent --show-error --location --retry 1 -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/${owner}/${name}" >"$metadata" 2>"$RUNNER_TEMP/public-target-error.log"

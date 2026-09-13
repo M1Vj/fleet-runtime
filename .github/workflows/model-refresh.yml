@@ -30,13 +30,13 @@ jobs:
       - name: validate public target
         id: public-target
         env:
-          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ github.repository }}
+          FLEET_PUBLIC_TARGET: ${{ github.repository }}
           FLEET_PUBLIC_OWNER: M1Vj
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          target="$FLEET_PUBLIC_REPOSITORY_INPUT"; owner="${target%%/*}"; name="${target#*/}"
+          target="$FLEET_PUBLIC_TARGET"; owner="${target%%/*}"; name="${target#*/}"
           [[ "$owner" == "$FLEET_PUBLIC_OWNER" && "$name" != "$target" && "$name" != */* ]]
           metadata="$RUNNER_TEMP/public-repository.json"
           curl --fail --silent --show-error --location --retry 1 -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/${owner}/${name}" >"$metadata" 2>"$RUNNER_TEMP/public-target-error.log"
@@ -72,9 +72,35 @@ jobs:
         run: node scripts/model-refresh.mjs
       - name: materialize public model manifest
         if: always()
+        env:
+          FLEET_PUBLIC_REPOSITORY: ${{ steps.public-target.outputs.repository }}
         run: |
-          if [ -f "$FLEET_PUBLIC_STATE_ROOT/state/model-chain.json" ]; then
-            cp "$FLEET_PUBLIC_STATE_ROOT/state/model-chain.json" "$FLEET_PUBLIC_ARTIFACT_MANIFEST"
+          if [ -n "${FLEET_PUBLIC_REPOSITORY:-}" ] && [ -f "$FLEET_PUBLIC_STATE_ROOT/state/model-chain.json" ]; then
+            node --input-type=module - "$FLEET_PUBLIC_STATE_ROOT/state/model-chain.json" "$FLEET_PUBLIC_ARTIFACT_MANIFEST" "$FLEET_PUBLIC_REPOSITORY" <<'NODE'
+          import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+          import path from "node:path";
+          import { publicArtifactPayload } from "./scripts/lib/private-state.mjs";
+
+          const [statePath, manifestPath, repository] = process.argv.slice(2);
+          const state = JSON.parse(readFileSync(statePath, "utf8"));
+          const chain = Array.isArray(state.chain) ? state.chain : [];
+          const validChain = chain.length > 0 && chain.length <= 5 && chain.every((id) => typeof id === "string" && id.length <= 200);
+          const publicOrigins = new Set(["zen-public", "models-dev-public"]);
+          const value = publicArtifactPayload({
+            mode: "model-refresh",
+            modelMode: publicOrigins.has(state.source) ? state.source : "unknown",
+            analyzed: validChain,
+            blocked: !validChain,
+            count: validChain ? chain.length : 0,
+            checks: { model: validChain ? "chain-valid" : "chain-invalid" },
+          }, {
+            kind: "model-refresh",
+            status: validChain ? "ok" : "blocked",
+            repository,
+          });
+          mkdirSync(path.dirname(manifestPath), { recursive: true });
+          writeFileSync(manifestPath, JSON.stringify(value, null, 2) + "\n", "utf8");
+          NODE
           fi
       - name: publish public model manifest
         if: always()

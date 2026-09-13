@@ -8,8 +8,9 @@ Do not move those responsibilities into this repository.
 
 ## 1. Public target contract
 
-Each operational workflow starts with a `validate public target` step. A target
-is accepted only when all of the following hold:
+Each operational workflow starts with a `validate public target` step. The
+workflow target is always its current `github.repository`, and it is accepted
+only when all of the following hold:
 
 - it is a single `owner/name` value with a conservative repository-name regex;
 - `owner` is exactly `M1Vj`;
@@ -21,9 +22,11 @@ is accepted only when all of the following hold:
 
 The target is rejected before checkout, model execution, and task execution on
 any validation or API error. Scheduled runs use the current public repository
-when no input is supplied. Manual runs may supply `repo` for another public
-target. Pull-request numbers and routes are accepted only after the target has
-passed the same check.
+and manual runs are bound to that same repository; no workflow-dispatch input
+can select another repository. After the preflight passes, the exact validated
+target is exported as `FLEET_PUBLIC_REPOSITORY`. Pull-request numbers and
+other workflow-specific controls are accepted only after the target has passed
+the same check. Never supply a private repository identifier to a public run.
 
 Public state is ephemeral below `${{ runner.temp }}/fleet-public-state`.
 `FLEET_PUBLIC_ARTIFACT_MANIFEST` points to one exact JSON file. A missing,
@@ -39,9 +42,9 @@ changing its permissions:
 
 ```bash
 gh workflow list -R M1Vj/fleet-runtime
-gh workflow run fleet-patrol.yml -R M1Vj/fleet-runtime -f repo=M1Vj/fleet-runtime
-gh workflow run fleet-deep.yml -R M1Vj/fleet-runtime -f repo=M1Vj/fleet-runtime -f workers=3
-gh workflow run fleet-merge-gate.yml -R M1Vj/fleet-runtime -f repo=M1Vj/fleet-runtime -f pr=1
+gh workflow run fleet-patrol.yml -R M1Vj/fleet-runtime
+gh workflow run fleet-deep.yml -R M1Vj/fleet-runtime -f workers=3
+gh workflow run fleet-merge-gate.yml -R M1Vj/fleet-runtime -f pr=1
 gh run list -R M1Vj/fleet-runtime --limit 10
 gh run watch <run-id> -R M1Vj/fleet-runtime
 ```

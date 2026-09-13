@@ -15,6 +15,7 @@ import {
   makeExecutionTerminal,
   publicModelEnv,
   publicRepository,
+  publicTargetDecision,
   privateRepository,
   PRIVATE_REPOSITORY_ENV,
   resolveStateRoot,
@@ -32,6 +33,27 @@ export const DEEP_QUEUE_CAP = 100;
 export const DEEP_QUEUE_ADDITION_CAP = 10;
 export const PATROL_MAX_STATE_PUSHES = 2;
 export const DEEP_WORKFLOW_REPO = "M1Vj/fleet-runtime";
+
+export function boundedPatrolScopes(identity) {
+  return Array.isArray(identity?.scopes) ? identity.scopes : [];
+}
+
+/**
+ * Public patrol failures are telemetry only: never echo provider errors,
+ * paths, or other untrusted detail. Private patrol retains a bounded reason
+ * for operator diagnosis.
+ */
+export function patrolFailureReason(error, env = process.env) {
+  let publicMode = false;
+  try {
+    publicMode = isPublicDataClass(env);
+  } catch {
+    // An invalid data-class must fail closed; use the public-safe message.
+    publicMode = true;
+  }
+  if (publicMode) return "public patrol failed";
+  return String(error?.reason || error?.message || "unknown").slice(0, 200);
+}
 
 function targetsPath() {
   return path.join(STATE_DIR, "targets.json");
@@ -178,22 +200,39 @@ function killSwitchEngaged() {
   }
 }
 
-async function collectSignals(env, audit) {
-  const repos = isPublicDataClass(env)
-    ? [gh(["api", `/repos/${publicRepository(env)}`], env)]
-    : gh(["api", "/user/repos?affiliation=owner&per_page=100&sort=pushed"], env);
+export async function collectSignals(env, audit, options = {}) {
+  const ghCall = options.gh || gh;
+  const publicTarget = isPublicDataClass(env) ? publicRepository(env) : "";
+  let repos;
+  try {
+    repos = isPublicDataClass(env)
+      ? [ghCall(["api", `/repos/${publicTarget}`], env)]
+      : ghCall(["api", "/user/repos?affiliation=owner&per_page=100&sort=pushed"], env);
+  } catch (err) {
+    if (!isPublicDataClass(env)) throw err;
+    audit.note("signal-error", "public target metadata read failed");
+    return [{ repo: publicTarget, error: "public target metadata read failed", openPulls: [], activeIssues: [], failingRuns24h: [] }];
+  }
   audit.note("enumerate", `owned repos=${repos.length}`);
   const signals = [];
   for (const repo of repos) {
-    const full = repo.full_name || (isPublicDataClass(env) ? publicRepository(env) : "");
+    if (isPublicDataClass(env)) {
+      const decision = publicTargetDecision(repo);
+      if (!decision.ok || decision.repository !== publicTarget) {
+        audit.note("signal-error", "public target metadata rejected");
+        signals.push({ repo: publicTarget, error: "PUBLIC_TARGET_NOT_PUBLIC", openPulls: [], activeIssues: [], failingRuns24h: [] });
+        continue;
+      }
+    }
+    const full = isPublicDataClass(env) ? publicTarget : repo.full_name || "";
     try {
-      const pulls = gh(["api", `/repos/${full}/pulls?state=open&per_page=20`], env) || [];
+      const pulls = ghCall(["api", `/repos/${full}/pulls?state=open&per_page=20`], env) || [];
       const since = readJson(heartbeatPath(), {}).lastRunUtc || new Date(Date.now() - 26 * 3600 * 1000).toISOString();
-      const issues = gh(
+      const issues = ghCall(
         ["api", `/repos/${full}/issues?state=open&since=${encodeURIComponent(since)}&per_page=30`],
         env,
       ) || [];
-      const runsRaw = gh(["api", `/repos/${full}/actions/runs?status=failure&per_page=15`], env) || {};
+      const runsRaw = ghCall(["api", `/repos/${full}/actions/runs?status=failure&per_page=15`], env) || {};
       const runs = (runsRaw.workflow_runs || []).filter((r) => new Date(r.created_at) > Date.now() - 24 * 3600 * 1000);
       signals.push({
         repo: full,
@@ -209,8 +248,11 @@ async function collectSignals(env, audit) {
         failingRuns24h: runs.map((r) => ({ id: r.id, name: r.name, url: r.html_url, created: r.created_at })),
       });
     } catch (err) {
-      audit.note("signal-error", `${full}: ${err.message}`);
-      signals.push({ repo: full, error: err.message.slice(0, 200), openPulls: [], activeIssues: [], failingRuns24h: [] });
+      const detail = isPublicDataClass(env)
+        ? "public signal read failed"
+        : String(err?.message || err).slice(0, 200);
+      audit.note("signal-error", `${full}: ${detail}`);
+      signals.push({ repo: full, error: detail, openPulls: [], activeIssues: [], failingRuns24h: [] });
     }
   }
   return signals;
@@ -624,7 +666,8 @@ export async function main() {
   try {
     identity = await runGate(process.env);
     configureIdentity(REPO_ROOT, identity);
-    audit.note("gate", `identity=${identity.login} id=${identity.id} scopes=${identity.scopes.join(",")}`);
+    const scopes = boundedPatrolScopes(identity);
+    audit.note("gate", `identity=${identity.login} id=${identity.id} scopes=${scopes.join(",")}`);
 
     gwRoot = REPO_ROOT;
 
@@ -820,11 +863,18 @@ export async function main() {
     return 0;
   } catch (err) {
     const code = err.code && Number.isInteger(err.code) ? err.code : 1;
-    if (code === 5) audit.incident("fatal", err.message);
-    else audit.incident("fatal", err.message);
-    const failureStatus = `failed(${err.reason || code})`;
+    const publicMode = (() => {
+      try {
+        return isPublicDataClass(process.env);
+      } catch {
+        return true;
+      }
+    })();
+    const failureReason = patrolFailureReason(err, process.env);
+    audit.incident("fatal", publicMode ? "public patrol failed" : err.message);
+    const failureStatus = `failed(${publicMode ? code : (err.reason || code)})`;
     writePatrolAudit(failureStatus);
-    console.error(`PATROL_FAILED code=${code} reason=${err.reason || err.message}`);
+    console.error(`PATROL_FAILED code=${code} reason=${failureReason}`);
     if (err.reason === "MODEL_UNAVAILABLE") {
       try {
         const { gatewayDown } = await import("./lib/gateway-health.mjs");
@@ -851,7 +901,12 @@ export async function main() {
         statePushVerified = true;
         audit.note("push-verify", `failure audit attribution verified sha=${failSha.slice(0, 10)}`);
       } catch (pushErr) {
-        audit.note("push-verify", `failure audit push skipped: ${String(pushErr.message || pushErr).slice(0, 160)}`);
+        audit.note(
+          "push-verify",
+          publicMode
+            ? "failure audit push skipped"
+            : `failure audit push skipped: ${String(pushErr.message || pushErr).slice(0, 160)}`,
+        );
       }
     }
     if (statePushAttempted && !statePushVerified) {

@@ -1163,7 +1163,7 @@ test("hosted improve workflow wires job outputs, artifact handoff, and receipt u
   assert.deepEqual([...text.matchAll(/merge-multiple:\s*(\w+)/g)].map((match) => match[1]), ["false", "false", "false"]);
   assert.match(text, /needs:\s*\[pick, research, plan, implement, review\]/);
   assert.match(text, /plan:\s*\n\s+needs:\s*\[pick, research\]/);
-  assert.match(text, /FLEET_PUBLIC_REPOSITORY_INPUT:\s+\$\{\{\s*needs\.pick\.outputs\.repository\s*\}\}/);
+  assert.match(text, /FLEET_PUBLIC_TARGET:\s+\$\{\{\s*needs\.pick\.outputs\.repository\s*\}\}/);
   assert.doesNotMatch(text, /matrix\.repo\s*\|\|\s*github\.repository/);
   assert.match(text, /name: download public improve manifests/);
   assert.match(text, /name: upload public improve receipt/);

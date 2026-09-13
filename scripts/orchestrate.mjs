@@ -38,6 +38,7 @@ import {
   publicRepository,
   publicModelEnv,
   publicStateRoot,
+  publicTargetDecision,
   writePublicArtifact,
 } from "./lib/private-state.mjs";
 
@@ -1317,7 +1318,69 @@ function repositoryNameFromApi(row) {
   }
 }
 
+function publicPullRequestRow(row, repo, number) {
+  const safe = {
+    repo,
+    number,
+    pr: number,
+    state: "open",
+    draft: row.draft === true,
+    repository: { full_name: repo },
+    base: { repo: { full_name: repo } },
+  };
+  for (const field of ["created_at", "opened_at", "updated_at"]) {
+    if (typeof row[field] === "string" && row[field].length <= MAX_EVENT_STRING) safe[field] = row[field];
+  }
+  for (const field of ["priority", "urgent"]) {
+    if (row[field] === true) safe[field] = true;
+  }
+  if (Array.isArray(row.labels)) {
+    safe.labels = row.labels
+      .map((label) => typeof label === "string" ? label : label?.name)
+      .filter((label) => typeof label === "string" && label.length <= MAX_EVENT_STRING && !/[\u0000-\u001f\u007f]/.test(label))
+      .map((name) => ({ name }));
+  }
+  return safe;
+}
+
+function publicRepositoryMetadata({ ghClient = defaultGh, env = process.env } = {}) {
+  const repository = publicRepository(env);
+  let metadata;
+  try {
+    metadata = ghClient(["api", `/repos/${repository}`], env);
+  } catch {
+    throw new Error("public repository metadata is unavailable");
+  }
+  const decision = publicTargetDecision(metadata, [OWNER]);
+  if (!decision.ok || decision.repository !== repository) {
+    throw new Error("public repository metadata is not publicly available");
+  }
+  // Keep the scheduler input to the minimum public, scalar metadata it uses.
+  // In particular, do not carry arbitrary API fields into the plan builder.
+  const name = repository.slice(OWNER.length + 1);
+  const safe = {
+    full_name: repository,
+    name,
+    owner: { login: OWNER },
+    private: false,
+    visibility: "public",
+    archived: false,
+    fork: metadata.fork === true,
+  };
+  for (const field of ["created_at", "pushed_at", "updated_at"]) {
+    if (typeof metadata[field] === "string" && metadata[field].length <= MAX_EVENT_STRING) {
+      safe[field] = metadata[field];
+    }
+  }
+  for (const field of ["open_issues_count", "stargazers_count", "watchers_count"]) {
+    const value = Number(metadata[field]);
+    if (Number.isSafeInteger(value) && value >= 0) safe[field] = value;
+  }
+  return safe;
+}
+
 export function discoverRepositories({ ghClient = defaultGh, env = process.env } = {}) {
+  if (isPublicDataClass(env)) return [publicRepositoryMetadata({ ghClient, env })];
   const rows = collectPaginated((page, perPage) => ghClient([
     "api",
     pageEndpoint("/user/repos?affiliation=owner&sort=pushed", page, perPage),
@@ -1337,7 +1400,10 @@ export function discoverRepositories({ ghClient = defaultGh, env = process.env }
 
 export function discoverOpenPullRequests(repositories, { ghClient = defaultGh, env = process.env, onError = () => {} } = {}) {
   const pulls = [];
-  for (const repository of Array.isArray(repositories) ? repositories : []) {
+  const candidates = Array.isArray(repositories) ? repositories : [];
+  const publicTarget = isPublicDataClass(env) ? publicRepository(env) : null;
+  for (const repository of candidates) {
+    if (publicTarget && repositoryNameFromApi(repository) !== publicTarget) continue;
     const repo = normalizeRepo(repository);
     let rows;
     try {
@@ -1346,7 +1412,11 @@ export function discoverOpenPullRequests(repositories, { ghClient = defaultGh, e
         pageEndpoint(`/repos/${repo}/pulls?state=open`, page, perPage),
       ], env));
     } catch (error) {
-      onError(`open PR discovery skipped for ${repo}: ${String(error?.message || error).slice(0, 180)}`);
+      if (isPublicDataClass(env)) {
+        onError("open PR discovery skipped for public repository");
+      } else {
+        onError(`open PR discovery skipped for ${repo}: ${String(error?.message || error).slice(0, 180)}`);
+      }
       continue;
     }
     for (const row of rows) {
@@ -1370,15 +1440,98 @@ export function discoverOpenPullRequests(repositories, { ghClient = defaultGh, e
         }
         if (canonical !== repo) continue;
       }
-      pulls.push({ ...row, repo, number, pr: number, repository: row.repository || { full_name: repo } });
+      pulls.push(isPublicDataClass(env)
+        ? publicPullRequestRow(row, repo, number)
+        : { ...row, repo, number, pr: number, repository: row.repository || { full_name: repo } });
     }
   }
   return pulls;
 }
 
+function publicSafeAction(event, value) {
+  if (value === undefined || value === null || value === "") return undefined;
+  try {
+    return validateAction(event, value);
+  } catch {
+    return undefined;
+  }
+}
+
+function publicSafePr(value) {
+  try {
+    const parsed = parsePositivePr(value, { optional: true });
+    return parsed === null ? undefined : parsed;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Build a public trigger from an event payload without carrying arbitrary
+ * client_payload fields or repository identities across the public fence.
+ */
+function publicTriggerPayload(env, payload, event, repository) {
+  const base = {
+    event,
+    event_name: event,
+    type: event,
+    repo: repository,
+    repository: { full_name: repository },
+  };
+  const clientCandidate = event === "repository_dispatch"
+    && payload && typeof payload === "object" && !Array.isArray(payload)
+    ? firstValue(payload.client_payload, payload.clientPayload, payload.payload)
+    : undefined;
+  const client = clientCandidate && typeof clientCandidate === "object" && !Array.isArray(clientCandidate)
+    ? clientCandidate
+    : {};
+  const action = publicSafeAction(event, firstValue(
+    env.FLEET_EVENT_ACTION,
+    client.action,
+    client.event_action,
+    payload?.action,
+    payload?.event_action,
+  ));
+  if (action !== undefined) base.action = action;
+
+  const explicitPr = firstValue(env.FLEET_PR_INPUT, env.FLEET_PR);
+  if (explicitPr !== undefined && explicitPr !== "") {
+    base.pr = parsePositivePr(explicitPr, { optional: false });
+    base.number = base.pr;
+  } else {
+    const candidatePr = event === "repository_dispatch"
+      ? firstValue(client.pr, client.number, pullRequestNumber(client.pull_request), pullRequestNumber(client.pullRequest))
+      : pullRequestNumber(payload?.pull_request) || pullRequestNumber(payload?.pullRequest);
+    const pr = publicSafePr(candidatePr);
+    if (pr !== undefined) {
+      base.pr = pr;
+      base.number = pr;
+    }
+  }
+
+  const delivery = firstValue(
+    env.FLEET_EVENT_DELIVERY,
+    client.delivery,
+    client.deliveryId,
+    payload?.delivery,
+    payload?.deliveryId,
+    payload?.delivery_id,
+    payload?.event_id,
+  );
+  if (delivery !== undefined && delivery !== null && delivery !== "") {
+    try { base.delivery = text(String(delivery), MAX_EVENT_STRING); } catch {}
+  }
+  return base;
+}
+
 function parseTriggerFromEnv(env = process.env) {
   const event = key(firstValue(env.FLEET_EVENT_NAME, env.GITHUB_EVENT_NAME, "workflow_dispatch")) || "workflow_dispatch";
   const payload = parseJson(env.FLEET_EVENT_PAYLOAD, {}, MAX_PAYLOAD_BYTES);
+  if (isPublicDataClass(env)) {
+    const repository = publicRepository(env);
+    const validated = validateTrigger(publicTriggerPayload(env, payload, event, repository));
+    return { ...validated, client_payload: undefined };
+  }
   const base = payload && typeof payload === "object" && !Array.isArray(payload) ? { ...payload } : {};
   base.event = event;
   base.event_name = event;
@@ -1504,6 +1657,78 @@ function matrixTask(task) {
   return output;
 }
 
+function publicTaskForMatrix(task, repository) {
+  let candidateRepo;
+  try {
+    candidateRepo = normalizeRepo(firstValue(task?.repo, task?.repository, task?.repoFullName));
+  } catch {
+    return null;
+  }
+  if (candidateRepo !== repository) return null;
+  const safe = {
+    id: stableTaskId({ ...task, repo: repository }),
+    type: task.type,
+    role: task.role,
+    repo: repository,
+    pr: task.pr,
+  };
+  for (const field of ["triggered", "reconciled", "recoverable", "recoveryRequested", "retryEligible"]) {
+    if (typeof task[field] === "boolean") safe[field] = task[field];
+  }
+  for (const field of ["desiredState", "priorState"]) {
+    if (typeof task[field] === "string" && /^[A-Za-z0-9_.:-]{1,80}$/.test(task[field])) safe[field] = task[field];
+  }
+  return safe;
+}
+
+function publicHistory(history, repository) {
+  return (Array.isArray(history) ? history : []).filter((entry) => {
+    const candidate = firstValue(
+      historyRepo(entry),
+      repositoryValue(entry?.task),
+      repositoryValue(entry?.pull_request),
+    );
+    return !candidate || candidate === repository;
+  });
+}
+
+function publicStateRows(value, repository) {
+  if (Array.isArray(value)) {
+    return value.filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry)).filter((entry) => {
+      const candidate = firstValue(
+        repositoryValue(entry?.repo),
+        repositoryValue(entry?.repository),
+        entry?.repoFullName,
+        entry?.repo_full_name,
+        repositoryValue(entry?.task),
+      );
+      return !candidate || candidate === repository;
+    });
+  }
+  if (!value || typeof value !== "object") return value;
+  const output = {};
+  for (const [field, fieldValue] of Object.entries(value)) {
+    if (field.includes("/")) {
+      let canonicalField;
+      try { canonicalField = normalizeRepo(field); } catch { canonicalField = null; }
+      if (canonicalField && canonicalField !== repository) continue;
+    }
+    if (Array.isArray(fieldValue)) {
+      output[field] = publicStateRows(fieldValue, repository);
+    } else if (fieldValue && typeof fieldValue === "object") {
+      const candidate = firstValue(
+        repositoryValue(fieldValue.repo),
+        repositoryValue(fieldValue.repository),
+        fieldValue.repoFullName,
+        fieldValue.repo_full_name,
+        repositoryValue(fieldValue.task),
+      );
+      if (!candidate || candidate === repository) output[field] = publicStateRows(fieldValue, repository);
+    }
+  }
+  return output;
+}
+
 async function buildPlan({ env = process.env, stateRoot: requestedStateRoot, ghClient = defaultGh, now = Date.now(), rng, logger = console.error, planBuilder = buildFleetPlan } = {}) {
   const stateRoot = executionStateRoot(env, { stateRoot: requestedStateRoot });
   const trigger = parseTriggerFromEnv(env);
@@ -1522,31 +1747,47 @@ async function buildPlan({ env = process.env, stateRoot: requestedStateRoot, ghC
   const isScan = triggerEvent(trigger) === "schedule" || triggerEvent(trigger) === "workflow_dispatch";
   const minimumUpgradeSlots = isScan ? 3 : 1;
   const builder = typeof planBuilder === "function" ? planBuilder : buildFleetPlan;
-  const plan = builder({
-    repos,
-    pulls,
-    history: state.history,
-    targets: state.targets,
-    desiredState: state.desired,
-    observedState: state.records,
-    now,
-    trigger: planningTrigger(trigger),
-    maxAgents,
-    agentsPerPr: 3,
-    upgradeSlots: maxAgents,
-    minimumUpgradeSlots,
-    reviewRoles: ["review", "tests", "security"],
-    ...(typeof rng === "function" ? { rng } : {}),
-  });
+  const publicTarget = isPublicDataClass(env) ? publicRepository(env) : null;
+  let plan;
+  try {
+    plan = builder({
+      repos,
+      pulls,
+      history: publicTarget ? publicHistory(state.history, publicTarget) : state.history,
+      targets: publicTarget ? { tier1: [], priority: [], excluded: [], observeAll: true, allOwned: true } : state.targets,
+      desiredState: publicTarget ? publicStateRows(state.desired, publicTarget) : state.desired,
+      observedState: publicTarget ? publicStateRows(state.records, publicTarget) : state.records,
+      now,
+      trigger: planningTrigger(trigger),
+      maxAgents,
+      agentsPerPr: 3,
+      upgradeSlots: maxAgents,
+      minimumUpgradeSlots,
+      reviewRoles: ["review", "tests", "security"],
+      ...(typeof rng === "function" ? { rng } : {}),
+    });
+  } catch (error) {
+    if (publicTarget) throw new Error("public planning failed");
+    throw error;
+  }
   const include = [];
   const seen = new Set();
   for (const task of plan.allTasks || plan.tasks || []) {
     if (include.length >= maxAgents) break;
+    const matrixCandidate = publicTarget ? publicTaskForMatrix(task, publicTarget) : task;
+    if (publicTarget && !matrixCandidate) {
+      logger("task rejected during public planning");
+      continue;
+    }
     let candidate;
     try {
-      candidate = matrixTask(task);
+      candidate = matrixTask(matrixCandidate);
     } catch (error) {
-      logger(`task rejected during planning: ${String(error?.message || error).slice(0, 160)}`);
+      if (publicTarget) {
+        logger("task rejected during public planning");
+      } else {
+        logger(`task rejected during planning: ${String(error?.message || error).slice(0, 160)}`);
+      }
       continue;
     }
     if (seen.has(candidate.id)) continue;
@@ -1865,7 +2106,7 @@ async function executeReviewTask(task, { env = process.env, ghClient = defaultGh
       status: "deferred",
       reason: "github-read-failed",
       observedAt,
-      error: String(error?.message || error).slice(0, 240),
+      error: isPublicDataClass(env) ? "public GitHub read failed" : String(error?.message || error).slice(0, 240),
     }, env);
     return { status: "deferred", reason: "github-read-failed", artifact };
   }
@@ -1891,7 +2132,11 @@ async function executeReviewTask(task, { env = process.env, ghClient = defaultGh
       workspace: modelEnv.GITHUB_WORKSPACE || process.cwd(),
     });
   } catch (error) {
-    modelResult = { complete: false, reply: "", error: String(error?.message || error).slice(0, 240) };
+    modelResult = {
+      complete: false,
+      reply: "",
+      error: isPublicDataClass(env) ? "public model unavailable" : String(error?.message || error).slice(0, 240),
+    };
   }
   const reply = safeModelReply(modelResult);
   const complete = Boolean(modelResult?.complete ?? reply);
@@ -1923,7 +2168,9 @@ async function executeReviewTask(task, { env = process.env, ghClient = defaultGh
       role: task.role,
       defaultBranch,
       analysis: reply ? redactText(reply, env) : "",
-      error: redactText(modelResult?.error || "no model reply", env).slice(0, 240),
+      error: isPublicDataClass(env)
+        ? "public model unavailable"
+        : redactText(modelResult?.error || "no model reply", env).slice(0, 240),
       retryAt: firstValue(modelResult?.retryAt, env.FLEET_RETRY_AT, new Date(Date.now() + 5 * 60 * 1000).toISOString()),
       readOnly: true,
       postedComment: false,
@@ -1984,7 +2231,7 @@ async function executeUpgradeTask(task, { env = process.env, ghClient = defaultG
       repo: task.repo,
       dispatchAttempted: true,
       dispatchConfirmed: false,
-      error: String(error?.message || error).slice(0, 240),
+      error: isPublicDataClass(env) ? "public workflow dispatch failed" : String(error?.message || error).slice(0, 240),
     };
     const artifact = writeTaskArtifact(task, result, env);
     return { ...result, artifact };
@@ -1994,6 +2241,20 @@ async function executeUpgradeTask(task, { env = process.env, ghClient = defaultG
 export async function executeTask(task, options = {}) {
   const normalized = validateTask(task);
   const env = options.env || process.env;
+  if (isPublicDataClass(env)) {
+    const target = publicRepository(env);
+    if (normalized.repo !== target) {
+      const envelope = describeOutcome({ status: "deferred", effectState: "blocked", processSuccess: false });
+      const rejected = {
+        status: "deferred",
+        reason: "public-target-mismatch",
+        effectState: "blocked",
+        ...envelope,
+      };
+      try { writeTaskArtifact(normalized, rejected, env); } catch {}
+      return rejected;
+    }
+  }
   const stateRoot = executionStateRoot(env, options);
   let prepared;
   try {
@@ -2010,7 +2271,7 @@ export async function executeTask(task, options = {}) {
       status: "deferred",
       reason: "transaction-prepare-failed",
       effectState: "unknown_effect",
-      error: redactText(error?.message || error, env),
+      error: isPublicDataClass(env) ? "public transaction preparation failed" : redactText(error?.message || error, env),
       ...envelope,
     };
     if (isPublicDataClass(env)) writeTaskArtifact(normalized, failed, env);
@@ -2115,8 +2376,12 @@ if (process.argv[1] && path.resolve(process.argv[1]) === modulePath) {
     const code = await main();
     process.exit(code);
   } catch (error) {
-    const redact = scrub(process.env);
-    process.stderr.write(`ORCHESTRATE_FAILED ${redact(error?.message || error).slice(0, 400)}\n`);
+    let publicMode = false;
+    try { publicMode = isPublicDataClass(process.env); } catch {}
+    const detail = publicMode
+      ? "public orchestration failed"
+      : scrub(process.env)(error?.message || error).slice(0, 400);
+    process.stderr.write(`ORCHESTRATE_FAILED ${detail}\n`);
     process.exit(1);
   }
 }

@@ -5,15 +5,10 @@ on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: "type STOP to confirm a public execution halt"
-        type: string
+        description: "confirm a public execution halt"
+        type: boolean
         required: true
-        default: ""
-      repo:
-        description: "allowlisted public owner/name (empty uses this repository)"
-        type: string
-        required: false
-        default: ""
+        default: false
 
 permissions:
   contents: read
@@ -31,13 +26,13 @@ jobs:
       - name: validate public target
         id: public-target
         env:
-          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ inputs.repo || github.event.inputs.repo || '' }}
+          FLEET_PUBLIC_TARGET: ${{ github.repository }}
           FLEET_PUBLIC_OWNER: M1Vj
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          target="${FLEET_PUBLIC_REPOSITORY_INPUT:-${GITHUB_REPOSITORY}}"
+          target="${FLEET_PUBLIC_TARGET:-${GITHUB_REPOSITORY}}"
           [[ "$target" == */* && "$target" != *$'\n'* && "$target" != *$'\r'* ]]
           owner="${target%%/*}"
           name="${target#*/}"
@@ -68,10 +63,10 @@ jobs:
           } >>"$GITHUB_ENV"
       - name: confirm guard
         env:
-          FLEET_CONFIRM: ${{ inputs.confirm || github.event.inputs.confirm || '' }}
+          FLEET_CONFIRM: ${{ inputs.confirm || false }}
         run: |
           set -euo pipefail
-          [[ "$FLEET_CONFIRM" == "STOP" ]]
+          [[ "$FLEET_CONFIRM" == "true" ]]
       - name: record public stop request
         run: |
           printf '%s\n' '{"dataClass":"public","status":"stop-requested"}' > "$FLEET_PUBLIC_STATE_ROOT/public-stop.json"

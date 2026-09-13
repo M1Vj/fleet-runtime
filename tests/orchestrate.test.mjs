@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import * as orchestrate from "../scripts/orchestrate.mjs";
 import { buildFleetPlan } from "../scripts/lib/fleet-scheduler.mjs";
 
@@ -385,6 +385,58 @@ test("upgrade dispatch targets the fleet-runtime workflow while scoping the targ
   }
 });
 
+test("public execution genericizes provider errors while private execution keeps detail", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-public-error-fence-"));
+  const privateRoot = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-private-error-fence-"));
+  const workflowPath = path.join(root, "improve.yml");
+  const targetRepo = "M1Vj/public-target";
+  const privateRepo = "M1Vj/private-secret";
+  const providerMarker = `provider failure references ${privateRepo}`;
+  const publicStateRoot = path.join(root, "state");
+  const publicManifest = path.join(publicStateRoot, "public-artifact.json");
+  writeFileSync(
+    workflowPath,
+    [
+      "on:",
+      "  workflow_dispatch:",
+      "    inputs:",
+      "      repo:",
+      "        description: target repository",
+      "        type: string",
+    ].join("\n"),
+  );
+  const throwingGh = () => { throw new Error(providerMarker); };
+  const publicEnv = {
+    FLEET_DATA_CLASS: "public",
+    FLEET_PUBLIC_OWNER: "M1Vj",
+    FLEET_PUBLIC_REPOSITORY: targetRepo,
+    FLEET_PUBLIC_STATE_ROOT: publicStateRoot,
+    FLEET_STATE_ROOT: publicStateRoot,
+    FLEET_PUBLIC_ARTIFACT_MANIFEST: publicManifest,
+    RUNNER_TEMP: root,
+    GITHUB_RUN_ID: "54321",
+  };
+  try {
+    const publicResult = await orchestrate.executeTask(
+      { id: "public-upgrade-error", type: "upgrade", role: "upgrade", repo: targetRepo },
+      { env: publicEnv, workflowPath, ghClient: throwingGh },
+    );
+    assert.equal(publicResult.reason, "improve-workflow-dispatch-failed");
+    assert.equal(publicResult.error, "public workflow dispatch failed");
+    assert.equal(JSON.stringify(publicResult).includes(providerMarker), false);
+    assert.equal(JSON.parse(readFileSync(publicManifest, "utf8")).error, undefined);
+
+    const privateResult = await orchestrate.executeTask(
+      { id: "private-upgrade-error", type: "upgrade", role: "upgrade", repo: privateRepo },
+      { env: { RUNNER_TEMP: privateRoot, FLEET_ARTIFACT_DIR: path.join(privateRoot, "fleet-task-results") }, workflowPath, ghClient: throwingGh },
+    );
+    assert.equal(privateResult.error, providerMarker);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(privateRoot, { recursive: true, force: true });
+  }
+});
+
 test("task artifacts honor an explicit runner-temp directory and reject traversal", () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-artifact-"));
   const task = { id: "artifact-target", type: "upgrade", role: "upgrade", repo: OWNER_REPO };
@@ -473,6 +525,129 @@ test("planFleet reserves three upgrades for scans and one for repository-dispatc
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("public planning is fenced to the validated repository and ignores private account and dispatch payload data", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-public-plan-fence-"));
+  const targetRepo = "M1Vj/public-target";
+  const privateRepo = "M1Vj/private-secret";
+  const targetMetadata = {
+    full_name: targetRepo,
+    name: "public-target",
+    owner: { login: "M1Vj" },
+    private: false,
+    visibility: "public",
+    archived: false,
+    fork: false,
+    created_at: iso(NOW - 365 * DAY_MS),
+    pushed_at: iso(NOW - DAY_MS),
+  };
+  const privateMetadata = {
+    full_name: privateRepo,
+    name: "private-secret",
+    owner: { login: "M1Vj" },
+    private: true,
+    visibility: "private",
+    archived: false,
+    fork: false,
+  };
+  const calls = [];
+  const env = {
+    FLEET_DATA_CLASS: "public",
+    FLEET_PUBLIC_OWNER: "M1Vj",
+    FLEET_PUBLIC_REPOSITORY: targetRepo,
+    FLEET_PUBLIC_STATE_ROOT: root,
+    FLEET_STATE_ROOT: root,
+    RUNNER_TEMP: root,
+    FLEET_EVENT_NAME: "repository_dispatch",
+    FLEET_EVENT_ACTION: "fleet-pr",
+    FLEET_EVENT_PAYLOAD: JSON.stringify({
+      event: "pull_request",
+      action: "opened",
+      repo: privateRepo,
+      pr: 99,
+      client_payload: {
+        repository: { full_name: privateRepo },
+        number: 99,
+        arbitrary: "private payload marker",
+      },
+    }),
+  };
+  const ghClient = (args) => {
+    const endpoint = String(args.at(-1) ?? "");
+    calls.push(endpoint);
+    if (endpoint === `/repos/${targetRepo}`) return targetMetadata;
+    if (endpoint.includes("/user/repos")) return [targetMetadata, privateMetadata];
+    if (endpoint.startsWith(`/repos/${targetRepo}/pulls`)) return [pullRequest(targetRepo, 7), pullRequest(privateRepo, 99)];
+    if (endpoint.startsWith(`/repos/${privateRepo}/pulls`)) return [pullRequest(privateRepo, 99)];
+    throw new Error(`unexpected endpoint ${endpoint}`);
+  };
+  let builderInput;
+  try {
+    mkdirSync(path.join(root, "state"), { recursive: true });
+    writeFileSync(path.join(root, "state", "orchestrate-desired.json"), JSON.stringify({
+      [privateRepo]: { type: "upgrade", role: "upgrade" },
+      [targetRepo]: { type: "upgrade", role: "upgrade" },
+    }));
+    const result = await orchestrate.planFleet({
+      env,
+      ghClient,
+      logger: () => {},
+      planBuilder(input) {
+        builderInput = input;
+        return buildFleetPlan(input);
+      },
+    });
+    const serialized = JSON.stringify({ result, builderInput });
+    assert.equal(calls.some((endpoint) => endpoint.includes("/user/repos")), false);
+    assert.equal(calls.some((endpoint) => endpoint.includes(privateRepo)), false);
+    assert.ok(calls.includes(`/repos/${targetRepo}`), "public metadata must be verified");
+    assert.ok(calls.some((endpoint) => endpoint.startsWith(`/repos/${targetRepo}/pulls`)), "only the target PR endpoint may be queried");
+    assert.deepEqual(builderInput.repos.map((repo) => repo.full_name), [targetRepo]);
+    assert.equal(JSON.stringify(builderInput.pulls).includes(privateRepo), false);
+    assert.equal(JSON.stringify(builderInput.desiredState).includes(privateRepo), false);
+    assert.equal(builderInput.trigger.repo, targetRepo);
+    assert.equal(builderInput.trigger.client_payload, undefined);
+    assert.ok(result.include.every((task) => task.repo === targetRepo));
+    assert.equal(serialized.includes(privateRepo), false);
+    assert.equal(serialized.includes("private payload marker"), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("public PR discovery emits a generic provider error while private mode keeps detail", () => {
+  const targetRepo = "M1Vj/public-target";
+  const privateRepo = "M1Vj/private-secret";
+  const providerMarker = `provider failure references ${privateRepo}`;
+  const publicErrors = [];
+  const publicEnv = {
+    FLEET_DATA_CLASS: "public",
+    FLEET_PUBLIC_OWNER: "M1Vj",
+    FLEET_PUBLIC_REPOSITORY: targetRepo,
+  };
+  const throwingGh = () => { throw new Error(providerMarker); };
+  assert.deepEqual(
+    orchestrate.discoverOpenPullRequests(
+      [{ full_name: targetRepo }],
+      { env: publicEnv, ghClient: throwingGh, onError: (message) => publicErrors.push(message) },
+    ),
+    [],
+  );
+  assert.deepEqual(publicErrors, ["open PR discovery skipped for public repository"]);
+  assert.equal(publicErrors.join(" ").includes(providerMarker), false);
+  assert.equal(publicErrors.join(" ").includes(privateRepo), false);
+
+  const privateErrors = [];
+  assert.deepEqual(
+    orchestrate.discoverOpenPullRequests(
+      [{ full_name: privateRepo }],
+      { env: {}, ghClient: throwingGh, onError: (message) => privateErrors.push(message) },
+    ),
+    [],
+  );
+  assert.equal(privateErrors.length, 1);
+  assert.match(privateErrors[0], new RegExp(providerMarker.replace(/[.*+?^${}()|[\\]\\]/g, "\\\\$&")));
 });
 
 test("durable planning suppresses duplicate delivery across separate processes", async () => {

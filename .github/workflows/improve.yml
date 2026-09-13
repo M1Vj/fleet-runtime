@@ -8,13 +8,8 @@ on:
     inputs:
       top_k:
         description: "how many public repositories to improve"
-        type: string
-        default: "2"
-      repo:
-        description: "allowlisted public owner/name (empty uses this repository)"
-        type: string
-        required: false
-        default: ""
+        type: number
+        default: 2
 
 concurrency:
   group: fleet-improve-public
@@ -43,13 +38,13 @@ jobs:
       - name: validate public target
         id: public-target
         env:
-          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ inputs.repo || github.event.inputs.repo || '' }}
+          FLEET_PUBLIC_TARGET: ${{ github.repository }}
           FLEET_PUBLIC_OWNER: M1Vj
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          target="${FLEET_PUBLIC_REPOSITORY_INPUT:-${GITHUB_REPOSITORY}}"; owner="${target%%/*}"; name="${target#*/}"
+          target="${FLEET_PUBLIC_TARGET:-${GITHUB_REPOSITORY}}"; owner="${target%%/*}"; name="${target#*/}"
           [[ "$target" == */* && "$target" != *$'\n'* && "$target" != *$'\r'* && "$owner" == "$FLEET_PUBLIC_OWNER" && "$name" != "$target" && "$name" != */* ]]
           [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]
           metadata="$RUNNER_TEMP/public-repository.json"
@@ -88,7 +83,7 @@ jobs:
         id: pick
         env:
           FLEET_PUBLIC_REPOSITORY: ${{ steps.public-target.outputs.repository }}
-          FLEET_TOP_K: ${{ inputs.top_k || github.event.inputs.top_k || '2' }}
+          FLEET_TOP_K: ${{ inputs.top_k || 2 }}
           FLEET_IMPROVE_MODE: pick
           FLEET_ARTIFACT_DIR: ${{ runner.temp }}/fleet-public-artifacts
         run: node scripts/improve.mjs
@@ -115,13 +110,13 @@ jobs:
       - name: validate public target
         id: public-target
         env:
-          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ matrix.repo }}
+          FLEET_PUBLIC_TARGET: ${{ matrix.repo }}
           FLEET_PUBLIC_OWNER: M1Vj
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          target="$FLEET_PUBLIC_REPOSITORY_INPUT"; owner="${target%%/*}"; name="${target#*/}"
+          target="$FLEET_PUBLIC_TARGET"; owner="${target%%/*}"; name="${target#*/}"
           [[ "$target" == */* && "$owner" == "$FLEET_PUBLIC_OWNER" && "$name" != "$target" && "$name" != */* && "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]
           metadata="$RUNNER_TEMP/public-repository.json"
           curl --fail --silent --show-error --location --retry 1 -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/${owner}/${name}" >"$metadata" 2>"$RUNNER_TEMP/public-target-error.log"
@@ -188,13 +183,13 @@ jobs:
       - name: validate public target
         id: public-target
         env:
-          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ needs.pick.outputs.repository }}
+          FLEET_PUBLIC_TARGET: ${{ needs.pick.outputs.repository }}
           FLEET_PUBLIC_OWNER: M1Vj
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          target="$FLEET_PUBLIC_REPOSITORY_INPUT"; owner="${target%%/*}"; name="${target#*/}"
+          target="$FLEET_PUBLIC_TARGET"; owner="${target%%/*}"; name="${target#*/}"
           [[ "$owner" == "$FLEET_PUBLIC_OWNER" && "$name" != "$target" && "$name" != */* ]]
           metadata="$RUNNER_TEMP/public-repository.json"
           curl --fail --silent --show-error --location --retry 1 -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/${owner}/${name}" >"$metadata" 2>"$RUNNER_TEMP/public-target-error.log"
@@ -271,13 +266,13 @@ jobs:
       - name: validate public target
         id: public-target
         env:
-          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ matrix.repo }}
+          FLEET_PUBLIC_TARGET: ${{ matrix.repo }}
           FLEET_PUBLIC_OWNER: M1Vj
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          target="$FLEET_PUBLIC_REPOSITORY_INPUT"; owner="${target%%/*}"; name="${target#*/}"
+          target="$FLEET_PUBLIC_TARGET"; owner="${target%%/*}"; name="${target#*/}"
           [[ "$target" == */* && "$owner" == "$FLEET_PUBLIC_OWNER" && "$name" != "$target" && "$name" != */* && "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]
           metadata="$RUNNER_TEMP/public-repository.json"
           curl --fail --silent --show-error --location --retry 1 -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/${owner}/${name}" >"$metadata" 2>"$RUNNER_TEMP/public-target-error.log"
@@ -347,13 +342,13 @@ jobs:
       - name: validate public target
         id: public-target
         env:
-          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ matrix.repo }}
+          FLEET_PUBLIC_TARGET: ${{ matrix.repo }}
           FLEET_PUBLIC_OWNER: M1Vj
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          target="$FLEET_PUBLIC_REPOSITORY_INPUT"; owner="${target%%/*}"; name="${target#*/}"
+          target="$FLEET_PUBLIC_TARGET"; owner="${target%%/*}"; name="${target#*/}"
           [[ "$target" == */* && "$owner" == "$FLEET_PUBLIC_OWNER" && "$name" != "$target" && "$name" != */* && "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]
           metadata="$RUNNER_TEMP/public-repository.json"
           curl --fail --silent --show-error --location --retry 1 -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/${owner}/${name}" >"$metadata" 2>"$RUNNER_TEMP/public-target-error.log"
@@ -424,13 +419,13 @@ jobs:
       - name: validate public target
         id: public-target
         env:
-          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ needs.pick.outputs.repository }}
+          FLEET_PUBLIC_TARGET: ${{ needs.pick.outputs.repository }}
           FLEET_PUBLIC_OWNER: M1Vj
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          target="$FLEET_PUBLIC_REPOSITORY_INPUT"; owner="${target%%/*}"; name="${target#*/}"
+          target="$FLEET_PUBLIC_TARGET"; owner="${target%%/*}"; name="${target#*/}"
           [[ "$owner" == "$FLEET_PUBLIC_OWNER" && "$name" != "$target" && "$name" != */* ]]
           metadata="$RUNNER_TEMP/public-repository.json"
           curl --fail --silent --show-error --location --retry 1 -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/${owner}/${name}" >"$metadata" 2>"$RUNNER_TEMP/public-target-error.log"

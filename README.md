@@ -12,14 +12,18 @@ state, and consequential writes.
 Every operational workflow declares `FLEET_DATA_CLASS=public` and starts with a
 public-target preflight. The preflight:
 
-1. accepts either an explicit `owner/name` workflow input or the workflow's
-   current repository;
+1. binds the target to the workflow's current repository (`github.repository`);
 2. requires the owner to be the fixed public owner allowlist (`M1Vj`);
 3. queries the GitHub repository API with the built-in `${{ github.token }}`;
 4. requires `private === false`, `visibility === "public"`, a matching owner,
    and a non-archived repository; and
 5. writes the validated target only to a step output, never to a run name or
    concurrency key before validation.
+
+Repository targets are not workflow-dispatch inputs. After validation, the
+workflow binds the exact result to `FLEET_PUBLIC_REPOSITORY`; manual runs may
+use only any workflow-specific non-repository controls that are declared.
+Private repository identifiers must never be supplied to a public workflow.
 
 Unknown, malformed, private, internal, archived, or API-error targets fail
 closed before checkout, model execution, or task execution. Public jobs use an

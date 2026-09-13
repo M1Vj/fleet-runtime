@@ -64,11 +64,11 @@ export function publicRepository(env = process.env) {
   const raw = String(env?.FLEET_PUBLIC_REPOSITORY || "").trim();
   const owner = publicOwner(env);
   if (!REPOSITORY_RE.test(raw)) {
-    throw new DataClassError(3, "PUBLIC_TARGET_INVALID", raw || "missing FLEET_PUBLIC_REPOSITORY");
+    throw new DataClassError(3, "PUBLIC_TARGET_INVALID", "expected an allowlisted public owner/name");
   }
   const [targetOwner, name] = raw.split("/");
   if (targetOwner !== owner || !PATH_SEGMENT_RE.test(name) || name === "." || name === "..") {
-    throw new DataClassError(3, "PUBLIC_TARGET_OWNER_MISMATCH", raw);
+    throw new DataClassError(3, "PUBLIC_TARGET_OWNER_MISMATCH", "target is outside the public owner allowlist");
   }
   return `${owner}/${name}`;
 }
@@ -524,7 +524,7 @@ export function publicArtifactPayload(payload = {}, { kind = "run", status = "ok
     const rawRepository = String(repository).trim();
     const [owner, name] = rawRepository.split("/");
     if (owner !== DEFAULT_PUBLIC_OWNER || !PATH_SEGMENT_RE.test(name || "") || !REPOSITORY_RE.test(rawRepository)) {
-      throw new DataClassError(3, "PUBLIC_ARTIFACT_REPOSITORY_INVALID", rawRepository);
+      throw new DataClassError(3, "PUBLIC_ARTIFACT_REPOSITORY_INVALID", "artifact target is not an allowlisted public repository");
     }
     repository = `${owner}/${name}`;
   }
@@ -565,7 +565,7 @@ export function writePublicArtifact(env = process.env, payload = {}, options = {
   const manifest = publicArtifactRoot(env);
   const target = publicRepository(env);
   const requested = options.repository === undefined ? target : String(options.repository).trim();
-  if (requested !== target) throw new DataClassError(3, "PUBLIC_ARTIFACT_TARGET_MISMATCH", requested || "missing");
+  if (requested !== target) throw new DataClassError(3, "PUBLIC_ARTIFACT_TARGET_MISMATCH", "artifact target does not match the validated public repository");
   mkdirSync(path.dirname(manifest), { recursive: true });
   const value = publicArtifactPayload(payload, { ...options, repository: target });
   writeFileSync(manifest, JSON.stringify(value, null, 2), "utf8");

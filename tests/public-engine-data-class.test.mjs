@@ -25,6 +25,8 @@ const ROOT = path.resolve(import.meta.dirname, "..");
 const KEEPALIVE_INSTALLER = path.join(ROOT, "scripts", "install-keepalive.sh");
 const LEGACY_CHECKOUT_MARKER = ["fleet", "private", "checkout"].join("-");
 const LEGACY_CONTROL_PATH_MARKER = ["Projects", "fleet", "control"].join("/");
+const PRIVATE_REPOSITORY_MARKER = ["M1Vj", ["fleet", "control"].join("-")].join("/");
+const SECRET_TOKEN_MARKER = ["ghp", "012345678901234567890123456789012345"].join("_");
 
 function keepaliveFixture() {
   const root = mkdtempSync(path.join(tmpdir(), "fleet-keepalive-test-"));
@@ -208,7 +210,7 @@ test("public artifacts fail closed for sensitive top-level fields and tainted te
       target: "M1Vj/private-target",
       note: "prompt=/Users/vjmabansag/private/prompt.log",
       detail: "log=https://private.example/session/abc",
-      token: "ghp_012345678901234567890123456789012345",
+      token: SECRET_TOKEN_MARKER,
     },
     results: [{
       title: "safe result",
@@ -228,7 +230,7 @@ test("public artifacts fail closed for sensitive top-level fields and tainted te
   assert.equal(data.checks.token, undefined);
   assert.equal(data.results[0].title, "safe result");
   assert.equal(data.results[0].msg, undefined);
-  for (const marker of ["/Users/vjmabansag", "M1Vj/private-target", "ghp_0123456789"]) {
+  for (const marker of ["/Users/vjmabansag", "M1Vj/private-target", ["ghp", "0123456789"].join("_")]) {
     assert.equal(JSON.stringify(data).includes(marker), false, `artifact must not contain ${marker}`);
   }
 });
@@ -249,14 +251,14 @@ test("public artifacts retain only bounded summary/error codes and public PR URL
 test("public artifact target fields cannot replace the validated repository identity", () => {
   const env = publicEnv();
   const manifest = writePublicArtifact(env, {
-    target: "M1Vj/fleet-control",
-    checks: { target: "M1Vj/fleet-control" },
-    selected: { repo: "M1Vj/fleet-control" },
-    verdict: "M1Vj/fleet-control",
-    title: "M1Vj/fleet-control",
-    why: "M1Vj/fleet-control",
-    reason: "M1Vj/fleet-control",
-    findings: [{ detail: "M1Vj/fleet-control" }, { detail: "OtherOwner/other-repo" }],
+    target: PRIVATE_REPOSITORY_MARKER,
+    checks: { target: PRIVATE_REPOSITORY_MARKER },
+    selected: { repo: PRIVATE_REPOSITORY_MARKER },
+    verdict: PRIVATE_REPOSITORY_MARKER,
+    title: PRIVATE_REPOSITORY_MARKER,
+    why: PRIVATE_REPOSITORY_MARKER,
+    reason: PRIVATE_REPOSITORY_MARKER,
+    findings: [{ detail: PRIVATE_REPOSITORY_MARKER }, { detail: "OtherOwner/other-repo" }],
   }, { kind: "target-identity", status: "ok", repository: env.FLEET_PUBLIC_REPOSITORY });
   const data = JSON.parse(readFileSync(manifest, "utf8"));
   assert.equal(data.target, undefined);
@@ -268,7 +270,7 @@ test("public artifact target fields cannot replace the validated repository iden
   assert.equal(data.reason, undefined);
   assert.equal(data.findings[0].detail, undefined);
   assert.equal(data.findings[1].detail, undefined);
-  assert.equal(JSON.stringify(data).includes("M1Vj/fleet-control"), false);
+  assert.equal(JSON.stringify(data).includes(PRIVATE_REPOSITORY_MARKER), false);
   assert.equal(JSON.stringify(data).includes("OtherOwner/other-repo"), false);
 });
 

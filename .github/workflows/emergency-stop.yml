@@ -25,8 +25,6 @@ jobs:
     env:
       FLEET_DATA_CLASS: public
       FLEET_PUBLIC_OWNER: M1Vj
-      FLEET_PUBLIC_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
-      FLEET_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
       GH_TOKEN: ${{ github.token }}
       GITHUB_TOKEN: ${{ github.token }}
     steps:
@@ -57,6 +55,17 @@ jobs:
           if (metadata.private !== false || metadata.visibility !== "public" || metadata.owner?.login !== process.env.FLEET_PUBLIC_OWNER || metadata.archived === true) process.exit(1);
           NODE
           printf 'repository=%s\n' "$target" >>"$GITHUB_OUTPUT"
+      - name: configure ephemeral public state
+        env:
+          FLEET_PUBLIC_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
+          FLEET_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
+          FLEET_PUBLIC_ARTIFACT_MANIFEST: ${{ runner.temp }}/fleet-public-state/public-artifact.json
+        run: |
+          {
+            printf 'FLEET_PUBLIC_STATE_ROOT=%s\n' "$FLEET_PUBLIC_STATE_ROOT"
+            printf 'FLEET_STATE_ROOT=%s\n' "$FLEET_STATE_ROOT"
+            printf 'FLEET_PUBLIC_ARTIFACT_MANIFEST=%s\n' "$FLEET_PUBLIC_ARTIFACT_MANIFEST"
+          } >>"$GITHUB_ENV"
       - name: confirm guard
         env:
           FLEET_CONFIRM: ${{ inputs.confirm || github.event.inputs.confirm || '' }}

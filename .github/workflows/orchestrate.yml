@@ -34,9 +34,6 @@ concurrency:
 env:
   FLEET_DATA_CLASS: public
   FLEET_PUBLIC_OWNER: M1Vj
-  FLEET_PUBLIC_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
-  FLEET_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
-  FLEET_PUBLIC_ARTIFACT_MANIFEST: ${{ runner.temp }}/fleet-public-state/public-artifact.json
   GH_TOKEN: ${{ github.token }}
   GITHUB_TOKEN: ${{ github.token }}
   FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
@@ -69,6 +66,17 @@ jobs:
           if (m.private !== false || m.visibility !== "public" || m.owner?.login !== process.env.FLEET_PUBLIC_OWNER || m.archived === true) process.exit(1);
           NODE
           printf 'repository=%s\n' "$target" >> "$GITHUB_OUTPUT"
+      - name: configure ephemeral public state
+        env:
+          FLEET_PUBLIC_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
+          FLEET_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
+          FLEET_PUBLIC_ARTIFACT_MANIFEST: ${{ runner.temp }}/fleet-public-state/public-artifact.json
+        run: |
+          {
+            printf 'FLEET_PUBLIC_STATE_ROOT=%s\n' "$FLEET_PUBLIC_STATE_ROOT"
+            printf 'FLEET_STATE_ROOT=%s\n' "$FLEET_STATE_ROOT"
+            printf 'FLEET_PUBLIC_ARTIFACT_MANIFEST=%s\n' "$FLEET_PUBLIC_ARTIFACT_MANIFEST"
+          } >>"$GITHUB_ENV"
       - name: checkout runtime
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -138,6 +146,17 @@ jobs:
           if (m.private !== false || m.visibility !== "public" || m.owner?.login !== process.env.FLEET_PUBLIC_OWNER || m.archived === true) process.exit(1);
           NODE
           printf 'repository=%s\n' "$target" >> "$GITHUB_OUTPUT"
+      - name: configure ephemeral public state
+        env:
+          FLEET_PUBLIC_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
+          FLEET_STATE_ROOT: ${{ runner.temp }}/fleet-public-state
+          FLEET_PUBLIC_ARTIFACT_MANIFEST: ${{ runner.temp }}/fleet-public-state/public-artifact.json
+        run: |
+          {
+            printf 'FLEET_PUBLIC_STATE_ROOT=%s\n' "$FLEET_PUBLIC_STATE_ROOT"
+            printf 'FLEET_STATE_ROOT=%s\n' "$FLEET_STATE_ROOT"
+            printf 'FLEET_PUBLIC_ARTIFACT_MANIFEST=%s\n' "$FLEET_PUBLIC_ARTIFACT_MANIFEST"
+          } >>"$GITHUB_ENV"
       - name: checkout runtime
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:

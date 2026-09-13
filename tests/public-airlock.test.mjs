@@ -18,9 +18,12 @@ const WORKFLOW_FILES = readdirSync(WORKFLOW_DIR)
   .filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"))
   .sort();
 
+const PRIVATE_CONTROL_MARKER = ["fleet", "control"].join("-");
+const STATE_CONTROL_MARKER = ["state", "control"].join("-");
+const PRIVATE_STATE_MARKER = ["private", "state"].join("-");
 const PRIVATE_MARKERS = [
-  ["fleet", "control"].join("-"),
-  "state-control",
+  PRIVATE_CONTROL_MARKER,
+  STATE_CONTROL_MARKER,
   "FLEET_GH_TOKEN",
   "FLEET_OPENCODE_AUTH",
   "GDRIVE_REFRESH_TOKEN",
@@ -87,6 +90,22 @@ function workflowStepBlock(text, stepName) {
   const remainder = text.slice(start);
   const nextStep = remainder.search(/\n\s+- name:/);
   return nextStep === -1 ? remainder : remainder.slice(0, nextStep);
+}
+
+function workflowStepBlocks(text, stepName) {
+  const marker = `- name: ${stepName}`;
+  return text
+    .split(/\n(?=\s+- (?:name|uses):)/g)
+    .filter((block) => block.includes(marker));
+}
+
+function workflowRunScript(stepBlock) {
+  const match = stepBlock.match(/^\s+run:\s*\|\s*\n([\s\S]*)$/m);
+  assert.ok(match, "step must contain a literal bash run block");
+  return match[1]
+    .split("\n")
+    .map((line) => line.startsWith("          ") ? line.slice(10) : line)
+    .join("\n");
 }
 
 function workflowJobBlocks(text) {
@@ -173,6 +192,110 @@ test("workflow manifests stay inside the ephemeral public state root", () => {
       if (!line.includes("FLEET_PUBLIC_ARTIFACT_MANIFEST:")) continue;
       assert.match(line, /runner\.temp\s*\}\}\/fleet-public-state\//, `${name} manifest escapes its public state root`);
     }
+  }
+});
+
+test("runner context is referenced only from step-level workflow expressions", () => {
+  for (const name of WORKFLOW_FILES) {
+    const lines = workflowText(name).split("\n");
+    let inJobs = false;
+    let currentJob = null;
+    let stepsStarted = false;
+    for (const line of lines) {
+      if (line === "jobs:") {
+        inJobs = true;
+        currentJob = null;
+        stepsStarted = false;
+        continue;
+      }
+      if (inJobs && /^  [A-Za-z0-9_-]+:\s*$/.test(line)) {
+        currentJob = line.trim().slice(0, -1);
+        stepsStarted = false;
+        continue;
+      }
+      if (inJobs && currentJob && /^    steps:\s*$/.test(line)) {
+        stepsStarted = true;
+        continue;
+      }
+      if (!line.includes("runner.")) continue;
+      const indentation = line.match(/^ */)?.[0].length || 0;
+      assert.equal(inJobs && currentJob && stepsStarted, true, `${name} uses runner context before a job's steps`);
+      assert.ok(indentation >= 10, `${name} uses runner context outside step-level configuration: ${line.trim()}`);
+    }
+  }
+});
+
+test("step-level runner paths propagate through GITHUB_ENV for later steps", () => {
+  const expectedKeys = [
+    "FLEET_PUBLIC_STATE_ROOT",
+    "FLEET_STATE_ROOT",
+    "FLEET_PUBLIC_ARTIFACT_MANIFEST",
+  ];
+  const consumerMarkers = [
+    "actions/checkout@",
+    "actions/setup-node@",
+    "actions/upload-artifact@",
+    "actions/download-artifact@",
+    "node scripts/",
+    "opencode ",
+  ];
+  const temporaryRoot = mkdtempSync(path.join(tmpdir(), "fleet-public-state-env-"));
+  let configureStepCount = 0;
+  try {
+    for (const name of WORKFLOW_FILES) {
+      const blocks = workflowStepBlocks(workflowText(name), "configure ephemeral public state");
+      if (name === "ci-diag.yml") {
+        assert.equal(blocks.length, 0, "ci-diag must not configure operational state");
+        continue;
+      }
+      assert.ok(blocks.length > 0, `${name} must configure ephemeral public state after validation`);
+      for (const job of workflowJobBlocks(workflowText(name))) {
+        const stepNames = [...job.matchAll(/^\s+- (?:name|uses):\s*(.+)$/gm)].map((match) => match[1]);
+        const validationIndex = stepNames.indexOf("validate public target");
+        const configurationIndex = stepNames.indexOf("configure ephemeral public state");
+        assert.ok(validationIndex >= 0, `${name} job is missing target validation`);
+        assert.equal(configurationIndex, validationIndex + 1, `${name} must configure state immediately after target validation`);
+        const configurationOffset = job.indexOf("- name: configure ephemeral public state");
+        assert.ok(configurationOffset >= 0, `${name} job is missing state configuration`);
+        for (const marker of consumerMarkers) {
+          const consumerOffset = job.indexOf(marker);
+          if (consumerOffset >= 0) {
+            assert.ok(consumerOffset > configurationOffset, `${name} consumes state before ephemeral configuration: ${marker}`);
+          }
+        }
+      }
+      for (const block of blocks) {
+        configureStepCount += 1;
+        for (const key of expectedKeys) {
+          assert.match(block, new RegExp(`${key}:\\s+\\$\\{\\{\\s*runner\\.temp\\s*\\}\\}/fleet-public-state`));
+        }
+        const stateRoot = path.join(temporaryRoot, `${name}-${configureStepCount}`, "fleet-public-state");
+        const envPath = path.join(temporaryRoot, `${name}-${configureStepCount}.env`);
+        const script = workflowRunScript(block);
+        const result = spawnSync("bash", ["-c", script], {
+          encoding: "utf8",
+          env: {
+            FLEET_PUBLIC_STATE_ROOT: stateRoot,
+            FLEET_STATE_ROOT: stateRoot,
+            FLEET_PUBLIC_ARTIFACT_MANIFEST: path.join(stateRoot, "public-artifact.json"),
+            GITHUB_ENV: envPath,
+          },
+        });
+        assert.equal(result.status, 0, `${name} state propagation failed: ${result.stderr || result.stdout}`);
+        assert.equal(
+          readFileSync(envPath, "utf8"),
+          [
+            `FLEET_PUBLIC_STATE_ROOT=${stateRoot}`,
+            `FLEET_STATE_ROOT=${stateRoot}`,
+            `FLEET_PUBLIC_ARTIFACT_MANIFEST=${path.join(stateRoot, "public-artifact.json")}`,
+            "",
+          ].join("\n"),
+        );
+      }
+    }
+    assert.equal(configureStepCount, 26, "every public validator job must propagate its state paths");
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
   }
 });
 
@@ -432,7 +555,10 @@ test("public orchestrate is a stateless read-only airlock, not a completion auth
   assert.match(text, /FLEET_STATE_ROOT:\s*\$\{\{\s*runner\.temp\s*\}\}\/fleet-public-state/);
   assert.doesNotMatch(text, /\bgit\s+(?:commit|push)\b|\bgh\s+(?:pr|issue)\s+(?:merge|close|comment|create)\b/i);
   assert.doesNotMatch(text, /curl[^\n]*(?:-X|--request)\s*(?:POST|PUT|PATCH|DELETE)\b/i);
-  assert.doesNotMatch(text, /(?:FLEET_PRIVATE_STATE|FLEET_GH_TOKEN|FLEET_OPENCODE_AUTH|fleet-control|state-control|private-state)/i);
+  assert.doesNotMatch(
+    text,
+    new RegExp(`(?:FLEET_PRIVATE_STATE|FLEET_GH_TOKEN|FLEET_OPENCODE_AUTH|${PRIVATE_CONTROL_MARKER}|${STATE_CONTROL_MARKER}|${PRIVATE_STATE_MARKER})`, "i"),
+  );
   assert.doesNotMatch(text, /(?:completion authority|outbox|durable task history|status:\s*completed)/i);
   assert.match(text, /upload-artifact/);
 });

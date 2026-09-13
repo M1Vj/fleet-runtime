@@ -9,7 +9,7 @@ on:
       workers:
         description: "max parallel sub-agents"
         type: string
-        default: "3"
+        default: "6"
 
 concurrency:
   group: fleet-deep
@@ -24,16 +24,14 @@ jobs:
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      max_parallel: ${{ steps.plan.outputs.max_parallel }}
     env:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
-      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
     steps:
-      - name: sanitize workers input
-        run: echo "FLEET_MAX_WORKERS=$(echo '${{ github.event.inputs.workers }}' | grep -E '^[0-9]+$' || echo 3)" >> "$GITHUB_ENV"
       - name: checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -51,22 +49,20 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
+      - name: sanitize workers input
+        env:
+          FLEET_WORKERS_INPUT: ${{ github.event.inputs.workers || '' }}
+        run: |
+          FLEET_MAX_WORKERS=$(node --input-type=module <<'NODE'
+          import { sanitizeMaxWorkers } from "./scripts/deep.mjs";
+          process.stdout.write(String(sanitizeMaxWorkers(process.env.FLEET_WORKERS_INPUT)));
+          NODE
+          )
+          echo "FLEET_MAX_WORKERS=$FLEET_MAX_WORKERS" >> "$GITHUB_ENV"
       - name: plan tasks
         id: plan
         run: |
-          MAXW="$FLEET_MAX_WORKERS"
-          TASKS=$(node -e '
-            const fs=require("fs");
-            const max=parseInt(process.argv[1])||3;
-            const qp=(process.env.FLEET_STATE_ROOT||".")+"/state/queue.jsonl";
-            const rows=fs.existsSync(qp)?fs.readFileSync(qp,"utf8").split("\n").filter(Boolean)
-              .map(l=>{try{return JSON.parse(l)}catch{return null}}).filter(Boolean):[];
-            const now=Date.now();
-            const claimable=rows.filter(t=>t.status==="pending"||(t.status==="in_progress"&&t.updatedUtc&&now-new Date(t.updatedUtc).getTime()>40*60*1000&&(t.attempts||0)<3));
-            const picked=claimable.slice(0,max).map(t=>({repo:t.repo,kind:t.kind}));
-            console.log(JSON.stringify({worker:picked.length?picked:[{repo:"",kind:"none"}]}));
-          ' "$MAXW")
-          echo "matrix=$TASKS" >> "$GITHUB_OUTPUT"
+          FLEET_DEEP_MODE=plan node scripts/deep.mjs >> "$GITHUB_OUTPUT"
 
   analyze:
     needs: plan
@@ -74,18 +70,28 @@ jobs:
     timeout-minutes: 65
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
-      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+      FLEET_OPENCODE_AUTH_2: ${{ secrets.FLEET_OPENCODE_AUTH_2 }}
+      FLEET_OPENCODE_AUTH_3: ${{ secrets.FLEET_OPENCODE_AUTH_3 }}
+      FLEET_OPENCODE_AUTH_4: ${{ secrets.FLEET_OPENCODE_AUTH_4 }}
+      FLEET_OPENCODE_AUTH_5: ${{ secrets.FLEET_OPENCODE_AUTH_5 }}
+      FLEET_OPENCODE_AUTH_6: ${{ secrets.FLEET_OPENCODE_AUTH_6 }}
+      FLEET_OPENCODE_AUTH_7: ${{ secrets.FLEET_OPENCODE_AUTH_7 }}
+      FLEET_OPENCODE_AUTH_8: ${{ secrets.FLEET_OPENCODE_AUTH_8 }}
+      FLEET_OPENCODE_AUTH_9: ${{ secrets.FLEET_OPENCODE_AUTH_9 }}
       FLEET_REPO: ${{ matrix.worker.repo || matrix.repo }}
       FLEET_KIND: ${{ matrix.worker.kind || matrix.kind }}
+      FLEET_TASK_ID: ${{ matrix.worker.taskId || matrix.taskId }}
+      FLEET_CLAIM_RUN_ID: ${{ matrix.worker.claimRunId || matrix.claimRunId }}
+      FLEET_CLAIM_ATTEMPT: ${{ matrix.worker.claimAttempt || matrix.claimAttempt }}
     steps:
       - name: skip-empty
         if: ${{ env.FLEET_REPO == '' }}
@@ -132,17 +138,18 @@ jobs:
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 8
+    concurrency:
+      group: fleet-state-writer
+      cancel-in-progress: false
     env:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
-      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
       FLEET_ANALYZE_RESULT: ${{ needs.analyze.result }}
+      FLEET_PLAN_MATRIX: ${{ needs.plan.outputs.matrix }}
     steps:
-      - name: sanitize workers input
-        run: echo "FLEET_MAX_WORKERS=$(echo '${{ github.event.inputs.workers }}' | grep -E '^[0-9]+$' || echo 3)" >> "$GITHUB_ENV"
       - name: checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:

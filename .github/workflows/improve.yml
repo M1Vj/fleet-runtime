@@ -10,6 +10,11 @@ on:
         description: "how many top repos to improve"
         type: string
         default: "2"
+      repo:
+        description: "exact owner/name repository to improve (optional)"
+        type: string
+        required: false
+        default: ""
 
 concurrency:
   group: fleet-improve
@@ -28,10 +33,10 @@ jobs:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
-      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
       FLEET_TOP_K: ${{ github.event.inputs.top_k || '2' }}
+      FLEET_REPO: ${{ github.event.inputs.repo || '' }}
     steps:
       - name: checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -53,10 +58,17 @@ jobs:
       - name: pick targets
         id: pick
         run: |
-          OUT=$(FLEET_IMPROVE_MODE=pick node scripts/improve.mjs)
+          mkdir -p artifacts
+          OUT=$(FLEET_IMPROVE_MODE=pick FLEET_ARTIFACT_DIR=artifacts node scripts/improve.mjs)
           echo "$OUT"
           MATRIX=$(echo "$OUT" | grep '^IMPROVE_MATRIX=' | sed 's/^IMPROVE_MATRIX=//')
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+      - name: upload selection evidence
+        if: hashFiles('artifacts/selection-*.json') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: selections
+          path: artifacts/selection-*.json
 
   research:
     needs: pick
@@ -64,15 +76,23 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
+      max-parallel: 10
       matrix: ${{ fromJSON(needs.pick.outputs.matrix) }}
     env:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
-      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+      FLEET_OPENCODE_AUTH_2: ${{ secrets.FLEET_OPENCODE_AUTH_2 }}
+      FLEET_OPENCODE_AUTH_3: ${{ secrets.FLEET_OPENCODE_AUTH_3 }}
+      FLEET_OPENCODE_AUTH_4: ${{ secrets.FLEET_OPENCODE_AUTH_4 }}
+      FLEET_OPENCODE_AUTH_5: ${{ secrets.FLEET_OPENCODE_AUTH_5 }}
+      FLEET_OPENCODE_AUTH_6: ${{ secrets.FLEET_OPENCODE_AUTH_6 }}
+      FLEET_OPENCODE_AUTH_7: ${{ secrets.FLEET_OPENCODE_AUTH_7 }}
+      FLEET_OPENCODE_AUTH_8: ${{ secrets.FLEET_OPENCODE_AUTH_8 }}
+      FLEET_OPENCODE_AUTH_9: ${{ secrets.FLEET_OPENCODE_AUTH_9 }}
       FLEET_REPO: ${{ matrix.repo }}
     steps:
       - name: checkout fleet repo
@@ -114,14 +134,22 @@ jobs:
     timeout-minutes: 40
     outputs:
       implmatrix: ${{ steps.plan.outputs.implmatrix }}
+      reviewmatrix: ${{ steps.plan.outputs.reviewmatrix }}
     env:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
-      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+      FLEET_OPENCODE_AUTH_2: ${{ secrets.FLEET_OPENCODE_AUTH_2 }}
+      FLEET_OPENCODE_AUTH_3: ${{ secrets.FLEET_OPENCODE_AUTH_3 }}
+      FLEET_OPENCODE_AUTH_4: ${{ secrets.FLEET_OPENCODE_AUTH_4 }}
+      FLEET_OPENCODE_AUTH_5: ${{ secrets.FLEET_OPENCODE_AUTH_5 }}
+      FLEET_OPENCODE_AUTH_6: ${{ secrets.FLEET_OPENCODE_AUTH_6 }}
+      FLEET_OPENCODE_AUTH_7: ${{ secrets.FLEET_OPENCODE_AUTH_7 }}
+      FLEET_OPENCODE_AUTH_8: ${{ secrets.FLEET_OPENCODE_AUTH_8 }}
+      FLEET_OPENCODE_AUTH_9: ${{ secrets.FLEET_OPENCODE_AUTH_9 }}
     steps:
       - name: checkout fleet repo
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -152,6 +180,7 @@ jobs:
         id: plan
         run: |
           echo 'implmatrix={"repo":[]}' >> "$GITHUB_OUTPUT"
+          echo 'reviewmatrix={"repo":[],"lens":["correctness","redteam","standards"]}' >> "$GITHUB_OUTPUT"
           set +e
           FLEET_IMPROVE_MODE=plan FLEET_ARTIFACT_DIR=artifacts node scripts/improve.mjs 2>&1 | tee plan-run.log
           CODE=${PIPESTATUS[0]}
@@ -160,10 +189,32 @@ jobs:
           REPOS=$(node -e '
             const fs=require("fs");
             const files=fs.existsSync("artifacts")?fs.readdirSync("artifacts").filter(f=>f.startsWith("plan-")&&f.endsWith(".json")):[];
-            const repos=files.map(f=>JSON.parse(fs.readFileSync("artifacts/"+f,"utf8")).repo);
-            console.log(JSON.stringify({repo:repos}));
+            const repos=[];
+            for (const f of files) {
+              try {
+                const repo=JSON.parse(fs.readFileSync("artifacts/"+f,"utf8")).repo;
+                if (typeof repo === "string" && repo.trim()) repos.push(repo.trim());
+              } catch (err) {
+                console.error("skip invalid plan artifact "+f+": "+err.message);
+              }
+            }
+            console.log(JSON.stringify({repo:[...new Set(repos)]}));
           ')
           echo "implmatrix=$REPOS" >> "$GITHUB_OUTPUT"
+          echo "reviewmatrix=$(node -e '
+            const fs=require("fs");
+            const files=fs.existsSync("artifacts")?fs.readdirSync("artifacts").filter(f=>f.startsWith("plan-")&&f.endsWith(".json")):[];
+            const repos=[];
+            for (const f of files) {
+              try {
+                const repo=JSON.parse(fs.readFileSync("artifacts/"+f,"utf8")).repo;
+                if (typeof repo === "string" && repo.trim()) repos.push(repo.trim());
+              } catch (err) {
+                console.error("skip invalid plan artifact "+f+": "+err.message);
+              }
+            }
+            console.log(JSON.stringify({repo:[...new Set(repos)],lens:["correctness","redteam","standards"]}));
+          ')" >> "$GITHUB_OUTPUT"
           exit $CODE
       - name: upload plans
         if: hashFiles('artifacts/plan-*.json') != ''
@@ -177,10 +228,15 @@ jobs:
     if: needs.plan.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix: ${{ fromJSON(needs.plan.outputs.implmatrix) }}
     env:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+      FLEET_REPO: ${{ matrix.repo }}
     steps:
       - name: checkout fleet repo
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -206,20 +262,12 @@ jobs:
           path: artifacts
       - name: implement draft PRs as M1Vj
         run: |
-          set +e
-          RC=0
-          for f in artifacts/plan-*.json; do
-            [ -e "$f" ] || continue
-            REPO=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).repo' "$f")
-            echo "== implementing $REPO"
-            FLEET_IMPROVE_MODE=implement FLEET_ARTIFACT_DIR=artifacts FLEET_REPO="$REPO" node scripts/improve.mjs || { echo "implement failed for $REPO"; RC=1; }
-          done
-          exit $RC
+          FLEET_IMPROVE_MODE=implement FLEET_ARTIFACT_DIR=artifacts node scripts/improve.mjs
       - name: upload pr metas
         if: hashFiles('artifacts/prmeta-*.json') != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: prmeta-all
+          name: prmeta-${{ strategy.job-index }}
           path: artifacts/prmeta-*.json
 
   review:
@@ -229,17 +277,25 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      matrix:
-        lens: [correctness, redteam, standards]
+      max-parallel: 10
+      matrix: ${{ fromJSON(needs.plan.outputs.reviewmatrix) }}
     env:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
-      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+      FLEET_OPENCODE_AUTH_2: ${{ secrets.FLEET_OPENCODE_AUTH_2 }}
+      FLEET_OPENCODE_AUTH_3: ${{ secrets.FLEET_OPENCODE_AUTH_3 }}
+      FLEET_OPENCODE_AUTH_4: ${{ secrets.FLEET_OPENCODE_AUTH_4 }}
+      FLEET_OPENCODE_AUTH_5: ${{ secrets.FLEET_OPENCODE_AUTH_5 }}
+      FLEET_OPENCODE_AUTH_6: ${{ secrets.FLEET_OPENCODE_AUTH_6 }}
+      FLEET_OPENCODE_AUTH_7: ${{ secrets.FLEET_OPENCODE_AUTH_7 }}
+      FLEET_OPENCODE_AUTH_8: ${{ secrets.FLEET_OPENCODE_AUTH_8 }}
+      FLEET_OPENCODE_AUTH_9: ${{ secrets.FLEET_OPENCODE_AUTH_9 }}
       FLEET_LENS: ${{ matrix.lens }}
+      FLEET_REPO: ${{ matrix.repo }}
     steps:
       - name: checkout fleet repo
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -263,7 +319,7 @@ jobs:
       - name: download plans and pr metas
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          pattern: "{plans,prmeta-all}"
+          pattern: "{plans,prmeta-*}"
           merge-multiple: true
           path: artifacts
       - name: review sub-agents
@@ -274,7 +330,7 @@ jobs:
         if: hashFiles('reviews/*.json') != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: reviews-${{ matrix.lens }}
+          name: reviews-${{ strategy.job-index }}
           path: reviews/
 
   finalize:
@@ -286,7 +342,6 @@ jobs:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
-      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
     steps:
@@ -310,7 +365,7 @@ jobs:
       - name: download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          pattern: "{prmeta-*,reviews-*}"
+          pattern: "{prmeta-*,reviews-*,selections}"
           merge-multiple: true
           path: alldownloaded
       - name: post reviews as M1Vj and record state
@@ -318,4 +373,5 @@ jobs:
           mkdir -p split/prmeta split/reviews
           cp alldownloaded/prmeta-*.json split/prmeta/ 2>/dev/null || true
           cp alldownloaded/review-*.json split/reviews/ 2>/dev/null || true
+          cp alldownloaded/selection-*.json split/prmeta/ 2>/dev/null || true
           FLEET_IMPROVE_MODE=finalize FLEET_ARTIFACT_DIR=split/prmeta FLEET_REVIEW_DIR=split/reviews node scripts/improve.mjs

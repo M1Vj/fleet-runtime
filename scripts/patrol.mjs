@@ -5,7 +5,7 @@ import path from "node:path";
 import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, ghInput, putFileContent, ensureBranch, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
-import { loadLedger, eventKey, has, append } from "./lib/ledger.mjs";
+import { eventKey, append } from "./lib/ledger.mjs";
 import { validateDirectives } from "./lib/directives.mjs";
 import { askModel } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor, verifyCommentAuthor, verifyIssueAuthor } from "./lib/verify.mjs";
@@ -16,6 +16,12 @@ const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
 const AUDIT_DIR = path.join(REPO_ROOT, "audit");
 const STATE_DIR = path.join(REPO_ROOT, "state");
+const DAY_MS = 24 * 60 * 60 * 1000;
+export const PATROL_REVISIT_TTL_MS = DAY_MS;
+export const DEEP_QUEUE_CAP = 100;
+export const DEEP_QUEUE_ADDITION_CAP = 10;
+export const PATROL_MAX_STATE_PUSHES = 2;
+export const DEEP_WORKFLOW_REPO = "M1Vj/fleet-runtime";
 
 function targetsPath() {
   return path.join(STATE_DIR, "targets.json");
@@ -55,6 +61,96 @@ function readJson(p, fallback) {
   }
 }
 
+function parseTimestamp(value) {
+  if (value instanceof Date) return Number.isFinite(value.getTime()) ? value.getTime() : null;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string" || !value.trim()) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function resolveNow(value = Date.now()) {
+  const parsed = parseTimestamp(value);
+  return parsed === null ? Date.now() : parsed;
+}
+
+function boundedTtl(value = PATROL_REVISIT_TTL_MS) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return PATROL_REVISIT_TTL_MS;
+  return Math.min(parsed, 7 * DAY_MS);
+}
+
+function ledgerTime(value) {
+  if (value && typeof value === "object") {
+    return parseTimestamp(value.t ?? value.timestamp ?? value.seenAt ?? value.updatedAt);
+  }
+  return parseTimestamp(value);
+}
+
+export function loadPatrolLedger(filePath) {
+  const entries = new Map();
+  if (!existsSync(filePath)) return entries;
+  for (const line of readFileSync(filePath, "utf8").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const row = JSON.parse(trimmed);
+      if (!row || typeof row.k !== "string") continue;
+      const observedAt = ledgerTime(row);
+      const previous = entries.get(row.k);
+      if (!entries.has(row.k) || (observedAt !== null && (previous === null || observedAt >= previous))) {
+        entries.set(row.k, observedAt);
+      }
+    } catch {
+      // Ignore malformed historical rows while preserving valid ledger entries.
+    }
+  }
+  return entries;
+}
+
+function observedLedgerTime(seen, key) {
+  if (seen instanceof Map) {
+    return seen.has(key) ? ledgerTime(seen.get(key)) : undefined;
+  }
+  if (seen instanceof Set) return seen.has(key) ? null : undefined;
+  if (Array.isArray(seen)) {
+    const row = seen.find((entry) => entry && typeof entry.k === "string" && entry.k === key);
+    return row ? ledgerTime(row) : undefined;
+  }
+  if (seen && typeof seen === "object") {
+    if (typeof seen.has === "function" && !seen.has(key)) return undefined;
+    if (Object.prototype.hasOwnProperty.call(seen, key)) return ledgerTime(seen[key]);
+    if (typeof seen.has === "function") return null;
+  }
+  return undefined;
+}
+
+function shouldIncludeSignal(seen, key, now, revisitTtlMs) {
+  const observedAt = observedLedgerTime(seen, key);
+  if (observedAt === undefined || observedAt === null) return observedAt === undefined;
+  return now - observedAt >= revisitTtlMs;
+}
+
+function activityTimestamp(item) {
+  return parseTimestamp(
+    item?.opened
+      ?? item?.opened_at
+      ?? item?.created
+      ?? item?.created_at
+      ?? item?.updated
+      ?? item?.updated_at,
+  ) ?? 0;
+}
+
+function pullPriority(item, seen, key, now, revisitTtlMs) {
+  const ageMs = Math.max(0, now - activityTimestamp(item));
+  const observedAt = observedLedgerTime(seen, key);
+  const overdueMs = observedAt === undefined || observedAt === null
+    ? 0
+    : Math.max(0, now - observedAt - revisitTtlMs);
+  return ageMs + (overdueMs * 2);
+}
+
 // Exit-code taxonomy (surfaced, never hidden): 2 kill-switch, 3 identity,
 // 4 scope, 5 rejected directives, 6 model-unavailable. Gateway outage and
 // validator exhaustion must exit 6/5, never 0 with a neutral pass.
@@ -88,7 +184,13 @@ async function collectSignals(env, audit) {
       signals.push({
         repo: full,
         pushedAt: repo.pushed_at,
-        openPulls: pulls.map((p) => ({ n: p.number, title: p.title, draft: p.draft, updated: p.updated_at })),
+        openPulls: pulls.map((p) => ({
+          n: p.number,
+          title: p.title,
+          draft: p.draft,
+          updated: p.updated_at,
+          ...(p.created_at ? { created: p.created_at } : {}),
+        })),
         activeIssues: issues.filter((i) => !i.pull_request).map((i) => ({ n: i.number, title: i.title, updated: i.updated_at })),
         failingRuns24h: runs.map((r) => ({ id: r.id, name: r.name, url: r.html_url, created: r.created_at })),
       });
@@ -100,14 +202,30 @@ async function collectSignals(env, audit) {
   return signals;
 }
 
-function buildDigest(signals, seen) {
+export function buildDigest(signals, seen, options = {}) {
+  const now = resolveNow(options.now);
+  const revisitTtlMs = boundedTtl(options.revisitTtlMs ?? options.revisitTtl ?? options.ttlMs);
   const fresh = [];
-  for (const s of signals) {
+  for (const s of Array.isArray(signals) ? signals : []) {
+    if (!s || typeof s !== "object") continue;
+    const openPulls = Array.isArray(s.openPulls) ? s.openPulls : [];
+    const activeIssues = Array.isArray(s.activeIssues) ? s.activeIssues : [];
+    const failingRuns = Array.isArray(s.failingRuns24h) ? s.failingRuns24h : [];
     const f = {
       repo: s.repo,
-      newPulls: s.openPulls.filter((p) => !has(seen, eventKey("sig-pr", s.repo, String(p.n), String(p.updated)))),
-      newIssueActivity: s.activeIssues.filter((i) => !has(seen, eventKey("sig-issue", s.repo, String(i.n), String(i.updated)))),
-      failingRuns: s.failingRuns24h.filter((r) => !has(seen, eventKey("sig-run", s.repo, String(r.id), String(r.created)))),
+      newPulls: openPulls
+        .filter((p) => shouldIncludeSignal(seen, eventKey("sig-pr", s.repo, String(p.n), String(p.updated)), now, revisitTtlMs))
+        .sort((a, b) => {
+          const aKey = eventKey("sig-pr", s.repo, String(a.n), String(a.updated));
+          const bKey = eventKey("sig-pr", s.repo, String(b.n), String(b.updated));
+          return pullPriority(b, seen, bKey, now, revisitTtlMs) - pullPriority(a, seen, aKey, now, revisitTtlMs);
+        }),
+      newIssueActivity: activeIssues.filter((i) =>
+        shouldIncludeSignal(seen, eventKey("sig-issue", s.repo, String(i.n), String(i.updated)), now, revisitTtlMs),
+      ),
+      failingRuns: failingRuns.filter((r) =>
+        shouldIncludeSignal(seen, eventKey("sig-run", s.repo, String(r.id), String(r.created)), now, revisitTtlMs),
+      ),
     };
     if (f.newPulls.length + f.newIssueActivity.length + f.failingRuns.length > 0) fresh.push(f);
   }
@@ -131,51 +249,254 @@ function buildPrompt(digest) {
   ].join("\n");
 }
 
+const PATROL_REPO_NAME_RE = /^[A-Za-z0-9_.-]{1,100}$/;
+const PATROL_REPO_MUTATION_KINDS = new Set(["comment", "label", "draft_pr"]);
+
+/**
+ * Return the only repository form patrol may send to GitHub. GitHub treats
+ * owner names case-insensitively, but keeping the owner canonical prevents a
+ * model-provided owner from escaping the M1Vj scope through allOwned mode.
+ */
+export function canonicalizePatrolRepo(value) {
+  if (typeof value !== "string" || value.trim() !== value) return "";
+  const match = value.match(/^([^/]+)\/([^/]+)$/);
+  if (!match || !/^m1vj$/i.test(match[1])) return "";
+  const name = match[2];
+  if (!PATROL_REPO_NAME_RE.test(name) || name === "." || name === ".." || name.includes("..")) return "";
+  return `M1Vj/${name}`;
+}
+
+/**
+ * Scope-check every directive before eligibility or execution. The returned
+ * array is a fresh array with owner-canonical repository references.
+ */
+export function fencePatrolDirectives(directives) {
+  if (!Array.isArray(directives)) {
+    return { ok: false, directives: [], errors: ["directives must be an array"] };
+  }
+  const errors = [];
+  const fenced = directives.map((directive, index) => {
+    if (!directive || typeof directive !== "object" || Array.isArray(directive)) return directive;
+    const hasRepo = Object.prototype.hasOwnProperty.call(directive, "repo");
+    if (!PATROL_REPO_MUTATION_KINDS.has(directive.kind) && !hasRepo) return directive;
+    const repo = canonicalizePatrolRepo(directive.repo);
+    if (!repo) {
+      errors.push(`directive[${index}].repo must be a valid M1Vj repository`);
+      return directive;
+    }
+    return { ...directive, repo };
+  });
+  return errors.length > 0
+    ? { ok: false, directives: [], errors }
+    : { ok: true, directives: fenced, errors };
+}
+
+export function reviewCommentPostingAllowed(env = process.env) {
+  return String(env?.FLEET_ALLOW_REVIEW_COMMENTS || "").trim().toLowerCase() === "true";
+}
+
+export function planPatrolPersistence({ changed = false, pushes = 0, maxPushes = PATROL_MAX_STATE_PUSHES } = {}) {
+  if (!changed) return { persist: false, reason: "no-changes" };
+  const used = Number.isSafeInteger(pushes) && pushes >= 0 ? pushes : 0;
+  const configuredCap = Number.isSafeInteger(maxPushes) && maxPushes >= 1 ? maxPushes : PATROL_MAX_STATE_PUSHES;
+  const cap = Math.min(PATROL_MAX_STATE_PUSHES, configuredCap);
+  if (used >= cap) return { persist: false, reason: "push-cap" };
+  return { persist: true, pushAttempt: used + 1 };
+}
+
 function eligible(targets, repo) {
   // Fail-closed on unknown targets (mirrors merge.isTier1Eligible).
   if (!targets || typeof targets !== "object") return false;
-  if ((targets.excluded || []).includes(repo)) return false;
+  const canonical = canonicalizePatrolRepo(repo);
+  if (!canonical) return false;
+  const matches = (value) => canonicalizePatrolRepo(value) === canonical;
+  if (Array.isArray(targets.excluded) && targets.excluded.some(matches)) return false;
   if (targets.allOwned === true) return true;
-  return (targets.tier1 || []).includes(repo);
+  return Array.isArray(targets.tier1) && targets.tier1.some(matches);
 }
 
-const DEEP_KINDS = ["security-audit", "redteam", "code-review", "docs-audit"];
+export const DEEP_KINDS = ["security-audit", "redteam", "code-review", "docs-audit"];
 
-function enqueueDeepTasks(signals) {
-  const queuePath = path.join(STATE_DIR, "queue.jsonl");
-  const existing = existsSync(queuePath)
-    ? readFileSync(queuePath, "utf8").split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean)
-    : [];
-  const openCount = existing.filter((t) => t.status === "pending" || t.status === "in_progress").length;
-  if (openCount >= 12) return 0;
-  const pendingKeys = new Set(existing.filter((t) => t.status === "pending" || t.status === "in_progress").map((t) => `${t.repo}|${t.kind}`));
+function taskKey(task) {
+  const rawRepo = typeof task?.repo === "string"
+    ? task.repo
+    : typeof task?.repository === "string"
+      ? task.repository
+      : task?.repository?.full_name || task?.repoFullName || "";
+  const repo = canonicalizePatrolRepo(rawRepo) || rawRepo;
+  return `${repo}|${task?.kind || ""}`;
+}
+
+function signalCounts(signal) {
+  return {
+    pulls: Array.isArray(signal?.openPulls) ? signal.openPulls.length : 0,
+    failures: Array.isArray(signal?.failingRuns24h) ? signal.failingRuns24h.length : 0,
+  };
+}
+
+function deepSignalPriority(signal) {
+  const { pulls, failures } = signalCounts(signal);
+  if (pulls === 0 && failures === 0) return 0;
+  // Broken runs are the most urgent, while PR activity still outranks quiet repos.
+  return (failures > 0 ? 2_000_000 : 0) + (pulls > 0 ? 1_000_000 : 0) + failures * 1_000 + pulls * 100;
+}
+
+export function planDeepQueueAdditions(existing, signals, options = {}) {
+  const rows = Array.isArray(existing) ? existing : [];
+  const requestedQueueCap = Number(options.queueCap ?? DEEP_QUEUE_CAP);
+  const queueCap = Number.isFinite(requestedQueueCap)
+    ? Math.min(DEEP_QUEUE_CAP, Math.max(0, Math.floor(requestedQueueCap)))
+    : DEEP_QUEUE_CAP;
+  const requestedAdditionCap = Number(options.maxAdditions ?? DEEP_QUEUE_ADDITION_CAP);
+  const additionCap = Number.isFinite(requestedAdditionCap)
+    ? Math.max(0, Math.floor(requestedAdditionCap))
+    : DEEP_QUEUE_ADDITION_CAP;
+  const openRows = rows.filter((task) => task?.status === "pending" || task?.status === "in_progress");
+  const availableSlots = Math.max(0, queueCap - openRows.length);
+  const limit = Math.min(availableSlots, additionCap);
+  if (limit === 0) return [];
+
+  const pendingKeys = new Set(openRows.map(taskKey));
+  const day = new Date(resolveNow(options.now)).toISOString().slice(0, 10);
   const doneToday = new Set(
-    existing
-      .filter((t) => t.status === "done" && (t.updatedUtc || "").slice(0, 10) === new Date().toISOString().slice(0, 10))
-      .map((t) => `${t.repo}|${t.kind}`),
+    rows
+      .filter((task) => task?.status === "done" && String(task.updatedUtc || "").slice(0, 10) === day)
+      .map(taskKey),
   );
+  const occupied = new Set([...pendingKeys, ...doneToday]);
+  const scopedSignals = (Array.isArray(signals) ? signals : [])
+    .map((signal) => {
+      if (!signal || typeof signal !== "object") return null;
+      const repo = canonicalizePatrolRepo(signal.repo);
+      return repo ? { ...signal, repo } : null;
+    })
+    .filter(Boolean);
+  const ranked = scopedSignals
+    .map((signal, index) => ({ signal, index, priority: deepSignalPriority(signal) }))
+    .filter((row) => row.priority > 0 && typeof row.signal?.repo === "string" && row.signal.repo.length > 0)
+    .sort((a, b) => b.priority - a.priority || a.index - b.index);
+
+  const now = resolveNow(options.now);
+  const timestamp = new Date(now).toISOString();
   const additions = [];
-  let kindIdx = existing.length % DEEP_KINDS.length;
-  for (const s of signals) {
-    const hasSignal = (s.openPulls && s.openPulls.length > 0) || (s.failingRuns24h && s.failingRuns24h.length > 0);
-    if (!hasSignal) continue;
-    const kind = DEEP_KINDS[kindIdx % DEEP_KINDS.length];
-    kindIdx += 1;
-    const key = `${s.repo}|${kind}`;
-    if (pendingKeys.has(key) || doneToday.has(key)) continue;
-    additions.push({ id: `deep-${Date.now()}-${additions.length}`, kind, repo: s.repo, status: "pending", attempts: 0, createdUtc: new Date().toISOString(), updatedUtc: new Date().toISOString() });
-    if (additions.length >= 10) break;
+  const initialKindIndex = Number.isInteger(options.kindIndex)
+    ? options.kindIndex
+    : rows.length % DEEP_KINDS.length;
+  let kindIndex = ((initialKindIndex % DEEP_KINDS.length) + DEEP_KINDS.length) % DEEP_KINDS.length;
+  for (const { signal } of ranked) {
+    let selectedKind = null;
+    for (let offset = 0; offset < DEEP_KINDS.length; offset += 1) {
+      const kind = DEEP_KINDS[(kindIndex + offset) % DEEP_KINDS.length];
+      if (!occupied.has(`${signal.repo}|${kind}`)) {
+        selectedKind = kind;
+        break;
+      }
+    }
+    kindIndex += 1;
+    if (!selectedKind) continue;
+    const key = `${signal.repo}|${selectedKind}`;
+    const task = {
+      id: `deep-${now}-${additions.length}`,
+      kind: selectedKind,
+      repo: signal.repo,
+      status: "pending",
+      attempts: 0,
+      createdUtc: timestamp,
+      updatedUtc: timestamp,
+    };
+    additions.push(task);
+    occupied.add(key);
+    if (additions.length >= limit) break;
   }
+  return additions;
+}
+
+export function enqueueDeepTasks(signals, options = {}) {
+  const queuePath = options.queuePath || path.join(STATE_DIR, "queue.jsonl");
+  const existing = existsSync(queuePath)
+    ? readFileSync(queuePath, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean)
+    : [];
+  const additions = planDeepQueueAdditions(existing, signals, options);
   if (additions.length > 0) {
-    appendFileSync(queuePath, additions.map((t) => JSON.stringify(t)).join("\n") + "\n");
+    appendFileSync(queuePath, additions.map((task) => JSON.stringify(task)).join("\n") + "\n");
   }
   return additions.length;
 }
 
-async function executeDirectives(env, identity, directives, targets, audit) {
+export async function applyPatrolLabels(repo, number, labels, env = process.env, audit = {}, options = {}) {
+  const ghCall = options.gh || gh;
+  const killSwitch = options.killSwitch || killSwitchEngaged;
+  let applied = 0;
+  let skipped = false;
+  const markSkipped = () => {
+    skipped = true;
+    if (typeof audit.incident === "function") {
+      audit.incident("kill-switch", `label processing stopped on ${repo}#${number}: KILL_SWITCH engaged mid-run`);
+    }
+  };
+  for (const label of Array.isArray(labels) ? labels : []) {
+    if (killSwitch()) {
+      markSkipped();
+      break;
+    }
+    try {
+      ghCall(["api", "-X", "POST", `/repos/${repo}/issues/${number}/labels`, "-f", `labels[]=${label}`], env);
+      applied += 1;
+    } catch (addErr) {
+      // Label may not exist yet: create it (tolerate 422 = already exists),
+      // then retry the attach (tolerate 422 = already attached). Every write,
+      // including these retries, is guarded independently by the kill switch.
+      if (killSwitch()) {
+        markSkipped();
+        break;
+      }
+      try {
+        ghCall(["api", "-X", "POST", `/repos/${repo}/labels`, "-f", `name=${label}`, "-f", "color=ededed"], env);
+      } catch (createErr) {
+        if (!/422|already.?exists/i.test(String(createErr.message))) throw createErr;
+        if (typeof audit.note === "function") audit.note("label-422", `${repo}: label ${label} already exists (tolerated)`);
+      }
+      if (killSwitch()) {
+        markSkipped();
+        break;
+      }
+      try {
+        ghCall(["api", "-X", "POST", `/repos/${repo}/issues/${number}/labels`, "-f", `labels[]=${label}`], env);
+        applied += 1;
+      } catch (retryErr) {
+        if (!/422|already/i.test(String(retryErr.message))) throw retryErr;
+        if (typeof audit.note === "function") audit.note("label-422", `${repo}#${number}: label ${label} already attached (tolerated)`);
+      }
+      void addErr;
+    }
+  }
+  return { applied, skipped };
+}
+
+export async function executeDirectives(env, identity, directives, targets, audit) {
+  const scoped = fencePatrolDirectives(directives);
+  if (!scoped.ok) {
+    for (const error of scoped.errors) {
+      if (typeof audit?.incident === "function") audit.incident("scope", error);
+    }
+    return {
+      mutations: 0,
+      results: scoped.errors.map((error) => ({ kind: "scope", ok: false, error })),
+    };
+  }
   let mutations = 0;
   const results = [];
-  for (const d of directives) {
+  for (const d of scoped.directives) {
     try {
       if (d.kind === "report") {
         results.push({ kind: d.kind, ok: true, note: d.section });
@@ -195,6 +516,16 @@ async function executeDirectives(env, identity, directives, targets, audit) {
           continue;
         }
         if (d.kind === "comment") {
+          if (!reviewCommentPostingAllowed(env)) {
+            audit.note("comment-draft", `comment suppressed on ${d.repo}#${d.number} (postedComment=false)`, {
+              postedComment: false,
+              repo: d.repo,
+              target: d.target,
+              number: d.number,
+            });
+            results.push({ kind: d.kind, ok: true, postedComment: false });
+            continue;
+          }
           if (killSwitchEngaged()) {
             audit.incident("kill-switch", `comment skipped on ${d.repo}#${d.number}: KILL_SWITCH engaged mid-run`);
             results.push({ kind: d.kind, ok: true, skipped: "kill-switch" });
@@ -205,35 +536,9 @@ async function executeDirectives(env, identity, directives, targets, audit) {
           mutations += 1;
           results.push({ kind: d.kind, ok: true, commentId: created.id });
         } else {
-          if (killSwitchEngaged()) {
-            audit.incident("kill-switch", `label skipped on ${d.repo}#${d.number}: KILL_SWITCH engaged mid-run`);
-            results.push({ kind: d.kind, ok: true, skipped: "kill-switch" });
-            continue;
-          }
-          for (const label of d.labels) {
-            try {
-              gh(["api", "-X", "POST", `/repos/${d.repo}/issues/${d.number}/labels`, "-f", `labels[]=${label}`], env);
-            } catch (addErr) {
-              // Label may not exist yet: create it (tolerate 422 = already
-              // exists after a concurrent create), then retry the attach
-              // (tolerate 422 = already attached).
-              try {
-                gh(["api", "-X", "POST", `/repos/${d.repo}/labels`, "-f", `name=${label}`, "-f", "color=ededed"], env);
-              } catch (createErr) {
-                if (!/422|already.?exists/i.test(String(createErr.message))) throw createErr;
-                audit.note("label-422", `${d.repo}: label ${label} already exists (tolerated)`);
-              }
-              try {
-                gh(["api", "-X", "POST", `/repos/${d.repo}/issues/${d.number}/labels`, "-f", `labels[]=${label}`], env);
-              } catch (retryErr) {
-                if (!/422|already/i.test(String(retryErr.message))) throw retryErr;
-                audit.note("label-422", `${d.repo}#${d.number}: label ${label} already attached (tolerated)`);
-              }
-              void addErr;
-            }
-          }
-          mutations += 1;
-          results.push({ kind: d.kind, ok: true });
+          const labelResult = await applyPatrolLabels(d.repo, d.number, d.labels, env, audit);
+          if (labelResult.applied > 0) mutations += 1;
+          results.push({ kind: d.kind, ok: true, applied: labelResult.applied, ...(labelResult.skipped ? { skipped: "kill-switch" } : {}) });
         }
       } else if (d.kind === "draft_pr") {
         if (!eligible(targets, d.repo)) {
@@ -284,6 +589,14 @@ export async function main() {
   const terminal = makeTerminal(REPO_ROOT, { lane: "patrol" });
   let trigger = "manual";
   let gwRoot = process.env.FLEET_STATE_ROOT || REPO_ROOT;
+  let auditFileRel = "";
+  let statePushAttempted = false;
+  let statePushVerified = false;
+  const writePatrolAudit = (outcome) => {
+    const file = audit.writeMarkdown(AUDIT_DIR, runId, "Patrol run", outcome);
+    auditFileRel = path.relative(REPO_ROOT, file);
+    return file;
+  };
   try {
     identity = await runGate(process.env);
     configureIdentity(REPO_ROOT, identity);
@@ -312,7 +625,7 @@ export async function main() {
     }
 
     const targets = readJson(targetsPath(), { tier1: [], excluded: [], observeAll: true });
-    const seen = loadLedger(ledgerPath());
+    const seen = loadPatrolLedger(ledgerPath());
     audit.note("state", `ledger keys=${seen.size} tier1=${targets.tier1.length}`);
 
     const signals = await collectSignals(process.env, audit);
@@ -401,20 +714,26 @@ export async function main() {
       JSON.stringify({ lastRunUtc: new Date().toISOString(), runId, modelMode, reposSeen: signals.length, mutations, chainUpdatedAt: chainRev.updatedAt || null, caps: "xhigh-contributor-cap" }, null, 2),
     );
 
-    const auditFileRel = path.relative(REPO_ROOT, audit.writeMarkdown(AUDIT_DIR, runId, "Patrol run", "ok"));
     status = "ok";
     const state = status === "ok" ? "SUCCESS" : "NO-OP";
     terminal(state, { runId, modelMode, mutations, trigger });
 
-    enqueueDeepTasks(signals);
-    audit.note("deep-queue", `tasks enqueued (rotation)`);
+    const queued = enqueueDeepTasks(signals);
+    audit.note("deep-queue", `tasks enqueued=${queued} (bounded cap=${DEEP_QUEUE_CAP})`);
+    // Write once before persistence so the audit itself is included in the
+    // single state commit/push. A final write below captures post-push notes
+    // without attempting a second unsafe push.
+    writePatrolAudit(status);
 
     if (gitHasChanges(REPO_ROOT, ["state", "audit"])) {
       gitAdd(REPO_ROOT, ["state", "audit"]);
       gitCommit(REPO_ROOT, `[fleet] patrol ${runId}`, identity);
+      audit.note("push", "state push attempted once");
+      statePushAttempted = true;
       gitPush(REPO_ROOT, "main", process.env);
       const sha = gitRevParse(REPO_ROOT, "HEAD");
       await verifyCommit("M1Vj/fleet-control", sha, identity, process.env.FLEET_GH_TOKEN);
+      statePushVerified = true;
       audit.note("push-verify", `attribution verified sha=${sha.slice(0, 10)}`);
       try {
         gh(["workflow", "run", "deep.yml", "-R", "M1Vj/fleet-control", "-f", "workers=3"], process.env);
@@ -423,8 +742,8 @@ export async function main() {
         audit.note("deep-dispatch", `dispatch skipped: ${err.message.slice(0, 120)}`);
       }
     } else {
-      audit.writeMarkdown(AUDIT_DIR, runId, "Patrol run", "ok-no-changes");
       status = "ok-no-changes";
+      audit.note("persistence", "no state or audit changes detected");
     }
 
     let patrolsSince = Number(heartbeatPre.patrolsSinceSelftest || 0);
@@ -444,13 +763,15 @@ export async function main() {
         JSON.stringify({ ...(readJson(heartbeatPath(), {})), patrolsSinceSelftest: patrolsSince }, null, 2),
       );
     }
+    writePatrolAudit(status);
     console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status, modelMode, directives: directives.length, mutations, auditFile: auditFileRel })}`);
     return 0;
   } catch (err) {
     const code = err.code && Number.isInteger(err.code) ? err.code : 1;
     if (code === 5) audit.incident("fatal", err.message);
     else audit.incident("fatal", err.message);
-    audit.writeMarkdown(AUDIT_DIR, runId, "Patrol run", `failed(${err.reason || code})`);
+    const failureStatus = `failed(${err.reason || code})`;
+    writePatrolAudit(failureStatus);
     console.error(`PATROL_FAILED code=${code} reason=${err.reason || err.message}`);
     if (err.reason === "MODEL_UNAVAILABLE") {
       try {
@@ -459,24 +780,34 @@ export async function main() {
           // Surfaced, not hidden: outage still exits 6 so watchdog/alerts fire.
           audit.note("outage-skip", "circuit open; recording EXHAUSTED code=6");
           terminal("EXHAUSTED", { runId, why: "gateway-circuit-open", code: 6, trigger });
+          writePatrolAudit(failureStatus);
           console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "model-unavailable", code: 6 })}`);
           return 6;
         }
       } catch {}
     }
     terminal(err.reason === "MODEL_UNAVAILABLE" ? "EXHAUSTED" : "BLOCKED", { runId, code, trigger });
-    if (identity && gitHasChanges(REPO_ROOT, ["audit"])) {
+    if (identity && !statePushAttempted && gitHasChanges(REPO_ROOT, ["audit"])) {
       try {
         gitAdd(REPO_ROOT, ["audit"]);
         gitCommit(REPO_ROOT, `[fleet] patrol-failure-audit ${runId}`, identity);
+        audit.note("push", "failure audit push attempted once");
+        statePushAttempted = true;
         gitPush(REPO_ROOT, "main", process.env);
         const failSha = gitRevParse(REPO_ROOT, "HEAD");
         await verifyCommit("M1Vj/fleet-control", failSha, identity, process.env.FLEET_GH_TOKEN);
+        statePushVerified = true;
         audit.note("push-verify", `failure audit attribution verified sha=${failSha.slice(0, 10)}`);
-      } catch {
-        /* best-effort failure audit */
+      } catch (pushErr) {
+        audit.note("push-verify", `failure audit push skipped: ${String(pushErr.message || pushErr).slice(0, 160)}`);
       }
     }
+    if (statePushAttempted && !statePushVerified) {
+      audit.note("push-verify", "state push outcome unresolved; retry suppressed");
+    }
+    // Preserve fatal incidents and any push outcome in the final local audit;
+    // never replay the push merely to persist this note.
+    writePatrolAudit(failureStatus);
     return code;
   }
 }

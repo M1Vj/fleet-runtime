@@ -18,8 +18,8 @@ const STATE_ROOT = process.env.FLEET_STATE_ROOT || REPO_ROOT;
 const AUDIT_DIR = path.join(STATE_ROOT, "audit");
 const MERGES_PATH = path.join(STATE_ROOT, "state", "merges.jsonl");
 const TARGETS_PATH = path.join(STATE_ROOT, "state", "targets.json");
-const TARGET_REPO = process.env.FLEET_TARGET_REPO || "";
-const PR_NUMBER = Number(process.env.FLEET_PR_NUMBER || 0);
+const RAW_TARGET_REPO = process.env.FLEET_TARGET_REPO;
+const RAW_PR_NUMBER = process.env.FLEET_PR_NUMBER;
 
 const UI_EXTENSIONS = /\.(html|htm|css|scss|less|jsx|tsx|vue|svelte|astro|mdx)$/i;
 const HARD_RISK_PATTERNS = [
@@ -40,6 +40,251 @@ const SECRET_PATTERNS = [
   /BEGIN [A-Z ]*PRIVATE KEY/,
   /sk-[A-Za-z0-9]{20,}/,
 ];
+
+const REPO_REF_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const FLEET_OWNER = "m1vj";
+const POSITIVE_INTEGER_PATTERN = /^[1-9][0-9]*$/;
+const DEFAULT_SCAN_CAP = 3;
+const MAX_SCAN_CAP = 15;
+const DEFAULT_SCAN_PAGES = 3;
+const MAX_SCAN_PAGES = 5;
+const SCAN_PAGE_SIZE = 100;
+
+function isM1VjRepo(value) {
+  const repo = String(value || "").trim();
+  return REPO_REF_PATTERN.test(repo) && repo.split("/", 1)[0].toLowerCase() === FLEET_OWNER;
+}
+
+/**
+ * Parse the explicit merge target without ever coercing an invalid value into
+ * a runnable revision.  An absent target is distinct from a malformed one so
+ * scheduled scans can proceed while partial/manual inputs fail closed.
+ */
+export function parseMergeTarget(repoInput, prInput) {
+  const repoValue = typeof repoInput === "string" ? repoInput.trim() : String(repoInput ?? "").trim();
+  const prValue = typeof prInput === "string" ? prInput.trim() : String(prInput ?? "").trim();
+  const repoValid = isM1VjRepo(repoValue);
+  const prValid = POSITIVE_INTEGER_PATTERN.test(prValue);
+  const parsedPr = prValid ? Number(prValue) : 0;
+  const valid = repoValid && Number.isSafeInteger(parsedPr) && parsedPr > 0;
+  return {
+    repo: valid ? repoValue : "",
+    prNumber: valid ? parsedPr : 0,
+    valid,
+    provided: repoValue.length > 0 || prValue.length > 0,
+  };
+}
+
+/**
+ * Return the exact GitHub Actions output values used by the revision step.
+ * Invalid or incomplete targets can never produce revision_needed=true.
+ */
+export function revisionOutputValues(repoInput, prInput, revisionNeeded = false) {
+  const target = parseMergeTarget(repoInput, prInput);
+  const enabled = (revisionNeeded === true || String(revisionNeeded).toLowerCase() === "true") && target.valid;
+  return {
+    revision_needed: enabled ? "true" : "false",
+    target_valid: target.valid ? "true" : "false",
+    target_repo: target.valid ? target.repo : "",
+    pr_number: target.valid ? String(target.prNumber) : "0",
+  };
+}
+
+/** Write explicit, fail-closed revision outputs when running under Actions. */
+export function writeRevisionOutputs(outputPath, repoInput, prInput, revisionNeeded = false) {
+  const values = revisionOutputValues(repoInput, prInput, revisionNeeded);
+  if (outputPath) {
+    try {
+      appendFileSync(
+        outputPath,
+        Object.entries(values).map(([key, value]) => `${key}=${value}`).join("\n") + "\n",
+      );
+    } catch {}
+  }
+  return values;
+}
+
+/** Keep a scheduled scan bounded even when a workflow variable is malformed. */
+export function normalizeScanCap(value, fallback = DEFAULT_SCAN_CAP) {
+  const candidate = Number(value);
+  const fallbackNumber = Number(fallback);
+  const safeFallback = Number.isInteger(fallbackNumber) && fallbackNumber > 0
+    ? Math.min(MAX_SCAN_CAP, fallbackNumber)
+    : DEFAULT_SCAN_CAP;
+  if (!Number.isFinite(candidate)) return safeFallback;
+  return Math.min(MAX_SCAN_CAP, Math.max(1, Math.floor(candidate)));
+}
+
+function normalizeScanPages(value, fallback = DEFAULT_SCAN_PAGES) {
+  const candidate = Number(value);
+  const fallbackNumber = Number(fallback);
+  const safeFallback = Number.isInteger(fallbackNumber) && fallbackNumber > 0
+    ? Math.min(MAX_SCAN_PAGES, fallbackNumber)
+    : DEFAULT_SCAN_PAGES;
+  if (!Number.isFinite(candidate)) return safeFallback;
+  return Math.min(MAX_SCAN_PAGES, Math.max(1, Math.floor(candidate)));
+}
+
+/** Build a page URL with exactly one bounded page/per_page pair. */
+export function buildScanPageEndpoint(endpoint, page, perPage = SCAN_PAGE_SIZE) {
+  const base = String(endpoint || "").replace(/([?&])(?:page|per_page)=[^&]*/g, "").replace(/[?&]$/, "");
+  const separator = base.includes("?") ? "&" : "?";
+  return `${base}${separator}page=${Math.max(1, Math.floor(Number(page) || 1))}&per_page=${Math.max(1, Math.floor(Number(perPage) || SCAN_PAGE_SIZE))}`;
+}
+
+/**
+ * Collect a finite number of API pages.  The fetcher is injected so this
+ * boundary remains unit-testable without a network or credential.
+ */
+export function collectScanPages(fetchPage, { maxPages = DEFAULT_SCAN_PAGES, perPage = SCAN_PAGE_SIZE } = {}) {
+  if (typeof fetchPage !== "function") return [];
+  const pages = normalizeScanPages(maxPages);
+  const pageSize = Math.max(1, Math.floor(Number(perPage) || SCAN_PAGE_SIZE));
+  const rows = [];
+  for (let page = 1; page <= pages; page += 1) {
+    let batch;
+    try {
+      batch = fetchPage(page, pageSize);
+    } catch {
+      break;
+    }
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    rows.push(...batch);
+    if (batch.length < pageSize) break;
+  }
+  return rows;
+}
+
+function repoReference(value) {
+  const repo = String(value || "").trim();
+  return isM1VjRepo(repo) ? repo : "";
+}
+
+function bareRepoName(repo) {
+  return String(repo || "").split("/").at(-1) || "";
+}
+
+function targetListContains(list, repo) {
+  const full = String(repo || "").toLowerCase();
+  const bare = bareRepoName(repo).toLowerCase();
+  if (!full) return false;
+  if (Array.isArray(list)) {
+    return list.some((entry) => {
+      const value = typeof entry === "string" ? entry : entry && (entry.full_name || entry.fullName || entry.repo || entry.name);
+      const normalized = String(value || "").trim().toLowerCase();
+      return normalized === full || normalized === bare;
+    });
+  }
+  if (list && typeof list === "object") {
+    return Object.entries(list).some(([entry, enabled]) => {
+      const normalized = String(entry || "").trim().toLowerCase();
+      return enabled !== false && (normalized === full || normalized === bare);
+    });
+  }
+  return false;
+}
+
+function isScanEnrolled(targets, repo, metadata = {}) {
+  if (!targets || typeof targets !== "object" || !isM1VjRepo(repo)) return false;
+  if (metadata.archived === true || metadata.fork === true || metadata.disabled === true) return false;
+  if (targetListContains(targets.excluded, repo)) return false;
+  if (targets.allOwned === true || targets.observeAll === true) return true;
+  return targetListContains(targets.tier1, repo) ||
+    targetListContains(targets.enrolled, repo) ||
+    targetListContains(targets.repositories, repo);
+}
+
+function pullRepo(pull) {
+  return repoReference(
+    pull && (pull.repo || pull.repoFullName || pull.repository?.full_name || pull.repository?.fullName || pull.base?.repo?.full_name || pull.base?.repo?.fullName),
+  );
+}
+
+function pullNumber(pull) {
+  const raw = pull && (pull.number ?? pull.pr ?? pull.pullRequest?.number ?? pull.pull_request?.number);
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+function parseTimestamp(value, fallback) {
+  const parsed = Date.parse(String(value || ""));
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function latestVisitTime(pull, history) {
+  const repo = pullRepo(pull).toLowerCase();
+  const number = pullNumber(pull);
+  let latest = 0;
+  for (const entry of Array.isArray(history) ? history : []) {
+    const entryRepo = String(entry?.repo || entry?.repository || entry?.repoFullName || "").trim().toLowerCase();
+    const entryNumber = Number(entry?.pr ?? entry?.number ?? entry?.prNumber);
+    if (entryRepo !== repo || (Number.isSafeInteger(entryNumber) && entryNumber > 0 && entryNumber !== number)) continue;
+    for (const value of [
+      entry.lastSelectedAt,
+      entry.selectedAt,
+      entry.lastVisitedAt,
+      entry.visitedAt,
+      entry.lastRunAt,
+      entry.at,
+      entry.t,
+    ]) {
+      const timestamp = parseTimestamp(value, Number.NaN);
+      if (Number.isFinite(timestamp) && timestamp > latest) latest = timestamp;
+    }
+  }
+  return latest;
+}
+
+function scanPullSortKey(pull, history) {
+  const created = parseTimestamp(pull?.created_at || pull?.createdAt || pull?.opened_at || pull?.openedAt, Number.POSITIVE_INFINITY);
+  const visited = latestVisitTime(pull, history);
+  const updated = parseTimestamp(pull?.updated_at || pull?.updatedAt || pull?.last_updated_at || pull?.lastUpdatedAt, Number.POSITIVE_INFINITY);
+  return [created, visited, updated, pullRepo(pull).toLowerCase(), pullNumber(pull)];
+}
+
+function compareScanPulls(a, b, history) {
+  const left = scanPullSortKey(a, history);
+  const right = scanPullSortKey(b, history);
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] < right[index]) return -1;
+    if (left[index] > right[index]) return 1;
+  }
+  return 0;
+}
+
+/**
+ * Filter and fairly order scan candidates.  Discovery is intentionally broad
+ * (including user-authored and ready PRs); targeted merge gates retain the
+ * existing author, tier, CI, judge, and SHA mutation fences.
+ */
+export function selectScanPullRequests(pulls, { targets, limit = DEFAULT_SCAN_CAP, history = [], repositories = [] } = {}) {
+  const cap = normalizeScanCap(limit);
+  const repositoryMap = new Map();
+  for (const repository of Array.isArray(repositories) ? repositories : []) {
+    const repo = repoReference(repository?.full_name || repository?.fullName || repository?.repo);
+    if (repo) repositoryMap.set(repo.toLowerCase(), repository);
+  }
+  const selected = [];
+  const seen = new Set();
+  for (const pull of Array.isArray(pulls) ? pulls : []) {
+    if (String(pull?.state || "open").toLowerCase() !== "open") continue;
+    const repo = pullRepo(pull);
+    const number = pullNumber(pull);
+    if (!repo || number === 0) continue;
+    const metadata = repositoryMap.get(repo.toLowerCase()) || pull.repository || pull.base?.repo || {};
+    if (!isScanEnrolled(targets, repo, metadata)) continue;
+    const key = `${repo.toLowerCase()}#${number}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    selected.push({ ...pull, repo, number });
+  }
+  selected.sort((a, b) => compareScanPulls(a, b, history));
+  return selected.slice(0, cap);
+}
+
+const INITIAL_TARGET = parseMergeTarget(RAW_TARGET_REPO, RAW_PR_NUMBER);
+const TARGET_REPO = INITIAL_TARGET.repo;
+const PR_NUMBER = INITIAL_TARGET.prNumber;
 
 export function classify(files) {
   const reasons = [];
@@ -110,6 +355,16 @@ export function killSwitchEngaged() {
   } catch {
     return false;
   }
+}
+
+/** Return false and record the stop whenever a mutation is about to run. */
+export function mutationAllowed(action, audit) {
+  if (!killSwitchEngaged()) return true;
+  const label = String(action || "mutation");
+  if (audit && typeof audit.incident === "function") {
+    audit.incident("kill-switch", `${label} skipped: KILL_SWITCH engaged`);
+  }
+  return false;
 }
 
 export function readTargets() {
@@ -198,6 +453,7 @@ export async function postCommentOnce(repo, number, marker, body, audit, env = p
       return null;
     }
   } catch {}
+  if (!mutationAllowed(`comment ${repo}#${number}`, audit)) return null;
   const c = gh(["api", "-X", "POST", `/repos/${repo}/issues/${number}/comments`, "-F", `body=${marker}\n\n${body}`], env);
   const user = gh(["api", `/repos/${repo}/issues/comments/${c.id}`], env);
   if ((user.user && user.user.login) !== "M1Vj") throw new Error("comment attribution mismatch");
@@ -236,6 +492,17 @@ async function getPr() {
   return { pr, files };
 }
 
+/** A test command is green only when it exits normally with status zero. */
+export function classifyTestResult(result = {}) {
+  const status = result && result.status;
+  if (status === 0) return { ok: true, exitCode: 0, why: "passed" };
+  const exitCode = Number.isInteger(status) ? status : null;
+  const reason = exitCode === null
+    ? (result && result.signal ? `signal=${String(result.signal)}` : "no-exit-status")
+    : `exit=${exitCode}`;
+  return { ok: false, exitCode, why: `failed (${reason})` };
+}
+
 async function runDeterministicChecks(repo, headSha, audit) {
   const evidenceLines = [];
   const workdir = path.join(mkdtempSync(path.join(tmpdir(), "pr-checkout-")), "repo");
@@ -267,9 +534,18 @@ async function runDeterministicChecks(repo, headSha, audit) {
         evidenceLines.push(`npm run build: exit=${b.status}`);
         if (b.status !== 0) return { ok: false, evidence: evidenceLines.join("\n") + `\n${String(b.stderr).slice(-600)}` };
       }
-      if (scripts.test) {
-        const t = spawnSync("bash", ["-lc", `${scripts.test} || true`], { cwd: workdir, encoding: "utf8", timeout: 420000, env: sanitizedExecEnv(process.env) });
-        evidenceLines.push(`npm test: ran (exit=${t.status}, non-blocking per repo config)`);
+      if (Object.prototype.hasOwnProperty.call(scripts, "test")) {
+        const testScript = typeof scripts.test === "string" ? scripts.test.trim() : "";
+        if (!testScript) {
+          evidenceLines.push("npm test: configured but empty");
+          return { ok: false, evidence: evidenceLines.join("\n") };
+        }
+        const t = spawnSync("bash", ["-lc", testScript], { cwd: workdir, encoding: "utf8", timeout: 420000, env: sanitizedExecEnv(process.env) });
+        const testVerdict = classifyTestResult(t);
+        evidenceLines.push(`npm test: ${testVerdict.why}`);
+        if (!testVerdict.ok) {
+          return { ok: false, evidence: evidenceLines.join("\n") + `\n${String(t.stderr || t.stdout || "").slice(-600)}` };
+        }
       }
     } else {
       evidenceLines.push("package.json without scripts; skipped build/test");
@@ -281,6 +557,7 @@ async function runDeterministicChecks(repo, headSha, audit) {
 }
 
 async function postComment(repo, number, body, audit) {
+  if (!mutationAllowed(`comment ${repo}#${number}`, audit)) return null;
   const c = gh(["api", "-X", "POST", `/repos/${repo}/issues/${number}/comments`, "-F", `body=${body}`], process.env);
   const user = gh(["api", `/repos/${repo}/issues/comments/${c.id}`], process.env);
   if ((user.user && user.user.login) !== "M1Vj") throw new Error("comment attribution mismatch");
@@ -300,10 +577,7 @@ async function recordTerminalState(state, details) {
   }
 
 async function runHygiene(identity, audit) {
-  if (killSwitchEngaged()) {
-    audit.incident("kill-switch", "hygiene skipped: KILL_SWITCH engaged (no closes, no comments)");
-    return 0;
-  }
+  if (!mutationAllowed("hygiene", audit)) return 0;
   const repos = gh(["api", "/user/repos?affiliation=owner&per_page=100&sort=pushed"], process.env) || [];
   const entries = [];
   for (const r of repos) {
@@ -319,7 +593,9 @@ async function runHygiene(identity, audit) {
   const now = Date.now();
   for (const sup of findSuperseded(entries, now)) {
     try {
+      if (!mutationAllowed(`hygiene comment ${sup.repo}#${sup.number}`, audit)) continue;
       await postComment(sup.repo, sup.number, `♻️ **fleet hygiene**: superseded by #${sup.supersededBy} (overlapping files). Closing this draft; reopen if still relevant.`, audit);
+      if (!mutationAllowed(`hygiene close ${sup.repo}#${sup.number}`, audit)) continue;
       gh(["api", "-X", "PATCH", `/repos/${sup.repo}/pulls/${sup.number}`, "-f", "state=closed"], process.env);
       await recordTerminalState("STALLED", { repo: sup.repo, pr: sup.number, why: "superseded", by: sup.supersededBy });
       audit.note("hygiene", `closed superseded ${sup.repo}#${sup.number}`);
@@ -330,7 +606,9 @@ async function runHygiene(identity, audit) {
   for (const e of entries) {
     if (!isStale(e, now)) continue;
     try {
+      if (!mutationAllowed(`hygiene comment ${e.repo}#${e.number}`, audit)) continue;
       await postComment(e.repo, e.number, "🕰 **fleet hygiene**: this draft has been open 14+ days without action. Closing to keep the queue honest — reopen if still relevant.", audit);
+      if (!mutationAllowed(`hygiene close ${e.repo}#${e.number}`, audit)) continue;
       gh(["api", "-X", "PATCH", `/repos/${e.repo}/pulls/${e.number}`, "-f", "state=closed"], process.env);
       await recordTerminalState("STALLED", { repo: e.repo, pr: e.number, why: "stale-14d" });
       audit.note("hygiene", `closed stale ${e.repo}#${e.number}`);
@@ -340,22 +618,34 @@ async function runHygiene(identity, audit) {
   }
 }
 
-async function discoverFleetPRs(limit = 3) {
-  const repos = gh(["api", "/user/repos?affiliation=owner&per_page=100&sort=pushed"], process.env) || [];
-  const found = [];
-  for (const r of repos) {
-    if (found.length >= limit) break;
+export async function discoverFleetPRs(limit = process.env.FLEET_MERGE_SCAN_CAP || DEFAULT_SCAN_CAP, options = {}) {
+  const targets = options.targets || readTargets();
+  const scanCap = normalizeScanCap(limit);
+  const maxPages = normalizeScanPages(options.maxPages ?? process.env.FLEET_MERGE_SCAN_MAX_PAGES);
+  const pageSize = Math.min(100, Math.max(1, Math.floor(Number(options.perPage || SCAN_PAGE_SIZE) || SCAN_PAGE_SIZE)));
+  const fetchPages = (endpoint) => collectScanPages(
+    (page, perPage) => gh(["api", buildScanPageEndpoint(endpoint, page, perPage)], process.env),
+    { maxPages, perPage: pageSize },
+  );
+
+  const repos = fetchPages("/user/repos?affiliation=owner&sort=pushed");
+  const pulls = [];
+  for (const repository of repos) {
+    const repo = repoReference(repository?.full_name || repository?.fullName || repository?.repo);
+    if (!repo || repository.archived === true || repository.fork === true || !isScanEnrolled(targets, repo, repository)) continue;
     try {
-      const pulls = gh(["api", `/repos/${r.full_name}/pulls?state=open&sort=created&direction=asc&per_page=20`], process.env) || [];
-      for (const p of pulls) {
-        if (p.draft && p.user && p.user.login === "M1Vj" && String(p.head.ref || "").startsWith("fleet/")) {
-          found.push({ repo: r.full_name, number: p.number });
-          if (found.length >= limit) break;
-        }
+      for (const pull of fetchPages(`/repos/${repo}/pulls?state=open&sort=created&direction=asc`)) {
+        pulls.push({ ...pull, repo: pullRepo(pull) || repo });
       }
     } catch {}
   }
-  return found;
+
+  return selectScanPullRequests(pulls, {
+    targets,
+    limit: scanCap,
+    history: options.history || [],
+    repositories: repos,
+  });
 }
 
 async function main() {
@@ -373,14 +663,22 @@ async function main() {
     if (!process.env.FLEET_GH_USER) process.env.FLEET_GH_USER = identity.login;
   }
   audit.note("gate", `identity=${identity.login} target=${TARGET_REPO} pr=${PR_NUMBER}`);
+  writeRevisionOutputs(process.env.GITHUB_OUTPUT, TARGET_REPO, PR_NUMBER, false);
 
-  if (!TARGET_REPO || !PR_NUMBER) {
-    const queue = await discoverFleetPRs(3);
-    audit.note("scan", `fleet draft PRs queued: ${queue.map((q) => `${q.repo}#${q.number}`).join(", ") || "none"}`);
+  if (!INITIAL_TARGET.valid && INITIAL_TARGET.provided) {
+    audit.note("target", "invalid or incomplete target; scan and revision both refused");
+    await recordTerminalState("NO-OP", { why: "invalid-target" });
+    console.log("MERGE_TERMINAL_STATE=NO-OP");
+    return finish(audit, runId, "NO-OP");
+  }
+
+  if (!INITIAL_TARGET.valid) {
+    const queue = await discoverFleetPRs(process.env.FLEET_MERGE_SCAN_CAP || DEFAULT_SCAN_CAP);
+    audit.note("scan", `enrolled open PRs queued: ${queue.map((q) => `${q.repo}#${q.number}`).join(", ") || "none"}`);
     if (queue.length === 0) {
       console.log("MERGE_TERMINAL_STATE=NO-OP (nothing to gate)");
       writeMergeState("NO-OP", { why: "scan-empty" });
-      return;
+      return finish(audit, runId, "NO-OP");
     }
     mkdirSync(AUDIT_DIR, { recursive: true });
     for (const item of queue) {
@@ -603,11 +901,7 @@ async function main() {
       }
     }
     if (fleetAuthored && process.env.GITHUB_OUTPUT) {
-      try {
-        appendFileSync(process.env.GITHUB_OUTPUT, "revision_needed=true\n");
-        appendFileSync(process.env.GITHUB_OUTPUT, `target_repo=${TARGET_REPO}\n`);
-        appendFileSync(process.env.GITHUB_OUTPUT, `pr_number=${PR_NUMBER}\n`);
-      } catch {}
+      writeRevisionOutputs(process.env.GITHUB_OUTPUT, TARGET_REPO, PR_NUMBER, true);
       await recordTerminalState("REVISION_QUEUED", { repo: TARGET_REPO, pr: PR_NUMBER, sha: evalSha, why: "judges rejected; revision queued" });
       console.log("MERGE_TERMINAL_STATE=REVISION_QUEUED");
       return finish(audit, runId, "REVISION_QUEUED");

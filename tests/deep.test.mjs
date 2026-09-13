@@ -3,10 +3,15 @@ import assert from "node:assert/strict";
 
 import {
   CLAIM_MAX_ATTEMPTS,
+  DEFAULT_MAX_WORKERS,
+  MAX_WORKERS,
   applyArtifactToQueue,
+  applyPlannedArtifacts,
   claimTask,
+  planTasks,
   parseFindingsWithRepair,
   reportArtifactName,
+  sanitizeMaxWorkers,
   isValidArtifactIdentity,
   isValidArtifactDocument,
 } from "../scripts/deep.mjs";
@@ -127,4 +132,124 @@ test("artifact documents reject malformed findings before publication", () => {
   assert.equal(isValidArtifactDocument({ ...base, exitCode: "6" }), false);
   assert.equal(isValidArtifactDocument({ ...base, verdict: "" }), false);
   assert.equal(isValidArtifactDocument({ ...base, finishedUtc: "2020-01-01T00:00:00Z" }), false);
+});
+
+test("worker limits default safely and clamp strict numeric input to the hard cap", () => {
+  assert.equal(DEFAULT_MAX_WORKERS, 6);
+  assert.equal(MAX_WORKERS, 15);
+  assert.equal(sanitizeMaxWorkers(undefined), DEFAULT_MAX_WORKERS);
+  assert.equal(sanitizeMaxWorkers(""), DEFAULT_MAX_WORKERS);
+  assert.equal(sanitizeMaxWorkers("0"), DEFAULT_MAX_WORKERS);
+  assert.equal(sanitizeMaxWorkers(" 9 "), 9);
+  assert.equal(sanitizeMaxWorkers("99"), MAX_WORKERS);
+  assert.equal(sanitizeMaxWorkers("999999999999999999999999"), MAX_WORKERS);
+  assert.equal(sanitizeMaxWorkers("3x"), DEFAULT_MAX_WORKERS);
+});
+
+test("planning claims stale work, blocks exhausted work, and never picks duplicate repo-kind tasks", () => {
+  const now = Date.parse("2026-09-13T00:00:00.000Z");
+  const stale = new Date(now - 41 * 60 * 1000).toISOString();
+  const queue = [
+    { id: "pending-1", repo: "M1Vj/a", kind: "code-review", status: "pending", attempts: 0 },
+    { id: "pending-duplicate", repo: "M1Vj/a", kind: "code-review", status: "pending", attempts: 0 },
+    { id: "stale-1", repo: "M1Vj/b", kind: "docs-audit", status: "in_progress", attempts: 1, updatedUtc: stale },
+    { id: "exhausted", repo: "M1Vj/c", kind: "redteam", status: "pending", attempts: CLAIM_MAX_ATTEMPTS },
+  ];
+
+  const plan = planTasks(queue, 15, { now, runId: "deep-run-1" });
+
+  assert.deepEqual(plan.worker.map((task) => task.id), ["stale-1", "pending-1"]);
+  assert.equal(new Set(plan.worker.map((task) => `${task.repo}|${task.kind}`)).size, plan.worker.length);
+  assert.equal(plan.worker.every((task) => task.status === "in_progress" && task.claimRunId === "deep-run-1"), true);
+  assert.equal(queue.find((task) => task.id === "stale-1").attempts, 2);
+  assert.equal(queue.find((task) => task.id === "exhausted").status, "blocked");
+});
+
+test("a second plan does not pick tasks already claimed by the first run", () => {
+  const now = Date.parse("2026-09-13T00:00:00.000Z");
+  const queue = [
+    { id: "one", repo: "M1Vj/a", kind: "code-review", status: "pending", attempts: 0 },
+    { id: "two", repo: "M1Vj/b", kind: "docs-audit", status: "pending", attempts: 0 },
+  ];
+
+  const first = planTasks(queue, 1, { now, runId: "deep-run-1" });
+  const second = planTasks(queue, 1, { now: now + 1, runId: "deep-run-2" });
+
+  assert.deepEqual(first.worker.map((task) => task.id), ["one"]);
+  assert.deepEqual(second.worker.map((task) => task.id), ["two"]);
+  assert.equal(queue.find((task) => task.id === "one").claimRunId, "deep-run-1");
+  assert.equal(queue.find((task) => task.id === "two").claimRunId, "deep-run-2");
+});
+
+test("successful sibling artifacts apply even when another selected task fails or is missing", () => {
+  const now = Date.parse("2026-09-13T00:00:00.000Z");
+  const initialQueue = [
+    { id: "one", repo: "M1Vj/a", kind: "code-review", status: "pending", attempts: 0 },
+    { id: "two", repo: "M1Vj/b", kind: "docs-audit", status: "pending", attempts: 0 },
+  ];
+  const planningQueue = structuredClone(initialQueue);
+  const plan = planTasks(planningQueue, 2, { now, runId: "deep-run-1" });
+  const queue = structuredClone(initialQueue);
+  const summary = applyPlannedArtifacts(queue, plan, [
+    {
+      taskId: "one",
+      repo: "M1Vj/a",
+      kind: "code-review",
+      claimRunId: "deep-run-1",
+      claimAttempt: 1,
+      findings: [],
+      verdict: "ok",
+      modelMode: "muse",
+      finishedUtc: new Date(now).toISOString(),
+      exitCode: 0,
+    },
+    {
+      taskId: "two",
+      repo: "M1Vj/b",
+      kind: "docs-audit",
+      claimRunId: "deep-run-1",
+      claimAttempt: 1,
+      findings: [],
+      verdict: "deferred",
+      modelMode: "output-rejected",
+      finishedUtc: new Date(now).toISOString(),
+      exitCode: 5,
+    },
+  ], { now, updatedUtc: new Date(now).toISOString() });
+
+  assert.equal(queue.find((task) => task.id === "one").status, "done");
+  assert.equal(queue.find((task) => task.id === "two").status, "pending");
+  assert.equal(summary.succeeded, 1);
+  assert.equal(summary.retryable, 1);
+  assert.equal(summary.missing, 0);
+});
+
+test("missing selected artifacts stay retryable while completed siblings remain done", () => {
+  const now = Date.parse("2026-09-13T00:00:00.000Z");
+  const initialQueue = [
+    { id: "one", repo: "M1Vj/a", kind: "code-review", status: "pending", attempts: 0 },
+    { id: "two", repo: "M1Vj/b", kind: "docs-audit", status: "pending", attempts: 0 },
+  ];
+  const plan = planTasks(structuredClone(initialQueue), 2, { now, runId: "deep-run-1" });
+  const queue = structuredClone(initialQueue);
+  const summary = applyPlannedArtifacts(queue, plan, [
+    {
+      taskId: "one",
+      repo: "M1Vj/a",
+      kind: "code-review",
+      claimRunId: "deep-run-1",
+      claimAttempt: 1,
+      findings: [],
+      verdict: "ok",
+      modelMode: "muse",
+      finishedUtc: new Date(now).toISOString(),
+      exitCode: 0,
+    },
+  ], { now, updatedUtc: new Date(now).toISOString() });
+
+  assert.equal(queue.find((task) => task.id === "one").status, "done");
+  assert.equal(queue.find((task) => task.id === "two").status, "pending");
+  assert.equal(summary.succeeded, 1);
+  assert.equal(summary.retryable, 1);
+  assert.equal(summary.missing, 1);
 });

@@ -17,6 +17,9 @@ jobs:
   refresh:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      group: fleet-state-writer
+      cancel-in-progress: false
     env:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
@@ -44,11 +47,14 @@ jobs:
         run: node scripts/model-refresh.mjs
       - name: commit chain override to fleet-control
         run: |
-          cd state-control
-          git config user.name "M1Vj"
-          git config user.email "M1Vj@users.noreply.github.com"
-          git add state/model-chain.json state/events.jsonl || true
-          git diff --cached --quiet && echo "no chain changes" && exit 0
-          git commit -m "[fleet] model chain refresh"
-          git remote set-url origin "https://x-access-token:${FLEET_GH_TOKEN}@github.com/M1Vj/fleet-control.git"
-          git push origin HEAD:main
+          node --input-type=module <<'NODE'
+          import { safeCommitState } from "./scripts/lib/util.mjs";
+          const outcome = safeCommitState(
+            "state-control",
+            ["state/model-chain.json", "state/events.jsonl"],
+            "[fleet] model chain refresh",
+            { name: "M1Vj", noreply: "M1Vj@users.noreply.github.com" },
+            process.env,
+          );
+          console.log(`model refresh state=${outcome}`);
+          NODE

@@ -10,6 +10,21 @@ import { verifyCommit, verifyIssueAuthor } from "./lib/verify.mjs";
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
 
+export const STOP_WORKFLOWS = Object.freeze([
+  "patrol.yml",
+  "watchdog.yml",
+  "selftest.yml",
+  "deep.yml",
+  "improve.yml",
+  "thesis.yml",
+  "kb.yml",
+  "retro.yml",
+  "orchestrate.yml",
+  "merge.yml",
+  "model-refresh.yml",
+  "ci-diag.yml",
+]);
+
 export async function main() {
   const runId = `stop-${Date.now()}`;
   const redact = scrub(process.env);
@@ -31,7 +46,7 @@ export async function main() {
     audit.note("kill-switch", `committed sha=${sha.slice(0, 10)}`);
 
     for (const repoFullName of ["M1Vj/fleet-runtime", "M1Vj/fleet-control"]) {
-      for (const wf of ["patrol.yml", "watchdog.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml"]) {
+      for (const wf of STOP_WORKFLOWS) {
         try {
           gh(["api", "-X", "PUT", `/repos/${repoFullName}/actions/workflows/${wf}/disable`], process.env);
           audit.note("disable", `${repoFullName}/${wf} disabled`);
@@ -48,7 +63,7 @@ export async function main() {
       [
         "api", "-X", "POST", "/repos/M1Vj/fleet-control/issues",
         "-f", `title=[EMERGENCY STOP] engaged run ${runId}`,
-        "-f", `body=Kill switch committed (${sha.slice(0, 10)}) and patrol/watchdog/selftest workflows disabled.\nRe-arm procedure is in docs/RUNBOOK.md.`,
+        "-f", `body=Kill switch committed (${sha.slice(0, 10)}). Disabled workflows: ${STOP_WORKFLOWS.join(", ")} (on both repositories).\nRe-arm procedure is in docs/RUNBOOK.md.`,
       ],
       process.env,
     );

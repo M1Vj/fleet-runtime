@@ -10,10 +10,17 @@ import { askModel, askModelResilient } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor, verifyCommentAuthor } from "./lib/verify.mjs";
 import { makeTerminal } from "./lib/terminal.mjs";
 import { isSafeRepoPath, sanitizeControlChars, extractJsonObject, firstBalancedObject, harvestFencedFiles } from "./lib/directives.mjs";
+import { scoreRepository, weightedSampleWithoutReplacement } from "./lib/fleet-scheduler.mjs";
 
 const CODE_ROOT = process.cwd();
 const REPO_ROOT = process.env.FLEET_STATE_ROOT ? path.resolve(process.env.FLEET_STATE_ROOT) : CODE_ROOT;
 const STATE_PATH = path.join(REPO_ROOT, "state", "improve-state.json");
+const MAX_SELECTION_HISTORY = 300;
+const MAX_TOP_K = 15;
+const DEFAULT_REPO_OWNER = "M1Vj";
+const REPO_REF_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const IDEA_MAX_COUNT = 5;
+const IDEA_IMPACTS = new Set(["high", "medium", "low"]);
 
 function readJson(p, fallback) {
   if (!existsSync(p)) return fallback;
@@ -24,26 +31,109 @@ function readJson(p, fallback) {
   }
 }
 
-export function rankRepos(repos) {
-  const now = Date.now();
-  return repos
-    .map((r) => {
-      const ageDays = (now - new Date(r.pushed_at).getTime()) / 86400000;
-      const recency = Math.max(0, 30 - Math.min(30, ageDays));
-      const activity = r.open_issues_count || 0;
-      return { full_name: r.full_name, pushed_at: r.pushed_at, score: recency * 2 + activity };
+function repoName(repo) {
+  return String(repo?.full_name || repo?.fullName || repo?.name || "").trim();
+}
+
+export function selectionHistoryFromState(state) {
+  if (!state || typeof state !== "object") return [];
+  const direct = Array.isArray(state.selectionHistory) ? state.selectionHistory : [];
+  const runs = Array.isArray(state.runs) ? state.runs : [];
+  const legacy = [];
+  for (const run of runs) {
+    const repos = run && run.repos && typeof run.repos === "object" ? run.repos : {};
+    for (const repo of Object.keys(repos)) legacy.push({ repo, selectedAt: run.utc || run.at || run.timestamp });
+    for (const repo of Array.isArray(run?.selectedRepos) ? run.selectedRepos : []) {
+      if (typeof repo === "string" && repo.trim()) legacy.push({ repo: repo.trim(), selectedAt: run.utc || run.at || run.timestamp });
+    }
+  }
+  const seen = new Set();
+  return [...direct, ...legacy].filter((entry) => {
+    if (!entry || typeof entry !== "object") return false;
+    const key = `${String(entry.repo || entry.repository || "").trim()}|${String(entry.selectedAt || entry.selected_at || entry.at || "")}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return Boolean(key.split("|")[0]);
+  });
+}
+
+export function rankRepos(repos, options = {}) {
+  const now = options.now ?? Date.now();
+  const history = Array.isArray(options.history) ? options.history : [];
+  return (Array.isArray(repos) ? repos : [])
+    .filter((repo) => repo && repo.archived !== true && repo.fork !== true)
+    .map((repo) => {
+      const score = scoreRepository(repo, { ...options, history, now });
+      return {
+        ...repo,
+        full_name: repoName(repo),
+        score,
+      };
     })
-    .sort((a, b) => b.score - a.score);
+    .filter((repo) => repo.full_name && repo.score > 0)
+    .sort((a, b) => (b.score - a.score) || a.full_name.localeCompare(b.full_name));
+}
+
+export function resolveRequestedRepo(repos, requestedRepo, owner = DEFAULT_REPO_OWNER) {
+  const target = String(requestedRepo ?? "").trim();
+  if (!target) return null;
+  if (!REPO_REF_RE.test(target)) throw new Error("invalid repo target");
+  const expectedOwner = String(owner || DEFAULT_REPO_OWNER).trim();
+  if (target.split("/")[0] !== expectedOwner) throw new Error("foreign repo target");
+  const match = (Array.isArray(repos) ? repos : []).find((repo) => repoName(repo) === target);
+  if (!match || match.archived === true || match.fork === true || target === expectedOwner + "/fleet-control") {
+    throw new Error("repo target unavailable");
+  }
+  return match;
+}
+
+export function selectImprovementRepos(repos, options = {}) {
+  const topK = Math.min(MAX_TOP_K, Math.max(0, Math.floor(Number(options.topK ?? options.top_k ?? 2) || 0)));
+  const requestedRepo = options.requestedRepo ?? options.requested_repo;
+  const exact = resolveRequestedRepo(repos, requestedRepo, options.owner || DEFAULT_REPO_OWNER);
+  if (exact) {
+    const rankedExact = rankRepos([exact], options)[0];
+    if (!rankedExact) throw new Error("repo target ineligible");
+    return [{ ...rankedExact, weight: rankedExact.score }];
+  }
+  if (topK === 0) return [];
+  const ranked = rankRepos(repos, options);
+  const rows = ranked.map((repo) => ({
+    ...repo,
+    weight: repo.score,
+  }));
+  const sampled = weightedSampleWithoutReplacement(rows, topK, options.rng || Math.random);
+  return sampled.map((repo) => ({ ...repo }));
 }
 
 async function modePick(audit) {
   const identity = await runGate(process.env);
   configureIdentity(REPO_ROOT, identity);
   const repos = gh(["api", "/user/repos?affiliation=owner&per_page=100&sort=pushed"], process.env) || [];
-  const topK = Number(process.env.FLEET_TOP_K || 2);
-  const ranked = rankRepos(repos.filter((r) => !r.archived && r.full_name !== "M1Vj/fleet-control")).slice(0, topK);
-  audit.note("pick", ranked.map((r) => `${r.full_name}(${r.score})`).join(", "));
-  console.log(`IMPROVE_MATRIX=${JSON.stringify({ repo: ranked.map((r) => r.full_name) })}`);
+  const state = readJson(STATE_PATH, { runs: [], selectionHistory: [] });
+  const history = selectionHistoryFromState(state);
+  const topK = Math.min(MAX_TOP_K, Math.max(0, Number(process.env.FLEET_TOP_K || 2) || 0));
+  const candidates = repos.filter((r) => r.full_name !== "M1Vj/fleet-control");
+  const selected = selectImprovementRepos(candidates, {
+    history,
+    topK,
+    rng: Math.random,
+    requestedRepo: process.env.FLEET_REPO,
+  });
+  const selectedAt = new Date().toISOString();
+  const selection = {
+    runId: process.env.GITHUB_RUN_ID || process.env.GITHUB_RUN_NUMBER || undefined,
+    selectedAt,
+    selected: selected.map((repo) => ({ repo: repo.full_name, score: repo.score })),
+  };
+  const outDir = process.env.FLEET_ARTIFACT_DIR;
+  if (outDir) {
+    mkdirSync(outDir, { recursive: true });
+    const suffix = String(selection.runId || Date.now()).replace(/[^A-Za-z0-9_-]/g, "-");
+    writeFileSync(path.join(outDir, `selection-${suffix}.json`), JSON.stringify(selection, null, 2));
+  }
+  audit.note("pick", selected.map((r) => `${r.full_name}(${r.score})`).join(", "));
+  console.log(`IMPROVE_MATRIX=${JSON.stringify({ repo: selected.map((r) => r.full_name) })}`);
   return 0;
 }
 
@@ -109,9 +199,20 @@ async function modeResearch(audit) {
     }
     throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });
   }
+  let ideas;
+  try {
+    ideas = salvageIdeas(result.reply);
+  } catch (err) {
+    audit.note("research", `repo=${repo} invalid ideas; skipped (${String(err.message || err).slice(0, 120)})`);
+    console.log(`IMPROVE_SKIPPED=invalid-ideas:${repo}`);
+    return 0;
+  }
   const outDir = process.env.FLEET_ARTIFACT_DIR || ".";
   mkdirSync(outDir, { recursive: true });
-  writeFileSync(path.join(outDir, `ideas-${repo.replace("/", "__")}.json`), JSON.stringify({ repo, reply: result.reply }, null, 2));
+  writeFileSync(
+    path.join(outDir, `ideas-${repo.replace("/", "__")}.json`),
+    JSON.stringify({ repo, ideas, reply: result.reply, validatedAt: new Date().toISOString() }, null, 2),
+  );
   console.log(`IMPROVE_DONE=research:${repo}`);
   return 0;
 }
@@ -127,9 +228,113 @@ export function extractJson(replyText) {
   return extractJsonObject(replyText);
 }
 
+function normalizeIdea(idea, index = 0) {
+  if (!idea || typeof idea !== "object" || Array.isArray(idea)) throw new Error(`idea ${index} invalid`);
+  if (typeof idea.title !== "string" || typeof idea.rationale !== "string" || typeof idea.evidence !== "string" || typeof idea.impact !== "string") {
+    throw new Error(`idea ${index} fields invalid`);
+  }
+  const title = idea.title.trim();
+  const rationale = idea.rationale.trim();
+  const evidence = idea.evidence.trim();
+  const impact = idea.impact.trim().toLowerCase();
+  if (!title || !rationale || !evidence) throw new Error(`idea ${index} missing fields`);
+  if (!IDEA_IMPACTS.has(impact)) throw new Error(`idea ${index} impact invalid`);
+  if (title.length > 240 || rationale.length > 2400 || evidence.length > 2400) {
+    throw new Error(`idea ${index} exceeds size limit`);
+  }
+  return { title, rationale, evidence, impact };
+}
+
+export function validateIdeasObject(value, { allowPartial = false } = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("ideas object invalid");
+  if (!Array.isArray(value.ideas) || value.ideas.length === 0 || value.ideas.length > IDEA_MAX_COUNT) {
+    throw new Error("ideas invalid");
+  }
+  const ideas = [];
+  const errors = [];
+  value.ideas.forEach((idea, index) => {
+    try {
+      ideas.push(normalizeIdea(idea, index));
+    } catch (err) {
+      errors.push(err);
+      if (!allowPartial) throw err;
+    }
+  });
+  if (ideas.length === 0) throw new Error("no valid ideas");
+  if (errors.length > 0 || ideas.length !== value.ideas.length) return { ideas, degraded: true };
+  return { ideas };
+}
+
+export function harvestIdeaCandidates(replyText) {
+  const text = String(replyText ?? "");
+  const candidates = [];
+  const seen = new Set();
+  const push = (candidate) => {
+    const value = String(candidate ?? "").trim();
+    if (!value.includes("{") || seen.has(value)) return;
+    seen.add(value);
+    candidates.push(value);
+  };
+  for (const match of text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) push(match[1]);
+  let rest = text;
+  for (let i = 0; i < 20 && rest.includes("{"); i += 1) {
+    let object;
+    try {
+      object = firstBalancedObject(rest);
+    } catch {
+      break;
+    }
+    push(object);
+    const offset = rest.indexOf(object);
+    if (offset < 0) break;
+    rest = rest.slice(offset + object.length);
+  }
+  push(text);
+  return candidates;
+}
+
+function parseIdeaCandidate(candidate) {
+  const variants = [String(candidate ?? "").trim()];
+  try {
+    const normalized = normalizePlanJsonText(variants[0]);
+    if (normalized && !variants.includes(normalized)) variants.push(normalized);
+  } catch {}
+  let lastError = new Error("ideas candidate invalid");
+  for (const variant of variants) {
+    try {
+      const parsed = extractJsonObject(variant);
+      try {
+        return validateIdeasObject(parsed);
+      } catch (strictError) {
+        lastError = strictError;
+        return validateIdeasObject(parsed, { allowPartial: true });
+      }
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError;
+}
+
+export function salvageIdeas(replyText) {
+  if (replyText && typeof replyText === "object" && !Array.isArray(replyText)) {
+    return validateIdeasObject(replyText);
+  }
+  let lastError = new Error("no ideas candidates");
+  for (const candidate of harvestIdeaCandidates(replyText)) {
+    try {
+      return parseIdeaCandidate(candidate);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError;
+}
+
 export function pickBestIdea(replyText) {
-  const obj = extractJson(replyText);
-  if (!Array.isArray(obj.ideas) || obj.ideas.length === 0) throw new Error("no ideas");
+  const obj = typeof replyText === "string"
+    ? salvageIdeas(replyText)
+    : validateIdeasObject(Array.isArray(replyText) ? { ideas: replyText } : replyText);
   const rank = { high: 3, medium: 2, low: 1 };
   return obj.ideas.slice().sort((a, b) => (rank[b.impact] || 0) - (rank[a.impact] || 0))[0];
 }
@@ -499,10 +704,20 @@ async function modePlan(audit) {
   const ideaFiles = existsSync(dir) ? readdirSync(dir).filter((f) => f.startsWith("ideas-") && f.endsWith(".json")) : [];
   let plans = 0;
   for (const f of ideaFiles) {
-    const data = JSON.parse(readFileSync(path.join(dir, f), "utf8"));
+    let data;
+    try {
+      data = JSON.parse(readFileSync(path.join(dir, f), "utf8"));
+    } catch (err) {
+      audit.note("plan", `${f}: invalid ideas artifact (${String(err.message || err).slice(0, 120)}); skipped`);
+      continue;
+    }
+    if (!data || typeof data !== "object" || !data.repo) {
+      audit.note("plan", `${f}: missing repo; skipped`);
+      continue;
+    }
     let idea;
     try {
-      idea = pickBestIdea(data.reply);
+      idea = pickBestIdea(data.ideas || data.reply);
     } catch (err) {
       audit.note("plan", `${data.repo}: ideas unparsable (${err.message})`);
       continue;
@@ -531,7 +746,18 @@ async function modePlan(audit) {
       "```",
       "Constraints: at most 6 files; each file under 15000 chars; no .env*, *.pem, *.key, state/, audit/ paths; no '..' in paths.",
     ].join("\n");
-    const plan = await askModel({ prompt: planPrompt, timeoutMs: 480000, env: process.env, preferVariantMax: true, maxRounds: 4, workspace: workdir });
+    let plan;
+    try {
+      plan = await askModel({ prompt: planPrompt, timeoutMs: 480000, env: process.env, preferVariantMax: true, maxRounds: 4, workspace: workdir });
+    } catch (err) {
+      audit.note("plan", `repo=${data.repo} model error (${String(err.message || err).slice(0, 120)}); skipped`);
+      if (workdir) {
+        try {
+          (await import("node:fs")).rmSync(workdir, { recursive: true, force: true });
+        } catch {}
+      }
+      continue;
+    }
     audit.note("plan", `repo=${data.repo} complete=${plan.complete} attempts=${JSON.stringify(plan.attempts)}`);
     if (workdir) {
       try {
@@ -671,7 +897,20 @@ async function modeReview(audit) {
   configureIdentity(REPO_ROOT, identity);
   const dir = process.env.FLEET_ARTIFACT_DIR || ".";
   const lens = process.env.FLEET_LENS;
-  const prmetas = existsSync(dir) ? readdirSync(dir).filter((f) => f.startsWith("prmeta-") && f.endsWith(".json")).map((f) => JSON.parse(readFileSync(path.join(dir, f), "utf8"))) : [];
+  const requestedRepo = process.env.FLEET_REPO;
+  const prmetas = existsSync(dir)
+    ? readdirSync(dir)
+      .filter((f) => f.startsWith("prmeta-") && f.endsWith(".json"))
+      .map((f) => {
+        try {
+          return JSON.parse(readFileSync(path.join(dir, f), "utf8"));
+        } catch {
+          audit.note("review", `${f}: malformed PR metadata; skipped`);
+          return null;
+        }
+      })
+      .filter((meta) => meta && (!requestedRepo || meta.repo === requestedRepo))
+    : [];
   mkdirSync(path.join(dir, "..", "reviews"), { recursive: true });
   for (const meta of prmetas) {
     const filesRaw = gh(["api", `/repos/${meta.repo}/pulls/${meta.prNumber}/files?per_page=20`], process.env) || [];
@@ -698,6 +937,57 @@ async function modeReview(audit) {
   return 0;
 }
 
+export function selectionEntriesFromArtifact(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  const raw = value.selected || value.selections || value.repos || [];
+  const entries = Array.isArray(raw) ? raw : [];
+  return entries.map((entry) => {
+    if (typeof entry === "string") return { repo: entry, score: undefined };
+    if (!entry || typeof entry !== "object") return null;
+    const repo = repoName(entry) || String(entry.repo || entry.repository || "").trim();
+    if (!repo) return null;
+    return {
+      repo,
+      score: Number.isFinite(Number(entry.score)) ? Number(entry.score) : undefined,
+      selectedAt: entry.selectedAt || entry.selected_at || value.selectedAt || value.at,
+      runId: entry.runId || entry.run_id || value.runId || value.run_id,
+    };
+  }).filter(Boolean);
+}
+
+export function mergeSelectionHistory(state, selections, now = Date.now()) {
+  const current = state && typeof state === "object" && !Array.isArray(state) ? state : {};
+  const existing = selectionHistoryFromState(current).filter((entry) => entry && typeof entry === "object");
+  const incoming = Array.isArray(selections)
+    ? selections
+    : (selections && (selections.selected || selections.selections || selections.repos)
+      ? selectionEntriesFromArtifact(selections)
+      : [selections]);
+  const history = [...existing];
+  const seen = new Set(history.map((entry) => {
+    const repo = String(entry.repo || entry.repository || "").trim();
+    const runId = String(entry.runId || entry.run_id || "").trim();
+    const selectedAt = String(entry.selectedAt || entry.selected_at || entry.at || "");
+    return runId ? `run:${runId}|${repo}` : `at:${selectedAt}|${repo}`;
+  }));
+  for (const raw of incoming) {
+    const candidate = typeof raw === "string" ? { repo: raw } : raw;
+    if (!candidate || typeof candidate !== "object") continue;
+    const repo = String(candidate.repo || candidate.repository || candidate.full_name || "").trim();
+    if (!repo) continue;
+    const selectedAt = String(candidate.selectedAt || candidate.selected_at || candidate.at || new Date(now).toISOString());
+    const runId = candidate.runId || candidate.run_id;
+    const identity = runId ? `run:${String(runId)}|${repo}` : `at:${selectedAt}|${repo}`;
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    const entry = { repo, selectedAt };
+    if (runId) entry.runId = String(runId);
+    if (Number.isFinite(Number(candidate.score))) entry.score = Number(candidate.score);
+    history.push(entry);
+  }
+  return { ...current, selectionHistory: history.slice(-MAX_SELECTION_HISTORY) };
+}
+
 async function modeFinalize(audit) {
   const identity = await runGate(process.env);
   configureIdentity(REPO_ROOT, identity);
@@ -705,10 +995,23 @@ async function modeFinalize(audit) {
   const metas = [];
   const artDir = process.env.FLEET_ARTIFACT_DIR || ".";
   for (const f of existsSync(artDir) ? readdirSync(artDir).filter((x) => x.startsWith("prmeta-")) : []) {
-    metas.push(JSON.parse(readFileSync(path.join(artDir, f), "utf8")));
+    try {
+      metas.push(JSON.parse(readFileSync(path.join(artDir, f), "utf8")));
+    } catch {
+      audit.note("finalize", `${f}: malformed PR metadata; skipped`);
+    }
   }
   const reviews = existsSync(revDir) ? readdirSync(revDir).filter((f) => f.endsWith(".json")).map((f) => JSON.parse(readFileSync(path.join(revDir, f), "utf8"))) : [];
-  const state = readJson(STATE_PATH, { runs: [] });
+  const selections = [];
+  for (const f of existsSync(artDir) ? readdirSync(artDir).filter((x) => x.startsWith("selection-") && x.endsWith(".json")) : []) {
+    try {
+      selections.push(...selectionEntriesFromArtifact(JSON.parse(readFileSync(path.join(artDir, f), "utf8"))));
+    } catch {
+      audit.note("finalize", `${f}: malformed selection artifact; skipped`);
+    }
+  }
+  let state = readJson(STATE_PATH, { runs: [], selectionHistory: [] });
+  state = mergeSelectionHistory(state, selections);
   const byRepo = {};
   for (const m of metas) byRepo[m.repo] = { ...m, verdicts: {}, commentsPosted: [] };
   for (const r of reviews) {
@@ -721,9 +1024,14 @@ async function modeFinalize(audit) {
     await verifyCommentAuthor(r.repo, created.id, identity, process.env.FLEET_GH_TOKEN);
     entry.commentsPosted.push(created.id);
   }
-  const runRecord = { utc: new Date().toISOString(), repos: Object.fromEntries(Object.entries(byRepo).map(([k, v]) => [k, { pr: v.prUrl, verdicts: v.verdicts }])) };
+  const runRecord = {
+    utc: new Date().toISOString(),
+    selectedRepos: selections.map((entry) => entry.repo),
+    repos: Object.fromEntries(Object.entries(byRepo).map(([k, v]) => [k, { pr: v.prUrl, verdicts: v.verdicts }])),
+  };
   state.runs.unshift(runRecord);
   state.runs = state.runs.slice(0, 30);
+  mkdirSync(path.dirname(STATE_PATH), { recursive: true });
   writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
   audit.note("finalize", `repos=${Object.keys(byRepo).length} reviews=${reviews.length}`);
   if (gitHasChanges(REPO_ROOT, ["state", "audit"])) {

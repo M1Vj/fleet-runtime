@@ -17,6 +17,9 @@ jobs:
   watchdog:
     runs-on: ubuntu-latest
     timeout-minutes: 6
+    concurrency:
+      group: fleet-state-writer
+      cancel-in-progress: false
     env:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH

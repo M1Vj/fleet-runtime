@@ -27,7 +27,14 @@ jobs:
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
-      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+      FLEET_OPENCODE_AUTH_2: ${{ secrets.FLEET_OPENCODE_AUTH_2 }}
+      FLEET_OPENCODE_AUTH_3: ${{ secrets.FLEET_OPENCODE_AUTH_3 }}
+      FLEET_OPENCODE_AUTH_4: ${{ secrets.FLEET_OPENCODE_AUTH_4 }}
+      FLEET_OPENCODE_AUTH_5: ${{ secrets.FLEET_OPENCODE_AUTH_5 }}
+      FLEET_OPENCODE_AUTH_6: ${{ secrets.FLEET_OPENCODE_AUTH_6 }}
+      FLEET_OPENCODE_AUTH_7: ${{ secrets.FLEET_OPENCODE_AUTH_7 }}
+      FLEET_OPENCODE_AUTH_8: ${{ secrets.FLEET_OPENCODE_AUTH_8 }}
+      FLEET_OPENCODE_AUTH_9: ${{ secrets.FLEET_OPENCODE_AUTH_9 }}
       FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
     steps:
@@ -70,11 +77,18 @@ jobs:
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
+      FLEET_OPENCODE_AUTH_2: ${{ secrets.FLEET_OPENCODE_AUTH_2 }}
+      FLEET_OPENCODE_AUTH_3: ${{ secrets.FLEET_OPENCODE_AUTH_3 }}
+      FLEET_OPENCODE_AUTH_4: ${{ secrets.FLEET_OPENCODE_AUTH_4 }}
+      FLEET_OPENCODE_AUTH_5: ${{ secrets.FLEET_OPENCODE_AUTH_5 }}
+      FLEET_OPENCODE_AUTH_6: ${{ secrets.FLEET_OPENCODE_AUTH_6 }}
+      FLEET_OPENCODE_AUTH_7: ${{ secrets.FLEET_OPENCODE_AUTH_7 }}
+      FLEET_OPENCODE_AUTH_8: ${{ secrets.FLEET_OPENCODE_AUTH_8 }}
+      FLEET_OPENCODE_AUTH_9: ${{ secrets.FLEET_OPENCODE_AUTH_9 }}
       GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
       GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
       GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
       GDRIVE_FOLDER_ID: ${{ vars.GDRIVE_FOLDER_ID || 'root' }}
-      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
       FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
     steps:
@@ -123,9 +137,19 @@ jobs:
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH
       FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
       FLEET_OPENCODE_AUTH: ${{ secrets.FLEET_OPENCODE_AUTH }}
-      OPENCODE_MODELS_URL: file://${{ github.workspace }}/config/models.json
+      FLEET_OPENCODE_AUTH_2: ${{ secrets.FLEET_OPENCODE_AUTH_2 }}
+      FLEET_OPENCODE_AUTH_3: ${{ secrets.FLEET_OPENCODE_AUTH_3 }}
+      FLEET_OPENCODE_AUTH_4: ${{ secrets.FLEET_OPENCODE_AUTH_4 }}
+      FLEET_OPENCODE_AUTH_5: ${{ secrets.FLEET_OPENCODE_AUTH_5 }}
+      FLEET_OPENCODE_AUTH_6: ${{ secrets.FLEET_OPENCODE_AUTH_6 }}
+      FLEET_OPENCODE_AUTH_7: ${{ secrets.FLEET_OPENCODE_AUTH_7 }}
+      FLEET_OPENCODE_AUTH_8: ${{ secrets.FLEET_OPENCODE_AUTH_8 }}
+      FLEET_OPENCODE_AUTH_9: ${{ secrets.FLEET_OPENCODE_AUTH_9 }}
       FLEET_MODEL_CHAIN: ${{ vars.FLEET_MODEL_CHAIN || '' }}
       FLEET_JUDGE_MODEL: ${{ vars.FLEET_JUDGE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
+    concurrency:
+      group: fleet-state-writer
+      cancel-in-progress: false
     steps:
       - name: checkout runtime
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -165,6 +189,9 @@ jobs:
     if: ${{ always() && needs.synthesize.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: fleet-state-writer
+      cancel-in-progress: false
     env:
       FLEET_STATE_ROOT: ${{ github.workspace }}/state-control
       FLEET_KILL_SWITCH_PATH: ${{ github.workspace }}/state-control/state/KILL_SWITCH

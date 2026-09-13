@@ -147,12 +147,22 @@ export function gitPush(repoDir, branch, env = process.env, { retries = 3 } = {}
       if (res.status === 0) return true;
       const output = `${res.stderr || ""}${res.stdout || ""}`;
       if (/non-fast-forward|fetch first|rejected/i.test(output) && attempt < retries) {
-        const pull = spawnSync("git", [...credArgs, "pull", "--rebase", "origin", branch], {
+        const pull = spawnSync("git", [...credArgs, "pull", "--rebase", "-X", "theirs", "origin", branch], {
           cwd: repoDir,
           encoding: "utf8",
           env: { ...childEnv(env), FLEET_GH_USER: env.FLEET_EXPECT_LOGIN || "M1Vj", FLEET_GH_TOKEN: env.FLEET_GH_TOKEN },
         });
-        if (pull.status !== 0) throw new Error(`git pull --rebase failed: ${redact(pull.stderr || pull.stdout)}`);
+        if (pull.status !== 0) {
+          spawnSync("git", ["rebase", "--abort"], { cwd: repoDir });
+          const mergePull = spawnSync("git", [...credArgs, "pull", "--no-rebase", "-X", "theirs", "origin", branch, "-m", "[fleet] merge concurrent state update"], {
+            cwd: repoDir,
+            encoding: "utf8",
+            env: { ...childEnv(env), FLEET_GH_USER: env.FLEET_EXPECT_LOGIN || "M1Vj", FLEET_GH_TOKEN: env.FLEET_GH_TOKEN },
+          });
+          if (mergePull.status !== 0) {
+            throw new Error(`git pull retry failed: ${redact(mergePull.stderr || mergePull.stdout || pull.stderr || pull.stdout)}`);
+          }
+        }
         continue;
       }
       throw new Error(`git push failed: ${redact(output || "unknown")}`);

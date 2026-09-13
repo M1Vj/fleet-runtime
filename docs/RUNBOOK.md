@@ -4,6 +4,11 @@ All commands assume `gh` authenticated as M1Vj on the owner Mac. Workflows live 
 `M1Vj/fleet-runtime`; durable state lives in private `M1Vj/fleet-control`. Use
 `-R M1Vj/fleet-runtime` for every lane below.
 
+## 0. Governance: Local-to-Fleet Cascading Rule (Approval Required)
+
+- **Mandatory Alignment**: Any architectural, configuration, prompt, model variant, sanitizer, proxy, or tooling improvements proven locally must always have an explicit cascade pathway to the fleet (`M1Vj/fleet-runtime` and `M1Vj/fleet-control`).
+- **CRITICAL APPROVAL GATE**: Cascading changes to the fleet MUST ONLY be pushed or deployed with the explicit prior approval of the owner (Vj). Agents must prepare, test, and present the proposed cascade changes, and wait for direct confirmation before executing the push or dispatch.
+
 ## 1. Secrets setup and rotation
 
 Required secrets on BOTH repos: `FLEET_GH_TOKEN` (PAT with `repo` + `workflow` scopes;

@@ -78,13 +78,13 @@ async function modePropose(audit) {
     prompt,
     timeoutMs: 480000,
     env: process.env,
-    // Contributor tier: high thinking effort, never the max variant.
-    preferVariantMax: false,
+    // Contributor tier: high thinking effort (maps to xhigh), never the max variant.
+    preferVariantMax: true,
     maxRounds: 3,
   });
   if (!result.complete) {
     await new Promise((r) => setTimeout(r, 60000));
-    result = await askModel({ prompt, timeoutMs: 480000, env: process.env, preferVariantMax: false, maxRounds: 3 });
+    result = await askModel({ prompt, timeoutMs: 480000, env: process.env, preferVariantMax: true, maxRounds: 3 });
   }
   audit.note("propose", `complete=${result.complete}`);
   if (!result.complete || !result.reply) throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });

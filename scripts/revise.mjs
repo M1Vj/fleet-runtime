@@ -172,8 +172,8 @@ async function main() {
     prompt: promptV3,
     timeoutMs: 600000,
     env: process.env,
-    // Contributor tier: high thinking effort, never the max variant.
-    preferVariantMax: false,
+    // Contributor tier: high thinking effort (maps to xhigh), never the max variant.
+    preferVariantMax: true,
     maxRounds: 4,
   });
   audit.note("revise", `complete=${result.complete}`);
@@ -190,7 +190,7 @@ async function main() {
       sessionId: result.sessionId,
       timeoutMs: 480000,
       env: process.env,
-      preferVariantMax: false,
+      preferVariantMax: true,
       maxRounds: 2,
     });
     if (firm.reply) files = parseRevisedFiles(firm.reply);

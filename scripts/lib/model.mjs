@@ -290,6 +290,7 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
     "Replacing real functionality with synthetic mocks, fake stubs, or naive heuristics is strictly prohibited.",
     "Anything that makes system behavior different from the real implementation is an unacceptable downgrade.",
     "Always fix, harden, and improve with genuine, evidence-based code. Never use Gemini models under any circumstances.",
+    "MAXIMUM OUTPUT CAPACITY & BATCH MULTI-TOOL EXECUTION: Batch multiple tool actions per turn (parallel file reads, searches, multi-file edits, and command verifications). Do NOT emit timid, truncated, or 100-token placeholder summaries. Deliver thorough, in-depth technical analysis, complete file implementations, and rigorous verification evidence.",
     "===================================================================="
   ].join("\n");
   const effectivePrompt = `${antiDowngradeBlock}\n\n${prompt}`;

@@ -1100,8 +1100,8 @@ async function judge({ repo, prNumber, title, body, files, extraEvidence, lens, 
     prompt,
     timeoutMs: 480000,
     env: process.env,
-    // Contributor tier: high thinking effort, never the max variant.
-    preferVariantMax: false,
+    // Contributor tier: high thinking effort (maps to xhigh), never the max variant.
+    preferVariantMax: true,
     maxRounds: 3,
     ...(judgeModel ? { modelOverride: judgeModel } : {}),
   });

@@ -640,8 +640,8 @@ export async function main() {
         timeoutMs: 480000,
         env: process.env,
         sessionId: loadPatrolSession() || undefined,
-        // Contributor tier: high thinking effort, never the max variant.
-        preferVariantMax: false,
+        // Contributor tier: high thinking effort (maps to xhigh), never the max variant.
+        preferVariantMax: true,
       });
       modelMode = modelResult.modelMode;
       audit.note("model", `mode=${modelMode} complete=${modelResult.complete} attempts=${JSON.stringify(modelResult.attempts)} session=${modelResult.sessionId ? "captured" : "none"}`);
@@ -667,7 +667,7 @@ export async function main() {
           sessionId: resumeSid,
           timeoutMs: 300000,
           env: process.env,
-          preferVariantMax: false,
+          preferVariantMax: true,
         });
         audit.note("repair", `round=${round} complete=${repair.complete} gotReply=${Boolean(repair.reply)}`);
         if (repair.sessionId) {

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import process from "node:process";
+import { spawnSync } from "node:child_process";
 import fsMod from "node:fs";
 import { appendFileSync, readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
@@ -10,6 +11,7 @@ import { askModel, askModelResilient } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor, verifyCommentAuthor } from "./lib/verify.mjs";
 import { isSafeRepoPath, sanitizeControlChars, extractJsonObject, firstBalancedObject, harvestFencedFiles } from "./lib/directives.mjs";
 import { scoreRepository, weightedSampleWithoutReplacement } from "./lib/fleet-scheduler.mjs";
+import { isAllowedModel } from "./lib/provider-registry.mjs";
 import {
   isPublicDataClass,
   makeExecutionTerminal,
@@ -22,6 +24,7 @@ import {
   writeExecutionArtifact,
   writeExecutionAudit,
   writePublicArtifact,
+  publicArtifactPayload,
   readPublicManifest,
   PUBLIC_ARTIFACT_SCHEMA,
 } from "./lib/private-state.mjs";
@@ -31,11 +34,171 @@ const REPO_ROOT = resolveStateRoot(process.env, CODE_ROOT);
 const STATE_PATH = path.join(REPO_ROOT, "state", "improve-state.json");
 const MAX_SELECTION_HISTORY = 300;
 const MAX_TOP_K = 15;
+const MAX_SELECTION_VALUE = 1_000_000_000;
+const VALIDATED_SELECTION_FIELDS = new Set(["repo", "repository", "score", "weight", "rank"]);
 const DEFAULT_REPO_OWNER = "M1Vj";
 const REPO_REF_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const IDEA_MAX_COUNT = 5;
 const IDEA_IMPACTS = new Set(["high", "medium", "low"]);
 const DEFAULT_RETRY_DELAY_MS = 30 * 60 * 1000;
+const MAX_RESEARCH_REPAIR_ROUNDS = 3;
+const RESEARCH_EVIDENCE_MIN_CHARS = 12;
+const SOURCE_REFERENCE_RE = /(?:^|[\s"'`([{])(?:\.\.?[\\/])?(?:(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})(?:[:#][A-Za-z0-9_.-]+)?/;
+const SOURCE_CLAIM_RE = /(?:^|[\s"'`([{=:])((?:\.{1,2}[\\/])?(?:(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})(?::([0-9]+)|#([A-Za-z_$][A-Za-z0-9_$.-]*))?)(?=$|[\s"'`)}\],.;!?])/g;
+const SOURCE_UNSAFE_PREFIX_RE = /(?:^|[\s"'`([{=:])(?:~[\\/]|[\\/]|[A-Za-z]:[\\/])/;
+const SOURCE_REVISION_RE = /^[0-9a-f]{40}$/i;
+const TREE_SNAPSHOT_RE = /^[0-9a-f]{64}$/i;
+const PUBLIC_SOURCE_PATH_RE = /^(?:(?:[A-Za-z0-9_.-]+)[\\/])+[A-Za-z0-9_.-]+$/;
+const SOURCE_PATH_PREFIXES = new Set([".github", "app", "apps", "client", "components", "config", "docs", "lib", "pages", "packages", "public", "scripts", "server", "src", "test", "tests"]);
+
+function evidenceHasForeignRepositoryPath(text, repository) {
+  const target = String(repository || "").trim();
+  if (!target) return false;
+  const targetOwner = target.split("/")[0];
+  const pathToken = /(?:^|[\s"'`([{=:])((?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+)(?=$|[\s"'`)}\],.;!?])/g;
+  for (const token of String(text || "").matchAll(pathToken)) {
+    const segments = token[1].split("/");
+    if (segments.length < 2) continue;
+    const start = segments.length >= 3 && SOURCE_PATH_PREFIXES.has(segments[0].toLowerCase()) ? 1 : 0;
+    for (let index = start; index < segments.length - 1; index += 1) {
+      const candidate = `${segments[index]}/${segments[index + 1]}`;
+      if (candidate === target) continue;
+      const owner = segments[index];
+      const name = segments[index + 1];
+      // A file-like second segment is a source path only when it is rooted in
+      // a known checkout directory. Otherwise a pair such as
+      // foreignOwner/foreign-repo.js is an owner/repository identity and is
+      // rejected even if a hostile checkout happens to track that path.
+      const secondBase = name.replace(/\.[A-Za-z0-9]{1,12}$/, "");
+      const ownerLikeIdentity = /^[A-Za-z][A-Za-z0-9_-]{2,63}$/.test(owner)
+        && /^[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+$/.test(secondBase);
+      if (owner === targetOwner || !/\.[A-Za-z0-9]{1,12}$/.test(name) || ownerLikeIdentity) return true;
+    }
+  }
+  return false;
+}
+
+function sourceEvidenceClaims(text) {
+  const source = String(text || "");
+  if (!source || SOURCE_UNSAFE_PREFIX_RE.test(source)) return null;
+  const claims = [];
+  for (const match of source.matchAll(SOURCE_CLAIM_RE)) {
+    const rawPath = String(match[1] || "").replaceAll("\\", "/");
+    const segments = rawPath.split("/");
+    if (!rawPath || segments.some((segment) => segment === "..") || rawPath.startsWith("/") || rawPath.startsWith("~") || /^[A-Za-z]:\//.test(rawPath)) return null;
+    const normalized = rawPath.replace(/^\.\//, "");
+    if (!normalized || normalized === "." || normalized.startsWith("../")) return null;
+    claims.push({ path: normalized, line: match[2] || "", symbol: match[3] || "" });
+  }
+  return claims;
+}
+
+function sourceWorkspaceBinding(workspace) {
+  const candidate = String(workspace || "").trim();
+  if (!candidate) return null;
+  try {
+    const root = fsMod.realpathSync(candidate);
+    if (!statSync(root).isDirectory()) return null;
+    const revision = gitRevParse(root, "HEAD");
+    if (!/^[0-9a-f]{40}$/i.test(revision)) return null;
+    const listed = spawnSync("git", ["ls-files", "-z", "--cached"], {
+      cwd: root,
+      encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    if (listed.status !== 0) return null;
+    const trackedIndex = new Set(String(listed.stdout || "").split("\0").filter(Boolean));
+    if (trackedIndex.size === 0) return null;
+    const tree = spawnSync("git", ["ls-tree", "-r", "--full-tree", "HEAD"], {
+      cwd: root,
+      encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    if (tree.status !== 0 || !String(tree.stdout || "").trim()) return null;
+    const trackedTree = new Set(String(tree.stdout || "").split("\n").map((line) => line.slice(line.indexOf("\t") + 1)).filter((entry) => entry && !entry.includes("\t")));
+    const tracked = new Set([...trackedIndex].filter((entry) => trackedTree.has(entry)));
+    if (tracked.size === 0) return null;
+    return { root, sourceRevision: revision, treeSnapshot: sha256(tree.stdout), tracked };
+  } catch {
+    return null;
+  }
+}
+
+function sourceClaimIsInsideBinding(binding, claim) {
+  if (!binding || !claim || !claim.path || !binding.tracked.has(claim.path)) return false;
+  const candidate = path.resolve(binding.root, ...claim.path.split("/"));
+  const rootPrefix = binding.root.endsWith(path.sep) ? binding.root : `${binding.root}${path.sep}`;
+  try {
+    const real = fsMod.realpathSync(candidate);
+    if (real !== binding.root && !real.startsWith(rootPrefix)) return false;
+    const info = statSync(real);
+    if (!info.isFile()) return false;
+    if (claim.line || claim.symbol) {
+      // Anchor checks are best-effort and bounded to a small public source
+      // file; larger files still pass the independently verified path gate.
+      if (info.size <= 512 * 1024) {
+        const body = readFileSync(real, "utf8");
+        if (claim.line) {
+          const line = Number(claim.line);
+          if (!Number.isInteger(line) || line < 1 || line > body.split(/\r?\n/).length) return false;
+        }
+        if (claim.symbol) {
+          const escaped = claim.symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          if (!new RegExp(`\\b${escaped}\\b`).test(body)) return false;
+        }
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hasVerifiedSourceEvidence(evidence, binding) {
+  const claims = sourceEvidenceClaims(evidence);
+  if (!binding || !claims || claims.length === 0) return false;
+  // Every path named by the model must be tracked and inside the same
+  // checkout; at least one such path is required for a substantive idea.
+  return verifiedSourcePaths(evidence, binding).length > 0;
+}
+
+function verifiedSourcePaths(evidence, binding) {
+  const claims = sourceEvidenceClaims(evidence);
+  if (!binding || !claims || claims.length === 0 || !claims.every((claim) => sourceClaimIsInsideBinding(binding, claim))) return [];
+  return [...new Set(claims.map((claim) => claim.path))];
+}
+
+function sourceAttestation(value) {
+  const paths = Array.isArray(value?.evidencePaths) ? value.evidencePaths.map((entry) => String(entry || "").trim()) : [];
+  return value?.evidenceVerified === true
+    && SOURCE_REVISION_RE.test(String(value?.sourceRevision || ""))
+    && TREE_SNAPSHOT_RE.test(String(value?.treeSnapshot || ""))
+    && paths.length > 0
+    && paths.every((entry) => PUBLIC_SOURCE_PATH_RE.test(entry) && !entry.split(/[\\/]/).some((part) => part === "." || part === ".."));
+}
+
+function sourceAttestationMatchesBinding(value, binding) {
+  return Boolean(binding && sourceAttestation(value)
+    && String(value.sourceRevision) === binding.sourceRevision
+    && String(value.treeSnapshot) === binding.treeSnapshot
+    && value.evidencePaths.every((entry) => sourceClaimIsInsideBinding(binding, { path: String(entry), line: "", symbol: "" })));
+}
+
+function sourcePathSubset(paths, allowedPaths) {
+  const source = Array.isArray(paths) ? paths.map((entry) => String(entry || "").trim()).filter(Boolean) : [];
+  const allowed = new Set(Array.isArray(allowedPaths) ? allowedPaths.map((entry) => String(entry || "").trim()) : []);
+  return source.length > 0 && source.every((entry) => allowed.has(entry));
+}
+
+function evidencePathsFromText(text) {
+  const claims = sourceEvidenceClaims(text);
+  return claims ? [...new Set(claims.map((claim) => claim.path))] : [];
+}
+
+function evidencePathsMatchClaims(text, paths) {
+  const claims = evidencePathsFromText(text);
+  return claims.length > 0 && sourcePathSubset(claims, paths);
+}
 
 function executionModelEnv() {
   return isPublicDataClass(process.env) ? publicModelEnv(process.env) : process.env;
@@ -90,53 +253,139 @@ export function readPublicImproveManifests(root, repository = "") {
       if (value.schema !== PUBLIC_ARTIFACT_SCHEMA || value.dataClass !== "public") return null;
       if (!/^M1Vj\/[A-Za-z0-9_.-]{1,100}$/.test(String(value.repository || ""))) return null;
       if (target && value.repository !== target) return null;
-      return value;
+      if (publicManifestHasForeignRepository(value, target || value.repository)) return null;
+      // Downloaded manifests are untrusted even when they carry the expected
+      // schema. Reapply the public sanitizer and reject any identity-bearing
+      // path that survives it before finalize consumes the stage rows.
+      const safe = publicArtifactPayload(value, {
+        kind: value.kind,
+        status: value.status,
+        repository: target || value.repository,
+        runId: value.runId,
+      });
+      if (!safe || safe.repository !== (target || value.repository) || publicManifestHasForeignRepository(safe, target || value.repository)) return null;
+      return safe;
     } catch {
       return null;
     }
   }).filter(Boolean);
 }
 
-export function isBoundedResearchManifest(value) {
+function publicManifestHasForeignRepository(value, repository) {
+  if (typeof value === "string") return evidenceHasForeignRepositoryPath(value, repository);
+  if (Array.isArray(value)) return value.some((item) => publicManifestHasForeignRepository(item, repository));
+  if (!value || typeof value !== "object") return false;
+  return Object.values(value).some((item) => publicManifestHasForeignRepository(item, repository));
+}
+
+function sourceBindingFromOptions(options = {}) {
+  return options?.binding || (options?.workspace ? sourceWorkspaceBinding(options.workspace) : null);
+}
+
+function researchEvidencePathsFromOptions(options = {}) {
+  if (Array.isArray(options?.researchEvidencePaths)) return options.researchEvidencePaths;
+  if (options?.research && Array.isArray(options.research.evidencePaths)) return options.research.evidencePaths;
+  return [];
+}
+
+function manifestEvidencePaths(value) {
+  return Array.isArray(value?.evidencePaths) ? value.evidencePaths.map((entry) => String(entry || "").trim()).filter(Boolean) : [];
+}
+
+export function isBoundedResearchManifest(value, options = {}) {
   if (!value || typeof value !== "object" || value.mode !== "research" || !["ok", "analyzed"].includes(String(value.status || ""))) return false;
   const ideas = Array.isArray(value.ideas) ? value.ideas : [];
+  const repository = String(value.repository || value.repo || "").trim();
+  const paths = manifestEvidencePaths(value);
+  const binding = sourceBindingFromOptions(options);
+  if (!sourceAttestation(value) || paths.some((entry) => evidenceHasForeignRepositoryPath(entry, repository)) || !paths.every((entry) => PUBLIC_SOURCE_PATH_RE.test(entry))) return false;
+  const claims = ideas.flatMap((idea) => evidencePathsFromText(idea?.evidence));
+  if (!claims.length || !sourcePathSubset(claims, paths) || !sourcePathSubset(paths, claims)) return false;
+  if (!binding || !sourceAttestationMatchesBinding(value, binding)) return false;
   return ideas.length > 0 && ideas.length <= IDEA_MAX_COUNT && ideas.every((idea) => (
     idea && typeof idea === "object" && !Array.isArray(idea)
-      && typeof idea.title === "string" && idea.title.trim().length > 0 && idea.title.length <= 240
-      && (idea.rationale === undefined || (typeof idea.rationale === "string" && idea.rationale.length <= 2400))
-      && (idea.evidence === undefined || (typeof idea.evidence === "string" && idea.evidence.length <= 2400))
+      && typeof idea.title === "string" && idea.title.trim().length >= 4 && idea.title.length <= 240
+      && typeof idea.rationale === "string" && idea.rationale.trim().length >= RESEARCH_EVIDENCE_MIN_CHARS && idea.rationale.length <= 2400
+      && typeof idea.evidence === "string" && idea.evidence.trim().length >= RESEARCH_EVIDENCE_MIN_CHARS && idea.evidence.length <= 2400
+      && SOURCE_REFERENCE_RE.test(idea.evidence)
+      && !evidenceHasForeignRepositoryPath(idea.evidence, repository)
+      && (!binding || hasVerifiedSourceEvidence(idea.evidence, binding))
       && ["high", "medium", "low"].includes(String(idea.impact || "").toLowerCase())
   ));
 }
 
-export function isBoundedPlanManifest(value) {
+export function isBoundedPlanManifest(value, options = {}) {
   const plan = value?.plan;
+  const repository = String(value?.repository || value?.repo || "").trim();
+  const paths = manifestEvidencePaths(value);
+  const binding = sourceBindingFromOptions(options);
+  const researchPaths = researchEvidencePathsFromOptions(options);
+  const planPaths = evidencePathsFromText(plan?.evidence);
   return Boolean(value && typeof value === "object" && !Array.isArray(value)
     && value.mode === "plan" && value.status === "analyzed"
+    && sourceAttestation(value)
+    && binding && sourceAttestationMatchesBinding(value, binding)
+    && (researchPaths.length === 0 || sourcePathSubset(paths, researchPaths))
+    && sourcePathSubset(planPaths, paths)
+    && planPaths.every((entry) => sourceClaimIsInsideBinding(binding, { path: entry, line: "", symbol: "" }))
     && plan && typeof plan === "object" && !Array.isArray(plan)
     && typeof plan.title === "string" && plan.title.trim().length > 0 && plan.title.length <= 160
-    && ["high", "medium", "low"].includes(String(plan.impact || "").toLowerCase()));
+    && ["high", "medium", "low"].includes(String(plan.impact || "").toLowerCase())
+    && typeof plan.evidence === "string" && plan.evidence.trim().length >= RESEARCH_EVIDENCE_MIN_CHARS
+    && SOURCE_REFERENCE_RE.test(plan.evidence)
+    && !evidenceHasForeignRepositoryPath(plan.evidence, repository)
+    && !paths.some((entry) => evidenceHasForeignRepositoryPath(entry, repository)));
 }
 
-export function isBoundedReviewManifest(value) {
-  return Boolean(value && typeof value === "object" && value.mode === "review" && value.status === "analyzed" && validReviewFindings(value.findings));
+export function isBoundedReviewManifest(value, options = {}) {
+  const repository = String(value?.repository || value?.repo || "").trim();
+  const paths = manifestEvidencePaths(value);
+  const binding = sourceBindingFromOptions(options);
+  return Boolean(value && typeof value === "object" && value.mode === "review" && value.status === "analyzed"
+    && sourceAttestation(value)
+    && binding && sourceAttestationMatchesBinding(value, binding)
+    && paths.every((entry) => !evidenceHasForeignRepositoryPath(entry, repository))
+    && validReviewPayload(value, repository));
 }
 
 /** Validate review output after the public artifact sanitizer has run. */
-export function publicReviewSerialization(value) {
-  if (isBoundedReviewManifest(value)) {
+export function publicReviewSerialization(value, options = {}) {
+  if (isBoundedReviewManifest(value, options)) {
     return { status: "analyzed", analyzed: true, blocked: false, reason: "public-read-only" };
   }
   return { status: "deferred", analyzed: false, blocked: false, reason: "PUBLIC_REVIEW_PAYLOAD_UNSAFE" };
 }
 
-function validReviewFindings(findings) {
-  return Array.isArray(findings) && findings.length <= 8 && findings.every((finding) => (
+function substantiveReviewText(value) {
+  return typeof value === "string" && value.trim().length >= RESEARCH_EVIDENCE_MIN_CHARS && value.length <= 2000;
+}
+
+function verifiedEmptyReview(value) {
+  const evidence = value?.evidence;
+  const checks = value?.checks;
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence) || !checks || typeof checks !== "object" || Array.isArray(checks)) return false;
+  if (!substantiveReviewText(evidence.inspectedScope) || !substantiveReviewText(evidence.noFindingsRationale)) return false;
+  if (checks.evidence !== true || checks.noFindingsVerified !== true) return false;
+  return /\b(?:no|none|zero|without)\s+(?:actionable\s+)?(?:findings?|issues?|vulnerabilit(?:y|ies))\b/i.test(evidence.noFindingsRationale)
+    || /\b(?:findings?|issues?|vulnerabilit(?:y|ies))\b[^.]{0,80}\b(?:not|never)\s+(?:found|identified|observed)\b/i.test(evidence.noFindingsRationale);
+}
+
+function validReviewFindings(findings, repository = "") {
+  return Array.isArray(findings) && findings.length > 0 && findings.length <= 8 && findings.every((finding) => (
     finding && typeof finding === "object" && !Array.isArray(finding)
       && ["critical", "high", "medium", "low"].includes(String(finding.severity || "").toLowerCase())
-      && typeof finding.title === "string" && finding.title.trim().length > 0 && finding.title.length <= 240
-      && typeof finding.detail === "string" && finding.detail.length <= 800
+      && typeof finding.title === "string" && finding.title.trim().length >= 4 && finding.title.length <= 240
+      && typeof finding.detail === "string" && finding.detail.trim().length >= RESEARCH_EVIDENCE_MIN_CHARS && finding.detail.length <= 800
+      && !evidenceHasForeignRepositoryPath(finding.title, repository)
+      && !evidenceHasForeignRepositoryPath(finding.detail, repository)
+      && (finding.recommendation === undefined || !evidenceHasForeignRepositoryPath(String(finding.recommendation), repository))
   ));
+}
+
+function validReviewPayload(value, repository = "") {
+  const findings = value?.findings;
+  if (!Array.isArray(findings) || findings.length > 8) return false;
+  return findings.length === 0 ? verifiedEmptyReview(value) : validReviewFindings(findings, repository);
 }
 
 function isValidatedPublicSelection(row, repository) {
@@ -148,11 +397,14 @@ function isValidatedPublicSelection(row, repository) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
     const selectedRepository = String(entry.repo || entry.repository || "").trim();
     if (selectedRepository !== repository) return false;
-    return entry.score === undefined || (Number.isFinite(Number(entry.score)) && Number(entry.score) >= 0);
+    if (Object.keys(entry).some((key) => !VALIDATED_SELECTION_FIELDS.has(key))) return false;
+    const bounded = (value) => value === undefined || (Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= MAX_SELECTION_VALUE);
+    const rank = entry.rank === undefined ? true : Number.isInteger(Number(entry.rank)) && Number(entry.rank) > 0 && Number(entry.rank) <= MAX_TOP_K;
+    return bounded(entry.score) && bounded(entry.weight) && rank;
   });
 }
 
-export function publicImproveReceipt(repository, manifests = [], stageResults = {}) {
+export function publicImproveReceipt(repository, manifests = [], stageResults = {}, options = {}) {
   const target = String(repository || "").trim();
   const rows = (Array.isArray(manifests) ? manifests : []).filter((row) => {
     if (!row || typeof row !== "object" || Array.isArray(row)) return false;
@@ -161,8 +413,25 @@ export function publicImproveReceipt(repository, manifests = [], stageResults = 
   });
   const result = (name) => String(stageResults?.[name] || "unknown").trim().toLowerCase();
   const selected = rows.some((row) => row && row.mode === "pick" && row.status === "ok" && isValidatedPublicSelection(row, target));
-  const analyzed = rows.some((row) => isBoundedResearchManifest(row) || isBoundedPlanManifest(row) || isBoundedReviewManifest(row));
+  const binding = sourceBindingFromOptions(options);
+  const research = rows.find((row) => row?.mode === "research");
+  const researchOptions = { ...options, binding };
+  const researchValid = Boolean(research && isBoundedResearchManifest(research, researchOptions));
+  const analyzed = rows.some((row) => {
+    if (row?.mode === "research") return isBoundedResearchManifest(row, researchOptions);
+    if (row?.mode === "plan") return isBoundedPlanManifest(row, { ...options, binding, research: researchValid ? research : undefined });
+    if (row?.mode === "review") return isBoundedReviewManifest(row, { ...options, binding, research: researchValid ? research : undefined });
+    return false;
+  });
+  const invalidAnalyzed = rows.some((row) => {
+    if (!row || typeof row !== "object") return false;
+    if (row.mode === "research" && ["ok", "analyzed"].includes(String(row.status || ""))) return !researchValid;
+    if (row.mode === "plan" && row.status === "analyzed") return !isBoundedPlanManifest(row, { ...options, binding, research: researchValid ? research : undefined });
+    if (row.mode === "review" && row.status === "analyzed") return !isBoundedReviewManifest(row, { ...options, binding, research: researchValid ? research : undefined });
+    return false;
+  });
   const blocked = ["implement", "review", "plan", "research"].some((name) => ["failure", "cancelled", "skipped"].includes(result(name)))
+    || invalidAnalyzed
     || rows.some((row) => row && typeof row === "object" && (row.status === "blocked" || row.blocked === true));
   const deferred = rows.some((row) => row && ["deferred", "waiting_for_capacity"].includes(String(row.status || "").toLowerCase()));
   const awaitingPrivateControl = selected && analyzed;
@@ -227,7 +496,11 @@ export function publicTerminalState(code, manifest = {}) {
     return "STALLED";
   }
   if (["blocked", "deferred"].includes(status)) return "BLOCKED";
-  return "SUCCESS";
+  // Public stages never establish durable completion on their own.  A
+  // successful terminal state requires an explicit final receipt assertion;
+  // unknown, empty, or stage-only statuses fail closed as BLOCKED.
+  if (manifest?.mode === "finalize" && manifest?.desiredTaskCompleted === true && status === "ok") return "SUCCESS";
+  return "BLOCKED";
 }
 
 export function researchCapacityOutcome(dataClass, nowMs = Date.now(), retryDelayMs = DEFAULT_RETRY_DELAY_MS) {
@@ -391,8 +664,10 @@ async function modePick(audit) {
   return 0;
 }
 
-export function researchPromptHeader(repo, workdir) {
-  return `You are the research sub-agent for repo ${repo}. A full shallow clone is mounted at your working directory ('.')${workdir ? "" : " (digest-only mode)"} — use read/grep/glob on real code before concluding. Decide what would MOST improve this project right now (correctness, security, DX, performance, docs, CI). You may use webfetch to consult authoritative sources.`;
+export function researchPromptHeader(repo, workdir, { publicMode = true } = {}) {
+  const base = `You are the research sub-agent for repo ${repo}. A full shallow clone is mounted at your working directory ('.')${workdir ? "" : " (digest-only mode)"} — use read/grep/glob on real code before concluding. Decide what would MOST improve this project right now (correctness, security, DX, performance, docs, CI).`;
+  if (!publicMode) return `${base} You may use webfetch to consult authoritative sources.`;
+  return `${base} Inspect at least one real source or test file for every idea; each evidence field must name the relative path and concrete symbol, test, or behavior you observed. Do not invent files, identities, or generic recommendations. You may use webfetch to consult authoritative sources.`;
 }
 
 export function publicResearchCloneDisposition(workdir) {
@@ -409,7 +684,7 @@ export function publicResearchCloneDisposition(workdir) {
     };
 }
 
-function buildResearchPrompt(repo, workdir) {
+function buildResearchPrompt(repo, workdir, { publicMode = false } = {}) {
   const meta = gh(["api", `/repos/${repo}`], process.env);
   const commits = gh(["api", `/repos/${repo}/commits?per_page=15`], process.env) || [];
   const pulls = gh(["api", `/repos/${repo}/pulls?state=open&per_page=10`], process.env) || [];
@@ -422,8 +697,10 @@ function buildResearchPrompt(repo, workdir) {
     `Open issues: ${issuesRaw.filter((i) => !i.pull_request).map((i) => `#${i.number} ${i.title}`).join("; ") || "none"}`,
   ];
   return [
-    researchPromptHeader(repo, workdir),
-    "Return ONLY strict JSON: {\"ideas\":[{\"title\":\"...\",\"rationale\":\"...\",\"evidence\":\"what you saw\",\"impact\":\"high|medium|low\"}]} max 5 ideas.",
+    researchPromptHeader(repo, workdir, { publicMode }),
+    publicMode
+      ? "Return ONLY strict JSON: {\"ideas\":[{\"title\":\"...\",\"rationale\":\"...\",\"evidence\":\"relative/source/path.ext and the concrete symbol, test, or behavior observed\",\"impact\":\"high|medium|low\"}]} max 5 ideas."
+      : "Return ONLY strict JSON: {\"ideas\":[{\"title\":\"...\",\"rationale\":\"...\",\"evidence\":\"what you saw\",\"impact\":\"high|medium|low\"}]} max 5 ideas.",
     "Context:",
     lines.join("\n").slice(0, 14000),
   ].join("\n");
@@ -459,37 +736,72 @@ async function modeResearch(audit) {
     console.log(`IMPROVE_DEFERRED=public-target-unavailable:${repo}`);
     return 0;
   }
+  const publicMode = isPublicDataClass(process.env);
   let result;
-  try {
-    result = await askModelResilient({
-      prompt: buildResearchPrompt(repo, workdir),
-      timeoutMs: 480000,
-      env: executionModelEnv(),
-      preferVariantMax: true,
-      maxRounds: 4,
-      workspace: workdir,
-    });
-  } finally {
-    if (workdir) {
-      try {
-        fsRemove(workdir);
-      } catch {}
+  let repaired;
+  if (!publicMode) {
+    // Preserve the private lane's historical salvage/artifact semantics. The
+    // public repair airlock is intentionally not reachable from this branch.
+    try {
+      result = await askModelResilient({
+        prompt: buildResearchPrompt(repo, workdir, { publicMode: false }),
+        timeoutMs: 480000,
+        env: executionModelEnv(),
+        preferVariantMax: true,
+        maxRounds: 4,
+        workspace: workdir,
+      });
+    } finally {
+      if (workdir) {
+        try {
+          fsRemove(workdir);
+        } catch {}
+      }
     }
+    audit.note("research", `repo=${repo} complete=${result.complete} ladders=${result.ladders}`);
+    if (!result.complete || !result.reply) {
+      const { gatewayDown } = await import("./lib/gateway-health.mjs");
+      if (gatewayDown(REPO_ROOT)) {
+        return recordResearchCapacityWait(audit, repo, "gateway-circuit-still-open");
+      }
+      throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });
+    }
+    let ideas;
+    try {
+      ideas = salvageIdeas(result.reply);
+    } catch (err) {
+      audit.note("research", `repo=${repo} invalid ideas; skipped (${String(err.message || err).slice(0, 120)})`);
+      console.log(`IMPROVE_SKIPPED=invalid-ideas:${repo}`);
+      return 0;
+    }
+    const outDir = process.env.FLEET_ARTIFACT_DIR || ".";
+    mkdirSync(outDir, { recursive: true });
+    writeFileSync(
+      path.join(outDir, `ideas-${repo.replace("/", "__")}.json`),
+      JSON.stringify({ repo, ideas, reply: result.reply, validatedAt: new Date().toISOString() }, null, 2),
+    );
+    console.log(`IMPROVE_DONE=research:${repo}`);
+    return 0;
   }
+  ({ result, repaired } = await runPublicResearchModel({
+    repo,
+    workdir,
+    env: executionModelEnv(),
+    ask: askModelResilient,
+    repair: repairResearchOutput,
+  }));
   audit.note("research", `repo=${repo} complete=${result.complete} ladders=${result.ladders}`);
-  if (!result.complete || !result.reply) {
+  if (!result.complete || !result.reply || repaired?.reason === "MODEL_UNAVAILABLE") {
     const { gatewayDown } = await import("./lib/gateway-health.mjs");
-    if (gatewayDown(REPO_ROOT)) {
+    const unavailable = repaired?.result || result;
+    if (unavailable?.waitingForCapacity || unavailable?.waiting_for_capacity || unavailable?.waitingForQuota || unavailable?.waiting_for_quota || gatewayDown(REPO_ROOT)) {
       return recordResearchCapacityWait(audit, repo, "gateway-circuit-still-open");
     }
     throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });
   }
-  let ideas;
-  try {
-    ideas = salvageIdeas(result.reply);
-  } catch (err) {
-    audit.note("research", `repo=${repo} invalid ideas; skipped (${String(err.message || err).slice(0, 120)})`);
-    if (isPublicDataClass(process.env)) {
+  if (!repaired?.accepted) {
+    audit.note("research", `repo=${repo} invalid ideas; skipped (${String(repaired?.reason || "INVALID_RESEARCH_OUTPUT").slice(0, 120)})`);
+    if (publicMode) {
       writePublicArtifact(process.env, {
         mode: "research",
         status: "deferred",
@@ -504,14 +816,25 @@ async function modeResearch(audit) {
     console.log(`IMPROVE_SKIPPED=invalid-ideas:${repo}`);
     return 0;
   }
-  if (isPublicDataClass(process.env)) {
-    writePublicArtifact(process.env, { mode: "research", status: "ok", repo, ideas, validatedAt: new Date().toISOString() }, { kind: "improve", status: "ok", repository: repo });
+  const ideas = repaired.ideas;
+  if (publicMode) {
+    writePublicArtifact(process.env, {
+      mode: "research",
+      status: "ok",
+      repo,
+      ideas,
+      evidenceVerified: repaired.evidenceVerified === true,
+      evidencePaths: repaired.evidencePaths,
+      sourceRevision: repaired.sourceRevision,
+      treeSnapshot: repaired.treeSnapshot,
+      validatedAt: new Date().toISOString(),
+    }, { kind: "improve", status: "ok", repository: repo });
   } else {
     const outDir = process.env.FLEET_ARTIFACT_DIR || ".";
     mkdirSync(outDir, { recursive: true });
     writeFileSync(
       path.join(outDir, `ideas-${repo.replace("/", "__")}.json`),
-      JSON.stringify({ repo, ideas, reply: result.reply, validatedAt: new Date().toISOString() }, null, 2),
+      JSON.stringify({ repo, ideas, reply: repaired.result?.reply || result.reply, validatedAt: new Date().toISOString() }, null, 2),
     );
   }
   console.log(`IMPROVE_DONE=research:${repo}`);
@@ -630,6 +953,172 @@ export function salvageIdeas(replyText) {
     }
   }
   throw lastError;
+}
+
+function substantiveResearchIdeas(ideas, repository = "", sourceBinding = null) {
+  return Array.isArray(ideas) && ideas.length > 0 && ideas.length <= IDEA_MAX_COUNT && ideas.every((idea) => (
+    idea && typeof idea === "object" && !Array.isArray(idea)
+      && typeof idea.title === "string" && idea.title.trim().length >= 4
+      && typeof idea.rationale === "string" && idea.rationale.trim().length >= RESEARCH_EVIDENCE_MIN_CHARS
+      && typeof idea.evidence === "string" && idea.evidence.trim().length >= RESEARCH_EVIDENCE_MIN_CHARS
+      && SOURCE_REFERENCE_RE.test(idea.evidence)
+      && !evidenceHasForeignRepositoryPath(idea.evidence, repository)
+      && hasVerifiedSourceEvidence(idea.evidence, sourceBinding)
+      && IDEA_IMPACTS.has(String(idea.impact || "").trim().toLowerCase())
+  ));
+}
+
+function repairModelFromResult(result) {
+  const raw = String(result?.model || result?.modelMode || "").trim();
+  const match = raw.match(/^(opencode\/[A-Za-z0-9._-]+)(?:@(?:xhigh|max|plain))?$/i);
+  return match && isAllowedModel(match[1]) ? match[1] : "";
+}
+
+function researchResultUnavailable(result) {
+  return Boolean(result?.waitingForCapacity
+    || result?.waiting_for_capacity
+    || result?.waitingForQuota
+    || result?.waiting_for_quota
+    || result?.circuitOpen
+    || result?.spawnFailed
+    || result?.transportFailure
+    || result?.authMissing
+    || result?.exhausted);
+}
+
+function strictResearchRepairPrompt(repository = "") {
+  return [
+    "Your previous research response was not accepted because it did not contain a complete, substantive JSON object.",
+    repository ? `The target repository remains ${repository}; do not change its identity.` : "Keep the original target repository identity unchanged.",
+    "Resume the exact same session and inspect the checked-out public workspace again before answering.",
+    "Return ONLY strict JSON with this exact shape: {\"ideas\":[{\"title\":\"...\",\"rationale\":\"...\",\"evidence\":\"relative/source/path.ext and the concrete symbol, test, or behavior observed\",\"impact\":\"high|medium|low\"}]}",
+    "Provide 1 to 5 bounded ideas. Every rationale and evidence must be substantive; every evidence field must name a real relative source path from the checked-out repository. No markdown, prose, placeholders, or invented repository identities.",
+  ].join("\n");
+}
+
+/**
+ * Parse research output and, only when an exact session and model identity are
+ * available, request up to three strict same-session repairs. Capacity or
+ * transport dispositions are terminal for this invocation so indefinite wait
+ * semantics are preserved and no unauthorized extra calls are added.
+ */
+export async function repairResearchOutput(initialResult, options = {}) {
+  const resume = typeof options.resume === "function" ? options.resume : askModel;
+  const env = options.env || process.env;
+  const workspace = options.workspace;
+  const exactSession = String(initialResult?.sessionId || "").trim();
+  const modelOverride = repairModelFromResult(initialResult);
+  const sourceBinding = sourceWorkspaceBinding(workspace);
+  let result = initialResult || {};
+  let repairRounds = 0;
+
+  const accepted = (candidate) => {
+    if (researchResultUnavailable(candidate) || !candidate?.complete || !candidate?.reply) return null;
+    try {
+      const parsed = salvageIdeas(candidate.reply);
+      if (!substantiveResearchIdeas(parsed.ideas, options.repository, sourceBinding)) return null;
+      const evidencePaths = [...new Set(parsed.ideas.flatMap((idea) => verifiedSourcePaths(idea.evidence, sourceBinding)))];
+      if (evidencePaths.length === 0) return null;
+      return {
+        accepted: true,
+        ideas: parsed.ideas,
+        result: candidate,
+        repairRounds,
+        evidenceVerified: true,
+        evidencePaths,
+        sourceRevision: sourceBinding.sourceRevision,
+        treeSnapshot: sourceBinding.treeSnapshot,
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  let parsed = accepted(result);
+  if (parsed) return parsed;
+  // A caller-supplied session ID is not proof that the provider returned that
+  // session.  Same-session repair is only safe after the model wrapper has
+  // observed an explicit provider sessionID on the original response.
+  if (researchResultUnavailable(result) || result?.sessionIdReturned !== true || !exactSession || !modelOverride) {
+    return {
+      accepted: false,
+      reason: researchResultUnavailable(result) ? "MODEL_UNAVAILABLE" : "INVALID_RESEARCH_OUTPUT",
+      result,
+      repairRounds,
+    };
+  }
+
+  while (repairRounds < MAX_RESEARCH_REPAIR_ROUNDS) {
+    let repair;
+    try {
+      repair = await resume({
+        prompt: strictResearchRepairPrompt(options.repository),
+        sessionId: exactSession,
+        modelOverride,
+        timeoutMs: 480000,
+        env,
+        preferVariantMax: true,
+        maxRounds: 1,
+        workspace,
+        pinModel: true,
+      });
+    } catch {
+      repair = { complete: false, sessionId: exactSession, modelMode: modelOverride, transportFailure: true };
+    }
+    repairRounds += 1;
+    result = repair || {};
+    // Never accept a response that manufactures or changes the exact session
+    // identity. A missing returned ID is treated as an unverified repair.
+    if (String(result.sessionId || "").trim() !== exactSession) break;
+    if (result.sessionIdReturned !== true) break;
+    if (repairModelFromResult(result) !== modelOverride) break;
+    if (researchResultUnavailable(result)) break;
+    parsed = accepted(result);
+    if (parsed) return parsed;
+  }
+  return {
+    accepted: false,
+    reason: researchResultUnavailable(result) ? "MODEL_UNAVAILABLE" : "INVALID_RESEARCH_OUTPUT",
+    result,
+    repairRounds,
+  };
+}
+
+/**
+ * Run the public research call and any bounded same-session repair while the
+ * checked-out workspace is still mounted. Cleanup happens only after repair
+ * completes (or fails), so every repair round can inspect the same checkout.
+ */
+export async function runPublicResearchModel({ repo, workdir, env = process.env, ask = askModelResilient, repair = repairResearchOutput, promptBuilder = buildResearchPrompt } = {}) {
+  let result;
+  let repaired;
+  try {
+    result = await ask({
+      prompt: promptBuilder(repo, workdir, { publicMode: true }),
+      timeoutMs: 480000,
+      env,
+      preferVariantMax: true,
+      maxRounds: 4,
+      workspace: workdir,
+    });
+    if (result?.complete && result?.reply) {
+      repaired = await repair(result, {
+        env,
+        workspace: workdir,
+        repository: repo,
+        resume: askModel,
+      });
+    } else {
+      repaired = { accepted: false, reason: "MODEL_UNAVAILABLE", result, repairRounds: 0 };
+    }
+    return { result, repaired };
+  } finally {
+    if (workdir) {
+      try {
+        fsRemove(workdir);
+      } catch {}
+    }
+  }
 }
 
 export function pickBestIdea(replyText) {
@@ -1010,11 +1499,22 @@ async function modePlan(audit) {
     const inputDir = process.env.FLEET_ARTIFACT_DIR || artifactDir();
     const outputDir = artifactDir();
     const research = readPublicImproveManifests(inputDir, repo).find((row) => row.mode === "research");
+    const binding = sourceWorkspaceBinding(path.join(process.cwd(), "public-target"));
     const idea = Array.isArray(research?.ideas) && research.ideas.length > 0 ? research.ideas[0] : null;
-    const analyzed = isBoundedResearchManifest(research) && Boolean(idea && typeof idea === "object");
-    const proposal = analyzed && idea && typeof idea === "object"
-      ? { title: String(idea.title || "public improvement proposal").slice(0, 160), impact: String(idea.impact || "medium").slice(0, 20) }
+    const analyzedResearch = isBoundedResearchManifest(research, { binding });
+    const proposal = analyzedResearch && idea && typeof idea === "object"
+      ? {
+        title: String(idea.title || "public improvement proposal").slice(0, 160),
+        impact: String(idea.impact || "medium").slice(0, 20),
+        rationale: String(idea.rationale || "").slice(0, 2400),
+        evidence: String(idea.evidence || "").slice(0, 2400),
+      }
       : undefined;
+    const proposalPaths = proposal ? evidencePathsFromText(proposal.evidence) : [];
+    const analyzed = Boolean(analyzedResearch
+      && proposal
+      && sourcePathSubset(proposalPaths, manifestEvidencePaths(research))
+      && proposalPaths.every((entry) => sourceClaimIsInsideBinding(binding, { path: entry, line: "", symbol: "" })));
     if (proposal) {
       mkdirSync(outputDir, { recursive: true });
       writeFileSync(path.join(outputDir, "public-plan.json"), JSON.stringify({ repository: repo, proposal, generatedUtc: new Date().toISOString() }, null, 2));
@@ -1034,6 +1534,12 @@ async function modePlan(audit) {
       awaitingPrivateControl: analyzed,
       reason: analyzed ? "public-read-only" : "research-unavailable",
       plan: proposal,
+      ...(analyzed ? {
+        evidenceVerified: true,
+        sourceRevision: research.sourceRevision,
+        treeSnapshot: research.treeSnapshot,
+        evidencePaths: manifestEvidencePaths(research),
+      } : {}),
     }, { kind: "improve", status: stageStatus, repository: repo });
     audit.note("plan", analyzed ? "public proposal generated in ephemeral state" : "public plan waiting for research evidence");
     console.log(`IMPROVE_MATRIX=${JSON.stringify(matrix)}`);
@@ -1257,9 +1763,19 @@ async function modeReview(audit) {
     const lens = LENSES[process.env.FLEET_LENS] ? process.env.FLEET_LENS : "correctness";
     const workdir = `/tmp/improve-review-${String(repo).replace("/", "__")}-${lens}-${process.pid}-${Date.now()}`;
     let workspace;
+    let reviewBinding;
+    let reviewResearchPaths = [];
     try {
       gh(["repo", "clone", repo, workdir, "--", "--depth", "1"], process.env);
       workspace = workdir;
+      reviewBinding = sourceWorkspaceBinding(workspace);
+      const researchRoot = String(process.env.FLEET_PUBLIC_RESEARCH_DIR || "").trim();
+      const researchManifest = researchRoot
+        ? readPublicImproveManifests(researchRoot, repo).find((row) => row.mode === "research")
+        : null;
+      if (researchManifest && isBoundedResearchManifest(researchManifest, { binding: reviewBinding })) {
+        reviewResearchPaths = manifestEvidencePaths(researchManifest);
+      }
     } catch (err) {
       audit.note("review", `${lens}: public target clone unavailable (${String(err?.code || err?.message || err).slice(0, 80)})`);
       try {
@@ -1281,7 +1797,7 @@ async function modeReview(audit) {
       `You are a bounded ${lens} reviewer for the public repository ${repo}.`,
       "Inspect the checked-out public source as read-only evidence; do not propose comments, commits, branches, pull requests, or private-state changes.",
       LENSES[lens],
-      'Return ONLY strict JSON: {"findings":[{"severity":"critical|high|medium|low","title":"...","detail":"..."}]} max 8 findings.',
+      'Return ONLY strict JSON: {"findings":[{"severity":"critical|high|medium|low","title":"...","detail":"..."}],"evidencePaths":["relative/source/path.ext"],"evidence":{"inspectedScope":"relative paths/symbols inspected","noFindingsRationale":"required only when findings is empty"},"checks":{"evidence":true,"noFindingsVerified":true}} max 8 findings.',
     ].join("\n");
     let result = { complete: false, reply: "" };
     try {
@@ -1295,24 +1811,39 @@ async function modeReview(audit) {
       });
     } catch (err) {
       audit.note("review", `${lens}: public analysis unavailable (${String(err?.code || err?.message || err).slice(0, 80)})`);
-    } finally {
-      if (workspace) {
-        try {
-          fsRemove(workspace);
-        } catch {}
-      }
     }
+    try {
     let findings = [];
     let parsedReview = false;
+    let reviewEvidence;
+    let reviewChecks;
+    let reviewEvidencePaths = [];
     if (result?.complete && result.reply) {
       try {
         const parsed = extractJson(result.reply);
-        parsedReview = Boolean(parsed && typeof parsed === "object" && !Array.isArray(parsed) && validReviewFindings(parsed.findings));
+        reviewEvidencePaths = Array.isArray(parsed?.evidencePaths) ? parsed.evidencePaths.map((entry) => String(entry || "").trim()).filter(Boolean) : [];
+        const attested = reviewBinding ? {
+          ...parsed,
+          mode: "review",
+          status: "analyzed",
+          repository: repo,
+          evidenceVerified: true,
+          sourceRevision: reviewBinding.sourceRevision,
+          treeSnapshot: reviewBinding.treeSnapshot,
+          evidencePaths: reviewEvidencePaths,
+        } : null;
+        parsedReview = Boolean(attested && isBoundedReviewManifest(attested, { binding: reviewBinding, researchEvidencePaths: reviewResearchPaths }));
         findings = parsedReview ? parsed.findings.map((finding) => ({
           severity: String(finding.severity).toLowerCase(),
           title: finding.title.trim(),
           detail: finding.detail,
         })) : [];
+        reviewEvidence = parsedReview && parsed.evidence && typeof parsed.evidence === "object" && !Array.isArray(parsed.evidence)
+          ? { inspectedScope: String(parsed.evidence.inspectedScope || "").trim().slice(0, 2000), noFindingsRationale: String(parsed.evidence.noFindingsRationale || "").trim().slice(0, 2000) }
+          : undefined;
+        reviewChecks = parsedReview && parsed.checks && typeof parsed.checks === "object" && !Array.isArray(parsed.checks)
+          ? { evidence: parsed.checks.evidence === true, noFindingsVerified: parsed.checks.noFindingsVerified === true }
+          : undefined;
       } catch {}
     }
     let analyzed = parsedReview;
@@ -1328,11 +1859,19 @@ async function modeReview(audit) {
       reason: reviewReason,
       lens,
       findings,
+      ...(reviewEvidence ? { evidence: reviewEvidence } : {}),
+      ...(reviewChecks ? { checks: reviewChecks } : {}),
+      ...(parsedReview ? {
+        evidenceVerified: true,
+        sourceRevision: reviewBinding.sourceRevision,
+        treeSnapshot: reviewBinding.treeSnapshot,
+        evidencePaths: reviewEvidencePaths,
+      } : {}),
     };
     writePublicArtifact(process.env, reviewPayload, { kind: "improve", status: stageStatus, repository: repo });
     if (parsedReview) {
       const serialized = readPublicManifest(process.env);
-      const post = publicReviewSerialization(serialized);
+      const post = publicReviewSerialization(serialized, { binding: reviewBinding, researchEvidencePaths: reviewResearchPaths });
       if (!post.analyzed) {
         analyzed = false;
         stageStatus = post.status;
@@ -1350,6 +1889,13 @@ async function modeReview(audit) {
     }
     audit.note("review", `${lens}: public read-only analysis complete=${analyzed}`);
     return 0;
+    } finally {
+      if (workspace) {
+        try {
+          fsRemove(workspace);
+        } catch {}
+      }
+    }
   }
   const dir = process.env.FLEET_ARTIFACT_DIR || ".";
   const lens = process.env.FLEET_LENS;
@@ -1450,6 +1996,7 @@ async function modeFinalize(audit) {
   if (isPublicDataClass(process.env)) {
     const repo = publicRepository(process.env);
     const manifests = readPublicImproveManifests(process.env.FLEET_ARTIFACT_DIR || ".", repo);
+    const binding = sourceWorkspaceBinding(path.join(process.cwd(), "public-target"));
     const stageResults = {
       pick: process.env.FLEET_IMPROVE_PICK_RESULT,
       research: process.env.FLEET_IMPROVE_RESEARCH_RESULT,
@@ -1457,7 +2004,7 @@ async function modeFinalize(audit) {
       implement: process.env.FLEET_IMPROVE_IMPLEMENT_RESULT,
       review: process.env.FLEET_IMPROVE_REVIEW_RESULT,
     };
-    const receipt = publicImproveReceipt(repo, manifests, stageResults);
+    const receipt = publicImproveReceipt(repo, manifests, stageResults, { binding });
     writePublicArtifact(process.env, receipt, {
       kind: "improve",
       status: receipt.status,

@@ -108,20 +108,25 @@ export function gh(args, env = process.env, { input } = {}) {
 
 function assertPublicGhReadOnly(args = []) {
   const values = args.map((value) => String(value));
-  const methodIndex = values.findIndex((value) => /^-X$|^--method$|^-X=/.test(value));
-  if (methodIndex >= 0) {
-    const method = values[methodIndex].includes("=")
-      ? values[methodIndex].split("=").at(-1)
-      : values[methodIndex + 1];
-    if (String(method || "GET").toUpperCase() !== "GET") {
-      throw new Error(`PUBLIC_WRITE_BLOCKED: gh ${method}`);
+  let method;
+  for (let index = 0; index < values.length; index += 1) {
+    const value = values[index];
+    let inline;
+    if (/^--method=/i.test(value)) inline = value.slice(value.indexOf("=") + 1);
+    else if (/^-X=/i.test(value)) inline = value.slice(3);
+    else if (value === "--method" || value === "-X") {
+      inline = values[index + 1];
+      index += 1;
+    } else if (/^-X.+/i.test(value)) inline = value.slice(2);
+    if (inline !== undefined) {
+      method = String(inline || "").trim().toUpperCase();
+      if (method !== "GET") throw new Error(`PUBLIC_WRITE_BLOCKED: gh ${inline || "unknown method"}`);
     }
   }
-  const explicitGet = methodIndex >= 0 && String(values[methodIndex].includes("=") ? values[methodIndex].split("=").at(-1) : values[methodIndex + 1] || "GET").toUpperCase() === "GET";
-  if (!explicitGet && values.some((value) => /^--?(?:raw-)?field$|^-F$|^-f$|^--input$/.test(value))) {
-    throw new Error("PUBLIC_WRITE_BLOCKED: gh request body");
-  }
-  if (methodIndex < 0 && values.some((value) => /^--?(?:raw-)?field$|^-F$|^-f$|^--input$/.test(value))) {
+  // `gh api` treats these as request-body/query parameters.  Keep rejecting
+  // both long and short forms, including attached `-fvalue`/`-Fvalue` forms,
+  // even when a caller explicitly spells the method as GET.
+  if (values.some((value) => /^(?:--(?:raw-)?field(?:=|$)|--input(?:=|$)|-[fF](?:$|=|[^-]))/i.test(value))) {
     throw new Error("PUBLIC_WRITE_BLOCKED: gh request body");
   }
   if (values[0] === "pr" && values.some((value) => /^(merge|ready|close|reopen|edit|comment|review|create)$/.test(value))) {

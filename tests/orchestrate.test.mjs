@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import * as orchestrate from "../scripts/orchestrate.mjs";
 import { buildFleetPlan } from "../scripts/lib/fleet-scheduler.mjs";
 
@@ -639,6 +639,9 @@ test("accepted workflow dispatch remains awaiting receipt until goal-bound evide
     assert.equal(replay.reason, "effect-in-flight");
     const current = loadOrchestrationState(root).records.find((row) => row.workKey === stableWorkKey(task));
     assert.equal(current.state, "awaiting_receipt");
+    assert.equal(result.processSuccess, true);
+    assert.equal(result.desiredTaskCompleted, false);
+    assert.equal(result.semanticStatus, "AWAITING_RECEIPT");
     const incomplete = applyEffectReceipt(root, {
       workKey: current.workKey,
       effectKey: current.effectKey,
@@ -653,11 +656,11 @@ test("accepted workflow dispatch remains awaiting receipt until goal-bound evide
       generation: current.generation,
       status: "completed",
       receiptId: "receipt-123",
-      goal: "upgrade M1Vj/fleet-fixture",
-      session: "session-123",
-      artifact: "artifact-123",
-      checks: ["run-status:success"],
-      verifier: "fleet-verifier-1",
+      goal: current.receiptBinding.goal,
+      session: current.receiptBinding.session,
+      artifact: current.receiptBinding.artifact,
+      checks: current.receiptBinding.checks,
+      verifier: current.receiptBinding.verifier,
     });
     assert.equal(complete.accepted, true);
     assert.equal(loadOrchestrationState(root).records.find((row) => row.workKey === current.workKey).state, "completed");
@@ -676,6 +679,398 @@ test("accepted workflow dispatch remains awaiting receipt until goal-bound evide
     });
     assert.equal(noRun.status, "dispatched");
     assert.equal(noRun.effectState, "unknown_effect");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Given a duplicate delivery, when execution is replayed, then process success never becomes semantic SUCCESS", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-duplicate-semantics-"));
+  const workflowPath = path.join(root, "improve.yml");
+  writeFileSync(workflowPath, [
+    "on:",
+    "  workflow_dispatch:",
+    "    inputs:",
+    "      repo:",
+    "        type: string",
+  ].join("\n"));
+  const task = { id: "duplicate-semantics", type: "upgrade", role: "upgrade", repo: OWNER_REPO };
+  const env = {
+    FLEET_STATE_ROOT: root,
+    RUNNER_TEMP: root,
+    FLEET_ARTIFACT_DIR: path.join(root, "fleet-task-results"),
+  };
+  try {
+    const first = await orchestrate.executeTask(task, {
+      workflowPath,
+      env,
+      ghClient: () => ({ runId: "run-duplicate" }),
+    });
+    assert.equal(first.processSuccess, true);
+    assert.equal(first.desiredTaskCompleted, false);
+    const replay = await orchestrate.executeTask(task, {
+      workflowPath,
+      env,
+      ghClient: () => { throw new Error("duplicate dispatch must not run"); },
+    });
+    assert.equal(replay.status, "duplicate");
+    assert.equal(replay.processSuccess, true);
+    assert.equal(replay.desiredTaskCompleted, false);
+    assert.equal(replay.semanticStatus, "DUPLICATE");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Given deferred, no-op, and awaiting-receipt stages, when the envelope is built, then only a completed receipt is SUCCESS", () => {
+  const cases = [
+    ["accepted", "ACCEPTED"],
+    ["deferred", "DEFERRED"],
+    ["no_op", "NO_OP"],
+    ["awaiting_receipt", "AWAITING_RECEIPT"],
+  ];
+  for (const [status, semanticStatus] of cases) {
+    const envelope = orchestrate.describeOutcome({ status, effectState: status });
+    assert.equal(envelope.processSuccess, true);
+    assert.equal(envelope.desiredTaskCompleted, false);
+    assert.equal(envelope.semanticStatus, semanticStatus);
+  }
+  const success = orchestrate.describeOutcome({ status: "completed", effectState: "completed" });
+  assert.equal(success.processSuccess, true);
+  assert.equal(success.desiredTaskCompleted, true);
+  assert.equal(success.semanticStatus, "SUCCESS");
+});
+
+test("Given a valid receipt, when goal, session, generation, artifact, check, or verifier drifts, then completion is rejected", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-receipt-binding-"));
+  const task = { id: "receipt-binding", type: "review", role: "review", repo: OWNER_REPO, pr: 51 };
+  const env = {
+    FLEET_STATE_ROOT: root,
+    RUNNER_TEMP: root,
+    FLEET_ARTIFACT_DIR: path.join(root, "fleet-task-results"),
+  };
+  try {
+    const result = await orchestrate.executeTask(task, {
+      env,
+      ghClient(args) {
+        const endpoint = String(args.at(-1) ?? "");
+        if (endpoint.includes("/pulls/51")) return { number: 51, state: "open", base: { ref: "main" } };
+        return { default_branch: "main" };
+      },
+      modelRunner: async () => ({ complete: true, reply: "bounded review evidence", modelMode: "test" }),
+    });
+    const record = loadOrchestrationState(root).records.find((row) => row.workKey === stableWorkKey(task));
+    assert.equal(record.state, "awaiting_receipt");
+    const binding = record.receiptBinding;
+    assert.ok(binding);
+    const base = {
+      workKey: record.workKey,
+      effectKey: record.effectKey,
+      generation: record.generation,
+      receiptId: "receipt-binding-51",
+      status: "completed",
+      ...binding,
+    };
+    assert.equal(applyEffectReceipt(root, base).accepted, true);
+    for (const [field, value] of [
+      ["goal", "review M1Vj/other#51"],
+      ["session", "session-drift"],
+      ["generation", record.generation + 1],
+      ["artifact", "artifact-drift"],
+      ["checks", ["check-drift"]],
+      ["verifier", "verifier-drift"],
+    ]) {
+      const isolatedRoot = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-receipt-binding-case-"));
+      try {
+        const isolated = await orchestrate.executeTask(task, {
+          env: { ...env, RUNNER_TEMP: isolatedRoot, FLEET_STATE_ROOT: isolatedRoot, FLEET_ARTIFACT_DIR: path.join(isolatedRoot, "fleet-task-results") },
+          ghClient(args) {
+            const endpoint = String(args.at(-1) ?? "");
+            if (endpoint.includes("/pulls/51")) return { number: 51, state: "open", base: { ref: "main" } };
+            return { default_branch: "main" };
+          },
+          modelRunner: async () => ({ complete: true, reply: "bounded review evidence", modelMode: "test" }),
+        });
+        const current = loadOrchestrationState(isolatedRoot).records.find((row) => row.workKey === stableWorkKey(task));
+        const receipt = { ...base, workKey: current.workKey, effectKey: current.effectKey, generation: current.generation, ...current.receiptBinding };
+        receipt[field] = value;
+        const rejected = applyEffectReceipt(isolatedRoot, receipt);
+        assert.equal(rejected.accepted, false, `${field} drift must reject`);
+        assert.ok(["receipt-binding-mismatch", "late-receipt"].includes(rejected.reason), `${field} drift reason`);
+        assert.equal(loadOrchestrationState(isolatedRoot).records.find((row) => row.workKey === current.workKey).state, "awaiting_receipt");
+        assert.equal(isolated.processSuccess, true);
+      } finally {
+        rmSync(isolatedRoot, { recursive: true, force: true });
+      }
+    }
+    assert.equal(result.desiredTaskCompleted, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Given the public orchestrate workflow, when it consumes a result, then effectState is required and the exact manifest is uploaded", () => {
+  const workflow = readFileSync(path.join(process.cwd(), ".github", "workflows", "orchestrate.yml"), "utf8");
+  assert.match(workflow, /consume structured orchestration state/i);
+  assert.match(workflow, /effectState/);
+  assert.match(workflow, /desiredTaskCompleted/);
+  assert.match(workflow, /FLEET_PUBLIC_ARTIFACT_MANIFEST/);
+  assert.match(workflow, /fleet-public-artifact-v1/);
+  assert.match(workflow, /manifest\.dataClass\s*!==\s*"public"/);
+  assert.doesNotMatch(workflow, />\s*\"?\$FLEET_PUBLIC_ARTIFACT_MANIFEST/);
+  assert.match(workflow, /--output-file\s+\"\$FLEET_RESULT_FILE\"/);
+  assert.doesNotMatch(workflow, />\s*\"?\$FLEET_RESULT_FILE/);
+  assert.match(workflow, /path:\s*\$\{\{\s*runner\.temp\s*\}\}\/fleet-public-state\/public-artifact\.json/);
+});
+
+test("Given a public execution, when a task artifact is emitted, then only the canonical sanitized manifest is written", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-public-manifest-"));
+  const stateRoot = path.join(root, "state");
+  const manifest = path.join(stateRoot, "public-artifact.json");
+  const env = {
+    FLEET_DATA_CLASS: "public",
+    FLEET_PUBLIC_OWNER: "M1Vj",
+    FLEET_PUBLIC_REPOSITORY: OWNER_REPO,
+    FLEET_PUBLIC_STATE_ROOT: stateRoot,
+    FLEET_STATE_ROOT: stateRoot,
+    FLEET_PUBLIC_ARTIFACT_MANIFEST: manifest,
+    RUNNER_TEMP: root,
+    GITHUB_RUN_ID: "12345",
+    FLEET_ARTIFACT_DIR: path.join(root, "raw-results"),
+  };
+  const task = { id: "public-manifest-task", type: "review", role: "review", repo: OWNER_REPO, pr: 73 };
+  try {
+    const result = await orchestrate.executeTask(task, {
+      env,
+      ghClient(args) {
+        const endpoint = String(args.at(-1) ?? "");
+        if (endpoint.includes("/pulls/73")) return { number: 73, state: "open", base: { ref: "main" } };
+        return { default_branch: "main" };
+      },
+      modelRunner: async () => ({ complete: true, reply: "public bounded review", modelMode: "test" }),
+    });
+    const value = JSON.parse(readFileSync(manifest, "utf8"));
+    assert.equal(value.schema, "fleet-public-artifact-v1");
+    assert.equal(value.dataClass, "public");
+    assert.equal(value.repository, OWNER_REPO);
+    assert.equal(value.runId, "12345");
+    assert.equal(value.effectState, result.effectState);
+    assert.equal(value.processSuccess, result.processSuccess);
+    assert.equal(value.semanticStatus, result.semanticStatus);
+    assert.equal(value.desiredTaskCompleted, false);
+    assert.equal(value.awaitingControl, true);
+    assert.equal(value.status, "awaiting-control");
+    assert.equal(value.checks.effectState, result.effectState);
+    assert.equal(value.checks.processSuccess, result.processSuccess);
+    assert.equal(value.checks.semanticStatus, result.semanticStatus);
+    assert.equal(existsSync(path.join(root, "raw-results")), false);
+    assert.equal(JSON.stringify(value).includes("/raw-results/"), false);
+    assert.equal(JSON.stringify(value).includes(result.workKey), false);
+    assert.equal(JSON.stringify(value).includes(result.effectKey), false);
+    assert.equal(JSON.stringify(value).includes(result.receiptBinding?.session || "session-v1-"), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Given a public review, when the model runner starts, then private auth and slots are absent", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-public-model-env-"));
+  const stateRoot = path.join(root, "state");
+  const manifest = path.join(stateRoot, "public-artifact.json");
+  const env = {
+    FLEET_DATA_CLASS: "public",
+    FLEET_PUBLIC_OWNER: "M1Vj",
+    FLEET_PUBLIC_REPOSITORY: OWNER_REPO,
+    FLEET_PUBLIC_STATE_ROOT: stateRoot,
+    FLEET_STATE_ROOT: stateRoot,
+    FLEET_PUBLIC_ARTIFACT_MANIFEST: manifest,
+    RUNNER_TEMP: root,
+    GITHUB_RUN_ID: "67890",
+    GITHUB_TOKEN: "built-in-token",
+    GH_TOKEN: "built-in-token",
+    FLEET_GH_TOKEN: "private-gh-token",
+    FLEET_OPENCODE_AUTH: "private-auth-1",
+    FLEET_PROXY_URL: "http://private-proxy.invalid",
+    OPENCODE_AUTH_CONTENT: "private-auth-content",
+    FLEET_AUTH_COOLDOWN_MS: "60000",
+    FLEET_PRIVATE_STATE_ROOT: "/private/state",
+    GITHUB_WORKSPACE: "/private/workspace",
+  };
+  for (let slot = 2; slot <= 9; slot += 1) env[`FLEET_OPENCODE_AUTH_${slot}`] = `private-auth-${slot}`;
+  const task = { id: "public-model-env-task", type: "review", role: "review", repo: OWNER_REPO, pr: 74 };
+  let captured;
+  try {
+    await orchestrate.executeTask(task, {
+      env,
+      ghClient(args) {
+        const endpoint = String(args.at(-1) ?? "");
+        if (endpoint.includes("/pulls/74")) return { number: 74, state: "open", base: { ref: "main" } };
+        return { default_branch: "main" };
+      },
+      modelRunner: async (options) => {
+        captured = options.env;
+        return { complete: true, reply: "public bounded review", modelMode: "test" };
+      },
+    });
+    assert.ok(captured, "model runner must receive an environment");
+    for (const key of [
+      "FLEET_GH_TOKEN",
+      "FLEET_OPENCODE_AUTH",
+      "FLEET_PROXY_URL",
+      "OPENCODE_AUTH_CONTENT",
+      "FLEET_AUTH_COOLDOWN_MS",
+      "FLEET_PRIVATE_STATE_ROOT",
+      "GITHUB_TOKEN",
+      "GH_TOKEN",
+      "GITHUB_WORKSPACE",
+    ]) assert.equal(captured[key], undefined, `${key} must not reach a public model runner`);
+    for (let slot = 2; slot <= 9; slot += 1) {
+      assert.equal(captured[`FLEET_OPENCODE_AUTH_${slot}`], undefined, `private auth slot ${slot} must be removed`);
+    }
+    assert.equal(captured.FLEET_DATA_CLASS, "public");
+    assert.equal(captured.FLEET_PUBLIC_OWNER, "M1Vj");
+    assert.equal(captured.FLEET_PUBLIC_REPOSITORY, OWNER_REPO);
+    assert.equal(captured.FLEET_PUBLIC_STATE_ROOT, stateRoot);
+    assert.equal(captured.FLEET_STATE_ROOT, stateRoot);
+    assert.equal(captured.FLEET_PUBLIC_ARTIFACT_MANIFEST, manifest);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Given an unsafe public state-root override, when execution starts, then it fails before any durable write", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-public-state-fence-"));
+  const unsafe = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-unsafe-state-"));
+  const stateRoot = path.join(root, "fleet-public-state");
+  const manifest = path.join(stateRoot, "public-artifact.json");
+  const baseEnv = {
+    FLEET_DATA_CLASS: "public",
+    FLEET_PUBLIC_OWNER: "M1Vj",
+    FLEET_PUBLIC_REPOSITORY: OWNER_REPO,
+    FLEET_PUBLIC_STATE_ROOT: stateRoot,
+    FLEET_STATE_ROOT: stateRoot,
+    FLEET_PUBLIC_ARTIFACT_MANIFEST: manifest,
+    RUNNER_TEMP: root,
+    GITHUB_RUN_ID: "89012",
+  };
+  const task = { id: "public-state-fence-task", type: "review", role: "review", repo: OWNER_REPO, pr: 76 };
+  try {
+    await assert.rejects(
+      orchestrate.executeTask(task, { env: { ...baseEnv, FLEET_STATE_ROOT: unsafe }, stateRoot: undefined }),
+      /public state root mismatch: FLEET_STATE_ROOT/,
+    );
+    assert.equal(existsSync(path.join(unsafe, "state")), false);
+    assert.equal(existsSync(stateRoot), false);
+
+    await assert.rejects(
+      orchestrate.executeTask(task, { env: baseEnv, stateRoot: unsafe }),
+      /public state root mismatch: stateRoot/,
+    );
+    assert.equal(existsSync(path.join(unsafe, "state")), false);
+    assert.equal(existsSync(stateRoot), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(unsafe, { recursive: true, force: true });
+  }
+});
+
+test("Given an unsafe public planning root, when planning starts, then no builder or scheduler write runs", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-public-plan-fence-"));
+  const unsafe = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-unsafe-plan-"));
+  const stateRoot = path.join(root, "fleet-public-state");
+  const env = {
+    FLEET_DATA_CLASS: "public",
+    FLEET_PUBLIC_OWNER: "M1Vj",
+    FLEET_PUBLIC_REPOSITORY: OWNER_REPO,
+    FLEET_PUBLIC_STATE_ROOT: stateRoot,
+    FLEET_STATE_ROOT: unsafe,
+    FLEET_PUBLIC_ARTIFACT_MANIFEST: path.join(stateRoot, "public-artifact.json"),
+    RUNNER_TEMP: root,
+    FLEET_EVENT_NAME: "schedule",
+    FLEET_EVENT_ACTION: "schedule",
+    FLEET_EVENT_PAYLOAD: "{}",
+  };
+  let builderCalled = false;
+  try {
+    await assert.rejects(
+      orchestrate.planFleet({
+        env,
+        stateRoot: unsafe,
+        ghClient: () => { throw new Error("planning must stop before GitHub access"); },
+        planBuilder: () => {
+          builderCalled = true;
+          return { allTasks: [] };
+        },
+      }),
+      /public state root mismatch: FLEET_STATE_ROOT/,
+    );
+    assert.equal(builderCalled, false);
+    assert.equal(existsSync(path.join(unsafe, "state")), false);
+    assert.equal(existsSync(stateRoot), false);
+
+    const symlinkRoot = path.join(root, "fleet-public-state-link");
+    symlinkSync(unsafe, symlinkRoot, "dir");
+    const symlinkEnv = { ...env, FLEET_PUBLIC_STATE_ROOT: symlinkRoot, FLEET_STATE_ROOT: symlinkRoot };
+    await assert.rejects(
+      orchestrate.planFleet({
+        env: symlinkEnv,
+        ghClient: () => { throw new Error("planning must stop before GitHub access"); },
+        planBuilder: () => ({ allTasks: [] }),
+      }),
+      /public state root resolves outside RUNNER_TEMP/,
+    );
+    assert.equal(existsSync(path.join(unsafe, "state")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(unsafe, { recursive: true, force: true });
+  }
+});
+
+test("Given pre-JSON terminal telemetry, when execute writes a result file, then capacity output stays parseable", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-result-file-"));
+  const stateRoot = path.join(root, "state");
+  const resultFile = path.join(root, "orchestrate-result.json");
+  const manifest = path.join(stateRoot, "public-artifact.json");
+  const retryAt = "2026-09-14T01:00:00.000Z";
+  const env = {
+    FLEET_DATA_CLASS: "public",
+    FLEET_PUBLIC_OWNER: "M1Vj",
+    FLEET_PUBLIC_REPOSITORY: OWNER_REPO,
+    FLEET_PUBLIC_STATE_ROOT: stateRoot,
+    FLEET_STATE_ROOT: stateRoot,
+    FLEET_PUBLIC_ARTIFACT_MANIFEST: manifest,
+    RUNNER_TEMP: root,
+    GITHUB_RUN_ID: "78901",
+  };
+  const taskArgs = [
+    "execute",
+    "--repo", OWNER_REPO,
+    "--pr", "75",
+    "--type", "review",
+    "--role", "review",
+    "--output-file", resultFile,
+  ];
+  try {
+    const code = await orchestrate.main(taskArgs, env, {
+      ghClient(args) {
+        const endpoint = String(args.at(-1) ?? "");
+        if (endpoint.includes("/pulls/75")) return { number: 75, state: "open", base: { ref: "main" } };
+        return { default_branch: "main" };
+      },
+      modelRunner: async () => {
+        process.stdout.write("TERMINAL_STATE=STALLED\n");
+        return { complete: false, error: "quota exhausted", retryAt };
+      },
+    });
+    assert.equal(code, 0, "deferred capacity should not fail the process");
+    const result = JSON.parse(readFileSync(resultFile, "utf8"));
+    assert.equal(result.status, "deferred");
+    assert.equal(result.effectState, "waiting_for_capacity");
+    assert.equal(result.semanticStatus, "DEFERRED");
+    assert.equal(result.processSuccess, true);
+    assert.equal(result.desiredTaskCompleted, false);
+    assert.equal(result.retryAt, retryAt);
+    assert.equal(JSON.stringify(result).includes("TERMINAL_STATE=STALLED"), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -837,11 +1232,11 @@ test("completed local analysis does not complete durable work without an observe
       effectKey: record.effectKey,
       generation: record.generation,
       receiptId: "review-receipt-12",
-      goal: "review M1Vj/fleet-fixture#12",
-      session: "review-session-12",
-      artifact: result.artifact,
-      checks: ["analysis-artifact-present"],
-      verifier: "review-verifier",
+      goal: record.receiptBinding.goal,
+      session: record.receiptBinding.session,
+      artifact: record.receiptBinding.artifact,
+      checks: record.receiptBinding.checks,
+      verifier: record.receiptBinding.verifier,
       status: "completed",
     });
     assert.equal(receipt.accepted, true);

@@ -33,6 +33,13 @@ import { createHash } from "node:crypto";
 import { gh as defaultGh, scrub } from "./lib/util.mjs";
 import { askModel as defaultAskModel } from "./lib/model.mjs";
 import { buildFleetPlan } from "./lib/fleet-scheduler.mjs";
+import {
+  isPublicDataClass,
+  publicRepository,
+  publicModelEnv,
+  publicStateRoot,
+  writePublicArtifact,
+} from "./lib/private-state.mjs";
 
 export const OWNER = "M1Vj";
 export const MAX_AGENTS = 15;
@@ -204,6 +211,24 @@ export function stableEffectKey(input, effect = "dispatch") {
   return `effect-v1-${createHash("sha256").update(material).digest("hex")}`;
 }
 
+/** Canonical goal used to fence a receipt to the task that produced it. */
+export function taskGoal(task) {
+  const identity = taskIdentity(task);
+  return identity.type === "review"
+    ? `review ${identity.repo}#${identity.pr}`
+    : `upgrade ${identity.repo}`;
+}
+
+/** Stable opaque session identity for one work generation. */
+export function stableSessionKey(input, generation = 0) {
+  const task = input && typeof input === "object" ? input : { type: "upgrade", role: "upgrade", repo: input };
+  const work = typeof task.workKey === "string" && /^[A-Za-z0-9_.:-]{1,180}$/.test(task.workKey.trim())
+    ? task.workKey.trim()
+    : stableWorkKey(task);
+  const gen = positiveGeneration(generation ?? task.generation, 0);
+  return `session-v1-${createHash("sha256").update(`${work}|${gen}`).digest("hex")}`;
+}
+
 export const workKey = stableWorkKey;
 export const effectKey = stableEffectKey;
 
@@ -211,6 +236,40 @@ export function canTransition(from, to) {
   const source = stateKey(from);
   const target = stateKey(to);
   return WORK_STATES.includes(source) && WORK_STATES.includes(target) && (source === target || WORK_TRANSITIONS[source].includes(target));
+}
+
+const PROCESS_NON_COMPLETING = new Set(["accepted", "dispatched", "duplicate", "deferred", "no_op", "awaiting_receipt"]);
+
+/**
+ * Keep process outcome, durable effect state, and semantic completion separate.
+ * A runner can finish its local process successfully while the requested work
+ * is still waiting for a receipt (or is an explicit no-op/duplicate).
+ */
+export function describeOutcome({ status = "", effectState = "", processSuccess } = {}) {
+  const processState = stateKey(status) || "unknown";
+  const effect = stateKey(effectState);
+  const processOk = processSuccess === undefined
+    ? !new Set(["failed", "error", "blocked"]).has(processState)
+    : Boolean(processSuccess);
+  let semanticStatus;
+  if (processState === "duplicate") semanticStatus = "DUPLICATE";
+  else if (processState === "no_op") semanticStatus = "NO_OP";
+  else if (processState === "deferred") semanticStatus = "DEFERRED";
+  else if (effect === "completed" && !PROCESS_NON_COMPLETING.has(processState)) semanticStatus = "SUCCESS";
+  else if (effect) semanticStatus = effect.toUpperCase();
+  else if (processState === "dispatched" || processState === "accepted") semanticStatus = "ACCEPTED";
+  else semanticStatus = processState.toUpperCase() || "UNKNOWN";
+  const desiredTaskCompleted = semanticStatus === "SUCCESS"
+    && effect === "completed"
+    && processOk
+    && !PROCESS_NON_COMPLETING.has(processState);
+  return {
+    processState,
+    processStatus: processState,
+    processSuccess: processOk,
+    semanticStatus,
+    desiredTaskCompleted,
+  };
 }
 
 /** Return a new state record or throw on an illegal lifecycle transition. */
@@ -802,8 +861,19 @@ function appendPlanBatch(stateRoot, tasks, trigger, now) {
   return { accepted, suppressed };
 }
 
-function prepareEffect(stateRoot, task, trigger, effect = "dispatch") {
-  if (!stateRoot) return { accepted: true, task, workKey: stableWorkKey(task), generation: positiveGeneration(task.generation, 0), effectKey: stableEffectKey({ ...task, effect }) };
+function prepareEffect(stateRoot, task, trigger, effect = "dispatch", { session } = {}) {
+  if (!stateRoot) {
+    const work = stableWorkKey(task);
+    const generation = positiveGeneration(task.generation, 0);
+    return {
+      accepted: true,
+      task,
+      workKey: work,
+      generation,
+      effectKey: stableEffectKey({ ...task, workKey: work, generation, effect }),
+      session: String(session || stableSessionKey({ ...task, workKey: work }, generation)).slice(0, MAX_EVENT_STRING),
+    };
+  }
   let outcome;
   withStateLock(stateRoot, (paths, files) => {
     const work = stableWorkKey(task);
@@ -841,13 +911,20 @@ function prepareEffect(stateRoot, task, trigger, effect = "dispatch") {
       record = transitionWorkState(record, "awaiting_receipt", { effectKey: effectKeyValue });
     }
     record.effectKey = record.effectKey || effectKeyValue;
+    const sameGenerationSession = existing && comparableGeneration(existing.generation) === comparableGeneration(record.generation)
+      ? existing.session
+      : undefined;
+    const sessionValue = String(firstValue(sameGenerationSession, session, stableSessionKey({ ...task, workKey: work }, record.generation)) || "").trim();
+    if (!sessionValue || sessionValue.length > MAX_EVENT_STRING || !/^[A-Za-z0-9_.:-]+$/.test(sessionValue)) throw new Error("receipt session is invalid");
+    record.session = sessionValue;
+    record.goal = taskGoal(task);
     record.task = transactionRows({ workKey: work, effectKey: record.effectKey, generation: record.generation, task, trigger, state: record.state }).task;
     recordTransactionUnlocked(paths, files, {
       record,
       outboxEvent: { event: "effect_prepared", operation: effect, state: "awaiting_receipt", task: record.task },
       historyEvent: { event: "effect_prepared", operation: effect, state: "awaiting_receipt", repo: record.repo, pr: record.pr, action: record.action, delivery: record.delivery },
     });
-    outcome = { accepted: true, task, workKey: work, generation: record.generation, effectKey: record.effectKey, record };
+    outcome = { accepted: true, task, workKey: work, generation: record.generation, effectKey: record.effectKey, session: record.session, record };
   });
   return outcome;
 }
@@ -915,6 +992,76 @@ function receiptEvidence(receipt) {
   return { goal, session, artifact, verifier, checks: checks.slice(0, 32).map((check) => check.slice(0, MAX_EVENT_STRING)) };
 }
 
+const RECEIPT_CHECKS = Object.freeze({
+  review: Object.freeze(["analysis-artifact-present"]),
+  upgrade: Object.freeze(["dispatch-accepted"]),
+});
+
+function receiptVerifier(task) {
+  return `fleet-orchestrate-${taskIdentity(task).type}-v1`;
+}
+
+function receiptBindingFor(task, prepared, result = {}) {
+  const artifact = typeof result.artifact === "string" ? result.artifact.trim() : "";
+  if (!artifact || artifact.length > MAX_EVENT_STRING) return null;
+  const identity = taskIdentity(task);
+  const session = String(prepared?.session || prepared?.record?.session || "").trim();
+  if (!session || session.length > MAX_EVENT_STRING) return null;
+  return {
+    goal: taskGoal(task),
+    session,
+    generation: positiveGeneration(prepared?.generation, 0),
+    artifact,
+    checks: [...(RECEIPT_CHECKS[identity.type] || [])],
+    verifier: receiptVerifier(task),
+  };
+}
+
+function sameReceiptBinding(expected, observed) {
+  if (!expected || !observed) return false;
+  if (expected.goal !== observed.goal || expected.session !== observed.session) return false;
+  if (comparableGeneration(expected.generation) !== comparableGeneration(observed.generation)) return false;
+  if (expected.artifact !== observed.artifact || expected.verifier !== observed.verifier) return false;
+  const expectedChecks = Array.isArray(expected.checks) ? expected.checks : [];
+  const observedChecks = Array.isArray(observed.checks) ? observed.checks : [];
+  return expectedChecks.length === observedChecks.length
+    && expectedChecks.every((check, index) => check === observedChecks[index]);
+}
+
+/** Bind a staged artifact and verifier to the current effect generation. */
+function bindReceiptContract(stateRoot, prepared, task, result) {
+  const binding = receiptBindingFor(task, prepared, result);
+  if (!stateRoot || !binding) return { accepted: false, reason: "receipt-binding-missing", binding };
+  let outcome;
+  withStateLock(stateRoot, (paths, files) => {
+    const current = currentRecord(files, String(prepared?.workKey || ""));
+    if (!current || current.effectKey !== prepared.effectKey || comparableGeneration(current.generation) !== comparableGeneration(prepared.generation)) {
+      outcome = { accepted: false, reason: "late-receipt" };
+      return;
+    }
+    if (current.state !== "awaiting_receipt") {
+      outcome = { accepted: false, reason: "state-not-awaiting-receipt", record: current };
+      return;
+    }
+    const record = {
+      ...current,
+      receiptBinding: binding,
+      goal: binding.goal,
+      session: binding.session,
+      artifact: binding.artifact,
+      checks: binding.checks,
+      verifier: binding.verifier,
+    };
+    recordTransactionUnlocked(paths, files, {
+      record,
+      outboxEvent: { event: "receipt_bound", operation: "receipt", state: "awaiting_receipt", binding },
+      historyEvent: { event: "receipt_bound", operation: "receipt", state: "awaiting_receipt", repo: current.repo, pr: current.pr, action: current.action },
+    });
+    outcome = { accepted: true, record, binding };
+  });
+  return outcome;
+}
+
 /** Record that a dispatch API accepted a request; this is not completion. */
 export function recordDispatchAcceptance(stateRoot, receipt = {}) {
   if (!stateRoot || !receipt || typeof receipt !== "object") return { accepted: false, reason: "receipt-invalid" };
@@ -963,14 +1110,33 @@ export function applyEffectReceipt(stateRoot, receipt = {}) {
       return;
     }
     const evidence = receiptEvidence(receipt);
-    if (!evidence) {
+    const receiptId = String(firstValue(receipt.receiptId, receipt.id, "")).trim();
+    const receiptStatus = key(firstValue(receipt.status, ""));
+    if (!evidence || !["completed", "acknowledged"].includes(receiptStatus)
+      || (receiptId && (receiptId.length > MAX_EVENT_STRING || /[\u0000-\u001f\u007f]/.test(receiptId)))) {
       outcome = { accepted: false, reason: "receipt-evidence-missing" };
       return;
     }
-    let record = transitionWorkState(current, "verifying", { receiptId: receipt.receiptId || undefined });
+    const expectedBinding = current.receiptBinding || (
+      current.goal && current.session && current.artifact && current.verifier && Array.isArray(current.checks)
+        ? {
+          goal: current.goal,
+          session: current.session,
+          generation: current.generation,
+          artifact: current.artifact,
+          checks: current.checks,
+          verifier: current.verifier,
+        }
+        : null
+    );
+    if (!sameReceiptBinding(expectedBinding, { ...evidence, generation: receipt.generation })) {
+      outcome = { accepted: false, reason: "receipt-binding-mismatch" };
+      return;
+    }
+    let record = transitionWorkState(current, "verifying", { receiptId });
     record = transitionWorkState(record, "completed", {
       acknowledgedAt: new Date().toISOString(),
-      resultStatus: key(firstValue(receipt.status, "acknowledged")) || "acknowledged",
+      resultStatus: "completed",
       evidence,
     });
     recordTransactionUnlocked(paths, files, {
@@ -1338,9 +1504,10 @@ function matrixTask(task) {
   return output;
 }
 
-async function buildPlan({ env = process.env, ghClient = defaultGh, now = Date.now(), rng, logger = console.error, planBuilder = buildFleetPlan } = {}) {
+async function buildPlan({ env = process.env, stateRoot: requestedStateRoot, ghClient = defaultGh, now = Date.now(), rng, logger = console.error, planBuilder = buildFleetPlan } = {}) {
+  const stateRoot = executionStateRoot(env, { stateRoot: requestedStateRoot });
   const trigger = parseTriggerFromEnv(env);
-  const state = loadSchedulingState(env.FLEET_STATE_ROOT);
+  const state = loadSchedulingState(stateRoot);
   if (triggerEvent(trigger) !== "schedule" && !shouldScheduleImmediate(trigger, state.history, now)) {
     logger(`immediate trigger deduplicated: ${trigger.event}${trigger.repo ? ` ${trigger.repo}` : ""}${trigger.pr ? `#${trigger.pr}` : ""}`);
     return { include: [] };
@@ -1386,7 +1553,7 @@ async function buildPlan({ env = process.env, ghClient = defaultGh, now = Date.n
     seen.add(candidate.id);
     include.push(candidate);
   }
-  const durable = appendPlanBatch(env.FLEET_STATE_ROOT, include, trigger, now);
+  const durable = appendPlanBatch(stateRoot, include, trigger, now);
   const accepted = durable.accepted.map((task) => matrixTask(task));
   logger(`planned ${accepted.length} task(s) from ${repos.length} repo(s) and ${pulls.length} open PR(s)`);
   return { include: accepted };
@@ -1423,6 +1590,38 @@ export function parseExecuteTask(args) {
   const flags = parseFlags(args);
   if (!flags.repo || !flags.type || !flags.role) throw new Error("execute requires --repo, --type, and --role");
   return validateTask({ ...flags, id: flags.id || undefined });
+}
+
+/**
+ * Separate machine-result transport flags from task flags. Execute may emit
+ * terminal telemetry on stdout through lower-level helpers, so callers that
+ * need machine-readable JSON must opt into an explicit result file.
+ */
+function parseResultFileFlag(args) {
+  const taskArgs = [];
+  let resultFile;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = String(args[index] ?? "");
+    const equals = argument.indexOf("=");
+    const name = argument.startsWith("--") ? argument.slice(2, equals >= 0 ? equals : undefined) : "";
+    if (name !== "output-file" && name !== "result-file") {
+      taskArgs.push(argument);
+      continue;
+    }
+    if (resultFile !== undefined) throw new Error("duplicate result file flag");
+    let value;
+    if (equals >= 0) {
+      value = argument.slice(equals + 1);
+    } else {
+      if (index + 1 >= args.length || String(args[index + 1]).startsWith("--")) throw new Error(`missing value for --${name}`);
+      value = args[++index];
+    }
+    if (typeof value !== "string" || value.length > MAX_EVENT_STRING || /[\u0000-\u001f\u007f]/.test(value) || !value.trim()) {
+      throw new Error("result file path is invalid");
+    }
+    resultFile = value.trim();
+  }
+  return { taskArgs, resultFile };
 }
 
 function redactText(value, env) {
@@ -1482,7 +1681,122 @@ export function artifactDirectory(env = process.env) {
   return directory;
 }
 
+function machineResultPath(value, env = process.env) {
+  if (typeof value !== "string" || !value.trim()) throw new Error("result file path is required");
+  const target = path.resolve(value.trim());
+  if (isPublicDataClass(env)) {
+    const runnerTempValue = firstValue(env.RUNNER_TEMP, env.TMPDIR, "");
+    if (typeof runnerTempValue !== "string" || !runnerTempValue.trim()) throw new Error("RUNNER_TEMP is required for public result file");
+    const runnerTemp = path.resolve(runnerTempValue);
+    if (!pathWithin(runnerTemp, target)) throw new Error("public result file must be under RUNNER_TEMP");
+  }
+  return target;
+}
+
+function writeMachineResult(value, result, env = process.env) {
+  const target = machineResultPath(value, env);
+  const directory = path.dirname(target);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  try { chmodSync(directory, 0o700); } catch {}
+  const temporary = path.join(directory, `.${path.basename(target)}.${process.pid}.${Date.now()}.tmp`);
+  writeFileSync(temporary, `${JSON.stringify(result)}\n`, { encoding: "utf8", mode: 0o600 });
+  try { chmodSync(temporary, 0o600); } catch {}
+  renameSync(temporary, target);
+  try { chmodSync(target, 0o600); } catch {}
+  return target;
+}
+
+function publicRunId(env = process.env) {
+  const runId = String(firstValue(env.GITHUB_RUN_ID, env.GITHUB_RUN_NUMBER, "")).trim();
+  if (!/^[0-9]{1,20}$/.test(runId)) throw new Error("public workflow run id is required");
+  return runId;
+}
+
+function pathWithinOrSame(parent, child) {
+  const base = path.resolve(parent);
+  const candidate = path.resolve(child);
+  return candidate === base || candidate.startsWith(`${base}${path.sep}`);
+}
+
+/**
+ * Public execution may only use the validated ephemeral state root. The
+ * legacy FLEET_STATE_ROOT and caller override are checked for exact equality
+ * so neither can redirect durable writes outside the public fence.
+ */
+function executionStateRoot(env = process.env, options = {}) {
+  if (!isPublicDataClass(env)) return options.stateRoot || env.FLEET_STATE_ROOT;
+  const validated = path.resolve(publicStateRoot(env));
+  for (const [label, supplied] of [["FLEET_STATE_ROOT", env.FLEET_STATE_ROOT], ["stateRoot", options.stateRoot]]) {
+    if (supplied === undefined || supplied === null || String(supplied).trim() === "") continue;
+    if (path.resolve(String(supplied).trim()) !== validated) throw new Error(`public state root mismatch: ${label}`);
+  }
+  const runnerTempValue = firstValue(env.RUNNER_TEMP, env.TMPDIR, "");
+  if (typeof runnerTempValue !== "string" || !runnerTempValue.trim()) throw new Error("RUNNER_TEMP is required for public state");
+  const runnerTemp = path.resolve(runnerTempValue);
+  if (!pathWithinOrSame(runnerTemp, validated)) throw new Error("public state root is outside RUNNER_TEMP");
+  const realRunnerTemp = realpathSync(runnerTemp);
+  const ancestor = existingAncestor(validated);
+  const realAncestor = realpathSync(ancestor);
+  if (!pathWithinOrSame(realRunnerTemp, realAncestor)) throw new Error("public state root resolves outside RUNNER_TEMP");
+  return validated;
+}
+
+function publicOutcomeStatus(result = {}) {
+  if (result.desiredTaskCompleted === true && result.effectState === "completed") return "ok";
+  if (result.effectState === "waiting_for_capacity") return "waiting_for_capacity";
+  if (result.status === "deferred") return "deferred";
+  if (result.status === "blocked" || result.effectState === "blocked") return "blocked";
+  return "awaiting-control";
+}
+
+const PUBLIC_EFFECT_STATES = new Set([
+  "registered", "leased", "executing", "awaiting_receipt", "verifying", "completed", "blocked",
+  "recovering", "escalated", "expired", "waiting_for_capacity", "unknown_effect",
+]);
+const PUBLIC_SEMANTIC_STATUSES = new Set([
+  "SUCCESS", "ACCEPTED", "DUPLICATE", "DEFERRED", "NO_OP", "AWAITING_RECEIPT", "WAITING_FOR_CAPACITY",
+  "UNKNOWN_EFFECT", "BLOCKED", "RECOVERING", "EXPIRED", "UNKNOWN",
+]);
+
+function publicEffectState(result = {}) {
+  const state = String(result.effectState || "").trim().toLowerCase();
+  return PUBLIC_EFFECT_STATES.has(state) ? state : "unknown_effect";
+}
+
+function publicSemanticStatus(result = {}) {
+  const status = String(result.semanticStatus || "").trim().toUpperCase();
+  return PUBLIC_SEMANTIC_STATUSES.has(status) ? status : "UNKNOWN";
+}
+
+function publicTaskArtifactPayload(result = {}) {
+  const status = publicOutcomeStatus(result);
+  return {
+    mode: "orchestrate",
+    status,
+    effectState: publicEffectState(result),
+    processSuccess: result.processSuccess === true,
+    semanticStatus: publicSemanticStatus(result),
+    desiredTaskCompleted: result.desiredTaskCompleted === true && status === "ok",
+    awaitingControl: status !== "ok",
+    checks: {
+      status,
+      effectState: publicEffectState(result),
+      processSuccess: result.processSuccess === true,
+      semanticStatus: publicSemanticStatus(result),
+      ok: result.processSuccess === true,
+    },
+  };
+}
+
 export function writeTaskArtifact(task, result, env = process.env) {
+  if (isPublicDataClass(env)) {
+    return writePublicArtifact(env, publicTaskArtifactPayload(result), {
+      kind: "orchestrate",
+      status: publicOutcomeStatus(result),
+      repository: publicRepository(env),
+      runId: publicRunId(env),
+    });
+  }
   const directory = artifactDirectory(env);
   const id = String(task.id || stableTaskId(task)).replace(/[^A-Za-z0-9_.:-]/g, "-").slice(0, MAX_ID_LENGTH);
   const filePath = path.join(directory, `${id}.json`);
@@ -1567,13 +1881,14 @@ async function executeReviewTask(task, { env = process.env, ghClient = defaultGh
   ].join("\n\n");
   let modelResult;
   try {
+    const modelEnv = isPublicDataClass(env) ? publicModelEnv(env) : env;
     modelResult = await modelRunner({
       prompt,
       timeoutMs: 480000,
-      env,
+      env: modelEnv,
       preferVariantMax: false,
       maxRounds: 2,
-      workspace: env.GITHUB_WORKSPACE || process.cwd(),
+      workspace: modelEnv.GITHUB_WORKSPACE || process.cwd(),
     });
   } catch (error) {
     modelResult = { complete: false, reply: "", error: String(error?.message || error).slice(0, 240) };
@@ -1679,32 +1994,48 @@ async function executeUpgradeTask(task, { env = process.env, ghClient = defaultG
 export async function executeTask(task, options = {}) {
   const normalized = validateTask(task);
   const env = options.env || process.env;
-  const stateRoot = options.stateRoot || env.FLEET_STATE_ROOT;
+  const stateRoot = executionStateRoot(env, options);
   let prepared;
   try {
-    prepared = prepareEffect(stateRoot, normalized, options.trigger, normalized.type === "upgrade" ? "dispatch" : "review");
+    prepared = prepareEffect(
+      stateRoot,
+      normalized,
+      options.trigger,
+      normalized.type === "upgrade" ? "dispatch" : "review",
+      { session: firstValue(options.session, options.sessionId, env.FLEET_SESSION_ID) },
+    );
   } catch (error) {
-    return {
+    const envelope = describeOutcome({ status: "deferred", effectState: "unknown_effect", processSuccess: false });
+    const failed = {
       status: "deferred",
       reason: "transaction-prepare-failed",
       effectState: "unknown_effect",
       error: redactText(error?.message || error, env),
+      ...envelope,
     };
+    if (isPublicDataClass(env)) writeTaskArtifact(normalized, failed, env);
+    return failed;
   }
   if (!prepared.accepted) {
-    return {
+    const envelope = describeOutcome({ status: "duplicate", effectState: prepared.record?.state || "completed" });
+    const duplicate = {
       status: "duplicate",
       reason: prepared.reason,
       effectState: prepared.record?.state || "completed",
       workKey: prepared.workKey,
       effectKey: prepared.effectKey,
       generation: prepared.generation,
+      receiptBinding: prepared.record?.receiptBinding,
+      ...envelope,
     };
+    if (isPublicDataClass(env)) writeTaskArtifact(normalized, duplicate, env);
+    return duplicate;
   }
   const executionOptions = { ...options, env, prepared };
   const result = normalized.type === "review"
     ? await executeReviewTask(normalized, executionOptions)
     : await executeUpgradeTask(normalized, executionOptions);
+  const bindingResult = bindReceiptContract(stateRoot, prepared, normalized, result);
   let stateResult;
   if (result.status === "completed") {
     const observedReceipt = options.receipt && typeof options.receipt === "object"
@@ -1743,15 +2074,21 @@ export async function executeTask(task, options = {}) {
       ? markWaitingForCapacity(stateRoot, receipt, result.retryAt)
       : markUnknownEffect(stateRoot, receipt, result.reason || "effect-ack-unknown");
   }
-  return {
+  const effectState = stateResult?.record?.state
+    || (stateResult?.accepted ? "completed" : stateResult?.reason === "receipt-evidence-required" ? "awaiting_receipt" : stateResult?.reason === "late-receipt" ? "unknown_effect" : undefined);
+  const envelope = describeOutcome({ status: result.status, effectState });
+  const finalResult = {
     ...result,
     workKey: prepared.workKey,
     effectKey: prepared.effectKey,
     generation: prepared.generation,
-    effectState: stateResult?.record?.state
-      || (stateResult?.accepted ? "completed" : stateResult?.reason === "receipt-evidence-required" ? "awaiting_receipt" : stateResult?.reason === "late-receipt" ? "unknown_effect" : undefined),
+    effectState,
+    receiptBinding: bindingResult?.binding || prepared.record?.receiptBinding,
+    ...envelope,
     ...(stateResult?.retryAt ? { retryAt: stateResult.retryAt } : {}),
   };
+  if (isPublicDataClass(env)) writeTaskArtifact(normalized, finalResult, env);
+  return finalResult;
 }
 
 export async function main(argv = process.argv.slice(2), env = process.env, dependencies = {}) {
@@ -1762,9 +2099,11 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     return 0;
   }
   if (mode === "execute") {
-    const task = parseExecuteTask(argv.slice(1));
+    const { taskArgs, resultFile } = parseResultFileFlag(argv.slice(1));
+    const task = parseExecuteTask(taskArgs);
     const result = await executeTask(task, { env, ...dependencies });
-    process.stdout.write(`${JSON.stringify(result)}\n`);
+    if (resultFile) writeMachineResult(resultFile, result, env);
+    else process.stdout.write(`${JSON.stringify(result)}\n`);
     return result.status === "failed" ? 1 : 0;
   }
   throw new Error("usage: node scripts/orchestrate.mjs <plan|execute>");

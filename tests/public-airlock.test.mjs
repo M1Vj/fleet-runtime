@@ -525,14 +525,17 @@ test("thesis uploads require the canonical public manifest", () => {
   }
 });
 
-test("orchestrate uploads the bounded task-result artifact emitted by execute", () => {
+test("orchestrate emits and uploads only the canonical public manifest", () => {
   const text = workflowText("orchestrate.yml");
   const executeBlock = workflowStepBlock(text, "execute public orchestration task");
-  assert.match(executeBlock, /FLEET_ARTIFACT_DIR:\s+\$\{\{\s*runner\.temp\s*\}\}\/fleet-task-results/);
+  assert.match(executeBlock, /FLEET_RESULT_FILE:\s+\$\{\{\s*runner\.temp\s*\}\}\/orchestrate-result\.json/);
+  assert.match(executeBlock, /--output-file\s+\"\$FLEET_RESULT_FILE\"/);
+  assert.doesNotMatch(executeBlock, />\s*\"?\$FLEET_RESULT_FILE/);
+  assert.doesNotMatch(executeBlock, />\s*\"?\$FLEET_PUBLIC_ARTIFACT_MANIFEST/);
   const uploadBlock = text.split(/(?=\n\s*- name:|\n\s*- uses:)/g)
     .find((block) => block.includes("upload public result manifest"));
   assert.ok(uploadBlock, "orchestrate task-result upload block must exist");
-  assert.match(uploadBlock, /path:\s*\$\{\{\s*runner\.temp\s*\}\}\/fleet-task-results\/\*\.json/);
+  assert.match(uploadBlock, /path:\s*\$\{\{\s*runner\.temp\s*\}\}\/fleet-public-state\/public-artifact\.json/);
   assert.match(uploadBlock, /if-no-files-found:\s*error\b/);
 
   const temporaryRoot = mkdtempSync(path.join(tmpdir(), "fleet-orchestrate-airlock-"));

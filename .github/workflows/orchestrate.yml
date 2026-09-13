@@ -173,12 +173,64 @@ jobs:
       - name: execute public orchestration task
         env:
           FLEET_PUBLIC_REPOSITORY: ${{ steps.public-target.outputs.repository }}
-          FLEET_ARTIFACT_DIR: ${{ runner.temp }}/fleet-task-results
-        run: node scripts/orchestrate.mjs execute --repo "$FLEET_TASK_REPO" --pr "$FLEET_TASK_PR" --type "$FLEET_TASK_TYPE" --role "$FLEET_TASK_ROLE"
+          FLEET_RESULT_FILE: ${{ runner.temp }}/orchestrate-result.json
+        run: |
+          set -euo pipefail
+          node scripts/orchestrate.mjs execute --repo "$FLEET_TASK_REPO" --pr "$FLEET_TASK_PR" --type "$FLEET_TASK_TYPE" --role "$FLEET_TASK_ROLE" --output-file "$FLEET_RESULT_FILE" 1>&2
+      - name: consume structured orchestration state
+        if: always()
+        env:
+          FLEET_PUBLIC_REPOSITORY: ${{ steps.public-target.outputs.repository }}
+          FLEET_RESULT_FILE: ${{ runner.temp }}/orchestrate-result.json
+          FLEET_RESULT_MANIFEST: ${{ runner.temp }}/fleet-public-state/public-artifact.json
+        run: |
+          set -euo pipefail
+          node --input-type=module - "$FLEET_RESULT_FILE" "$FLEET_RESULT_MANIFEST" <<'NODE'
+          import { readFileSync } from "node:fs";
+          const result = JSON.parse(readFileSync(process.argv[2], "utf8"));
+          const effectState = String(result.effectState || "");
+          if (!effectState) throw new Error("orchestration result is missing effectState");
+          if (typeof result.processSuccess !== "boolean") throw new Error("orchestration result is missing processSuccess");
+          if (typeof result.desiredTaskCompleted !== "boolean" || typeof result.semanticStatus !== "string") {
+            throw new Error("orchestration result is missing semantic completion fields");
+          }
+          if (result.semanticStatus === "SUCCESS" && (effectState !== "completed" || result.desiredTaskCompleted !== true)) {
+            throw new Error("semantic SUCCESS is not bound to completed durable effect");
+          }
+          if (result.desiredTaskCompleted === true && result.semanticStatus !== "SUCCESS") {
+            throw new Error("desired task completion requires semantic SUCCESS");
+          }
+          const nonCompleting = new Set(["duplicate", "deferred", "no_op", "dispatched", "awaiting_receipt"]);
+          if (nonCompleting.has(String(result.status || "")) && (result.desiredTaskCompleted === true || result.semanticStatus === "SUCCESS")) {
+            throw new Error("process outcome cannot claim desired task completion");
+          }
+          const manifest = JSON.parse(readFileSync(process.argv[3], "utf8"));
+          if (manifest.schema !== "fleet-public-artifact-v1" || manifest.dataClass !== "public") {
+            throw new Error("public orchestration manifest schema is invalid");
+          }
+          if (manifest.repository !== process.env.FLEET_PUBLIC_REPOSITORY) {
+            throw new Error("public orchestration manifest target mismatch");
+          }
+          if (manifest.runId !== process.env.GITHUB_RUN_ID) {
+            throw new Error("public orchestration manifest run binding mismatch");
+          }
+          for (const field of ["effectState", "processSuccess", "semanticStatus", "desiredTaskCompleted"]) {
+            if (manifest[field] !== result[field]) throw new Error(`public orchestration manifest ${field} mismatch`);
+          }
+          if (!manifest.checks || manifest.checks.effectState !== result.effectState
+            || manifest.checks.processSuccess !== result.processSuccess
+            || manifest.checks.semanticStatus !== result.semanticStatus) {
+            throw new Error("public orchestration manifest checks mismatch");
+          }
+          const serialized = JSON.stringify(manifest);
+          if (/(?:\/Users\/|\/home\/|\/tmp\/|session-v1-|work-v1-|effect-v1-)/i.test(serialized)) {
+            throw new Error("public orchestration manifest contains private provenance");
+          }
+          NODE
       - name: upload public result manifest
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: public-orchestration-${{ strategy.job-index }}
-          path: ${{ runner.temp }}/fleet-task-results/*.json
+          path: ${{ runner.temp }}/fleet-public-state/public-artifact.json
           if-no-files-found: error

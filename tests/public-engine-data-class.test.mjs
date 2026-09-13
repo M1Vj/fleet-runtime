@@ -128,6 +128,9 @@ test("public gate uses only built-in token and live public metadata before targe
 
 test("public child environment strips private state, auth, proxy, and session material", () => {
   const env = publicEnv();
+  env.ARBITRARY_PRIVATE = "must-not-be-forwarded";
+  env.HOME = "/private-home";
+  env.XDG_CONFIG_HOME = "/private-config";
   const child = publicChildEnv(env);
   assert.equal(child.FLEET_DATA_CLASS, "public");
   assert.equal(child.FLEET_STATE_ROOT, env.FLEET_PUBLIC_STATE_ROOT);
@@ -135,8 +138,13 @@ test("public child environment strips private state, auth, proxy, and session ma
   assert.equal(child.FLEET_OPENCODE_AUTH, undefined);
   assert.equal(child.FLEET_PROXY_URL, undefined);
   assert.equal(child.GITHUB_TOKEN, env.GITHUB_TOKEN);
+  assert.equal(child.ARBITRARY_PRIVATE, undefined);
+  assert.notEqual(child.HOME, env.HOME);
+  assert.equal(child.XDG_CONFIG_HOME.startsWith(`${env.FLEET_PUBLIC_STATE_ROOT}${path.sep}`), true);
+  assert.equal(existsSync(child.HOME), true);
   const model = publicChildEnv(env, { forModel: true });
   assert.equal(model.GITHUB_TOKEN, undefined);
+  assert.equal(model.FLEET_OPENCODE_AUTH, undefined);
 });
 
 test("public artifacts use the exact manifest and schema allowlist", () => {
@@ -261,6 +269,51 @@ test("public artifact options own status and run identity", () => {
   assert.equal(unsafe.runId, undefined);
 });
 
+test("public orchestrate artifacts retain only bounded outcome fields", () => {
+  const value = publicArtifactPayload({
+    mode: "orchestrate",
+    status: "awaiting-control",
+    effectState: "awaiting_receipt",
+    processSuccess: true,
+    semanticStatus: "awaiting_receipt",
+    desiredTaskCompleted: false,
+    workKey: "upgrade:M1Vj/public-repo",
+    path: "/runner/private/result.json",
+    sessionId: "session-private-marker",
+    checks: {
+      effectState: "awaiting_receipt",
+      processSuccess: true,
+      semanticStatus: "AWAITING_RECEIPT",
+      desiredTaskCompleted: false,
+      workKey: "upgrade:M1Vj/public-repo",
+      path: "/runner/private/result.json",
+      sessionId: "session-private-marker",
+    },
+  }, { kind: "orchestrate", status: "awaiting-control", repository: "M1Vj/public-repo", runId: "34766668040" });
+  assert.equal(value.effectState, "awaiting_receipt");
+  assert.equal(value.processSuccess, true);
+  assert.equal(value.semanticStatus, "AWAITING_RECEIPT");
+  assert.equal(value.desiredTaskCompleted, false);
+  assert.equal(value.checks.effectState, "awaiting_receipt");
+  assert.equal(value.checks.processSuccess, true);
+  assert.equal(value.checks.semanticStatus, "AWAITING_RECEIPT");
+  assert.equal(value.checks.desiredTaskCompleted, false);
+  for (const key of ["workKey", "path", "sessionId"]) {
+    assert.equal(value[key], undefined, `top-level ${key} must be omitted`);
+    assert.equal(value.checks[key], undefined, `nested ${key} must be omitted`);
+  }
+  const unsafe = publicArtifactPayload({
+    effectState: "made_up",
+    processSuccess: "true",
+    semanticStatus: "SUCCESS-ish",
+    desiredTaskCompleted: 1,
+  }, { kind: "orchestrate", status: "ok", repository: "M1Vj/public-repo" });
+  assert.equal(unsafe.effectState, undefined);
+  assert.equal(unsafe.processSuccess, undefined);
+  assert.equal(unsafe.semanticStatus, undefined);
+  assert.equal(unsafe.desiredTaskCompleted, undefined);
+});
+
 test("public artifacts retain only bounded summary/error codes and public PR URLs", () => {
   const env = publicEnv();
   const manifest = writePublicArtifact(env, {
@@ -315,6 +368,12 @@ test("public artifact identity comes only from the validated target option", () 
 test("public GitHub helper blocks all mutations and watchdog emits no actions", () => {
   const env = publicEnv();
   assert.throws(() => gh(["api", "-X", "POST", "/repos/M1Vj/public-repo/issues"], env), /PUBLIC_WRITE_BLOCKED/);
+  for (const method of ["--method=POST", "--method=PATCH", "--method=PUT", "--method=DELETE", "-XPOST", "-XPATCH", "-XPUT", "-XDELETE", "-X=POST", "-X=PATCH"]) {
+    assert.throws(() => gh(["api", method, "/repos/M1Vj/public-repo/issues"], env), /PUBLIC_WRITE_BLOCKED/, method);
+  }
+  for (const flag of ["-f", "-F", "-fbody=value", "-Fbody=value", "--field", "--field=body=value", "--raw-field", "--raw-field=body=value"]) {
+    assert.throws(() => gh(["api", flag, "body=value", "/repos/M1Vj/public-repo"], env), /PUBLIC_WRITE_BLOCKED/, flag);
+  }
   assert.throws(() => gh(["pr", "merge", "1", "-R", "M1Vj/public-repo"], env), /PUBLIC_WRITE_BLOCKED/);
   const plan = planWatchdogActions({ lastRunUtc: new Date(Date.now() - 4 * 3600 * 1000).toISOString() }, Date.now(), 90 * 60 * 1000, { dataClass: "public" });
   assert.deepEqual(plan.actions, []);

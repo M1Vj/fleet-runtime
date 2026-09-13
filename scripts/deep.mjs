@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 import process from "node:process";
+import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
-import { scrub, gh, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
+import { scrub, gh, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, sha256, configureIdentity } from "./lib/util.mjs";
 import { askModel } from "./lib/model.mjs";
 import { verifyCommit } from "./lib/verify.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
+import { isAllowedModel } from "./lib/provider-registry.mjs";
 import {
   isPublicDataClass,
   publicModelEnv,
@@ -170,11 +172,48 @@ export function claimTask(queue, options = {}) {
     && task.claimAttempt === claimed.claimAttempt) || claimed;
 }
 
-function buildContext(repo) {
-  const meta = gh(["api", `/repos/${repo}`], process.env);
-  const readmeRaw = gh(["api", `-H=Accept: application/vnd.github.raw`, `/repos/${repo}/readme`], process.env);
-  const commits = gh(["api", `/repos/${repo}/commits?per_page=10`], process.env) || [];
-  const pulls = gh(["api", `/repos/${repo}/pulls?state=open&per_page=10`], process.env) || [];
+export function buildContext(repo, { fetch = gh } = {}) {
+  const request = (args) => fetch(args, process.env);
+  const meta = request(["api", `/repos/${repo}`]);
+  let readmeRaw;
+  try {
+    readmeRaw = request(["api", `-H=Accept: application/vnd.github.raw`, `/repos/${repo}/readme`]);
+  } catch {
+    // Public repositories are allowed to omit README.md. Keep the research
+    // prompt meaningful by falling back to bounded metadata, tree paths, and
+    // a few root manifests instead of treating a 404 as a clone failure.
+    const branch = String(meta?.default_branch || "HEAD");
+    let treePaths = [];
+    try {
+      const tree = request(["api", `/repos/${repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`]);
+      if (Array.isArray(tree?.tree)) {
+        treePaths = tree.tree
+          .filter((entry) => entry && entry.type === "blob" && typeof entry.path === "string")
+          .slice(0, 200)
+          .map((entry) => entry.path.slice(0, 240));
+      }
+    } catch {}
+    const manifestNames = ["package.json", "pyproject.toml", "Cargo.toml", "go.mod"];
+    const manifests = [];
+    for (const name of manifestNames) {
+      try {
+        const value = request(["api", `/repos/${repo}/contents/${name}?ref=${encodeURIComponent(branch)}`]);
+        const encoded = typeof value?.content === "string" ? value.content.replace(/\s+/g, "") : "";
+        const text = encoded ? Buffer.from(encoded, "base64").toString("utf8") : String(value || "");
+        if (text.trim()) manifests.push(`${name}:\n${text.slice(0, 2000)}`);
+      } catch {}
+      if (manifests.length >= 3) break;
+    }
+    readmeRaw = [
+      "README unavailable; repository metadata, tree paths, and manifests were inspected instead.",
+      `Description: ${String(meta?.description || "(none)").slice(0, 600)}`,
+      `Primary language: ${String(meta?.language || "(unknown)").slice(0, 120)}`,
+      `Tree paths (bounded): ${treePaths.join(", ") || "(unavailable)"}`,
+      manifests.join("\n\n") || "No root package manifests were available.",
+    ].join("\n").slice(0, 10000);
+  }
+  const commits = request(["api", `/repos/${repo}/commits?per_page=10`]) || [];
+  const pulls = request(["api", `/repos/${repo}/pulls?state=open&per_page=10`]) || [];
   const lines = [];
   lines.push(`Repo: ${repo}`);
   lines.push(`Default branch: ${meta.default_branch}; pushedAt: ${meta.pushed_at}`);
@@ -195,8 +234,9 @@ function buildPrompt(task) {
   return [
     `You are a specialized deep-audit sub-agent for repo ${task.repo} (kind=${task.kind}).`,
     focus,
-    "Return ONLY strict JSON: {\"findings\":[{\"severity\":\"critical|high|medium|low\",\"title\":\"...\",\"detail\":\"...\",\"recommendation\":\"...\"}],\"verdict\":\"one-paragraph summary\"}",
+    "Return ONLY strict JSON: {\"findings\":[{\"severity\":\"critical|high|medium|low\",\"title\":\"...\",\"detail\":\"...\",\"recommendation\":\"...\"}],\"verdict\":\"one-paragraph summary\",\"evidence\":{\"inspectedScope\":\"relative paths/symbols inspected\",\"noFindingsRationale\":\"required only when findings is empty\"}}",
     "Max 12 findings; be specific and evidence-based; do not invent files you have not seen.",
+    "If findings is empty, evidence.inspectedScope must identify the checked-out files/scope inspected and evidence.noFindingsRationale must explicitly explain why no actionable findings were verified. Exit status alone is never evidence of a clean audit.",
     "A full clone of the repository is mounted at '.' (your working directory). Use read/grep/glob freely to inspect real code before concluding.",
     "Repository context follows:",
     buildContext(task.repo),
@@ -224,7 +264,22 @@ function parseFindings(reply) {
   });
   const verdict = String(obj.verdict || "").slice(0, 2000).trim();
   if (!verdict) throw new Error("missing verdict");
-  return { findings, verdict };
+  const evidence = obj.evidence && typeof obj.evidence === "object" && !Array.isArray(obj.evidence)
+    ? {
+      inspectedScope: String(obj.evidence.inspectedScope || "").trim().slice(0, 2000),
+      noFindingsRationale: String(obj.evidence.noFindingsRationale || "").trim().slice(0, 2000),
+    }
+    : undefined;
+  if (findings.length === 0) {
+    const rationale = evidence?.noFindingsRationale || "";
+    const scope = evidence?.inspectedScope || "";
+    const verified = /\b(?:no|none|zero|without)\s+(?:actionable\s+)?(?:findings?|issues?|vulnerabilit(?:y|ies))\b/i.test(rationale)
+      || /\b(?:findings?|issues?|vulnerabilit(?:y|ies))\b[^.]{0,80}\b(?:not|never)\s+(?:found|identified|observed)\b/i.test(rationale);
+    if (!substantiveReceiptText(scope) || !substantiveReceiptText(rationale) || !verified) {
+      throw new Error("empty findings require inspected scope and verified no-findings rationale");
+    }
+  }
+  return { findings, verdict, ...(evidence ? { evidence } : {}) };
 }
 
 export function reportArtifactName(repo, kind) {
@@ -245,6 +300,66 @@ export function isValidArtifactIdentity(repo, kind) {
     && validPart(kind);
 }
 
+const SOURCE_REVISION_RE = /^[0-9a-f]{40}$/i;
+const TREE_SNAPSHOT_RE = /^[0-9a-f]{64}$/i;
+const RECEIPT_TEXT_MIN = 12;
+
+function substantiveReceiptText(value) {
+  return typeof value === "string" && value.trim().length >= RECEIPT_TEXT_MIN;
+}
+
+function hasArtifactClaimIdentity(data) {
+  const taskId = data?.taskId;
+  const claimRunId = data?.claimRunId;
+  return (typeof taskId === "string" || Number.isSafeInteger(taskId))
+    && String(taskId).trim().length > 0
+    && (typeof claimRunId === "string" || Number.isSafeInteger(claimRunId))
+    && String(claimRunId).trim().length > 0;
+}
+
+function hasSourceEvidenceReceipt(data) {
+  if (!SOURCE_REVISION_RE.test(String(data?.sourceRevision || ""))) return false;
+  if (!TREE_SNAPSHOT_RE.test(String(data?.treeSnapshot || ""))) return false;
+  const evidence = data?.evidence;
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) return false;
+  if (!substantiveReceiptText(evidence.inspectedScope)) return false;
+  const checks = data?.checks;
+  if (!checks || typeof checks !== "object" || Array.isArray(checks)) return false;
+  if (checks.sourceRevision !== true || checks.treeSnapshot !== true || checks.evidence !== true) return false;
+  return true;
+}
+
+function hasNoFindingsReceipt(data) {
+  if (!hasSourceEvidenceReceipt(data)) return false;
+  const rationale = data?.evidence?.noFindingsRationale;
+  if (!substantiveReceiptText(rationale) || data?.checks?.noFindingsVerified !== true) return false;
+  return /\b(?:no|none|zero|without)\s+(?:actionable\s+)?(?:findings?|issues?|vulnerabilit(?:y|ies))\b/i.test(rationale)
+    || /\b(?:findings?|issues?|vulnerabilit(?:y|ies))\b[^.]{0,80}\b(?:not|never)\s+(?:found|identified|observed)\b/i.test(rationale);
+}
+
+/**
+ * Capture an immutable revision and bounded tree digest for a checked-out
+ * audit workspace. The digest covers git's tracked tree listing rather than
+ * arbitrary untracked worker state, so the receipt binds the inspected source
+ * snapshot without persisting source contents in the artifact.
+ */
+export function captureSourceSnapshot(workdir) {
+  const sourceRevision = gitRevParse(workdir, "HEAD");
+  if (!SOURCE_REVISION_RE.test(sourceRevision)) throw new Error("source revision is not a commit hash");
+  const tree = spawnSync("git", ["ls-tree", "-r", "--full-tree", "HEAD"], {
+    cwd: workdir,
+    encoding: "utf8",
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  if (tree.status !== 0) throw new Error(`tree snapshot failed: ${tree.stderr || "unknown"}`);
+  const listing = String(tree.stdout || "");
+  return {
+    sourceRevision,
+    treeSnapshot: sha256(listing),
+    treeEntryCount: listing.split("\n").filter(Boolean).length,
+  };
+}
+
 export function isValidArtifactDocument(data, now = Date.now()) {
   if (!isValidArtifactIdentity(data?.repo, data?.kind) || !Array.isArray(data?.findings) || data.findings.length > 12) {
     return false;
@@ -252,10 +367,14 @@ export function isValidArtifactDocument(data, now = Date.now()) {
   if (typeof data.verdict !== "string" || !data.verdict.trim()) return false;
   if (!Number.isInteger(data.exitCode) || ![0, 5, 6].includes(data.exitCode)) return false;
   if (typeof data.modelMode !== "string" || !data.modelMode.trim()) return false;
+  // Only a complete success receipt can transition a claimed task to done.
+  // It must identify the exact planner claim and bind the inspected source
+  // revision/tree plus explicit evidence/check receipts.
+  if (data.exitCode === 0 && (!hasArtifactClaimIdentity(data) || !hasSourceEvidenceReceipt(data))) return false;
   const finished = Date.parse(String(data.finishedUtc || ""));
   const maxAgeMs = 7 * 24 * 60 * 60 * 1000;
   if (!Number.isFinite(finished) || finished > now + 5 * 60 * 1000 || now - finished > maxAgeMs) return false;
-  return data.findings.every((finding) => {
+  const findingsValid = data.findings.every((finding) => {
     if (!finding || typeof finding !== "object" || Array.isArray(finding)) return false;
     const severity = String(finding.severity || "").toLowerCase();
     return ["critical", "high", "medium", "low"].includes(severity)
@@ -263,10 +382,25 @@ export function isValidArtifactDocument(data, now = Date.now()) {
       && Boolean(String(finding.detail || "").trim())
       && Boolean(String(finding.recommendation || "").trim());
   });
+  if (!findingsValid) return false;
+  if (data.exitCode === 0 && data.findings.length === 0 && !hasNoFindingsReceipt(data)) return false;
+  return true;
 }
 
 export async function parseFindingsWithRepair(initialResult, repair, maxRepairRounds = 3) {
   let result = initialResult;
+  const expectedSession = String(initialResult?.sessionId || "").trim();
+  const expectedModel = String(initialResult?.modelMode || "").trim();
+  const providerSessionAttested = initialResult?.sessionIdReturned === true;
+  const rejectRepair = (cause) => {
+    throw Object.assign(new Error("DEEP_FINDINGS_REJECTED"), {
+      code: 5,
+      reason: "DIRECTIVES_REJECTED",
+      sessionId: expectedSession,
+      modelMode: expectedModel,
+      cause,
+    });
+  };
   for (let round = 0; round <= maxRepairRounds; round++) {
     if (!result?.complete || !result?.reply) {
       throw Object.assign(new Error("MODEL_UNAVAILABLE"), {
@@ -282,15 +416,17 @@ export async function parseFindingsWithRepair(initialResult, repair, maxRepairRo
         modelMode: result.modelMode,
       };
     } catch (parseError) {
-      if (round >= maxRepairRounds || !result.sessionId) {
-        throw Object.assign(new Error("DEEP_FINDINGS_REJECTED"), {
-          code: 5,
-          reason: "DIRECTIVES_REJECTED",
-          sessionId: result.sessionId || "",
-          cause: parseError,
-        });
+      if (round >= maxRepairRounds || !providerSessionAttested || !expectedSession || !expectedModel) rejectRepair(parseError);
+      const repaired = await repair(expectedSession, round + 1, {
+        sessionId: expectedSession,
+        modelMode: expectedModel,
+      });
+      if (!repaired || repaired.sessionIdReturned !== true
+        || String(repaired.sessionId || "").trim() !== expectedSession
+        || String(repaired.modelMode || "").trim() !== expectedModel) {
+        rejectRepair(new Error("repair session/model provenance was not provider-attested"));
       }
-      result = await repair(result.sessionId, round + 1);
+      result = repaired;
     }
   }
   throw new Error("unreachable repair loop");
@@ -318,8 +454,12 @@ function clearClaim(task) {
 
 export function applyArtifactToQueue(queue, data, updatedUtc = new Date().toISOString()) {
   const task = findClaimedTask(queue, data);
-  if (!task) return "unmatched";
+  if (!task) return data?.exitCode === 0 ? "invalid" : "unmatched";
   if (!Number.isInteger(data?.exitCode) || ![0, 5, 6].includes(data.exitCode)) return "invalid";
+  // A success receipt cannot be matched by repository/kind alone. Reject it
+  // before lookup when claim or source evidence is absent, so exitCode 0 never
+  // marks an unrelated/legacy row done.
+  if (data.exitCode === 0 && !isValidArtifactDocument(data)) return "invalid";
   const claimAttempt = Number(data.claimAttempt);
   const hasMatchingClaim = Boolean(data.claimRunId)
     && String(task.claimRunId || "") === String(data.claimRunId);
@@ -343,6 +483,9 @@ export function applyArtifactToQueue(queue, data, updatedUtc = new Date().toISOS
     task.status = task.attempts >= CLAIM_MAX_ATTEMPTS ? "blocked" : "pending";
     clearClaim(task);
     return task.status === "blocked" ? "blocked" : "retry";
+  }
+  if (data.exitCode === 0 && (!hasMatchingClaim || !Number.isSafeInteger(claimAttempt) || task.attempts !== claimAttempt)) {
+    return "invalid";
   }
   task.status = "done";
   clearClaim(task);
@@ -512,6 +655,17 @@ function loadPersistedSession(repo, kind) {
   }
 }
 
+function repairModelOptions(modelMode) {
+  const raw = String(modelMode || "").trim();
+  const match = raw.match(/^(opencode\/[A-Za-z0-9._-]+)(?:@(xhigh|max|plain))?$/i);
+  if (!match || !isAllowedModel(match[1])) return {};
+  return {
+    modelOverride: match[1],
+    pinModel: true,
+    preferVariantMax: match[2] !== "plain",
+  };
+}
+
 export async function analyzeOne(repo, kind, workdir, audit) {
   const prior = loadPersistedSession(repo, kind);
   const result = await askModel({
@@ -524,6 +678,7 @@ export async function analyzeOne(repo, kind, workdir, audit) {
     maxRounds: 4,
   });
   audit.note("model", `repo=${repo} kind=${kind} complete=${result.complete} resumed=${Boolean(prior?.sessionId)} attempts=${JSON.stringify(result.attempts)}`);
+  const pinnedRepairModel = repairModelOptions(result.modelMode);
   return parseFindingsWithRepair(result, async (sessionId, repairRound) => {
     audit.note("validator", `deep findings repair round ${repairRound}/3`);
     const repaired = await askModel({
@@ -532,7 +687,8 @@ export async function analyzeOne(repo, kind, workdir, audit) {
       sessionId,
       timeoutMs: 300000,
       env: isPublicDataClass(process.env) ? publicModelEnv(process.env) : process.env,
-      preferVariantMax: true,
+      ...pinnedRepairModel,
+      preferVariantMax: pinnedRepairModel.preferVariantMax ?? true,
       maxRounds: 2,
     });
     return repaired;
@@ -584,6 +740,7 @@ async function mainWorker() {
   if (!publicMode) mkdirSync(artifactDir, { recursive: true });
   const outPath = publicMode ? null : path.join(artifactDir, reportArtifactName(repo, kind));
   const claimMetadata = workerClaimMetadata();
+  let sourceProof = null;
   const writeFailureArtifact = (err, detail) => {
     const code = err?.code === 5 ? 5 : 6;
     const modelMode = code === 6 ? "model-unavailable" : "output-rejected";
@@ -597,6 +754,15 @@ async function mainWorker() {
       sessionId: err?.sessionId || "",
       finishedUtc: new Date().toISOString(),
       exitCode: code,
+      ...(sourceProof ? {
+        sourceRevision: sourceProof.sourceRevision,
+        treeSnapshot: sourceProof.treeSnapshot,
+        evidence: { inspectedScope: `checked-out ${repo} source snapshot was captured before the audit failed`, noFindingsRationale: "The audit did not produce a findings result; no clean-result claim is being made." },
+        checks: { sourceRevision: true, treeSnapshot: true, evidence: true, noFindingsVerified: false },
+      } : {
+        evidence: { inspectedScope: `audit workspace was unavailable for ${repo}; no source receipt was produced` },
+        checks: { sourceRevision: false, treeSnapshot: false, evidence: false, noFindingsVerified: false },
+      }),
     };
     if (publicMode) writePublicArtifact(process.env, payload, { kind: "deep", status: code === 6 ? "deferred" : "rejected", repository: repo, runId });
     else writeFileSync(outPath, JSON.stringify(payload, null, 2));
@@ -606,7 +772,19 @@ async function mainWorker() {
     // Surfaced, not hidden: outage exits 6 with an explicit artifact so the
     // commit lane and watchdog can see MODEL_UNAVAILABLE. No exit-0 skip.
     const stamp0 = new Date().toISOString();
-    const payload = { repo, kind, ...claimMetadata, findings: [], verdict: "Deferred: model unavailable while the gateway circuit is open.", modelMode: "model-unavailable", sessionId: "", finishedUtc: stamp0, exitCode: 6 };
+    const payload = {
+      repo,
+      kind,
+      ...claimMetadata,
+      findings: [],
+      verdict: "Deferred: model unavailable while the gateway circuit is open.",
+      modelMode: "model-unavailable",
+      sessionId: "",
+      finishedUtc: stamp0,
+      exitCode: 6,
+      evidence: { inspectedScope: `audit workspace was unavailable for ${repo}; no source receipt was produced` },
+      checks: { sourceRevision: false, treeSnapshot: false, evidence: false, noFindingsVerified: false },
+    };
     if (publicMode) writePublicArtifact(process.env, payload, { kind: "deep", status: "deferred", repository: repo, runId });
     else writeFileSync(outPath, JSON.stringify(payload, null, 2));
     console.log(`DEEP_BLOCKED=circuit-open ${repo} code=6`);
@@ -618,8 +796,30 @@ async function mainWorker() {
   const cloneDir = path.join(cloneRoot, "repo");
   try {
     gh(["repo", "clone", repo, cloneDir, "--", "--depth", "1"], process.env);
+    sourceProof = captureSourceSnapshot(cloneDir);
     const analysis = await analyzeOne(repo, kind, cloneDir, audit);
-    const payload = { repo, kind, ...claimMetadata, ...analysis, exitCode: 0, finishedUtc: new Date().toISOString() };
+    const evidence = {
+      ...(analysis.evidence || {}),
+      inspectedScope: analysis.evidence?.inspectedScope
+        || `checked-out ${repo} source and tests for ${kind} at ${sourceProof.sourceRevision.slice(0, 12)}`,
+    };
+    const checks = {
+      sourceRevision: true,
+      treeSnapshot: true,
+      evidence: true,
+      ...(analysis.findings.length === 0 ? { noFindingsVerified: true } : {}),
+    };
+    const payload = {
+      repo,
+      kind,
+      ...claimMetadata,
+      ...analysis,
+      ...sourceProof,
+      evidence,
+      checks,
+      exitCode: 0,
+      finishedUtc: new Date().toISOString(),
+    };
     if (publicMode) writePublicArtifact(process.env, payload, { kind: "deep", status: "ok", repository: repo, runId });
     else writeFileSync(outPath, JSON.stringify(payload, null, 2));
     console.log(`DEEP_RESULT_FILE=${outPath || process.env.FLEET_PUBLIC_ARTIFACT_MANIFEST}`);

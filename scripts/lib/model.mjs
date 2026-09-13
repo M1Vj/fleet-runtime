@@ -57,6 +57,7 @@ import {
   classifyQuotaAvailability,
   verifyCoreIntegrity,
 } from "../../packages/indefinite-core/index.mjs";
+import { publicModelEnv } from "./private-state.mjs";
 
 
 // Model-layer timeouts (ms): standard calls 480s, long-form 540s,
@@ -284,6 +285,14 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
     // explicit `-m` IDs are passed through here rather than discovered.)
     const requested = String(modelOverride || model || DEFAULT_MODEL_CHAIN[0]).trim();
     const selected = isAllowedModel(requested) ? requested : DEFAULT_MODEL_CHAIN[0];
+    if (String(env?.FLEET_DATA_CLASS || "").trim().toLowerCase() === "public") {
+      try {
+        env = publicModelEnv(env);
+      } catch {
+        resolve({ reply: "", sessionId: "", exitCode: -1, interrupted: false, stderrTail: "public environment unavailable", spawnFailed: false, blocked: true, modelMode: "public-env-invalid", model: selected });
+        return;
+      }
+    }
     const poolRoot = env.FLEET_STATE_ROOT || process.cwd();
     const coreRoot = String(env.FLEET_CORE_ROOT || "").trim();
     if (!CORE_INTEGRITY_OK || !verifyCoreIntegrity(coreRoot || undefined)) {
@@ -429,6 +438,7 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
       resolve({
         reply,
         sessionId: sid,
+        sessionIdReturned: Boolean(sid),
         exitCode: code ?? -1,
         interrupted: timedOut,
         stderrTail: tail,
@@ -517,7 +527,7 @@ function allAttemptsQuotaLimited(attempts = []) {
   });
 }
 
-export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.standard, env = process.env, preferVariantMax = true, maxRounds = 4, files = [], modelOverride, workspace, skipCircuitCheck = false }) {
+export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.standard, env = process.env, preferVariantMax = true, maxRounds = 4, files = [], modelOverride, workspace, skipCircuitCheck = false, pinModel = false }) {
   const stateRoot = env.FLEET_STATE_ROOT || process.cwd();
   const coreRoot = String(env.FLEET_CORE_ROOT || "").trim();
   if (!CORE_INTEGRITY_OK || !verifyCoreIntegrity(coreRoot || undefined)) return coreParityBlocked(stateRoot);
@@ -532,7 +542,7 @@ export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.s
   // preserving failover to the resolved chain so single-model outages or rate
   // limits never stall judging, revisions, or audits.
   const chain = modelOverride && isAllowedModel(modelOverride)
-    ? [modelOverride, ...resolveModelChain(env).filter((m) => m !== modelOverride)]
+    ? (pinModel ? [modelOverride] : [modelOverride, ...resolveModelChain(env).filter((m) => m !== modelOverride)])
     : resolveModelChain(env);
   logModelAudit(stateRoot, { event: "chain_start", chain, sessionId: sessionId || null });
   const allAttempts = [];
@@ -565,7 +575,7 @@ export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.s
     if (r.complete) {
       try { markGatewayUp(stateRoot); } catch {}
       logModelAudit(stateRoot, { event: "model_success", model: chain[ci], mode: r.modelMode, attempts: r.attempts?.length });
-      return { reply: r.reply, sessionId: lastSid, modelMode: lastMode, attempts: allAttempts, complete: true, ...(chainExhausted ? { degraded: true, exhausted: true } : {}) };
+      return { reply: r.reply, sessionId: lastSid, sessionIdReturned: r.sessionIdReturned === true, modelMode: lastMode, attempts: allAttempts, complete: true, ...(chainExhausted ? { degraded: true, exhausted: true } : {}) };
     }
     logModelAudit(stateRoot, { event: "model_failover", model: chain[ci], nextModel: chain[ci + 1] || null, attempts: r.attempts?.length });
   }
@@ -590,6 +600,7 @@ export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.s
     complete: false,
     ...(chainExhausted ? { degraded: true, exhausted: true } : {}),
     ...(quotaDisposition ? { waitingForQuota: true, surfaced: true, quotaDisposition } : {}),
+    sessionIdReturned: allAttempts.some((attempt) => attempt.sessionReturned === true),
   };
 }
 
@@ -604,6 +615,7 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
   const stateRoot = env.FLEET_STATE_ROOT || process.cwd();
   const startedAuthenticated = collectSlots(env).length > 0 || Boolean(env.OPENCODE_AUTH_CONTENT);
   let sid = sessionId || "";
+  let sessionReturned = false;
   // Contributor-tier thinking caps at xhigh (Standard-tier max is rejected on
   // contributor plans), so the ladder top is xhigh on this tier, max elsewhere.
   // Anonymous rounds are available only when the invocation began anonymous.
@@ -631,6 +643,7 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
       interrupted: r.interrupted,
       gotReply: Boolean(r.reply),
       hadSession: Boolean(r.sessionId),
+      sessionReturned: r.sessionIdReturned === true,
       errTail: (r.stderrTail || "").slice(-160),
       rawTail: (r.rawTail || "").slice(-300),
     };
@@ -647,9 +660,10 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
     // an authenticated invocation to an anonymous route.
     if (r.exhausted) ladderExhausted = true;
     if (r.sessionId) sid = r.sessionId;
+    if (r.sessionIdReturned === true) sessionReturned = true;
     if (!r.interrupted && r.exitCode === 0 && r.reply) {
       try { markGatewayUp(stateRoot); } catch {}
-      return { reply: r.reply, sessionId: sid, modelMode: `${model}${mode === "plain" ? "" : `@${mode}`}`, attempts, complete: true, ...(ladderExhausted ? { degraded: true, exhausted: true } : {}) };
+      return { reply: r.reply, sessionId: sid, sessionIdReturned: sessionReturned, modelMode: `${model}${mode === "plain" ? "" : `@${mode}`}`, attempts, complete: true, ...(ladderExhausted ? { degraded: true, exhausted: true } : {}) };
     }
     // Variant best-effort: an unknown/invalid-variant round failure
     // retries that round once WITHOUT --variant before falling through
@@ -668,6 +682,7 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
         interrupted: vr.interrupted,
         gotReply: Boolean(vr.reply),
         hadSession: Boolean(vr.sessionId),
+        sessionReturned: vr.sessionIdReturned === true,
         errTail: (vr.stderrTail || "").slice(-160),
         rawTail: (vr.rawTail || "").slice(-300),
         variantRetry: true,
@@ -677,9 +692,10 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
         return { ...wait, sessionId: vr.sessionId || sid || "", attempts, model, complete: false };
       }
       if (vr.sessionId) sid = vr.sessionId;
+      if (vr.sessionIdReturned === true) sessionReturned = true;
       if (!vr.interrupted && vr.exitCode === 0 && vr.reply) {
         try { markGatewayUp(stateRoot); } catch {}
-        return { reply: vr.reply, sessionId: sid, modelMode: `${model}`, attempts, complete: true, ...(ladderExhausted ? { degraded: true, exhausted: true } : {}) };
+        return { reply: vr.reply, sessionId: sid, sessionIdReturned: sessionReturned, modelMode: `${model}`, attempts, complete: true, ...(ladderExhausted ? { degraded: true, exhausted: true } : {}) };
       }
     }
     if (mode === "max" || mode === "xhigh") {
@@ -699,7 +715,7 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
     promptNow = "You were interrupted mid-task. Continue from where you stopped and finish the job. Output ONLY the requested final answer now.";
     sid = "";
   }
-  return { reply: "", sessionId: sid, modelMode: mode, attempts, complete: false, ...(ladderExhausted ? { degraded: true, exhausted: true } : {}) };
+  return { reply: "", sessionId: sid, sessionIdReturned: sessionReturned, modelMode: mode, attempts, complete: false, ...(ladderExhausted ? { degraded: true, exhausted: true } : {}) };
 }
 
 export async function askModelResilient(opts) {

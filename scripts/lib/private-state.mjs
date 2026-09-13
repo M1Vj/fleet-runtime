@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { makeTerminal as privateMakeTerminal } from "./terminal.mjs";
@@ -142,22 +142,82 @@ export function publicRepositoryFromIdentity(identity, env = process.env) {
   return publicRepository(env);
 }
 
+const PUBLIC_CHILD_ENV_KEYS = new Set([
+  "PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TERM", "CI", "TZ", "NO_COLOR", "FORCE_COLOR",
+  "GITHUB_ACTIONS", "GITHUB_SERVER_URL", "GITHUB_API_URL", "GITHUB_GRAPHQL_URL", "GITHUB_REPOSITORY", "GITHUB_REF", "GITHUB_REF_NAME", "GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_NUMBER", "GITHUB_RUN_ATTEMPT", "GITHUB_WORKFLOW", "GITHUB_WORKFLOW_REF", "GITHUB_WORKFLOW_SHA",
+  "RUNNER_OS", "RUNNER_ARCH", "RUNNER_NAME", "RUNNER_ENVIRONMENT", "RUNNER_TOOL_CACHE",
+  "FLEET_MODEL_CHAIN", "FLEET_JUDGE_MODEL", "FLEET_CHAIN_TTL_MS", "FLEET_GATEWAY_RETRY_MS", "FLEET_OPENCODE_DEBUG",
+]);
+
+function boundedPublicEnvValue(value) {
+  if (value === null || value === undefined) return undefined;
+  const text = String(value);
+  if (!text || text.length > 4096 || /[\u0000-\u001f\u007f]/.test(text)) return undefined;
+  return text;
+}
+
+function publicEphemeralDirectories(env, stateRoot) {
+  const runnerRoot = runnerTempRoot(env);
+  try {
+    mkdirSync(runnerRoot, { recursive: true, mode: 0o700 });
+    mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
+    try { chmodSync(runnerRoot, 0o700); } catch {}
+    try { chmodSync(stateRoot, 0o700); } catch {}
+    const realRunner = realpathSync(runnerRoot);
+    const realState = realpathSync(stateRoot);
+    const runnerPrefix = realRunner.endsWith(path.sep) ? realRunner : `${realRunner}${path.sep}`;
+    if (realState !== realRunner && !realState.startsWith(runnerPrefix)) {
+      throw new DataClassError(4, "PUBLIC_STATE_OUTSIDE_RUNNER_TEMP", stateRoot);
+    }
+    // Keep the caller's absolute runner/state spelling in the child env.  On
+    // macOS `/var` is a symlink to `/private/var`; exporting realpath values
+    // would make ordinary containment checks appear to escape the configured
+    // public root even though the validated filesystem target is the same.
+    // Every path is still realpath-checked below before it is returned.
+    const paths = {
+      home: path.join(stateRoot, "home"),
+      config: path.join(stateRoot, "xdg-config"),
+      data: path.join(stateRoot, "xdg-data"),
+      cache: path.join(stateRoot, "xdg-cache"),
+      tmp: path.join(stateRoot, "tmp"),
+    };
+    for (const directory of Object.values(paths)) {
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      try { chmodSync(directory, 0o700); } catch {}
+      const real = realpathSync(directory);
+      const statePrefix = realState.endsWith(path.sep) ? realState : `${realState}${path.sep}`;
+      if (real !== realState && !real.startsWith(statePrefix)) throw new DataClassError(4, "PUBLIC_ENV_ROOT_INVALID", directory);
+    }
+    return { ...paths, runner: runnerRoot, state: stateRoot };
+  } catch (error) {
+    if (error instanceof DataClassError) throw error;
+    throw new DataClassError(4, "PUBLIC_ENV_ROOT_INVALID", stateRoot);
+  }
+}
+
 /** Public jobs receive a minimal, non-secret child environment. */
 export function publicChildEnv(env = process.env, { forModel = false } = {}) {
   const stateRoot = publicStateRoot(env);
-  const manifest = String(env?.FLEET_PUBLIC_ARTIFACT_MANIFEST || "");
+  const ephemeral = publicEphemeralDirectories(env, stateRoot);
   const out = {};
   for (const [key, value] of Object.entries(env || {})) {
-    if (/TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL|COOKIE|SESSION|PROXY/i.test(key)) continue;
-    if (/^(?:FLEET_|OPENCODE_|GH_|GITHUB_)/i.test(key)) continue;
-    out[key] = value;
+    if (!PUBLIC_CHILD_ENV_KEYS.has(key)) continue;
+    const safe = boundedPublicEnvValue(value);
+    if (safe !== undefined) out[key] = safe;
   }
   out.FLEET_DATA_CLASS = PUBLIC_DATA_CLASS;
   out.FLEET_PUBLIC_OWNER = DEFAULT_PUBLIC_OWNER;
   out.FLEET_PUBLIC_REPOSITORY = publicRepository(env);
-  out.FLEET_PUBLIC_STATE_ROOT = stateRoot;
-  out.FLEET_STATE_ROOT = stateRoot;
-  if (manifest) out.FLEET_PUBLIC_ARTIFACT_MANIFEST = manifest;
+  out.FLEET_PUBLIC_STATE_ROOT = ephemeral.state;
+  out.FLEET_STATE_ROOT = ephemeral.state;
+  out.FLEET_WORKSPACE_ROOT = ephemeral.state;
+  out.RUNNER_TEMP = ephemeral.runner;
+  out.HOME = ephemeral.home;
+  out.XDG_CONFIG_HOME = ephemeral.config;
+  out.XDG_DATA_HOME = ephemeral.data;
+  out.XDG_CACHE_HOME = ephemeral.cache;
+  out.TMPDIR = ephemeral.tmp;
+  if (env?.FLEET_PUBLIC_ARTIFACT_MANIFEST) out.FLEET_PUBLIC_ARTIFACT_MANIFEST = resolveArtifactManifest(env);
   if (!forModel && env?.GITHUB_TOKEN) out.GITHUB_TOKEN = String(env.GITHUB_TOKEN);
   return out;
 }
@@ -222,6 +282,14 @@ const PUBLIC_SAFE_STATUSES = new Set([
   "awaiting-control",
   "awaiting-private-control",
 ]);
+const PUBLIC_SAFE_EFFECT_STATES = new Set([
+  "registered", "leased", "executing", "awaiting_receipt", "verifying", "completed", "blocked",
+  "recovering", "escalated", "expired", "waiting_for_capacity", "unknown_effect",
+]);
+const PUBLIC_SAFE_SEMANTIC_STATUSES = new Set([
+  "SUCCESS", "ACCEPTED", "DUPLICATE", "DEFERRED", "NO_OP", "AWAITING_RECEIPT", "WAITING_FOR_CAPACITY",
+  "UNKNOWN_EFFECT", "BLOCKED", "RECOVERING", "EXPIRED", "UNKNOWN",
+]);
 const PUBLIC_SAFE_ERRORS = new Set([
   "DATA_CLASS_INVALID",
   "MODEL_UNAVAILABLE",
@@ -245,10 +313,55 @@ const PUBLIC_PR_URL_RE = /^https:\/\/github\.com\/([^/]+)\/([A-Za-z0-9_.-]{1,100
 const PUBLIC_PRIVATE_TEXT_RE = /(?:https?:|ftp:|file:|data:|\bwww\.|(?:^|[^A-Za-z0-9_])(?:~[\\/]|[A-Za-z]:[\\/]|\/(?:Users|home|private|tmp|var|etc|opt|workspace|runner|Volumes)[\\/]|(?:private|secret|credential|session|log|artifact|prompt|source)[\\/][^\s"'<>]+)|\b(?:prompt|source|session|private(?:State)?|log|artifact)\s*[:=]|\b(?:private[-_])?(?:ses(?:sion)?|task|thread|job)[-_][A-Za-z0-9]{2,}\b|\b(?:gh[pousr]_|github_pat_|sk-[A-Za-z0-9_-]{8,}|AKIA[0-9A-Z]{12,}|AIza[0-9A-Za-z_-]{16,}|xox[baprs]-[A-Za-z0-9-]{8,}|Bearer\s+[A-Za-z0-9._-]{12,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}))/i;
 const PUBLIC_REPOSITORY_SHAPE_RE = /(?:^|[\s"'`([{=:])([A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100})(?=$|[\s"'`)}\],.;!?])/g;
 
-function hasForeignRepositoryReference(text, repository) {
-  const matches = String(text).matchAll(PUBLIC_REPOSITORY_SHAPE_RE);
+const PUBLIC_SOURCE_PATH_PREFIXES = new Set([
+  ".github", "app", "apps", "client", "components", "config", "docs", "lib", "pages", "packages", "public", "scripts", "server", "src", "test", "tests",
+]);
+
+function isLikelySourcePath(reference) {
+  const [prefix, ...rest] = String(reference || "").split("/");
+  if (!PUBLIC_SOURCE_PATH_PREFIXES.has(prefix.toLowerCase()) || rest.length === 0) return false;
+  const suffix = rest.join("/");
+  return rest.length > 1 || /\.[A-Za-z0-9]{1,12}$/.test(suffix);
+}
+
+function hasForeignRepositoryReference(text, repository, { allowSourcePaths = false, rejectTarget = false } = {}) {
+  const source = String(text);
+  const matches = source.matchAll(PUBLIC_REPOSITORY_SHAPE_RE);
   for (const match of matches) {
-    if (!repository || match[1] !== repository) return true;
+    if (allowSourcePaths && isLikelySourcePath(match[1])) continue;
+    if (!repository || match[1] !== repository || rejectTarget) return true;
+  }
+  // A repository-shaped pair can be embedded after a source prefix, e.g.
+  // `src/Owner/foreign-repo`; the boundary regex above intentionally avoids
+  // matching the first pair because it is followed by another slash. Inspect
+  // adjacent path segments so a foreign owner/repo cannot survive as evidence.
+  if (allowSourcePaths || source.includes("/")) {
+    const pathToken = /(?:^|[\s"'`([{=:])((?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+)(?=$|[\s"'`)}\],.;!?])/g;
+    const targetOwner = String(repository || "").split("/")[0];
+    for (const token of source.matchAll(pathToken)) {
+      const segments = token[1].split("/");
+      if (segments.length < 2) continue;
+      const prefix = segments[0].toLowerCase();
+      // A known source prefix followed by one file segment is an ordinary
+      // source path (for example src/foo-bar.js), not an owner/repository
+      // identity. Deeper paths remain subject to the identity detector.
+      if (allowSourcePaths && segments.length === 2
+        && PUBLIC_SOURCE_PATH_PREFIXES.has(prefix)
+        && /\.[A-Za-z0-9]{1,12}$/.test(segments[1])) continue;
+      const start = segments.length >= 3 && PUBLIC_SOURCE_PATH_PREFIXES.has(segments[0].toLowerCase()) ? 1 : 0;
+      for (let index = start; index < segments.length - 1; index += 1) {
+        const candidate = `${segments[index]}/${segments[index + 1]}`;
+        if (candidate === repository && !rejectTarget) continue;
+        const owner = segments[index];
+        const name = segments[index + 1];
+        // File-like second segments are source paths; owner/repository-shaped
+        // pairs remain forbidden even when nested under a source prefix.
+        const secondBase = name.replace(/\.[A-Za-z0-9]{1,12}$/, "");
+        const ownerLikeIdentity = /^[A-Za-z][A-Za-z0-9_-]{2,63}$/.test(owner)
+          && /^[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+$/.test(secondBase);
+        if (owner === targetOwner || !/\.[A-Za-z0-9]{1,12}$/.test(name) || ownerLikeIdentity) return true;
+      }
+    }
   }
   return false;
 }
@@ -258,6 +371,17 @@ function publicScalar(value, max = 4000, key = "", repository) {
   if (cleanKey === "status") {
     const text = scalar(value, max);
     return typeof text === "string" && PUBLIC_SAFE_STATUSES.has(text.trim()) ? text.trim() : undefined;
+  }
+  if (cleanKey === "effectState") {
+    const text = scalar(value, max);
+    return typeof text === "string" && PUBLIC_SAFE_EFFECT_STATES.has(text.trim()) ? text.trim() : undefined;
+  }
+  if (cleanKey === "semanticStatus") {
+    const text = scalar(value, max);
+    return typeof text === "string" && PUBLIC_SAFE_SEMANTIC_STATUSES.has(text.trim().toUpperCase()) ? text.trim().toUpperCase() : undefined;
+  }
+  if (cleanKey === "processSuccess" || cleanKey === "desiredTaskCompleted") {
+    return typeof value === "boolean" ? value : undefined;
   }
   if (cleanKey === "summary") {
     const text = scalar(value, max);
@@ -288,7 +412,15 @@ function publicScalar(value, max = 4000, key = "", repository) {
   if (value === null || value === undefined) return undefined;
   if (typeof value === "boolean" || typeof value === "number") return value;
   const text = String(value).slice(0, max);
-  return PUBLIC_PRIVATE_TEXT_RE.test(text) || hasForeignRepositoryReference(text, repository) ? undefined : text;
+  const allowSourcePaths = cleanKey === "evidence" || cleanKey === "evidencePaths" || cleanKey === "inspectedScope";
+  if (cleanKey === "evidencePaths") {
+    if (!/^(?:(?:[A-Za-z0-9_.-]+)[\\/])+[A-Za-z0-9_.-]+$/.test(text)
+      || text.split(/[\\/]/).some((part) => part === "." || part === "..")
+      || hasForeignRepositoryReference(text, repository, { allowSourcePaths: true, rejectTarget: true })) return undefined;
+    return text;
+  }
+  const rejectTarget = !["repository", "repo", "target", "prUrl"].includes(cleanKey);
+  return PUBLIC_PRIVATE_TEXT_RE.test(text) || hasForeignRepositoryReference(text, repository, { allowSourcePaths, rejectTarget }) ? undefined : text;
 }
 
 function safeAudit(audit) {
@@ -305,8 +437,8 @@ const PUBLIC_FIELDS = new Set([
   "generatedUtc", "finishedUtc", "exitCode", "modelMode", "verdict", "findings", "ideas", "plan",
   "files", "lens", "prNumber", "prUrl", "count", "summary", "reason", "checks", "audit", "results",
   "selected", "validatedAt", "title", "why", "impact", "effort", "error", "externalWrites", "visibility", "archived",
-  "analyzed", "blocked", "awaitingPrivateControl",
-  "awaitingControl",
+  "analyzed", "blocked", "awaitingPrivateControl", "effectState", "processSuccess", "semanticStatus",
+  "awaitingControl", "evidenceVerified", "sourceRevision", "treeSnapshot", "evidencePaths",
   "stageResults", "desiredTaskCompleted", "evidence",
 ]);
 
@@ -322,24 +454,66 @@ const PUBLIC_NESTED_FIELDS = new Set([
   "impact", "effort", "error", "externalWrites", "severity", "detail", "recommendation", "approach", "ok", "skipped", "note", "rationale", "evidence",
   "issue", "number", "commentId", "applied", "postedComment", "downgraded", "digestBytes", "stale", "actions", "model",
   "identity", "entries", "incidents", "t", "step", "msg",
-  "analyzed", "blocked", "awaitingPrivateControl",
+  "analyzed", "blocked", "awaitingPrivateControl", "effectState", "processSuccess", "semanticStatus",
   "stageResults", "desiredTaskCompleted", "evidence", "receipt", "pick", "research", "plan", "implement", "review", "terminalState",
+  "inspectedScope", "noFindingsRationale", "noFindingsVerified",
+  "evidenceVerified", "sourceRevision", "treeSnapshot", "evidencePaths",
   "awaitingControl", "durableControl",
 ]);
 const PUBLIC_NESTED_DENY = /(?:token|secret|password|credential|cookie|session|prompt|reply|proxy|auth|private|source|log|artifact|path|url|repository)/i;
+const PUBLIC_SELECTION_MAX = 15;
+const PUBLIC_SELECTION_FIELDS = new Set(["repo", "repository", "score", "weight", "rank"]);
 
-function allowPublicValue(value, depth = 0, repository) {
+function boundedSelectionNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 && number <= 1_000_000_000 ? number : undefined;
+}
+
+/**
+ * Selection artifacts are the one nested shape that intentionally carries a
+ * public repository identity.  Preserve only the validated target and small
+ * ranking fields; foreign identities and arbitrary nested metadata are
+ * dropped before the public manifest is written.
+ */
+function allowPublicSelection(value, repository) {
+  if (typeof value === "boolean") return value;
+  const raw = Array.isArray(value) ? value : [value];
+  const entries = [];
+  for (const item of raw.slice(0, PUBLIC_SELECTION_MAX)) {
+    const candidate = typeof item === "string" ? { repo: item } : item;
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+    const selectedRepository = String(candidate.repo ?? candidate.repository ?? "").trim();
+    if (!repository || selectedRepository !== repository) continue;
+    const clean = { repo: repository };
+    for (const key of PUBLIC_SELECTION_FIELDS) {
+      if (key === "repo" || key === "repository" || candidate[key] === undefined) continue;
+      const bounded = key === "rank" ? Number(candidate[key]) : boundedSelectionNumber(candidate[key]);
+      if (key === "rank" ? Number.isInteger(bounded) && bounded > 0 && bounded <= PUBLIC_SELECTION_MAX : bounded !== undefined) {
+        clean[key] = bounded;
+      }
+    }
+    entries.push(clean);
+  }
+  return entries;
+}
+
+function allowPublicValue(value, depth = 0, repository, key = "") {
   if (depth > 4) return undefined;
-  if (Array.isArray(value)) return value.slice(0, 100).map((item) => allowPublicValue(item, depth + 1, repository)).filter((item) => item !== undefined);
-  if (!value || typeof value !== "object") return publicScalar(value, 4000, "", repository);
+  if (Array.isArray(value)) return value.slice(0, 100).map((item) => allowPublicValue(item, depth + 1, repository, key)).filter((item) => item !== undefined);
+  if (!value || typeof value !== "object") return publicScalar(value, 4000, key, repository);
   const out = {};
   for (const [key, item] of Object.entries(value)) {
+    if (key === "selected") {
+      const selection = allowPublicSelection(item, repository);
+      if (selection !== undefined) out[key] = selection;
+      continue;
+    }
     const topLevel = depth === 0;
     if ((!topLevel && PUBLIC_NESTED_DENY.test(key)) || (topLevel && PUBLIC_NESTED_DENY.test(key) && !PUBLIC_FIELDS.has(key))) continue;
     if (!(topLevel ? PUBLIC_FIELDS : PUBLIC_NESTED_FIELDS).has(key)) continue;
     const clean = (key === "status" || key === "summary" || key === "error" || key === "prUrl" || key === "target" || key === "repository" || key === "repo")
       ? publicScalar(item, 4000, key, repository)
-      : allowPublicValue(item, depth + 1, repository);
+      : allowPublicValue(item, depth + 1, repository, key);
     if (clean !== undefined) out[key] = clean;
   }
   return out;

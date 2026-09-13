@@ -239,7 +239,7 @@ jobs:
         with:
           pattern: public-research-*
           path: ${{ runner.temp }}/fleet-public-research
-          merge-multiple: true
+          merge-multiple: false
         continue-on-error: true
       - name: plan public improvements
         id: plan
@@ -393,11 +393,19 @@ jobs:
           node-version: "20"
       - name: install pinned opencode cli
         run: npm install -g opencode-ai@1.18.30
+      - name: download public research manifests for review
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: public-research-*
+          path: ${{ runner.temp }}/fleet-public-research
+          merge-multiple: false
+        continue-on-error: true
       - name: review public result
         env:
           FLEET_PUBLIC_REPOSITORY: ${{ steps.public-target.outputs.repository }}
           FLEET_IMPROVE_MODE: review
           FLEET_ARTIFACT_DIR: ${{ runner.temp }}/fleet-public-artifacts
+          FLEET_PUBLIC_RESEARCH_DIR: ${{ runner.temp }}/fleet-public-research
         run: node scripts/improve.mjs
       - name: upload public review manifest
         if: always()

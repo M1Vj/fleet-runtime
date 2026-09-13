@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cpSync, mkdtempSync, writeFileSync, readFileSync, chmodSync, existsSync, mkdirSync } from "node:fs";
+import { cpSync, mkdtempSync, writeFileSync, readFileSync, chmodSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -13,6 +13,7 @@ import {
   DEFAULT_JUDGE_MODEL,
 } from "../scripts/lib/provider-registry.mjs";
 import { resolveModelChain, MODEL_TIMEOUTS } from "../scripts/lib/model.mjs";
+import { publicModelEnv } from "../scripts/lib/private-state.mjs";
 
 const EXPECTED_CHAIN = [
   "opencode/muse-spark-1.3-contributor-free",
@@ -123,13 +124,14 @@ test("askModel fails closed on a tampered core before spawning OpenCode", async 
 // Behavioral test for the fixed hardcode: runOnce must pass the requested
 // model to `opencode -m` (via allowlist) instead of a hardcoded ID. Uses a
 // fake `opencode` executable first on PATH — no network, no credentials.
-function makeFakeOpencode() {
+function makeFakeOpencode({ includeSession = true } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "fleetmodel-"));
   const capture = path.join(dir, "args.jsonl");
   const bin = path.join(dir, "opencode");
+  const output = includeSession ? '{text:"hello-test",sessionID:"sess-test-1"}' : '{text:"hello-without-session"}';
   writeFileSync(
     bin,
-    `#!/usr/bin/env node\nconst fs=require("fs");\nfs.appendFileSync(${JSON.stringify(capture)},JSON.stringify(process.argv.slice(2))+"\\n");\nconsole.log(JSON.stringify({text:"hello-test",sessionID:"sess-test-1"}));\n`,
+    `#!/usr/bin/env node\nconst fs=require("fs");\nfs.appendFileSync(${JSON.stringify(capture)},JSON.stringify(process.argv.slice(2))+"\\n");\nconsole.log(JSON.stringify(${output}));\n`,
   );
   chmodSync(bin, 0o755);
   return { dir, capture };
@@ -171,6 +173,23 @@ test("anonymous provider-authorized calls preserve variant and exact session arg
   const args = await lastArgs(capture);
   assert.equal(args[args.indexOf("--variant") + 1], "xhigh");
   assert.equal(args[args.indexOf("-s") + 1], "sess-anonymous-1");
+});
+
+test("caller session is not treated as provider-returned when response omits sessionID", async () => {
+  const { runOnce } = await import("../scripts/lib/model.mjs");
+  const { dir } = makeFakeOpencode({ includeSession: false });
+  const env = { ...process.env, PATH: `${dir}:${process.env.PATH}`, FLEET_OPENCODE_AUTH: "test-auth" };
+  const result = await runOnce({
+    prompt: "continue without provider session evidence",
+    sessionId: "caller-supplied-session",
+    variant: "xhigh",
+    timeoutMs: 15000,
+    env,
+    model: PRIMARY_MODEL,
+  });
+  assert.equal(result.reply, "hello-without-session");
+  assert.equal(result.sessionId, "");
+  assert.equal(result.sessionIdReturned, false);
 });
 
 test("authenticated retries preserve a returned exact session", async () => {
@@ -302,6 +321,53 @@ test("runOnce preserves the workspace permission boundary when pinning models", 
     model: "opencode/nemotron-3.5-lightning-free",
     small_model: "opencode/nemotron-3.5-lightning-free",
   });
+});
+
+test("public runOnce uses an allowlisted environment and ephemeral config roots", async () => {
+  const { runOnce } = await import("../scripts/lib/model.mjs");
+  const root = mkdtempSync(path.join(tmpdir(), "fleet-public-model-env-"));
+  const dir = mkdtempSync(path.join(tmpdir(), "fleet-public-model-bin-"));
+  const stateRoot = path.join(root, "state");
+  const seen = path.join(dir, "env.json");
+  const bin = path.join(dir, "opencode");
+  writeFileSync(
+    bin,
+    `#!/usr/bin/env node\nconst fs=require("fs");fs.writeFileSync(${JSON.stringify(seen)},JSON.stringify({HOME:process.env.HOME,XDG_CONFIG_HOME:process.env.XDG_CONFIG_HOME,XDG_DATA_HOME:process.env.XDG_DATA_HOME,XDG_CACHE_HOME:process.env.XDG_CACHE_HOME,TMPDIR:process.env.TMPDIR,RUNNER_TEMP:process.env.RUNNER_TEMP,ARBITRARY_PRIVATE:process.env.ARBITRARY_PRIVATE,FLEET_OPENCODE_AUTH:process.env.FLEET_OPENCODE_AUTH,OPENCODE_AUTH_CONTENT:process.env.OPENCODE_AUTH_CONTENT,NODE_OPTIONS:process.env.NODE_OPTIONS}));console.log(JSON.stringify({text:"ok",sessionID:"s-public-env-1"}));\n`,
+  );
+  chmodSync(bin, 0o755);
+  const env = {
+    FLEET_DATA_CLASS: "public",
+    FLEET_PUBLIC_OWNER: "M1Vj",
+    FLEET_PUBLIC_REPOSITORY: "M1Vj/public-repo",
+    RUNNER_TEMP: root,
+    FLEET_PUBLIC_STATE_ROOT: stateRoot,
+    FLEET_PUBLIC_ARTIFACT_MANIFEST: path.join(stateRoot, "public-artifact.json"),
+    PATH: `${dir}:${process.env.PATH || ""}`,
+    HOME: "/private-home",
+    XDG_CONFIG_HOME: "/private-config",
+    ARBITRARY_PRIVATE: "must-not-be-forwarded",
+    FLEET_OPENCODE_AUTH: "private-auth",
+    OPENCODE_AUTH_CONTENT: "private-auth",
+    NODE_OPTIONS: "--require /private-module.js",
+  };
+  try {
+    const result = await runOnce({ prompt: "public env probe", timeoutMs: 15000, env, model: PRIMARY_MODEL });
+    assert.equal(result.reply, "ok");
+    const captured = JSON.parse(readFileSync(seen, "utf8"));
+    const publicRoot = path.resolve(stateRoot);
+    for (const key of ["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "TMPDIR"]) {
+      assert.equal(captured[key].startsWith(`${publicRoot}${path.sep}`), true, `${key} must be ephemeral public state`);
+    }
+    assert.equal(captured.RUNNER_TEMP, path.resolve(root));
+    assert.equal(captured.ARBITRARY_PRIVATE, undefined);
+    assert.equal(captured.FLEET_OPENCODE_AUTH, undefined);
+    assert.equal(captured.OPENCODE_AUTH_CONTENT, "");
+    assert.equal(captured.NODE_OPTIONS, undefined);
+    assert.equal(publicModelEnv(env).HOME.startsWith(`${publicRoot}${path.sep}`), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("runOnce rejects an error event even when the CLI exits zero", async () => {

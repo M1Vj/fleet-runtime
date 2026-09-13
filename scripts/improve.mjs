@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import process from "node:process";
 import fsMod from "node:fs";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
@@ -22,6 +22,8 @@ import {
   writeExecutionArtifact,
   writeExecutionAudit,
   writePublicArtifact,
+  readPublicManifest,
+  PUBLIC_ARTIFACT_SCHEMA,
 } from "./lib/private-state.mjs";
 
 const CODE_ROOT = process.cwd();
@@ -41,6 +43,191 @@ function executionModelEnv() {
 
 function artifactDir(fallback = ".") {
   return isPublicDataClass(process.env) ? resolveArtifactDir(process.env, fallback) : (process.env.FLEET_ARTIFACT_DIR || fallback);
+}
+
+/**
+ * Materialize a bounded job output when the improve workflow is running under
+ * Actions.  Local invocations deliberately remain stdout-only; this keeps the
+ * script useful outside Actions while ensuring matrix consumers never depend
+ * on a log line such as IMPROVE_MATRIX=... being parsed implicitly.
+ */
+export function writeGitHubOutput(name, value, env = process.env) {
+  const key = String(name || "").trim();
+  const output = String(env?.GITHUB_OUTPUT || "").trim();
+  if (!output) return false;
+  if (!/^[A-Za-z_][A-Za-z0-9_-]*$/.test(key)) throw new Error("invalid GitHub output name");
+  const encoded = typeof value === "string" ? value : JSON.stringify(value);
+  appendFileSync(output, `${key}=${encoded}\n`, "utf8");
+  return true;
+}
+
+function publicStageManifestPaths(root) {
+  const base = String(root || "").trim();
+  if (!base || !existsSync(base)) return [];
+  const paths = [];
+  const add = (candidate) => {
+    try {
+      if (paths.length >= 32 || !existsSync(candidate) || !statSync(candidate).isFile() || statSync(candidate).size > 128 * 1024) return;
+      if (path.basename(candidate) !== "public-artifact.json") return;
+      paths.push(candidate);
+    } catch {}
+  };
+  add(path.join(base, "public-artifact.json"));
+  try {
+    for (const entry of readdirSync(base, { withFileTypes: true }).slice(0, 32)) {
+      if (entry.isDirectory()) add(path.join(base, entry.name, "public-artifact.json"));
+    }
+  } catch {}
+  return paths;
+}
+
+export function readPublicImproveManifests(root, repository = "") {
+  const target = String(repository || "").trim();
+  return publicStageManifestPaths(root).map((file) => {
+    try {
+      const value = JSON.parse(readFileSync(file, "utf8"));
+      if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+      if (value.schema !== PUBLIC_ARTIFACT_SCHEMA || value.dataClass !== "public") return null;
+      if (!/^M1Vj\/[A-Za-z0-9_.-]{1,100}$/.test(String(value.repository || ""))) return null;
+      if (target && value.repository !== target) return null;
+      return value;
+    } catch {
+      return null;
+    }
+  }).filter(Boolean);
+}
+
+export function isBoundedResearchManifest(value) {
+  if (!value || typeof value !== "object" || value.mode !== "research" || !["ok", "analyzed"].includes(String(value.status || ""))) return false;
+  const ideas = Array.isArray(value.ideas) ? value.ideas : [];
+  return ideas.length > 0 && ideas.length <= IDEA_MAX_COUNT && ideas.every((idea) => (
+    idea && typeof idea === "object" && !Array.isArray(idea)
+      && typeof idea.title === "string" && idea.title.trim().length > 0 && idea.title.length <= 240
+      && (idea.rationale === undefined || (typeof idea.rationale === "string" && idea.rationale.length <= 2400))
+      && (idea.evidence === undefined || (typeof idea.evidence === "string" && idea.evidence.length <= 2400))
+      && ["high", "medium", "low"].includes(String(idea.impact || "").toLowerCase())
+  ));
+}
+
+export function isBoundedPlanManifest(value) {
+  const plan = value?.plan;
+  return Boolean(value && typeof value === "object" && !Array.isArray(value)
+    && value.mode === "plan" && value.status === "analyzed"
+    && plan && typeof plan === "object" && !Array.isArray(plan)
+    && typeof plan.title === "string" && plan.title.trim().length > 0 && plan.title.length <= 160
+    && ["high", "medium", "low"].includes(String(plan.impact || "").toLowerCase()));
+}
+
+export function isBoundedReviewManifest(value) {
+  return Boolean(value && typeof value === "object" && value.mode === "review" && value.status === "analyzed" && validReviewFindings(value.findings));
+}
+
+/** Validate review output after the public artifact sanitizer has run. */
+export function publicReviewSerialization(value) {
+  if (isBoundedReviewManifest(value)) {
+    return { status: "analyzed", analyzed: true, blocked: false, reason: "public-read-only" };
+  }
+  return { status: "deferred", analyzed: false, blocked: false, reason: "PUBLIC_REVIEW_PAYLOAD_UNSAFE" };
+}
+
+function validReviewFindings(findings) {
+  return Array.isArray(findings) && findings.length <= 8 && findings.every((finding) => (
+    finding && typeof finding === "object" && !Array.isArray(finding)
+      && ["critical", "high", "medium", "low"].includes(String(finding.severity || "").toLowerCase())
+      && typeof finding.title === "string" && finding.title.trim().length > 0 && finding.title.length <= 240
+      && typeof finding.detail === "string" && finding.detail.length <= 800
+  ));
+}
+
+function isValidatedPublicSelection(row, repository) {
+  if (!row || typeof row !== "object" || Array.isArray(row) || row.repository !== repository) return false;
+  if (row.selected === true) return true;
+  if (!Array.isArray(row.selected) || row.selected.length === 0 || row.selected.length > MAX_TOP_K) return false;
+  return row.selected.every((entry) => {
+    if (typeof entry === "string") return entry === repository;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+    const selectedRepository = String(entry.repo || entry.repository || "").trim();
+    if (selectedRepository !== repository) return false;
+    return entry.score === undefined || (Number.isFinite(Number(entry.score)) && Number(entry.score) >= 0);
+  });
+}
+
+export function publicImproveReceipt(repository, manifests = [], stageResults = {}) {
+  const target = String(repository || "").trim();
+  const rows = (Array.isArray(manifests) ? manifests : []).filter((row) => {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return false;
+    const rowRepository = String(row.repository || "").trim();
+    return Boolean(target) && rowRepository === target;
+  });
+  const result = (name) => String(stageResults?.[name] || "unknown").trim().toLowerCase();
+  const selected = rows.some((row) => row && row.mode === "pick" && row.status === "ok" && isValidatedPublicSelection(row, target));
+  const analyzed = rows.some((row) => isBoundedResearchManifest(row) || isBoundedPlanManifest(row) || isBoundedReviewManifest(row));
+  const blocked = ["implement", "review", "plan", "research"].some((name) => ["failure", "cancelled", "skipped"].includes(result(name)))
+    || rows.some((row) => row && typeof row === "object" && (row.status === "blocked" || row.blocked === true));
+  const deferred = rows.some((row) => row && ["deferred", "waiting_for_capacity"].includes(String(row.status || "").toLowerCase()));
+  const awaitingPrivateControl = selected && analyzed;
+  const status = awaitingPrivateControl
+    ? "awaiting-control"
+    : blocked
+      ? "blocked"
+      : analyzed
+        ? "analyzed"
+        : deferred
+          ? "deferred"
+        : selected
+          ? "selected"
+          : "blocked";
+  const reason = awaitingPrivateControl
+    ? "public-read-only"
+    : deferred
+      ? "public-analysis-deferred"
+      : blocked
+        ? "public-analysis-blocked"
+        : selected
+          ? "public-selection-only"
+          : "no-public-selection";
+  return {
+    mode: "finalize",
+    status,
+    selected,
+    analyzed,
+    blocked,
+    awaitingControl: awaitingPrivateControl,
+    awaitingPrivateControl,
+    desiredTaskCompleted: false,
+    reason,
+    evidence: {
+      selected,
+      analyzed,
+      blocked,
+      awaitingControl: awaitingPrivateControl,
+      durableControl: "required",
+    },
+    checks: {
+      externalWrites: "blocked",
+      receipt: "emitted",
+      selected,
+      analyzed,
+      blocked,
+      awaitingControl: awaitingPrivateControl,
+      awaitingPrivateControl,
+    },
+    stageResults: Object.fromEntries(["pick", "research", "plan", "implement", "review"].map((name) => [name, result(name)])),
+    repository,
+  };
+}
+
+export function publicTerminalState(code, manifest = {}) {
+  if (Number(code) !== 0) return "BLOCKED";
+  const status = String(manifest?.status || "").trim().toLowerCase();
+  if (manifest?.desiredTaskCompleted === false
+    && (["awaiting-control", "analyzed", "selected"].includes(status)
+      || manifest?.awaitingControl === true
+      || manifest?.awaitingPrivateControl === true)) {
+    return "STALLED";
+  }
+  if (["blocked", "deferred"].includes(status)) return "BLOCKED";
+  return "SUCCESS";
 }
 
 export function researchCapacityOutcome(dataClass, nowMs = Date.now(), retryDelayMs = DEFAULT_RETRY_DELAY_MS) {
@@ -167,6 +354,8 @@ async function modePick(audit) {
       selected: [{ repo, score: 1 }],
     };
     writePublicArtifact(process.env, { mode: "pick", status: "ok", ...selection }, { kind: "improve", status: "ok", repository: repo, runId: selection.runId });
+    writeGitHubOutput("matrix", { repo: [repo] });
+    writeGitHubOutput("repository", repo);
     audit.note("pick", repo);
     console.log(`IMPROVE_MATRIX=${JSON.stringify({ repo: [repo] })}`);
     return 0;
@@ -189,6 +378,8 @@ async function modePick(audit) {
     selectedAt,
     selected: selected.map((repo) => ({ repo: repo.full_name, score: repo.score })),
   };
+  writeGitHubOutput("matrix", { repo: selected.map((repo) => repo.full_name) });
+  if (selected.length === 1) writeGitHubOutput("repository", selected[0].full_name);
   const outDir = process.env.FLEET_ARTIFACT_DIR;
   if (outDir) {
     mkdirSync(outDir, { recursive: true });
@@ -198,6 +389,24 @@ async function modePick(audit) {
   audit.note("pick", selected.map((r) => `${r.full_name}(${r.score})`).join(", "));
   console.log(`IMPROVE_MATRIX=${JSON.stringify({ repo: selected.map((r) => r.full_name) })}`);
   return 0;
+}
+
+export function researchPromptHeader(repo, workdir) {
+  return `You are the research sub-agent for repo ${repo}. A full shallow clone is mounted at your working directory ('.')${workdir ? "" : " (digest-only mode)"} — use read/grep/glob on real code before concluding. Decide what would MOST improve this project right now (correctness, security, DX, performance, docs, CI). You may use webfetch to consult authoritative sources.`;
+}
+
+export function publicResearchCloneDisposition(workdir) {
+  return workdir
+    ? { status: "ready", reason: "public-read-only" }
+    : {
+      status: "deferred",
+      selected: true,
+      analyzed: false,
+      blocked: false,
+      awaitingPrivateControl: false,
+      reason: "PUBLIC_TARGET_UNAVAILABLE",
+      ideas: [],
+    };
 }
 
 function buildResearchPrompt(repo, workdir) {
@@ -213,7 +422,7 @@ function buildResearchPrompt(repo, workdir) {
     `Open issues: ${issuesRaw.filter((i) => !i.pull_request).map((i) => `#${i.number} ${i.title}`).join("; ") || "none"}`,
   ];
   return [
-    `You are the research sub-agent for repo ${repo}. A full shallow clone is mounted at your working directory ('.')${workdir ? "" : " (digest-only mode)"} — use read/grep/glob on real code before concluding. Decide what would MOST improve this project right now (correctness, security, DX, performance, docs, CI). You may use webfetch to consult authoritative sources.`,
+    researchPromptHeader(repo, workdir),
     "Return ONLY strict JSON: {\"ideas\":[{\"title\":\"...\",\"rationale\":\"...\",\"evidence\":\"what you saw\",\"impact\":\"high|medium|low\"}]} max 5 ideas.",
     "Context:",
     lines.join("\n").slice(0, 14000),
@@ -232,25 +441,42 @@ async function modeResearch(audit) {
   }
   let workdir;
   try {
-    workdir = `/tmp/improve-${String(repo).replace("/", "__")}`;
+    const candidate = `/tmp/improve-${String(repo).replace("/", "__")}-${process.pid}-${Date.now()}`;
+    workdir = candidate;
     gh(["repo", "clone", repo0(repo), workdir, "--", "--depth", "1"], process.env);
   } catch {
+    if (workdir) {
+      try {
+        fsRemove(workdir);
+      } catch {}
+    }
     workdir = undefined;
   }
-  const result = await askModelResilient({
-    prompt: buildResearchPrompt(repo),
-    timeoutMs: 480000,
-    env: executionModelEnv(),
-    preferVariantMax: true,
-    maxRounds: 4,
-    workspace: workdir,
-  });
-  audit.note("research", `repo=${repo} complete=${result.complete} ladders=${result.ladders}`);
-  if (workdir) {
-    try {
-      fsRemove(workdir);
-    } catch {}
+  if (isPublicDataClass(process.env) && !workdir) {
+    const disposition = publicResearchCloneDisposition(workdir);
+    writePublicArtifact(process.env, { mode: "research", ...disposition }, { kind: "improve", status: disposition.status, repository: repo });
+    audit.note("research", `repo=${repo} public target unavailable; deferred without digest-only model analysis`);
+    console.log(`IMPROVE_DEFERRED=public-target-unavailable:${repo}`);
+    return 0;
   }
+  let result;
+  try {
+    result = await askModelResilient({
+      prompt: buildResearchPrompt(repo, workdir),
+      timeoutMs: 480000,
+      env: executionModelEnv(),
+      preferVariantMax: true,
+      maxRounds: 4,
+      workspace: workdir,
+    });
+  } finally {
+    if (workdir) {
+      try {
+        fsRemove(workdir);
+      } catch {}
+    }
+  }
+  audit.note("research", `repo=${repo} complete=${result.complete} ladders=${result.ladders}`);
   if (!result.complete || !result.reply) {
     const { gatewayDown } = await import("./lib/gateway-health.mjs");
     if (gatewayDown(REPO_ROOT)) {
@@ -263,6 +489,18 @@ async function modeResearch(audit) {
     ideas = salvageIdeas(result.reply);
   } catch (err) {
     audit.note("research", `repo=${repo} invalid ideas; skipped (${String(err.message || err).slice(0, 120)})`);
+    if (isPublicDataClass(process.env)) {
+      writePublicArtifact(process.env, {
+        mode: "research",
+        status: "deferred",
+        selected: true,
+        analyzed: false,
+        blocked: false,
+        awaitingPrivateControl: false,
+        reason: "INVALID_RESEARCH_OUTPUT",
+        ideas: [],
+      }, { kind: "improve", status: "deferred", repository: repo });
+    }
     console.log(`IMPROVE_SKIPPED=invalid-ideas:${repo}`);
     return 0;
   }
@@ -765,9 +1003,42 @@ async function modePlan(audit) {
   configureIdentity(REPO_ROOT, identity);
   if (isPublicDataClass(process.env)) {
     const repo = publicRepository(process.env);
-    writePublicArtifact(process.env, { mode: "plan", status: "blocked", reason: "public-read-only-plan-artifacts" }, { kind: "improve", status: "blocked", repository: repo });
-    audit.note("plan", "public mode does not read private multi-step artifacts");
-    return 4;
+    // Downloaded research artifacts are read from the runner-provided input
+    // directory, but every ephemeral plan write stays inside the fenced
+    // public state/artifact directory.  Never write back into an arbitrary
+    // target-controlled path supplied through FLEET_ARTIFACT_DIR.
+    const inputDir = process.env.FLEET_ARTIFACT_DIR || artifactDir();
+    const outputDir = artifactDir();
+    const research = readPublicImproveManifests(inputDir, repo).find((row) => row.mode === "research");
+    const idea = Array.isArray(research?.ideas) && research.ideas.length > 0 ? research.ideas[0] : null;
+    const analyzed = isBoundedResearchManifest(research) && Boolean(idea && typeof idea === "object");
+    const proposal = analyzed && idea && typeof idea === "object"
+      ? { title: String(idea.title || "public improvement proposal").slice(0, 160), impact: String(idea.impact || "medium").slice(0, 20) }
+      : undefined;
+    if (proposal) {
+      mkdirSync(outputDir, { recursive: true });
+      writeFileSync(path.join(outputDir, "public-plan.json"), JSON.stringify({ repository: repo, proposal, generatedUtc: new Date().toISOString() }, null, 2));
+    }
+    const stageStatus = analyzed ? "analyzed" : "blocked";
+    const matrix = { repo: [repo] };
+    const reviewMatrix = { repo: [repo], lens: Object.keys(LENSES) };
+    writeGitHubOutput("hasanalysis", String(analyzed));
+    writeGitHubOutput("implmatrix", matrix);
+    writeGitHubOutput("reviewmatrix", reviewMatrix);
+    writePublicArtifact(process.env, {
+      mode: "plan",
+      status: stageStatus,
+      selected: true,
+      analyzed,
+      blocked: !analyzed,
+      awaitingPrivateControl: analyzed,
+      reason: analyzed ? "public-read-only" : "research-unavailable",
+      plan: proposal,
+    }, { kind: "improve", status: stageStatus, repository: repo });
+    audit.note("plan", analyzed ? "public proposal generated in ephemeral state" : "public plan waiting for research evidence");
+    console.log(`IMPROVE_MATRIX=${JSON.stringify(matrix)}`);
+    console.log(`IMPROVE_REVIEW_MATRIX=${JSON.stringify(reviewMatrix)}`);
+    return 0;
   }
   const dir = process.env.FLEET_ARTIFACT_DIR || ".";
   const ideaFiles = existsSync(dir) ? readdirSync(dir).filter((f) => f.startsWith("ideas-") && f.endsWith(".json")) : [];
@@ -910,6 +1181,14 @@ async function modePlan(audit) {
       audit.incident("plan-parse", `${data.repo}: ${err.message}`);
     }
   }
+  if (process.env.GITHUB_OUTPUT) {
+    const plannedRepos = existsSync(dir)
+      ? readdirSync(dir).filter((name) => name.startsWith("plan-") && name.endsWith(".json")).map((name) => name.slice(5, -5).replace("__", "/"))
+      : [];
+    writeGitHubOutput("hasanalysis", String(plannedRepos.length > 0));
+    writeGitHubOutput("implmatrix", { repo: plannedRepos });
+    writeGitHubOutput("reviewmatrix", { repo: plannedRepos, lens: Object.keys(LENSES) });
+  }
   console.log(`IMPROVE_DONE=plan:${plans}`);
   return plans > 0 || ideaFiles.length === 0 ? 0 : 1;
 }
@@ -921,7 +1200,10 @@ async function modeImplement(audit) {
     const repo = publicRepository(process.env);
     writePublicArtifact(process.env, { mode: "implement", status: "blocked", reason: "public-read-only" }, { kind: "improve", status: "blocked", repository: repo });
     audit.note("implement", "public mode cannot create branches, commits, or pull requests");
-    return 4;
+    // A blocked public mutation stage is an expected policy outcome, not a
+    // failed public run.  The manifest remains explicitly blocked and the
+    // private controller still owns any durable implementation.
+    return 0;
   }
   const dir = process.env.FLEET_ARTIFACT_DIR || ".";
   const repo = process.env.FLEET_REPO;
@@ -972,9 +1254,102 @@ async function modeReview(audit) {
   configureIdentity(REPO_ROOT, identity);
   if (isPublicDataClass(process.env)) {
     const repo = publicRepository(process.env);
-    writePublicArtifact(process.env, { mode: "review", status: "blocked", reason: "public-read-only" }, { kind: "improve", status: "blocked", repository: repo });
-    audit.note("review", "public mode does not consume private PR metadata");
-    return 4;
+    const lens = LENSES[process.env.FLEET_LENS] ? process.env.FLEET_LENS : "correctness";
+    const workdir = `/tmp/improve-review-${String(repo).replace("/", "__")}-${lens}-${process.pid}-${Date.now()}`;
+    let workspace;
+    try {
+      gh(["repo", "clone", repo, workdir, "--", "--depth", "1"], process.env);
+      workspace = workdir;
+    } catch (err) {
+      audit.note("review", `${lens}: public target clone unavailable (${String(err?.code || err?.message || err).slice(0, 80)})`);
+      try {
+        fsRemove(workdir);
+      } catch {}
+      writePublicArtifact(process.env, {
+        mode: "review",
+        status: "blocked",
+        selected: true,
+        analyzed: false,
+        blocked: true,
+        awaitingPrivateControl: false,
+        reason: "PUBLIC_TARGET_UNAVAILABLE",
+        lens,
+      }, { kind: "improve", status: "blocked", repository: repo });
+      return 0;
+    }
+    const prompt = [
+      `You are a bounded ${lens} reviewer for the public repository ${repo}.`,
+      "Inspect the checked-out public source as read-only evidence; do not propose comments, commits, branches, pull requests, or private-state changes.",
+      LENSES[lens],
+      'Return ONLY strict JSON: {"findings":[{"severity":"critical|high|medium|low","title":"...","detail":"..."}]} max 8 findings.',
+    ].join("\n");
+    let result = { complete: false, reply: "" };
+    try {
+      result = await askModelResilient({
+        prompt,
+        timeoutMs: 480000,
+        env: executionModelEnv(),
+        preferVariantMax: true,
+        maxRounds: 4,
+        workspace,
+      });
+    } catch (err) {
+      audit.note("review", `${lens}: public analysis unavailable (${String(err?.code || err?.message || err).slice(0, 80)})`);
+    } finally {
+      if (workspace) {
+        try {
+          fsRemove(workspace);
+        } catch {}
+      }
+    }
+    let findings = [];
+    let parsedReview = false;
+    if (result?.complete && result.reply) {
+      try {
+        const parsed = extractJson(result.reply);
+        parsedReview = Boolean(parsed && typeof parsed === "object" && !Array.isArray(parsed) && validReviewFindings(parsed.findings));
+        findings = parsedReview ? parsed.findings.map((finding) => ({
+          severity: String(finding.severity).toLowerCase(),
+          title: finding.title.trim(),
+          detail: finding.detail,
+        })) : [];
+      } catch {}
+    }
+    let analyzed = parsedReview;
+    let stageStatus = analyzed ? "analyzed" : "blocked";
+    let reviewReason = analyzed ? "public-read-only" : "MODEL_UNAVAILABLE";
+    const reviewPayload = {
+      mode: "review",
+      status: stageStatus,
+      selected: true,
+      analyzed,
+      blocked: !analyzed,
+      awaitingPrivateControl: analyzed,
+      reason: reviewReason,
+      lens,
+      findings,
+    };
+    writePublicArtifact(process.env, reviewPayload, { kind: "improve", status: stageStatus, repository: repo });
+    if (parsedReview) {
+      const serialized = readPublicManifest(process.env);
+      const post = publicReviewSerialization(serialized);
+      if (!post.analyzed) {
+        analyzed = false;
+        stageStatus = post.status;
+        reviewReason = post.reason;
+        writePublicArtifact(process.env, {
+          ...reviewPayload,
+          status: stageStatus,
+          analyzed: false,
+          blocked: false,
+          awaitingPrivateControl: false,
+          reason: reviewReason,
+          findings: [],
+        }, { kind: "improve", status: stageStatus, repository: repo });
+      }
+    }
+    audit.note("review", `${lens}: public read-only analysis complete=${analyzed}`);
+    return 0;
   }
   const dir = process.env.FLEET_ARTIFACT_DIR || ".";
   const lens = process.env.FLEET_LENS;
@@ -1074,9 +1449,36 @@ async function modeFinalize(audit) {
   configureIdentity(REPO_ROOT, identity);
   if (isPublicDataClass(process.env)) {
     const repo = publicRepository(process.env);
-    writePublicArtifact(process.env, { mode: "finalize", status: "blocked", reason: "public-read-only" }, { kind: "improve", status: "blocked", repository: repo });
-    audit.note("finalize", "public mode cannot post comments or commit durable state");
-    return 4;
+    const manifests = readPublicImproveManifests(process.env.FLEET_ARTIFACT_DIR || ".", repo);
+    const stageResults = {
+      pick: process.env.FLEET_IMPROVE_PICK_RESULT,
+      research: process.env.FLEET_IMPROVE_RESEARCH_RESULT,
+      plan: process.env.FLEET_IMPROVE_PLAN_RESULT,
+      implement: process.env.FLEET_IMPROVE_IMPLEMENT_RESULT,
+      review: process.env.FLEET_IMPROVE_REVIEW_RESULT,
+    };
+    const receipt = publicImproveReceipt(repo, manifests, stageResults);
+    writePublicArtifact(process.env, receipt, {
+      kind: "improve",
+      status: receipt.status,
+      repository: repo,
+      runId: process.env.GITHUB_RUN_ID || process.env.GITHUB_RUN_NUMBER,
+    });
+    const summaryPath = String(process.env.GITHUB_STEP_SUMMARY || "").trim();
+    if (summaryPath) {
+      appendFileSync(summaryPath, [
+        "### Fleet public improve receipt",
+        `- Stage status: ${receipt.status}`,
+        `- Selected: ${receipt.selected}`,
+        `- Analyzed: ${receipt.analyzed}`,
+        `- Durable task completed: ${receipt.desiredTaskCompleted}`,
+        "- Durable control: awaiting private controller",
+        "",
+      ].join("\n"), "utf8");
+    }
+    audit.note("finalize", `public receipt status=${receipt.status} selected=${receipt.selected} analyzed=${receipt.analyzed}`);
+    console.log(`IMPROVE_RECEIPT=${JSON.stringify({ status: receipt.status, selected: receipt.selected, analyzed: receipt.analyzed, blocked: receipt.blocked })}`);
+    return 0;
   }
   const revDir = process.env.FLEET_REVIEW_DIR;
   const metas = [];
@@ -1149,13 +1551,49 @@ if (process.argv[1] && import.meta.url.endsWith(path.basename(process.argv[1])))
   };
   try {
     const code = await MODES[mode](audit);
-    makeExecutionTerminal(process.env, REPO_ROOT)(code === 0 ? "SUCCESS" : "BLOCKED", { mode });
-    writeExecutionAudit(audit, process.env, REPO_ROOT, `improve-${mode}-${Date.now()}`, `Improve ${mode}`, code === 0 ? "ok" : "failed");
+    const publicStatus = isPublicDataClass(process.env) ? readPublicManifest(process.env)?.status : undefined;
+    const terminalState = isPublicDataClass(process.env)
+      ? publicTerminalState(code, readPublicManifest(process.env) || {})
+      : (code !== 0 ? "BLOCKED" : "SUCCESS");
+    const terminalDetails = { mode, status: publicStatus };
+    if (isPublicDataClass(process.env)) {
+      terminalDetails.runId = process.env.GITHUB_RUN_ID || process.env.GITHUB_RUN_NUMBER;
+    }
+    makeExecutionTerminal(process.env, REPO_ROOT)(terminalState, terminalDetails);
+    const auditRunId = isPublicDataClass(process.env)
+      ? (process.env.GITHUB_RUN_ID || process.env.GITHUB_RUN_NUMBER || `improve-${mode}-${Date.now()}`)
+      : `improve-${mode}-${Date.now()}`;
+    writeExecutionAudit(
+      audit,
+      process.env,
+      REPO_ROOT,
+      auditRunId,
+      `Improve ${mode}`,
+      publicStatus || (code === 0 ? "ok" : "failed"),
+    );
     if (code !== 0) dumpAudit();
     process.exit(code);
   } catch (err) {
     audit.incident("fatal", err.message);
-    writeExecutionAudit(audit, process.env, REPO_ROOT, `improve-${mode}-${Date.now()}`, `Improve ${mode}`, `failed(${err.code || 1})`);
+    const publicFailure = (() => {
+      try { return isPublicDataClass(process.env); } catch { return false; }
+    })();
+    if (publicFailure) {
+      // A fatal public stage is blocked, never a durable success.  Emit the
+      // terminal marker first so the subsequent audit merge cannot overwrite
+      // the failure state with a generic error status.
+      try {
+        makeExecutionTerminal(process.env, REPO_ROOT)("BLOCKED", { mode, status: "blocked" });
+      } catch {}
+    }
+    writeExecutionAudit(
+      audit,
+      process.env,
+      REPO_ROOT,
+      `improve-${mode}-${Date.now()}`,
+      `Improve ${mode}`,
+      publicFailure ? "blocked" : `failed(${err.code || 1})`,
+    );
     console.error(`IMPROVE_FAILED mode=${mode} code=${err.code || 1} reason=${err.reason || err.message}`);
     dumpAudit();
     process.exit(err.code && Number.isInteger(err.code) ? err.code : 1);

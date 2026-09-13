@@ -38,6 +38,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.pick.outputs.matrix }}
+      repository: ${{ steps.pick.outputs.repository }}
     steps:
       - name: validate public target
         id: public-target
@@ -114,7 +115,7 @@ jobs:
       - name: validate public target
         id: public-target
         env:
-          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ matrix.repo || github.repository }}
+          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ matrix.repo }}
           FLEET_PUBLIC_OWNER: M1Vj
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -175,18 +176,19 @@ jobs:
           if-no-files-found: ignore
 
   plan:
-    needs: research
+    needs: [pick, research]
     if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     outputs:
+      hasanalysis: ${{ steps.plan.outputs.hasanalysis }}
       implmatrix: ${{ steps.plan.outputs.implmatrix }}
       reviewmatrix: ${{ steps.plan.outputs.reviewmatrix }}
     steps:
       - name: validate public target
         id: public-target
         env:
-          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ github.repository }}
+          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ needs.pick.outputs.repository }}
           FLEET_PUBLIC_OWNER: M1Vj
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -232,12 +234,19 @@ jobs:
           node-version: "20"
       - name: install pinned opencode cli
         run: npm install -g opencode-ai@1.18.30
+      - name: download public research manifests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: public-research-*
+          path: ${{ runner.temp }}/fleet-public-research
+          merge-multiple: true
+        continue-on-error: true
       - name: plan public improvements
         id: plan
         env:
           FLEET_PUBLIC_REPOSITORY: ${{ steps.public-target.outputs.repository }}
           FLEET_IMPROVE_MODE: plan
-          FLEET_ARTIFACT_DIR: ${{ runner.temp }}/fleet-public-artifacts
+          FLEET_ARTIFACT_DIR: ${{ runner.temp }}/fleet-public-research
         run: node scripts/improve.mjs
       - name: upload public plan manifest
         if: always()
@@ -249,7 +258,7 @@ jobs:
 
   implement:
     needs: plan
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' && needs.plan.result == 'success' }}
+    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' && needs.plan.result == 'success' && needs.plan.outputs.hasanalysis == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
@@ -262,7 +271,7 @@ jobs:
       - name: validate public target
         id: public-target
         env:
-          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ matrix.repo || github.repository }}
+          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ matrix.repo }}
           FLEET_PUBLIC_OWNER: M1Vj
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -324,7 +333,7 @@ jobs:
 
   review:
     needs: [plan, implement]
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' && always() && needs.implement.result != 'skipped' }}
+    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' && always() && needs.plan.result == 'success' && needs.plan.outputs.hasanalysis == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -338,7 +347,7 @@ jobs:
       - name: validate public target
         id: public-target
         env:
-          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ matrix.repo || github.repository }}
+          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ matrix.repo }}
           FLEET_PUBLIC_OWNER: M1Vj
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -399,7 +408,7 @@ jobs:
           if-no-files-found: ignore
 
   finalize:
-    needs: [plan, review]
+    needs: [pick, research, plan, implement, review]
     if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' && always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -407,7 +416,7 @@ jobs:
       - name: validate public target
         id: public-target
         env:
-          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ github.repository }}
+          FLEET_PUBLIC_REPOSITORY_INPUT: ${{ needs.pick.outputs.repository }}
           FLEET_PUBLIC_OWNER: M1Vj
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -451,9 +460,28 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "20"
+      - name: download public improve manifests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: public-*
+          path: ${{ runner.temp }}/fleet-public-receipts
+          merge-multiple: false
+        continue-on-error: true
       - name: finalize public result
         env:
           FLEET_PUBLIC_REPOSITORY: ${{ steps.public-target.outputs.repository }}
           FLEET_IMPROVE_MODE: finalize
-          FLEET_ARTIFACT_DIR: ${{ runner.temp }}/fleet-public-artifacts
+          FLEET_ARTIFACT_DIR: ${{ runner.temp }}/fleet-public-receipts
+          FLEET_IMPROVE_PICK_RESULT: ${{ needs.pick.result }}
+          FLEET_IMPROVE_RESEARCH_RESULT: ${{ needs.research.result }}
+          FLEET_IMPROVE_PLAN_RESULT: ${{ needs.plan.result }}
+          FLEET_IMPROVE_IMPLEMENT_RESULT: ${{ needs.implement.result }}
+          FLEET_IMPROVE_REVIEW_RESULT: ${{ needs.review.result }}
         run: node scripts/improve.mjs
+      - name: upload public improve receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: public-improve-receipt
+          path: ${{ runner.temp }}/fleet-public-state/public-artifact.json
+          if-no-files-found: error

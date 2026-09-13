@@ -13,6 +13,7 @@ import {
   PRIVATE_REPOSITORY_ENV,
   publicRepository,
   publicTargetDecision,
+  publicArtifactPayload,
   resolveArtifactManifest,
   resolveStateRoot,
   writePublicArtifact,
@@ -233,6 +234,31 @@ test("public artifacts fail closed for sensitive top-level fields and tainted te
   for (const marker of ["/Users/vjmabansag", "M1Vj/private-target", ["ghp", "0123456789"].join("_")]) {
     assert.equal(JSON.stringify(data).includes(marker), false, `artifact must not contain ${marker}`);
   }
+});
+
+test("public sanitizer rejects concrete paths regardless of surrounding punctuation", () => {
+  const value = publicArtifactPayload({
+    findings: [{ title: "see(/Users/vjmabansag/private.log)", detail: "ordinary-looking text" }, { title: "private-session-id", detail: "ses_abc12345" }],
+  }, { kind: "privacy", status: "analyzed", repository: "M1Vj/public-repo" });
+  assert.equal(value.findings[0].title, undefined);
+  assert.equal(value.findings[1].title, undefined);
+  assert.equal(value.findings[1].detail, undefined);
+  const ordinary = publicArtifactPayload({ findings: [{ title: "Review private session handling", detail: "Public prose remains bounded." }] }, { kind: "privacy", status: "analyzed", repository: "M1Vj/public-repo" });
+  assert.equal(ordinary.findings[0].title, "Review private session handling");
+});
+
+test("public artifact options own status and run identity", () => {
+  const value = publicArtifactPayload({ status: "ok", runId: "../../private", checks: { status: "ok" } }, {
+    kind: "audit",
+    status: "awaiting-control",
+    runId: "34762905711",
+    repository: "M1Vj/public-repo",
+  });
+  assert.equal(value.kind, "audit");
+  assert.equal(value.status, "awaiting-control");
+  assert.equal(value.runId, "34762905711");
+  const unsafe = publicArtifactPayload({}, { kind: "audit", status: "ok", runId: "private-session-id", repository: "M1Vj/public-repo" });
+  assert.equal(unsafe.runId, undefined);
 });
 
 test("public artifacts retain only bounded summary/error codes and public PR URLs", () => {

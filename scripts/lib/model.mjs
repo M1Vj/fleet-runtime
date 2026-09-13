@@ -101,15 +101,40 @@ function stripSecretConfig(value, key = "") {
   return out;
 }
 
-export function buildOpenCodeConfigContent(selectedModel, existing = "", workspace = "") {
+// Public target repositories are untrusted input.  Do not load their
+// opencode.json (or any caller-supplied config) into a public model process:
+// a target could otherwise re-enable edit/bash/external-directory access
+// after this runtime's read-only airlock has been established.  Keep the
+// useful read-only tools available for analysis and pin every mutation-capable
+// tool to deny in the final config.
+export const PUBLIC_READ_ONLY_PERMISSIONS = Object.freeze({
+  edit: "deny",
+  write: "deny",
+  bash: "deny",
+  external_directory: "deny",
+  question: "deny",
+  todowrite: "deny",
+  read: "allow",
+  grep: "allow",
+  glob: "allow",
+  list: "allow",
+  webfetch: "allow",
+  websearch: "allow",
+});
+
+export function buildOpenCodeConfigContent(selectedModel, existing = "", workspace = "", options = {}) {
+  const publicMode = options && options.publicMode === true;
   let config = {};
   try {
-    const workspaceConfigPath = workspace ? path.join(workspace, "opencode.json") : "";
-    const workspaceConfig = workspaceConfigPath && existsSync(workspaceConfigPath)
-      ? parseConfigObject(readFileSync(workspaceConfigPath, "utf8"))
-      : {};
-    config = mergeConfig(workspaceConfig, parseConfigObject(existing));
+    if (!publicMode) {
+      const workspaceConfigPath = workspace ? path.join(workspace, "opencode.json") : "";
+      const workspaceConfig = workspaceConfigPath && existsSync(workspaceConfigPath)
+        ? parseConfigObject(readFileSync(workspaceConfigPath, "utf8"))
+        : {};
+      config = mergeConfig(workspaceConfig, parseConfigObject(existing));
+    }
   } catch {}
+  if (publicMode) config = { permission: { ...PUBLIC_READ_ONLY_PERMISSIONS } };
   config.model = selectedModel;
   config.small_model = selectedModel;
   return JSON.stringify(stripSecretConfig(config));
@@ -342,7 +367,12 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
     // Pin OpenCode's internal title/summary helpers to the same selected live
     // contributor model. Otherwise OpenCode may call its paid default small
     // model even though the primary `-m` argument is free and valid.
-    childEnv.OPENCODE_CONFIG_CONTENT = buildOpenCodeConfigContent(selected, childEnv.OPENCODE_CONFIG_CONTENT, workspace);
+    childEnv.OPENCODE_CONFIG_CONTENT = buildOpenCodeConfigContent(
+      selected,
+      childEnv.OPENCODE_CONFIG_CONTENT,
+      workspace,
+      { publicMode: String(env?.FLEET_DATA_CLASS || "").trim().toLowerCase() === "public" },
+    );
     childEnv.OPENCODE_DISABLE_AUTOUPDATE = "1";
     const child = spawn("opencode", args, { env: childEnv, stdio: ["ignore", "pipe", "pipe"], cwd: workspace || undefined });
     const timer = setTimeout(() => {

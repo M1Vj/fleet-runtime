@@ -71,6 +71,11 @@ capacity is unavailable.
 - Public workflows have no write permission. Publishing comments, branches,
   pull requests, merges, durable state, or controller records belongs to the
   private plane.
+- In `fleet-improve`, the public stage may inspect the validated repository,
+  produce bounded research, and generate ephemeral plan/review proposals. Its
+  final receipt is `awaiting-control` with `desiredTaskCompleted: false`; only
+  the private controller may implement, comment, commit, or otherwise make the
+  durable task change.
 - Action references are immutable commit pins. Keep the pins current through a
   reviewed dependency update.
 

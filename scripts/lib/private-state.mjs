@@ -211,6 +211,17 @@ const PUBLIC_SAFE_SUMMARIES = new Set([
   "public status digest completed",
   "public thesis survey completed",
 ]);
+const PUBLIC_SAFE_STATUSES = new Set([
+  "ok",
+  "rejected",
+  "selected",
+  "analyzed",
+  "blocked",
+  "deferred",
+  "waiting_for_capacity",
+  "awaiting-control",
+  "awaiting-private-control",
+]);
 const PUBLIC_SAFE_ERRORS = new Set([
   "DATA_CLASS_INVALID",
   "MODEL_UNAVAILABLE",
@@ -228,7 +239,10 @@ const PUBLIC_SAFE_ERRORS = new Set([
   "PUBLIC_WRITE_BLOCKED",
 ]);
 const PUBLIC_PR_URL_RE = /^https:\/\/github\.com\/([^/]+)\/([A-Za-z0-9_.-]{1,100})\/(?:pull|issues)\/\d+$/;
-const PUBLIC_PRIVATE_TEXT_RE = /(?:https?:|ftp:|file:|data:|\bwww\.|(?:^|[\s"'=])(?:~[\\/]|[A-Za-z]:[\\/]|\/(?:Users|home|private|tmp|var|etc|opt|workspace|runner|Volumes)[\\/]|(?:private|secret|credential|session|log|artifact|prompt|source)[\\/][^\s"'<>]+)|\b(?:prompt|source|session|private(?:State)?|log|artifact)\s*[:=]|\b(?:private|secret|credential|session|prompt|source|log|artifact)\b|\b(?:gh[pousr]_|github_pat_|sk-[A-Za-z0-9_-]{8,}|AKIA[0-9A-Z]{12,}|AIza[0-9A-Za-z_-]{16,}|xox[baprs]-[A-Za-z0-9-]{8,}|Bearer\s+[A-Za-z0-9._-]{12,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}))/i;
+// Reject concrete transport/path/credential markers while retaining bounded
+// public prose. Bare words such as "source" or "private" are not secrets on
+// their own and commonly occur in legitimate review findings.
+const PUBLIC_PRIVATE_TEXT_RE = /(?:https?:|ftp:|file:|data:|\bwww\.|(?:^|[^A-Za-z0-9_])(?:~[\\/]|[A-Za-z]:[\\/]|\/(?:Users|home|private|tmp|var|etc|opt|workspace|runner|Volumes)[\\/]|(?:private|secret|credential|session|log|artifact|prompt|source)[\\/][^\s"'<>]+)|\b(?:prompt|source|session|private(?:State)?|log|artifact)\s*[:=]|\b(?:private[-_])?(?:ses(?:sion)?|task|thread|job)[-_][A-Za-z0-9]{2,}\b|\b(?:gh[pousr]_|github_pat_|sk-[A-Za-z0-9_-]{8,}|AKIA[0-9A-Z]{12,}|AIza[0-9A-Za-z_-]{16,}|xox[baprs]-[A-Za-z0-9-]{8,}|Bearer\s+[A-Za-z0-9._-]{12,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}))/i;
 const PUBLIC_REPOSITORY_SHAPE_RE = /(?:^|[\s"'`([{=:])([A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100})(?=$|[\s"'`)}\],.;!?])/g;
 
 function hasForeignRepositoryReference(text, repository) {
@@ -241,6 +255,10 @@ function hasForeignRepositoryReference(text, repository) {
 
 function publicScalar(value, max = 4000, key = "", repository) {
   const cleanKey = String(key || "");
+  if (cleanKey === "status") {
+    const text = scalar(value, max);
+    return typeof text === "string" && PUBLIC_SAFE_STATUSES.has(text.trim()) ? text.trim() : undefined;
+  }
   if (cleanKey === "summary") {
     const text = scalar(value, max);
     return typeof text === "string" && PUBLIC_SAFE_SUMMARIES.has(text.trim()) ? text.trim() : undefined;
@@ -258,6 +276,10 @@ function publicScalar(value, max = 4000, key = "", repository) {
   if (cleanKey === "target") {
     const text = scalar(value, max);
     return typeof text === "string" && repository && text.trim() === repository ? text.trim() : undefined;
+  }
+  if (cleanKey === "runId") {
+    const text = scalar(value, max);
+    return typeof text === "string" && /^(?:[0-9]{1,20}|[A-Fa-f0-9]{8,64})$/.test(text.trim()) ? text.trim() : undefined;
   }
   if (cleanKey === "repository" || cleanKey === "repo") {
     const text = scalar(value, max);
@@ -283,6 +305,9 @@ const PUBLIC_FIELDS = new Set([
   "generatedUtc", "finishedUtc", "exitCode", "modelMode", "verdict", "findings", "ideas", "plan",
   "files", "lens", "prNumber", "prUrl", "count", "summary", "reason", "checks", "audit", "results",
   "selected", "validatedAt", "title", "why", "impact", "effort", "error", "externalWrites", "visibility", "archived",
+  "analyzed", "blocked", "awaitingPrivateControl",
+  "awaitingControl",
+  "stageResults", "desiredTaskCompleted", "evidence",
 ]);
 
 // Nested values are intentionally narrower than the top-level manifest.  A
@@ -294,9 +319,12 @@ const PUBLIC_NESTED_FIELDS = new Set([
   "schema", "dataClass", "kind", "status", "mode", "target", "runId", "generatedUtc", "finishedUtc",
   "exitCode", "modelMode", "verdict", "findings", "ideas", "plan", "files", "lens", "prNumber", "prUrl",
   "count", "summary", "reason", "checks", "audit", "results", "selected", "validatedAt", "title", "why",
-  "impact", "effort", "error", "severity", "detail", "recommendation", "approach", "ok", "skipped", "note",
+  "impact", "effort", "error", "externalWrites", "severity", "detail", "recommendation", "approach", "ok", "skipped", "note", "rationale", "evidence",
   "issue", "number", "commentId", "applied", "postedComment", "downgraded", "digestBytes", "stale", "actions", "model",
   "identity", "entries", "incidents", "t", "step", "msg",
+  "analyzed", "blocked", "awaitingPrivateControl",
+  "stageResults", "desiredTaskCompleted", "evidence", "receipt", "pick", "research", "plan", "implement", "review", "terminalState",
+  "awaitingControl", "durableControl",
 ]);
 const PUBLIC_NESTED_DENY = /(?:token|secret|password|credential|cookie|session|prompt|reply|proxy|auth|private|source|log|artifact|path|url|repository)/i;
 
@@ -309,7 +337,7 @@ function allowPublicValue(value, depth = 0, repository) {
     const topLevel = depth === 0;
     if ((!topLevel && PUBLIC_NESTED_DENY.test(key)) || (topLevel && PUBLIC_NESTED_DENY.test(key) && !PUBLIC_FIELDS.has(key))) continue;
     if (!(topLevel ? PUBLIC_FIELDS : PUBLIC_NESTED_FIELDS).has(key)) continue;
-    const clean = (key === "summary" || key === "error" || key === "prUrl" || key === "target" || key === "repository" || key === "repo")
+    const clean = (key === "status" || key === "summary" || key === "error" || key === "prUrl" || key === "target" || key === "repository" || key === "repo")
       ? publicScalar(item, 4000, key, repository)
       : allowPublicValue(item, depth + 1, repository);
     if (clean !== undefined) out[key] = clean;
@@ -327,17 +355,26 @@ export function publicArtifactPayload(payload = {}, { kind = "run", status = "ok
     repository = `${owner}/${name}`;
   }
   const now = new Date().toISOString();
+  const safeKind = publicScalar(kind, 80, "", repository) || "run";
+  const safeStatus = publicScalar(status, 80, "status", repository) || "blocked";
+  const safeRunId = runId === undefined || runId === null ? undefined : publicScalar(runId, 160, "runId", repository);
   const base = {
     schema: PUBLIC_ARTIFACT_SCHEMA,
     dataClass: PUBLIC_DATA_CLASS,
-    kind: publicScalar(kind, 80, "", repository) || "run",
-    status: publicScalar(status, 80, "", repository) || "ok",
+    kind: safeKind,
+    status: safeStatus,
     generatedUtc: now,
   };
   if (repository) base.repository = publicScalar(repository, 220, "repository", repository);
-  if (runId) base.runId = publicScalar(runId, 160, "", repository);
+  if (safeRunId !== undefined) base.runId = safeRunId;
   const clean = allowPublicValue(payload, 0, repository);
   const merged = { ...base, ...(clean && typeof clean === "object" && !Array.isArray(clean) ? clean : {}) };
+  // Caller options own schema-controlled telemetry.  Model/result payloads
+  // cannot replace the explicit kind, status, or run identity.
+  merged.kind = safeKind;
+  merged.status = safeStatus;
+  if (safeRunId !== undefined) merged.runId = safeRunId;
+  else delete merged.runId;
   // The caller-supplied repository option is the only identity source. A
   // model/result payload cannot replace it with a private target.
   if (repository) {
@@ -371,12 +408,22 @@ export function writeExecutionArtifact(env = process.env, payload = {}, options 
   return output;
 }
 
+function stripPublicEnvelope(value = {}) {
+  const out = value && typeof value === "object" && !Array.isArray(value) ? { ...value } : {};
+  for (const key of ["schema", "dataClass", "kind", "status", "repository", "repo", "runId"]) delete out[key];
+  return out;
+}
+
 export function writeExecutionAudit(audit, env = process.env, root = process.cwd(), runId = "run", title = "Fleet run", status = "ok", meta = {}) {
   if (isPublicDataClass(env)) {
     const entries = safeAudit([...(audit?.entries || [])]);
     const incidents = safeAudit([...(audit?.incidents || [])]);
     const previous = readPublicManifest(env) || {};
-    return writePublicArtifact(env, { ...previous, mode: title, status, audit: { entries, incidents }, checks: meta }, {
+    const checks = {
+      ...(previous.checks && typeof previous.checks === "object" && !Array.isArray(previous.checks) ? previous.checks : {}),
+      ...(meta && typeof meta === "object" && !Array.isArray(meta) ? meta : {}),
+    };
+    return writePublicArtifact(env, { ...stripPublicEnvelope(previous), mode: previous.mode || title, audit: { entries, incidents }, checks }, {
       kind: "audit",
       status,
       repository: env.FLEET_PUBLIC_REPOSITORY,
@@ -391,9 +438,11 @@ export function makeExecutionTerminal(env = process.env, root = process.cwd(), o
   if (isPublicDataClass(env)) {
     return (state, details = {}) => {
       try {
-        writePublicArtifact(env, { mode: options.lane || "terminal", status: state, results: details }, {
+        const previous = readPublicManifest(env) || {};
+        const status = String(state || "").toUpperCase() === "BLOCKED" ? "blocked" : (previous.status || state);
+        writePublicArtifact(env, { ...stripPublicEnvelope(previous), mode: previous.mode || options.lane || "terminal", results: { ...previous.results, ...details, terminalState: state } }, {
           kind: "terminal",
-          status: state,
+          status,
           repository: env.FLEET_PUBLIC_REPOSITORY,
           runId: details.runId,
         });

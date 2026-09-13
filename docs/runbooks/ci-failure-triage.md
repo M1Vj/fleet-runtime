@@ -22,3 +22,27 @@ Unrelated workflows fail at near-identical timestamps (kb/thesis at 14:32:51/54)
 
 ## Escalation
 If the merge gate stays red beyond 2 hours, page the repo owner and mark open fleet PRs `do-not-merge`.
+
+---
+
+Incident window: 2026-09-12 23:19-00:03 UTC.
+
+## Observed failures
+- `merge gate scan#` - 1 failure (run 34725129509). Blocks all merges; highest priority.
+- `fleet deep` - 1 failure (run 34725422303 in M1Vj/fleet-control).
+- `fleet kb` - 1 failure (run 34725502502).
+- `fleet improve` - 1 failure (run 34727000584).
+
+## Pattern
+Four unrelated workflows across two repos fail within 44 minutes. Strongly indicates shared root cause: FLEET_GH_TOKEN / FLEET_OPENCODE_AUTH expiry or quota exhaustion, or opencode gateway 429 cascade triggering circuit breaker (model.mjs gateway health opens for 30 min after full chain failure). Not per-workflow logic regressions.
+
+## Steps
+1. Check merge-gate run 34725129509 logs for first error: auth failure (401/403), rate limit (429), or 'gateway circuit open' message.
+2. Verify secrets on both repos: `gh secret list -R M1Vj/fleet-runtime` and `gh secret list -R M1Vj/fleet-control` — confirm FLEET_GH_TOKEN and FLEET_OPENCODE_AUTH exist and are current.
+3. If token expiry: run `scripts/refresh-auth-secret.mjs` locally with fresh PAT and opencode auth, then push to both repos via `gh secret set`.
+4. If gateway 429 cascade: wait for 30-min circuit breaker expiry (or manually remove `state/gateway-health.json` in fleet-control), then re-run failed jobs.
+5. Re-run one canary per family: merge-gate, fleet-deep, fleet-kb, fleet-improve.
+6. Log root cause and resolution in this file.
+
+## Escalation
+If the merge gate stays red beyond 2 hours, page the repo owner and mark open fleet PRs `do-not-merge`.

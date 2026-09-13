@@ -448,6 +448,46 @@ test("self-repo public canary resolves from GitHub context without a dispatch ta
   }
 });
 
+test("selftest hosted validator binds the exact public target context", () => {
+  const temporaryRoot = mkdtempSync(path.join(tmpdir(), "fleet-public-selftest-"));
+  const mockBin = path.join(temporaryRoot, "bin");
+  const mockCurl = path.join(mockBin, "curl");
+  const outputPath = path.join(temporaryRoot, "github-output");
+  try {
+    mkdirSync(mockBin);
+    writeFileSync(mockCurl, [
+      "#!/bin/sh",
+      "request=",
+      "for argument in \"$@\"; do",
+      "  case \"$argument\" in",
+      "    https://api.github.com/repos/*) request=\"$argument\" ;;",
+      "  esac",
+      "done",
+      "[ \"$request\" = \"https://api.github.com/repos/M1Vj/public-repo\" ] || exit 23",
+      "printf '%s\\n' '{\"name\":\"public-repo\",\"private\":false,\"visibility\":\"public\",\"archived\":false,\"owner\":{\"login\":\"M1Vj\"}}'",
+      "",
+    ].join("\n"));
+    chmodSync(mockCurl, 0o755);
+    const [script] = publicTargetRuns(workflowText("selftest.yml"));
+    const result = spawnSync("bash", ["-c", script], {
+      encoding: "utf8",
+      env: {
+        PATH: `${mockBin}:${process.env.PATH || ""}`,
+        FLEET_PUBLIC_TARGET: "M1Vj/public-repo",
+        GITHUB_REPOSITORY: "M1Vj/other-public-repo",
+        FLEET_PUBLIC_OWNER: "M1Vj",
+        RUNNER_TEMP: temporaryRoot,
+        GITHUB_OUTPUT: outputPath,
+        GH_TOKEN: "test-token",
+      },
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(readFileSync(outputPath, "utf8"), "repository=M1Vj/public-repo\n");
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
 test("public target and artifact validation errors redact untrusted identifiers", () => {
   const privateIdentifier = `${["M1Vj", ["fleet", "control"].join("-")].join("/")}?secret=redact-me`;
   assert.throws(

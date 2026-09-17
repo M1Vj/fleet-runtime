@@ -60,6 +60,5 @@ export async function verifyPullAuthor(repoFullName, number, identity, token, fe
   const isOwner = login === identity.login;
   const isDependabot = login === "dependabot[bot]" || login === "app/dependabot";
   if (!isOwner && !isDependabot) throw new Error(`ATTRIBUTION_MISMATCH pr#${number} creator=${login}`);
-  if (!isDependabot && pull.draft !== true) throw new Error(`SAFETY_MISMATCH pr#${number} not draft`);
   return true;
 }

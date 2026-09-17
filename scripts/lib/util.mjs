@@ -137,7 +137,7 @@ function assertPublicGhReadOnly(args = []) {
   }
 }
 
-export function putFileContent(repo, filePath, contentUtf8, branch, message, env = process.env) {
+export function putFileContent(repo, filePath, contentUtf8, branch, message, env = process.env, identity = null) {
   assertMutationAllowed(env, `put file ${repo}/${filePath}`);
   let sha;
   try {
@@ -146,14 +146,20 @@ export function putFileContent(repo, filePath, contentUtf8, branch, message, env
   } catch {
     sha = undefined;
   }
+  const body = {
+    message,
+    content: Buffer.from(contentUtf8, "utf8").toString("base64"),
+    branch,
+    ...(sha ? { sha } : {}),
+  };
+  if (identity && (identity.noreply || identity.email)) {
+    const email = identity.noreply || identity.email;
+    body.committer = { name: identity.name || identity.login || "Vj", email };
+    body.author = { name: identity.name || identity.login || "Vj", email };
+  }
   return ghInput(
     ["api", "-X", "PUT", `/repos/${repo}/contents/${filePath}`],
-    {
-      message,
-      content: Buffer.from(contentUtf8, "utf8").toString("base64"),
-      branch,
-      ...(sha ? { sha } : {}),
-    },
+    body,
     env,
   );
 }

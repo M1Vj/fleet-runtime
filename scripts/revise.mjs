@@ -270,11 +270,11 @@ async function main() {
         branch,
         committer: {
           name: identity.name,
-          email: identity.email,
+          email: identity.noreply || identity.email,
         },
         author: {
           name: identity.name,
-          email: identity.email,
+          email: identity.noreply || identity.email,
         },
         ...(sha ? { sha } : {}),
       },

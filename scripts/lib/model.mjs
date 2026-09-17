@@ -58,6 +58,7 @@ import {
   verifyCoreIntegrity,
 } from "../../packages/indefinite-core/index.mjs";
 import { publicModelEnv } from "./private-state.mjs";
+import { startIndefiniteDispatcher, getDispatcherInstance } from "./indefinite-dispatcher.mjs";
 
 
 // Model-layer timeouts (ms): standard calls 480s, long-form 540s,
@@ -386,6 +387,19 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
       { publicMode: String(env?.FLEET_DATA_CLASS || "").trim().toLowerCase() === "public" },
     );
     childEnv.OPENCODE_DISABLE_AUTOUPDATE = "1";
+    if (env.FLEET_INDEFINITE_DISABLE !== "1") {
+      try {
+        const dispatcher = startIndefiniteDispatcher({
+          stateRoot: poolRoot,
+          port: env.FLEET_DISPATCHER_PORT || 58444,
+        });
+        if (dispatcher && dispatcher.port) {
+          childEnv.HTTP_PROXY = `http://127.0.0.1:${dispatcher.port}`;
+          childEnv.HTTPS_PROXY = `http://127.0.0.1:${dispatcher.port}`;
+          childEnv.NO_PROXY = "localhost,127.0.0.1";
+        }
+      } catch {}
+    }
     const child = spawn("opencode", args, { env: childEnv, stdio: ["ignore", "pipe", "pipe"], cwd: workspace || undefined });
     const timer = setTimeout(() => {
       timedOut = true;

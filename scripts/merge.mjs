@@ -833,6 +833,11 @@ async function main() {
           },
         });
         audit.note("child", `${item.repo}#${item.number} exit=${res.status}`);
+        if (res.stdout && res.stdout.includes("MERGE_TERMINAL_STATE=REVISION_QUEUED")) {
+          writeRevisionOutputs(process.env.GITHUB_OUTPUT, item.repo, item.number, true);
+          writeQueueOutputs(process.env.GITHUB_OUTPUT, true);
+          break;
+        }
       } catch (err) {
         audit.incident("child", `${item.repo}#${item.number}: ${err.message}`);
       }

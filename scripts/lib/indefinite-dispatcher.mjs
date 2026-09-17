@@ -357,7 +357,8 @@ export function startIndefiniteDispatcher(options = {}) {
     const target = `${targetHost}:${targetPort}`;
     const affinityKey = req.headers ? (req.headers["x-session-id"] || req.headers["session-id"] || req.headers["x-correlation-id"] || null) : null;
 
-    const useDirect = !pool.isDirectRateLimited() && (pool.proxies.length === 0 || targetHost !== "opencode.ai");
+    const isApiHost = targetHost === "opencode.ai";
+    const useDirect = !isApiHost || !pool.isDirectRateLimited();
 
     if (useDirect) {
       const directSocket = net.connect(targetPort, targetHost, () => {
@@ -441,14 +442,53 @@ export function startIndefiniteDispatcher(options = {}) {
         pool.recordSuccess(candidate, latency);
         logger("INFO", `[TUNNEL_ESTABLISHED] Connected via ${candidate} (${latency}ms) to ${target}`);
 
+        let firstByteReceived = false;
         clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
         if (head && head.length > 0) proxySocket.write(head);
         proxySocket.pipe(clientSocket);
         clientSocket.pipe(proxySocket);
 
-        proxySocket.on("error", () => clientSocket.destroy());
-        clientSocket.on("error", () => proxySocket.destroy());
-        proxySocket.on("close", () => clientSocket.destroy());
+        // Fast-fail handshake watchdog: if proxy stalls on TLS handshake after 200 CONNECT, kill in 3000ms
+        const handshakeTimer = setTimeout(() => {
+          if (!firstByteReceived) {
+            pool.recordFailure(candidate, "TLS_HANDSHAKE_STALL", 300000);
+            proxySocket.destroy();
+            clientSocket.destroy();
+          }
+        }, 3000);
+
+        proxySocket.once("data", () => {
+          firstByteReceived = true;
+          clearTimeout(handshakeTimer);
+        });
+
+        proxySocket.setTimeout(180000, () => {
+          clearTimeout(handshakeTimer);
+          proxySocket.destroy();
+          clientSocket.destroy();
+        });
+        clientSocket.setTimeout(180000, () => {
+          clearTimeout(handshakeTimer);
+          clientSocket.destroy();
+          proxySocket.destroy();
+        });
+
+        proxySocket.on("error", () => {
+          clearTimeout(handshakeTimer);
+          clientSocket.destroy();
+        });
+        clientSocket.on("error", () => {
+          clearTimeout(handshakeTimer);
+          proxySocket.destroy();
+        });
+        proxySocket.on("close", () => {
+          clearTimeout(handshakeTimer);
+          clientSocket.destroy();
+        });
+        clientSocket.on("close", () => {
+          clearTimeout(handshakeTimer);
+          proxySocket.destroy();
+        });
       });
 
       proxyReq.on("timeout", () => {

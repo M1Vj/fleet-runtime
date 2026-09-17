@@ -87,7 +87,7 @@ const TOOLS = [
         },
         repo: {
           type: "string",
-          description: "Repository slug (e.g. 'fleet-control', 'fleet-runtime', or 'global')",
+          description: "Repository slug (e.g. 'app-control', 'fleet-runtime', or 'global')",
         },
         tags: {
           type: "array",

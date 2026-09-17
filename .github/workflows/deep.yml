@@ -108,7 +108,7 @@ jobs:
     needs: plan
     if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 65
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}

@@ -1,7 +1,6 @@
 ---
 description: "Test engineering & QA specialist. Designs test strategies, writes unit/integration/e2e tests, hardens flaky tests, and enforces comprehensive verification across any language or testing framework."
 mode: subagent
-model: opencode/muse-spark-1.3-contributor-free
 reasoningEffort: xhigh
 permission:
   "*": allow

@@ -44,7 +44,11 @@ const DEFAULT_RETRY_DELAY_MS = 30 * 60 * 1000;
 const MAX_RESEARCH_REPAIR_ROUNDS = 3;
 const RESEARCH_EVIDENCE_MIN_CHARS = 12;
 const SOURCE_REFERENCE_RE = /(?:^|[\s"'`([{])(?:\.\.?[\\/])?(?:(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})(?:[:#][A-Za-z0-9_.-]+)?/;
-const SOURCE_CLAIM_RE = /(?:^|[\s"'`([{=:])((?:\.{1,2}[\\/])?(?:(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})(?::([0-9]+)|#([A-Za-z_$][A-Za-z0-9_$.-]*))?)(?=$|[\s"'`)}\],.;!?])/g;
+// Keep the source path separate from an optional line/range or symbol anchor.
+// Hosted model evidence commonly uses `path:line-line` or `path#symbol`; if
+// the anchor is captured as part of the path, the tracked-source gate rejects
+// otherwise valid evidence as if the file did not exist.
+const SOURCE_CLAIM_RE = /(?:^|[\s"'`([{=:])((?:\.{1,2}[\\/])?(?:(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12}))(?::([0-9]+)(?:-([0-9]+))?|#([A-Za-z_$][A-Za-z0-9_$.-]*))?(?=$|[\s"'`)}\],.;!?])/g;
 const SOURCE_UNSAFE_PREFIX_RE = /(?:^|[\s"'`([{=:])(?:~[\\/]|[\\/]|[A-Za-z]:[\\/])/;
 const SOURCE_REVISION_RE = /^[0-9a-f]{40}$/i;
 const TREE_SNAPSHOT_RE = /^[0-9a-f]{64}$/i;
@@ -55,7 +59,11 @@ function evidenceHasForeignRepositoryPath(text, repository) {
   const target = String(repository || "").trim();
   if (!target) return false;
   const targetOwner = target.split("/")[0];
-  const pathToken = /(?:^|[\s"'`([{=:])((?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+)(?=$|[\s"'`)}\],.;!?])/g;
+  // Consume an optional line/range or symbol anchor with the path. Without
+  // this suffix, a reference such as `scripts/improve.mjs:123` backtracks to
+  // `scripts/improve` at the dot and is falsely classified as a foreign
+  // owner/repository pair before source verification runs.
+  const pathToken = /(?:^|[\s"'`([{=:])((?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+)(?::[0-9]+(?:-[0-9]+)?|#[A-Za-z_$][A-Za-z0-9_$.-]*)?(?=$|[\s"'`)}\],.;!?])/g;
   for (const token of String(text || "").matchAll(pathToken)) {
     const segments = token[1].split("/");
     if (segments.length < 2) continue;
@@ -88,7 +96,7 @@ function sourceEvidenceClaims(text) {
     if (!rawPath || segments.some((segment) => segment === "..") || rawPath.startsWith("/") || rawPath.startsWith("~") || /^[A-Za-z]:\//.test(rawPath)) return null;
     const normalized = rawPath.replace(/^\.\//, "");
     if (!normalized || normalized === "." || normalized.startsWith("../")) return null;
-    claims.push({ path: normalized, line: match[2] || "", symbol: match[3] || "" });
+    claims.push({ path: normalized, line: match[2] || "", lineEnd: match[3] || "", symbol: match[4] || "" });
   }
   return claims;
 }
@@ -140,7 +148,9 @@ function sourceClaimIsInsideBinding(binding, claim) {
         const body = readFileSync(real, "utf8");
         if (claim.line) {
           const line = Number(claim.line);
-          if (!Number.isInteger(line) || line < 1 || line > body.split(/\r?\n/).length) return false;
+          const lineEnd = claim.lineEnd ? Number(claim.lineEnd) : line;
+          const lineCount = body.split(/\r?\n/).length;
+          if (!Number.isInteger(line) || !Number.isInteger(lineEnd) || line < 1 || lineEnd < line || lineEnd > lineCount) return false;
         }
         if (claim.symbol) {
           const escaped = claim.symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -167,6 +177,7 @@ function verifiedSourcePaths(evidence, binding) {
   if (!binding || !claims || claims.length === 0 || !claims.every((claim) => sourceClaimIsInsideBinding(binding, claim))) return [];
   return [...new Set(claims.map((claim) => claim.path))];
 }
+
 
 function sourceAttestation(value) {
   const paths = Array.isArray(value?.evidencePaths) ? value.evidencePaths.map((entry) => String(entry || "").trim()) : [];

@@ -58,12 +58,12 @@ jobs:
             printf 'FLEET_PUBLIC_ARTIFACT_MANIFEST=%s\n' "$FLEET_PUBLIC_ARTIFACT_MANIFEST"
           } >>"$GITHUB_ENV"
       - name: checkout runtime
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           fetch-depth: 1
       - name: checkout public target
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: ${{ steps.public-target.outputs.repository }}
           token: ${{ github.token }}
@@ -71,9 +71,10 @@ jobs:
           fetch-depth: 1
           path: public-target
       - name: setup node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: "20"
+          package-manager-cache: false
       - name: install pinned opencode cli
         run: npm install -g opencode-ai@1.18.30
       - name: inventory public target
@@ -84,7 +85,7 @@ jobs:
         run: node scripts/kb.mjs
       - name: upload public knowledge manifest
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: public-knowledge
           path: ${{ runner.temp }}/fleet-public-state/public-artifact.json
@@ -127,12 +128,12 @@ jobs:
             printf 'FLEET_PUBLIC_ARTIFACT_MANIFEST=%s\n' "$FLEET_PUBLIC_ARTIFACT_MANIFEST"
           } >>"$GITHUB_ENV"
       - name: checkout runtime
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           fetch-depth: 1
       - name: checkout public target
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: ${{ steps.public-target.outputs.repository }}
           token: ${{ github.token }}
@@ -140,13 +141,14 @@ jobs:
           fetch-depth: 1
           path: public-target
       - name: setup node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: "20"
+          package-manager-cache: false
       - name: install pinned opencode cli
         run: npm install -g opencode-ai@1.18.30
       - name: download public knowledge manifest
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: public-knowledge
           path: ${{ runner.temp }}/public-knowledge
@@ -159,7 +161,7 @@ jobs:
         run: node scripts/kb.mjs
       - name: upload public synthesis manifest
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: public-knowledge-synthesis
           path: ${{ runner.temp }}/fleet-public-state/public-artifact.json
@@ -202,12 +204,12 @@ jobs:
             printf 'FLEET_PUBLIC_ARTIFACT_MANIFEST=%s\n' "$FLEET_PUBLIC_ARTIFACT_MANIFEST"
           } >>"$GITHUB_ENV"
       - name: checkout runtime
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           fetch-depth: 1
       - name: checkout public target
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: ${{ steps.public-target.outputs.repository }}
           token: ${{ github.token }}
@@ -215,13 +217,14 @@ jobs:
           fetch-depth: 1
           path: public-target
       - name: setup node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: "20"
+          package-manager-cache: false
       - name: install pinned opencode cli
         run: npm install -g opencode-ai@1.18.30
       - name: download public synthesis manifest
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: public-knowledge-synthesis
           path: ${{ runner.temp }}/public-knowledge-synthesis
@@ -234,7 +237,7 @@ jobs:
         run: node scripts/kb.mjs
       - name: upload public shipped manifest
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: public-knowledge-shipped
           path: ${{ runner.temp }}/fleet-public-state/public-artifact.json
@@ -277,12 +280,12 @@ jobs:
             printf 'FLEET_PUBLIC_ARTIFACT_MANIFEST=%s\n' "$FLEET_PUBLIC_ARTIFACT_MANIFEST"
           } >>"$GITHUB_ENV"
       - name: checkout runtime
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           fetch-depth: 1
       - name: checkout public target
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: ${{ steps.public-target.outputs.repository }}
           token: ${{ github.token }}
@@ -290,13 +293,14 @@ jobs:
           fetch-depth: 1
           path: public-target
       - name: setup node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: "20"
+          package-manager-cache: false
       - name: install pinned opencode cli
         run: npm install -g opencode-ai@1.18.30
       - name: download public shipped manifest
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: public-knowledge-shipped
           path: ${{ runner.temp }}/public-knowledge-shipped

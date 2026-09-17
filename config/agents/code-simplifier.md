@@ -1,7 +1,6 @@
 ---
 description: "Code clarity & refactoring specialist. Simplifies and refines implementations for maximum readability, elegance, and maintainability while strictly preserving 100% of existing behavior and test coverage."
 mode: subagent
-model: opencode/muse-spark-1.3-contributor-free
 reasoningEffort: xhigh
 permission:
   "*": allow

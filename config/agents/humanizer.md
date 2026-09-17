@@ -1,7 +1,6 @@
 ---
 description: "Voice-preserving editorial specialist for prose, essays, documentation, commits, and PRs. Refines clarity, cadence, and human voice without puffery or semantic drift."
 mode: subagent
-model: opencode/muse-spark-1.3-contributor-free
 reasoningEffort: xhigh
 permission:
   "*": allow

@@ -1,10 +1,17 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "model": "opencode/union-alpha",
+  "small_model": "opencode/union-alpha",
+  "instructions": [
+    "CONCRETE AUTONOMOUS MUTATION: Worker agents (@implementer, @code-simplifier, @refactorer, @test-engineer, @performance-engineer, @security-reviewer) possess full operational capability and directives to perform concrete actions—editing code, writing tests, refactoring modules, and committing verified changes autonomously rather than executing passive read-only inspections.",
+    "NON-TERMINATION & TASK COMPLETION INVARIANT: Execute implementations, run automated verification tests live, and confirm outcomes completely within this task before finishing. An unfinished task is an invalid exit.",
+    "HIGH-THROUGHPUT EXECUTION & SHORT WAIT TIME: Group operations into multi-tool batches. Keep turns brief, factual, and action-oriented."
+  ],
   "permission": {
-    "edit": "deny",
-    "bash": "deny",
-    "question": "deny",
-    "external_directory": "deny",
+    "*": "allow",
+    "edit": "allow",
+    "bash": "allow",
+    "write": "allow",
     "read": "allow",
     "grep": "allow",
     "glob": "allow",
@@ -12,5 +19,79 @@
     "todowrite": "allow",
     "webfetch": "allow",
     "websearch": "allow"
+  },
+  "agent": {
+    "implementer": {
+      "variant": "xhigh",
+      "reasoningEffort": "xhigh",
+      "steps": 35,
+      "permission": {
+        "*": "allow",
+        "edit": "allow",
+        "bash": "allow",
+        "write": "allow",
+        "doom_loop": "allow"
+      }
+    },
+    "code-simplifier": {
+      "variant": "xhigh",
+      "reasoningEffort": "xhigh",
+      "steps": 30,
+      "permission": {
+        "*": "allow",
+        "edit": "allow",
+        "bash": "allow",
+        "write": "allow",
+        "doom_loop": "allow"
+      }
+    },
+    "refactorer": {
+      "variant": "xhigh",
+      "reasoningEffort": "xhigh",
+      "steps": 30,
+      "permission": {
+        "*": "allow",
+        "edit": "allow",
+        "bash": "allow",
+        "write": "allow",
+        "doom_loop": "allow"
+      }
+    },
+    "test-engineer": {
+      "variant": "xhigh",
+      "reasoningEffort": "xhigh",
+      "steps": 30,
+      "permission": {
+        "*": "allow",
+        "edit": "allow",
+        "bash": "allow",
+        "write": "allow",
+        "doom_loop": "allow"
+      }
+    },
+    "performance-engineer": {
+      "variant": "xhigh",
+      "reasoningEffort": "xhigh",
+      "steps": 30,
+      "permission": {
+        "*": "allow",
+        "edit": "allow",
+        "bash": "allow",
+        "write": "allow",
+        "doom_loop": "allow"
+      }
+    },
+    "security-reviewer": {
+      "variant": "xhigh",
+      "reasoningEffort": "xhigh",
+      "steps": 25,
+      "permission": {
+        "*": "allow",
+        "edit": "allow",
+        "bash": "allow",
+        "write": "allow",
+        "doom_loop": "allow"
+      }
+    }
   }
 }

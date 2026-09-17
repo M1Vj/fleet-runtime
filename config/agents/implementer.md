@@ -1,7 +1,6 @@
 ---
 description: "Senior production implementation engineer with full write/edit authority across any language or domain. Implements specifications, fixes root causes, handles edge cases, and writes automated tests."
 mode: subagent
-model: opencode/muse-spark-1.3-contributor-free
 reasoningEffort: xhigh
 permission:
   "*": allow

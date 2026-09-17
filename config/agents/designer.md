@@ -1,7 +1,6 @@
 ---
 description: "Interface ergonomics, visual hierarchy & UI/UX specialist. Designs and reviews design systems, typography, color harmony, responsive layouts, motion, accessibility (a11y), and interactive polish."
 mode: subagent
-model: opencode/muse-spark-1.3-contributor-free
 reasoningEffort: xhigh
 permission:
   "*": allow

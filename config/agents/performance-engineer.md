@@ -1,7 +1,6 @@
 ---
 description: "Performance optimization, latency & profiling specialist. Analyzes bottlenecks, Core Web Vitals, memory allocations, query optimization, caching, and algorithmic efficiency."
 mode: subagent
-model: opencode/muse-spark-1.3-contributor-free
 reasoningEffort: xhigh
 permission:
   "*": allow

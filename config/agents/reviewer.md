@@ -1,7 +1,6 @@
 ---
 description: "Senior code reviewer and integration gatekeeper. Evaluates diffs and changes across correctness, architecture, security, and performance with severity categorization (Critical, Important, Minor)."
 mode: subagent
-model: opencode/muse-spark-1.3-contributor-free
 reasoningEffort: xhigh
 permission:
   "*": deny

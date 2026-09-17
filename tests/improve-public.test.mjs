@@ -664,6 +664,60 @@ test("invalid research resumes the exact returned session for bounded strict rep
   }
 });
 
+test("public research accepts hosted line-range source evidence", async () => {
+  const workspace = makeTrackedWorkspace({ "scripts/improve.mjs": "export const hostedResearch = true;\n" });
+  try {
+    const result = await repairResearchOutput({
+      complete: true,
+      reply: "prose only",
+      sessionId: "sess-hosted-research",
+      sessionIdReturned: true,
+      modelMode: "opencode/muse-spark-1.3-contributor-free@xhigh",
+    }, {
+      workspace,
+      repository: "M1Vj/public-repo",
+      resume: async () => ({
+        complete: true,
+        reply: JSON.stringify({ ideas: [{
+          title: "Cover hosted parser path",
+          rationale: "The checked-out source exposes a bounded gap worth a focused regression.",
+          evidence: "scripts/improve.mjs:1-1 contains the hosted research path.",
+          impact: "medium",
+        }] }),
+        sessionId: "sess-hosted-research",
+        sessionIdReturned: true,
+        modelMode: "opencode/muse-spark-1.3-contributor-free@xhigh",
+      }),
+    });
+    assert.equal(result.accepted, true);
+    assert.equal(result.evidencePaths[0], "scripts/improve.mjs");
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("public artifact preserves hosted anchored source evidence", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "fleet-improve-anchored-artifact-"));
+  const evidence = "scripts/improve.mjs:1-1 contains the hosted research path.";
+  try {
+    const env = publicEnv(root);
+    writePublicArtifact(env, {
+      mode: "research",
+      status: "ok",
+      ideas: [{
+        title: "Cover hosted parser path",
+        rationale: "The checked-out source exposes a bounded gap worth a focused regression.",
+        evidence,
+        impact: "medium",
+      }],
+    }, { kind: "improve", status: "ok", repository: env.FLEET_PUBLIC_REPOSITORY });
+    const value = JSON.parse(readFileSync(env.FLEET_PUBLIC_ARTIFACT_MANIFEST, "utf8"));
+    assert.equal(value.ideas[0].evidence, evidence);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("research repair rejects nonexistent and traversing source evidence", async () => {
   const target = "M1Vj/public-repo";
   for (const evidence of ["tests/missing.test.mjs names a missing source file.", "../outside.js escapes the checked-out repository."]) {

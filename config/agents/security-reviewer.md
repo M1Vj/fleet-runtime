@@ -1,7 +1,6 @@
 ---
 description: "Security vulnerability & hardening specialist. Audits code, endpoints, configurations, and dependencies against OWASP Top 10, secrets leakage, injection attacks, auth flaws, and unsafe patterns."
 mode: subagent
-model: opencode/muse-spark-1.3-contributor-free
 reasoningEffort: xhigh
 permission:
   "*": allow

@@ -1,7 +1,6 @@
 ---
 description: "Deterministic schema-bound batch operations: formatting passes, inventory extraction, mechanical transforms against an exact output schema."
 mode: subagent
-model: opencode/muse-spark-1.3-contributor-free
 reasoningEffort: xhigh
 permission:
   "*": deny

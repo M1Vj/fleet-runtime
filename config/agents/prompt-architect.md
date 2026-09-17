@@ -1,7 +1,6 @@
 ---
 description: "Prompt architecture & system instruction specialist. Designs, refines, and calibrates system prompts, agent instructions, cognitive guardrails, and epistemic boundaries against drift and hallucination."
 mode: subagent
-model: opencode/muse-spark-1.3-contributor-free
 reasoningEffort: xhigh
 permission:
   "*": allow

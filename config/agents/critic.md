@@ -1,7 +1,6 @@
 ---
 description: "Principal adversarial auditor and critique subagent. Scrutinizes code, systems, and interfaces across 7 foundational quality axes, assigning 1-10 scores with concrete failure modes and actionable directives."
 mode: subagent
-model: opencode/muse-spark-1.3-contributor-free
 reasoningEffort: xhigh
 permission:
   "*": deny

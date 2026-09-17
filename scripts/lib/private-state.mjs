@@ -311,7 +311,11 @@ const PUBLIC_PR_URL_RE = /^https:\/\/github\.com\/([^/]+)\/([A-Za-z0-9_.-]{1,100
 // public prose. Bare words such as "source" or "private" are not secrets on
 // their own and commonly occur in legitimate review findings.
 const PUBLIC_PRIVATE_TEXT_RE = /(?:https?:|ftp:|file:|data:|\bwww\.|(?:^|[^A-Za-z0-9_])(?:~[\\/]|[A-Za-z]:[\\/]|\/(?:Users|home|private|tmp|var|etc|opt|workspace|runner|Volumes)[\\/]|(?:private|secret|credential|session|log|artifact|prompt|source)[\\/][^\s"'<>]+)|\b(?:prompt|source|session|private(?:State)?|log|artifact)\s*[:=]|\b(?:private[-_])?(?:ses(?:sion)?|task|thread|job)[-_][A-Za-z0-9]{2,}\b|\b(?:gh[pousr]_|github_pat_|sk-[A-Za-z0-9_-]{8,}|AKIA[0-9A-Z]{12,}|AIza[0-9A-Za-z_-]{16,}|xox[baprs]-[A-Za-z0-9-]{8,}|Bearer\s+[A-Za-z0-9._-]{12,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}))/i;
-const PUBLIC_REPOSITORY_SHAPE_RE = /(?:^|[\s"'`([{=:])([A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100})(?=$|[\s"'`)}\],.;!?])/g;
+// Consume a source line/range or symbol anchor with the repository-shaped
+// token. Otherwise the lookahead may backtrack at the file extension in
+// `scripts/improve.mjs:123`, classify `scripts/improve` as an identity, and
+// drop legitimate public evidence before the anchored path check runs.
+const PUBLIC_REPOSITORY_SHAPE_RE = /(?:^|[\s"'`([{=:])([A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100})(?::[0-9]+(?:-[0-9]+)?|#[A-Za-z_$][A-Za-z0-9_$.-]*)?(?=$|[\s"'`)}\],.;!?])/g;
 
 const PUBLIC_SOURCE_PATH_PREFIXES = new Set([
   ".github", "app", "apps", "client", "components", "config", "docs", "lib", "pages", "packages", "public", "scripts", "server", "src", "test", "tests",
@@ -336,7 +340,10 @@ function hasForeignRepositoryReference(text, repository, { allowSourcePaths = fa
   // matching the first pair because it is followed by another slash. Inspect
   // adjacent path segments so a foreign owner/repo cannot survive as evidence.
   if (allowSourcePaths || source.includes("/")) {
-    const pathToken = /(?:^|[\s"'`([{=:])((?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+)(?=$|[\s"'`)}\],.;!?])/g;
+    // Keep optional line/range or symbol anchors attached to the source path.
+    // Otherwise `scripts/improve.mjs:123` backtracks to `scripts/improve` and
+    // is falsely treated as a foreign owner/repository identity.
+    const pathToken = /(?:^|[\s"'`([{=:])((?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+)(?::[0-9]+(?:-[0-9]+)?|#[A-Za-z_$][A-Za-z0-9_$.-]*)?(?=$|[\s"'`)}\],.;!?])/g;
     const targetOwner = String(repository || "").split("/")[0];
     for (const token of source.matchAll(pathToken)) {
       const segments = token[1].split("/");

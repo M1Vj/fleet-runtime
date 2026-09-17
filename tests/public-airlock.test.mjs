@@ -50,6 +50,32 @@ const FAILURE_LOG_MARKERS = [
 
 const PUBLIC_GITHUB_TOKEN = "${{ github.token }}";
 
+const PUBLIC_ACTION_PINS = {
+  "actions/checkout": {
+    ref: "3d3c42e5aac5ba805825da76410c181273ba90b1",
+    count: 50,
+  },
+  "actions/setup-node": {
+    ref: "820762786026740c76f36085b0efc47a31fe5020",
+    count: 22,
+  },
+  "actions/upload-artifact": {
+    ref: "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+    count: 15,
+  },
+  "actions/download-artifact": {
+    ref: "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+    count: 10,
+  },
+};
+
+const LEGACY_PUBLIC_ACTION_REFS = [
+  "11d5960a326750d5838078e36cf38b85af677262",
+  "49933ea5288caeca8642d1e84afbd3f7d6820020",
+  "ea165f8d65b6e75b540449e92b4886f43607fa02",
+  "d3f86a106a0bac45b974a628896c90dbdf5c8093",
+];
+
 function workflowText(name) {
   return readFileSync(path.join(WORKFLOW_DIR, name), "utf8");
 }
@@ -152,6 +178,32 @@ test("all public workflows are secretless and contain no private-control referen
     const permissionsBlock = text.match(/^permissions:\n((?:^[ \t]+[^\n]*\n?)*)/m)?.[1] || "";
     assert.doesNotMatch(permissionsBlock, /\b(?:write|none)\b/i, `${name} grants a write permission`);
   }
+});
+
+test("public workflows pin supported action runtimes and preserve safe defaults", () => {
+  const observedCounts = Object.fromEntries(Object.keys(PUBLIC_ACTION_PINS).map((name) => [name, 0]));
+  for (const name of WORKFLOW_FILES) {
+    const text = workflowText(name);
+    for (const ref of LEGACY_PUBLIC_ACTION_REFS) assert.equal(text.includes(ref), false, `${name} contains a legacy action pin`);
+    for (const match of text.matchAll(/^\s*uses:\s*(actions\/(?:checkout|setup-node|upload-artifact|download-artifact))@([^\s#]+)\s*$/gm)) {
+      const [, action, ref] = match;
+      assert.ok(PUBLIC_ACTION_PINS[action], `${name} uses an unregistered public action: ${action}`);
+      observedCounts[action] += 1;
+      assert.equal(ref, PUBLIC_ACTION_PINS[action].ref, `${name} must pin ${action} to its verified commit`);
+    }
+
+    for (const block of text.split(/\n(?=\s+- (?:name|uses):)/g)) {
+      if (block.includes("actions/setup-node@")) {
+        assert.match(block, /node-version:\s*["']20["']/i, `${name} must keep Node.js 20`);
+        assert.match(block, /package-manager-cache:\s*false\b/i, `${name} must disable setup-node package-manager caching`);
+      }
+      if (block.includes("actions/download-artifact@")) {
+        const digestMismatch = block.match(/^\s*digest-mismatch:\s*([^\s#]+)\s*$/mi)?.[1];
+        assert.ok(!digestMismatch || digestMismatch.toLowerCase() === "error", `${name} must retain digest-mismatch=error`);
+      }
+    }
+  }
+  assert.deepEqual(observedCounts, Object.fromEntries(Object.entries(PUBLIC_ACTION_PINS).map(([name, pin]) => [name, pin.count])));
 });
 
 test("public workflows use only the built-in read token when a token is needed", () => {

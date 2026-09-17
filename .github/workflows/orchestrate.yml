@@ -74,12 +74,12 @@ jobs:
             printf 'FLEET_PUBLIC_ARTIFACT_MANIFEST=%s\n' "$FLEET_PUBLIC_ARTIFACT_MANIFEST"
           } >>"$GITHUB_ENV"
       - name: checkout runtime
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           fetch-depth: 1
       - name: checkout public target
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: ${{ steps.public-target.outputs.repository }}
           token: ${{ github.token }}
@@ -154,12 +154,12 @@ jobs:
             printf 'FLEET_PUBLIC_ARTIFACT_MANIFEST=%s\n' "$FLEET_PUBLIC_ARTIFACT_MANIFEST"
           } >>"$GITHUB_ENV"
       - name: checkout runtime
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           fetch-depth: 1
       - name: checkout public target
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: ${{ steps.public-target.outputs.repository }}
           token: ${{ github.token }}
@@ -225,7 +225,7 @@ jobs:
           NODE
       - name: upload public result manifest
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: public-orchestration-${{ strategy.job-index }}
           path: ${{ runner.temp }}/fleet-public-state/public-artifact.json

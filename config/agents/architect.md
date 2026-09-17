@@ -1,7 +1,6 @@
 ---
 description: "Strategic architecture & system design specialist. Evaluates system boundaries, diagnoses root causes, designs data flows, and prevents architectural debt with strict file:line traceability."
 mode: subagent
-model: opencode/muse-spark-1.3-contributor-free
 reasoningEffort: xhigh
 permission:
   "*": allow

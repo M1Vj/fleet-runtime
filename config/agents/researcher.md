@@ -1,7 +1,6 @@
 ---
 description: "Systems & codebase research specialist. Deeply investigates root causes, specifications, architecture, and documentation with batch search/read tools and evidence-grounded findings."
 mode: subagent
-model: opencode/muse-spark-1.3-contributor-free
 reasoningEffort: xhigh
 permission:
   "*": deny

@@ -494,15 +494,32 @@ export function planPatrolDispatches(signals, options = {}) {
   const now = resolveNow(options.now);
   const dispatches = [];
 
+  const priorityRepos = (Array.isArray(options.priorityRepos) && options.priorityRepos.length > 0)
+    ? options.priorityRepos
+    : (Array.isArray(options.tier1) && options.tier1.length > 0 ? options.tier1.slice(0, 2) : ["VSU-SmartMap", "SangkAI-city"]);
+
+  function repoRank(repoName) {
+    const norm = String(repoName || "").toLowerCase();
+    for (let i = 0; i < priorityRepos.length; i++) {
+      if (norm.endsWith(priorityRepos[i].toLowerCase())) return i;
+    }
+    const tier1List = Array.isArray(options.tier1) ? options.tier1 : [];
+    for (let j = 0; j < tier1List.length; j++) {
+      if (norm.endsWith(tier1List[j].toLowerCase())) return priorityRepos.length + j;
+    }
+    return 1000;
+  }
+
   const scopedSignals = (Array.isArray(signals) ? signals : [])
     .map((signal) => {
       if (!signal || typeof signal !== "object") return null;
       const repo = canonicalizePatrolRepo(signal.repo);
       return repo ? { ...signal, repo } : null;
     })
-    .filter(Boolean);
+    .filter(Boolean)
+    .sort((a, b) => repoRank(a.repo) - repoRank(b.repo));
 
-  // 1. Pull Requests: check for eligible, non-draft open PRs that haven't been dispatched recently
+  // 1. Pull Requests: check in priority order for eligible, non-draft open PRs
   const prDispatches = [];
   for (const signal of scopedSignals) {
     const pulls = Array.isArray(signal.openPulls) ? signal.openPulls : [];
@@ -531,16 +548,13 @@ export function planPatrolDispatches(signals, options = {}) {
 
   // 2. Idle Tier-1 Repo Improvement: if no PR dispatch is planned, check for idle tier-1 repos
   if (dispatches.length === 0) {
-    const tier1List = Array.isArray(options.tier1) ? options.tier1 : [];
     for (const signal of scopedSignals) {
-      const isTier1 = tier1List.some((t) => signal.repo.toLowerCase().endsWith(t.toLowerCase()));
-      if (!isTier1) continue;
       const hasOpenPulls = Array.isArray(signal.openPulls) && signal.openPulls.length > 0;
       if (hasOpenPulls) continue; // Skip if repo already has open PRs
 
       const key = eventKey("dispatch-improve", signal.repo, "idle", "");
       const lastObserved = observedLedgerTime(ledger, key);
-      const idleTtl = 48 * 60 * 60 * 1000; // 48h
+      const idleTtl = 24 * 60 * 60 * 1000; // 24h
       if (lastObserved === undefined || now - lastObserved >= idleTtl) {
         dispatches.push({
           workflow: "improve.yml",

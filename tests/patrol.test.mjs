@@ -272,3 +272,48 @@ test("planPatrolDispatches plans improve.yml for idle tier-1 repo when no PRs ar
   assert.equal(dispatches[0].workflow, "improve.yml");
   assert.equal(dispatches[0].repo, "M1Vj/CodexSwap");
 });
+
+test("planPatrolDispatches enforces strict Top-2 priority ordering (VSU-SmartMap > SangkAI-city > Others)", () => {
+  const prCodex = pull("M1Vj/CodexSwap", 1, NOW);
+  const prSmartMap = pull("M1Vj/VSU-SmartMap", 102, NOW);
+  const prSangkai = pull("M1Vj/SangkAI-city", 5, NOW);
+
+  // Even when signals are passed in reverse order (CodexSwap, SangkAI-city, VSU-SmartMap)
+  const dispatches = planPatrolDispatches(
+    [
+      signal("M1Vj/CodexSwap", { pulls: [prCodex] }),
+      signal("M1Vj/SangkAI-city", { pulls: [prSangkai] }),
+      signal("M1Vj/VSU-SmartMap", { pulls: [prSmartMap] }),
+    ],
+    {
+      now: NOW,
+      ledger: new Map(),
+      priorityRepos: ["VSU-SmartMap", "SangkAI-city"],
+      tier1: ["VSU-SmartMap", "SangkAI-city", "CodexSwap"],
+    },
+  );
+
+  // VSU-SmartMap must be chosen first!
+  assert.equal(dispatches.length, 1);
+  assert.equal(dispatches[0].repo, "M1Vj/VSU-SmartMap");
+  assert.equal(dispatches[0].pr, "102");
+
+  // When VSU-SmartMap has no PRs, SangkAI-city must be chosen before CodexSwap
+  const dispatches2 = planPatrolDispatches(
+    [
+      signal("M1Vj/CodexSwap", { pulls: [prCodex] }),
+      signal("M1Vj/SangkAI-city", { pulls: [prSangkai] }),
+      signal("M1Vj/VSU-SmartMap", { pulls: [] }),
+    ],
+    {
+      now: NOW,
+      ledger: new Map(),
+      priorityRepos: ["VSU-SmartMap", "SangkAI-city"],
+      tier1: ["VSU-SmartMap", "SangkAI-city", "CodexSwap"],
+    },
+  );
+
+  assert.equal(dispatches2.length, 1);
+  assert.equal(dispatches2[0].repo, "M1Vj/SangkAI-city");
+  assert.equal(dispatches2[0].pr, "5");
+});

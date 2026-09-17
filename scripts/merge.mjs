@@ -588,6 +588,22 @@ export function classifyTestResult(result = {}) {
 
 async function runDeterministicChecks(repo, headSha, audit) {
   const evidenceLines = [];
+  try {
+    const remoteCi = fetchCi(repo, headSha, process.env);
+    const remoteVerdict = ciVerdict(remoteCi);
+    if (remoteVerdict.ok && Array.isArray(remoteCi.runs) && remoteCi.runs.length > 0) {
+      if (audit && typeof audit.note === "function") {
+        audit.note("deterministic", `remote CI authoritative green (${remoteCi.runs.length} check runs passed)`);
+      }
+      evidenceLines.push(`remote CI: authoritative green (${remoteCi.runs.length} check runs passed on ${headSha.slice(0, 10)})`);
+      return { ok: true, evidence: evidenceLines.join("\n") };
+    }
+  } catch (err) {
+    if (audit && typeof audit.note === "function") {
+      audit.note("deterministic", `remote CI check skipped: ${err.message.slice(0, 100)}`);
+    }
+  }
+
   const workdir = path.join(mkdtempSync(path.join(tmpdir(), "pr-checkout-")), "repo");
   gh(["repo", "clone", repo, workdir, "--", "--depth", "1"], process.env);
   installCredentialHelper(workdir, process.env);
@@ -609,7 +625,12 @@ async function runDeterministicChecks(repo, headSha, audit) {
       scripts = JSON.parse(readFileSync(pkgPath, "utf8")).scripts || {};
     } catch {}
     if (Object.keys(scripts).length > 0) {
-      const inst = spawnSync("bash", ["-lc", "npm install --no-audit --no-fund"], { cwd: workdir, encoding: "utf8", timeout: 420000, env: sanitizedExecEnv(process.env, workdir) });
+      const hasLock = existsSync(path.join(workdir, "package-lock.json"));
+      const installCmd = hasLock ? "npm ci --no-audit --no-fund" : "npm install --no-audit --no-fund";
+      let inst = spawnSync("bash", ["-lc", installCmd], { cwd: workdir, encoding: "utf8", timeout: 420000, env: sanitizedExecEnv(process.env, workdir) });
+      if (inst.status !== 0 && hasLock) {
+        inst = spawnSync("bash", ["-lc", "npm install --no-audit --no-fund"], { cwd: workdir, encoding: "utf8", timeout: 420000, env: sanitizedExecEnv(process.env, workdir) });
+      }
       evidenceLines.push(`npm install: exit=${inst.status}`);
       if (inst.status !== 0) return { ok: false, evidence: evidenceLines.join("\n") + `\n${String(inst.stderr).slice(-400)}` };
       if (scripts.build) {

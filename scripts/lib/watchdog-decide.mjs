@@ -6,7 +6,7 @@ export function decideStale(lastRunUtc, nowMs = Date.now(), thresholdMs = 90 * 6
   return { stale: ageMinutes * 60000 > thresholdMs, ageMinutes, reason: ageMinutes * 60000 > thresholdMs ? "stale" : "fresh" };
 }
 
-const WATCHDOG_WORKFLOWS = ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml"];
+const WATCHDOG_WORKFLOWS = ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml", "merge.yml", "model-refresh.yml"];
 
 export function planWatchdogActions(heartbeat, nowMs = Date.now(), thresholdMs = 90 * 60 * 1000, options = {}) {
   const decision = decideStale(heartbeat && heartbeat.lastRunUtc, nowMs, thresholdMs);

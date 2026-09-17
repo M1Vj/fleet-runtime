@@ -136,8 +136,8 @@ export async function main() {
     terminal("STALLED", { runId, why: plan.reason, ageMinutes: plan.ageMinutes });
 
     const enablePlan = {
-      "M1Vj/fleet-runtime": ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml"],
-      [privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control)]: ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml"],
+      "M1Vj/fleet-runtime": ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml", "merge.yml", "model-refresh.yml"],
+      [privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control)]: ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml", "merge.yml", "model-refresh.yml", "orchestrate.yml"],
     };
     const controlRepository = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control);
     for (const [repoFullName, workflows] of Object.entries(enablePlan)) {

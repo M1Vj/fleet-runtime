@@ -3,7 +3,7 @@
   "model": "opencode/union-alpha",
   "small_model": "opencode/union-alpha",
   "instructions": [
-    "CONCRETE AUTONOMOUS MUTATION: Worker agents (@implementer, @code-simplifier, @refactorer, @test-engineer, @performance-engineer, @security-reviewer) possess full operational capability and directives to perform concrete actions—editing code, writing tests, refactoring modules, and committing verified changes autonomously rather than executing passive read-only inspections.",
+    "CONCRETE AUTONOMOUS MUTATION: Worker agents (@implementer, @code-simplifier, @refactorer, @test-engineer, @performance-engineer, @security-reviewer, @architect, @designer, @prompt-architect, @humanizer) possess full operational capability and directives to perform concrete actions—editing code, writing tests, refactoring modules, and committing verified changes autonomously rather than executing passive read-only inspections.",
     "NON-TERMINATION & TASK COMPLETION INVARIANT: Execute implementations, run automated verification tests live, and confirm outcomes completely within this task before finishing. An unfinished task is an invalid exit.",
     "HIGH-THROUGHPUT EXECUTION & SHORT WAIT TIME: Group operations into multi-tool batches. Keep turns brief, factual, and action-oriented."
   ],
@@ -90,6 +90,112 @@
         "edit": "allow",
         "bash": "allow",
         "write": "allow",
+        "doom_loop": "allow"
+      }
+    },
+    "architect": {
+      "variant": "xhigh",
+      "reasoningEffort": "xhigh",
+      "steps": 30,
+      "permission": {
+        "*": "allow",
+        "edit": "allow",
+        "bash": "allow",
+        "write": "allow",
+        "doom_loop": "allow"
+      }
+    },
+    "designer": {
+      "variant": "xhigh",
+      "reasoningEffort": "xhigh",
+      "steps": 30,
+      "permission": {
+        "*": "allow",
+        "edit": "allow",
+        "bash": "allow",
+        "write": "allow",
+        "doom_loop": "allow"
+      }
+    },
+    "prompt-architect": {
+      "variant": "xhigh",
+      "reasoningEffort": "xhigh",
+      "steps": 25,
+      "permission": {
+        "*": "allow",
+        "edit": "allow",
+        "bash": "allow",
+        "write": "allow",
+        "doom_loop": "allow"
+      }
+    },
+    "humanizer": {
+      "variant": "xhigh",
+      "reasoningEffort": "xhigh",
+      "steps": 25,
+      "permission": {
+        "*": "allow",
+        "edit": "allow",
+        "bash": "allow",
+        "write": "allow",
+        "doom_loop": "allow"
+      }
+    },
+    "critic": {
+      "variant": "xhigh",
+      "reasoningEffort": "xhigh",
+      "steps": 25,
+      "permission": {
+        "*": "allow",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "lsp": "allow",
+        "doom_loop": "allow"
+      }
+    },
+    "reviewer": {
+      "variant": "xhigh",
+      "reasoningEffort": "xhigh",
+      "steps": 25,
+      "permission": {
+        "*": "allow",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "lsp": "allow",
+        "doom_loop": "allow"
+      }
+    },
+    "clerk": {
+      "variant": "xhigh",
+      "reasoningEffort": "xhigh",
+      "steps": 20,
+      "permission": {
+        "*": "allow",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "lsp": "allow",
+        "doom_loop": "allow"
+      }
+    },
+    "researcher": {
+      "variant": "xhigh",
+      "reasoningEffort": "xhigh",
+      "steps": 25,
+      "permission": {
+        "*": "allow",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "lsp": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
         "doom_loop": "allow"
       }
     }

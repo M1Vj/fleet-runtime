@@ -5,7 +5,7 @@ import path from "node:path";
 import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh } from "./lib/util.mjs";
-import { askModel } from "./lib/model.mjs";
+import { askModel, askModelResilient } from "./lib/model.mjs";
 import { verifyIssueAuthor } from "./lib/verify.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
 import {
@@ -47,12 +47,12 @@ async function modePropose(audit) {
     const events = readEvents();
     const counts = {};
     for (const e of events) counts[e.state] = (counts[e.state] || 0) + 1;
-    const result = await askModel({
+    const result = await askModelResilient({
       prompt: `Review public telemetry for ${repo}. Return ONLY strict JSON {"health_summary":"...","proposals":[{"title":"...","impact":"high|medium|low","effort":"small|medium|large","detail":"..."}]} with 3 to 6 proposals.\nCounts: ${JSON.stringify(counts)}\nRecent public issue titles: ${recentIssues.map((i) => i.title).filter(Boolean).slice(0, 20).join("; ")}`,
       timeoutMs: 480000,
       env: publicModelEnv(process.env),
       preferVariantMax: true,
-      maxRounds: 3,
+      maxRounds: 5,
     });
     writePublicArtifact(process.env, {
       mode: "retro",
@@ -108,19 +108,15 @@ async function modePropose(audit) {
     digest.slice(0, 30000),
   ].join("\n");
 
-  let result = await askModel({
+  const result = await askModelResilient({
     prompt,
     timeoutMs: 480000,
     env: process.env,
     // Contributor tier: high thinking effort (maps to xhigh), never the max variant.
     preferVariantMax: true,
-    maxRounds: 3,
+    maxRounds: 5,
   });
-  if (!result.complete) {
-    await new Promise((r) => setTimeout(r, 60000));
-    result = await askModel({ prompt, timeoutMs: 480000, env: process.env, preferVariantMax: true, maxRounds: 3 });
-  }
-  audit.note("propose", `complete=${result.complete}`);
+  audit.note("propose", `complete=${result.complete} ladders=${result.ladders || 0}`);
   if (!result.complete || !result.reply) throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });
 
   let parsed;

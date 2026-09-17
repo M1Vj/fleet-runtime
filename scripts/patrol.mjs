@@ -489,6 +489,72 @@ export function enqueueDeepTasks(signals, options = {}) {
   return additions.length;
 }
 
+export function planPatrolDispatches(signals, options = {}) {
+  const ledger = options.ledger || new Map();
+  const now = resolveNow(options.now);
+  const dispatches = [];
+
+  const scopedSignals = (Array.isArray(signals) ? signals : [])
+    .map((signal) => {
+      if (!signal || typeof signal !== "object") return null;
+      const repo = canonicalizePatrolRepo(signal.repo);
+      return repo ? { ...signal, repo } : null;
+    })
+    .filter(Boolean);
+
+  // 1. Pull Requests: check for eligible, non-draft open PRs that haven't been dispatched recently
+  const prDispatches = [];
+  for (const signal of scopedSignals) {
+    const pulls = Array.isArray(signal.openPulls) ? signal.openPulls : [];
+    for (const pr of pulls) {
+      if (!pr || pr.draft === true) continue;
+      const prNumber = Number(pr.n ?? pr.number);
+      if (!Number.isSafeInteger(prNumber) || prNumber <= 0) continue;
+      const updated = String(pr.updated ?? pr.updated_at ?? "");
+      const key = eventKey("dispatch-merge", signal.repo, String(prNumber), updated);
+      const lastObserved = observedLedgerTime(ledger, key);
+      if (lastObserved === undefined) {
+        prDispatches.push({
+          workflow: "merge.yml",
+          repo: signal.repo,
+          pr: String(prNumber),
+          key,
+        });
+      }
+    }
+  }
+
+  // Cap PR dispatches to at most 1 per patrol cycle to avoid runner queue storms
+  if (prDispatches.length > 0) {
+    dispatches.push(prDispatches[0]);
+  }
+
+  // 2. Idle Tier-1 Repo Improvement: if no PR dispatch is planned, check for idle tier-1 repos
+  if (dispatches.length === 0) {
+    const tier1List = Array.isArray(options.tier1) ? options.tier1 : [];
+    for (const signal of scopedSignals) {
+      const isTier1 = tier1List.some((t) => signal.repo.toLowerCase().endsWith(t.toLowerCase()));
+      if (!isTier1) continue;
+      const hasOpenPulls = Array.isArray(signal.openPulls) && signal.openPulls.length > 0;
+      if (hasOpenPulls) continue; // Skip if repo already has open PRs
+
+      const key = eventKey("dispatch-improve", signal.repo, "idle", "");
+      const lastObserved = observedLedgerTime(ledger, key);
+      const idleTtl = 48 * 60 * 60 * 1000; // 48h
+      if (lastObserved === undefined || now - lastObserved >= idleTtl) {
+        dispatches.push({
+          workflow: "improve.yml",
+          repo: signal.repo,
+          key,
+        });
+        break; // At most 1 improve dispatch per cycle
+      }
+    }
+  }
+
+  return dispatches;
+}
+
 export async function applyPatrolLabels(repo, number, labels, env = process.env, audit = {}, options = {}) {
   const ghCall = options.gh || gh;
   const killSwitch = options.killSwitch || killSwitchEngaged;
@@ -835,6 +901,23 @@ export async function main() {
         audit.note("deep-dispatch", "deep.yml dispatched");
       } catch (err) {
         audit.note("deep-dispatch", `dispatch skipped: ${err.message.slice(0, 120)}`);
+      }
+      // Dynamic autonomous worker dispatch (Scout / Radar)
+      const scoutDispatches = planPatrolDispatches(signals, {
+        ledger: loadPatrolLedger(ledgerPath()),
+        tier1: readJson(targetsPath(), {}).tier1 || [],
+      });
+      for (const d of scoutDispatches) {
+        try {
+          const args = ["workflow", "run", d.workflow, "-R", privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control)];
+          if (d.repo) args.push("-f", `repo=${d.repo}`);
+          if (d.pr) args.push("-f", `pr=${d.pr}`);
+          gh(args, process.env);
+          append(ledgerPath(), d.key, { workflow: d.workflow, repo: d.repo, pr: d.pr });
+          audit.note("scout-dispatch", `dispatched ${d.workflow} for ${d.repo}${d.pr ? `#${d.pr}` : ""}`);
+        } catch (err) {
+          audit.note("scout-dispatch", `dispatch ${d.workflow} failed: ${err.message.slice(0, 120)}`);
+        }
       }
     } else {
       status = "ok-no-changes";

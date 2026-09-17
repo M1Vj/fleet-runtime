@@ -12,6 +12,7 @@ import {
   loadPatrolLedger,
   planPatrolPersistence,
   planDeepQueueAdditions,
+  planPatrolDispatches,
   DEEP_QUEUE_CAP,
 } from "../scripts/patrol.mjs";
 import { eventKey } from "../scripts/lib/ledger.mjs";
@@ -229,4 +230,45 @@ test("planPatrolPersistence bounds the lifecycle to one initial push plus one fi
   assert.deepEqual(planPatrolPersistence({ changed: true, pushes: 0 }), { persist: true, pushAttempt: 1 });
   assert.deepEqual(planPatrolPersistence({ changed: true, pushes: 1 }), { persist: true, pushAttempt: 2 });
   assert.deepEqual(planPatrolPersistence({ changed: true, pushes: 2 }), { persist: false, reason: "push-cap" });
+});
+
+test("planPatrolDispatches detects open non-draft PR and plans targeted merge.yml", () => {
+  const pr = pull("M1Vj/VSU-SmartMap", 102, NOW);
+  const dispatches = planPatrolDispatches([signal("M1Vj/VSU-SmartMap", { pulls: [pr] })], {
+    now: NOW,
+    ledger: new Map(),
+    tier1: ["VSU-SmartMap"],
+  });
+
+  assert.equal(dispatches.length, 1);
+  assert.equal(dispatches[0].workflow, "merge.yml");
+  assert.equal(dispatches[0].repo, "M1Vj/VSU-SmartMap");
+  assert.equal(dispatches[0].pr, "102");
+});
+
+test("planPatrolDispatches skips draft PRs and deduplicates against the ledger", () => {
+  const draftPr = { n: 103, title: "Draft PR", draft: true, updated: iso(NOW) };
+  const openPr = pull("M1Vj/VSU-SmartMap", 104, NOW);
+  const key = eventKey("dispatch-merge", "M1Vj/VSU-SmartMap", "104", openPr.updated);
+  const ledger = new Map([[key, NOW]]);
+
+  const dispatches = planPatrolDispatches([signal("M1Vj/VSU-SmartMap", { pulls: [draftPr, openPr] })], {
+    now: NOW,
+    ledger,
+    tier1: ["VSU-SmartMap"],
+  });
+
+  assert.equal(dispatches.length, 0);
+});
+
+test("planPatrolDispatches plans improve.yml for idle tier-1 repo when no PRs are pending", () => {
+  const dispatches = planPatrolDispatches([signal("M1Vj/CodexSwap", { pulls: [] })], {
+    now: NOW,
+    ledger: new Map(),
+    tier1: ["CodexSwap"],
+  });
+
+  assert.equal(dispatches.length, 1);
+  assert.equal(dispatches[0].workflow, "improve.yml");
+  assert.equal(dispatches[0].repo, "M1Vj/CodexSwap");
 });

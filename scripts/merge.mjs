@@ -799,7 +799,7 @@ async function main() {
   }
   audit.note("gate", `identity=${identity.login} target=${TARGET_REPO} pr=${PR_NUMBER}`);
   writeRevisionOutputs(process.env.GITHUB_OUTPUT, TARGET_REPO, PR_NUMBER, false);
-  writeQueueOutputs(process.env.GITHUB_OUTPUT, Boolean(INITIAL_TARGET.valid));
+  writeQueueOutputs(process.env.GITHUB_OUTPUT, false);
 
   if (!INITIAL_TARGET.valid && INITIAL_TARGET.provided) {
     audit.note("target", "invalid or incomplete target; scan and revision both refused");

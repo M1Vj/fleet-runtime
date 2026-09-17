@@ -67,3 +67,31 @@ test("validateDirectives accepts model output with control chars via fallback", 
   assert.equal(r.ok, true);
   assert.equal(r.directives[0].text, "para1\npara2");
 });
+
+test("extractJsonObject extracts JSON even when preceded by shell codeblocks or preamble", async () => {
+  const { extractJsonObject } = await import("../scripts/lib/directives.mjs");
+  const complex = [
+    "I analyzed the dependency update.",
+    "```bash",
+    "npm audit --json",
+    "```",
+    "Here is my verdict:",
+    "```json",
+    '{"verdict":"approve","score":95,"reasons":["clean diff"],"blockers":[]}',
+    "```",
+    "Final comment."
+  ].join("\n");
+  const parsed = extractJsonObject(complex);
+  assert.equal(parsed.verdict, "approve");
+  assert.equal(parsed.score, 95);
+  assert.deepEqual(parsed.reasons, ["clean diff"]);
+});
+
+test("extractJsonObject rescues JSON with control chars in raw text without fences", async () => {
+  const { extractJsonObject } = await import("../scripts/lib/directives.mjs");
+  const raw = 'Review complete: {"verdict":"reject","score":40,"reasons":["bad\nmultiline"],"blockers":["breaking"]} Thanks.';
+  const parsed = extractJsonObject(raw);
+  assert.equal(parsed.verdict, "reject");
+  assert.equal(parsed.score, 40);
+});
+

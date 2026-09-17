@@ -91,21 +91,44 @@ export function firstBalancedObject(text) {
 }
 
 export function extractJsonObject(replyText) {
-  const fenced = String(replyText).match(/```(?:json)?\s*([\s\S]*?)```/);
-  const candidate = fenced ? fenced[1].trim() : String(replyText).trim();
-  const start = candidate.indexOf("{");
-  const end = candidate.lastIndexOf("}");
-  if (start === -1 || end <= start) throw new Error("no JSON object found");
-  const slice = candidate.slice(start, end + 1);
-  try {
-    return JSON.parse(slice);
-  } catch {
-    try {
-      return JSON.parse(sanitizeControlChars(slice));
-    } catch {
-      return JSON.parse(sanitizeControlChars(firstBalancedObject(candidate)));
+  const text = String(replyText || "");
+  const candidates = [];
+  // 1. Explicit ```json ... ``` blocks
+  const jsonBlocks = [...text.matchAll(/```(?:json)\s*([\s\S]*?)```/gi)];
+  for (const m of jsonBlocks) {
+    if (m[1]) candidates.push(m[1].trim());
+  }
+  // 2. Any fenced codeblock
+  const anyBlocks = [...text.matchAll(/```(?:[a-zA-Z0-9_-]+)?\s*([\s\S]*?)```/g)];
+  for (const m of anyBlocks) {
+    if (m[1]) candidates.push(m[1].trim());
+  }
+  // 3. Whole trimmed text
+  candidates.push(text.trim());
+
+  for (const candidate of candidates) {
+    const start = candidate.indexOf("{");
+    const end = candidate.lastIndexOf("}");
+    if (start !== -1 && end > start) {
+      const slice = candidate.slice(start, end + 1);
+      try {
+        return JSON.parse(slice);
+      } catch {
+        try {
+          return JSON.parse(sanitizeControlChars(slice));
+        } catch {
+          try {
+            return JSON.parse(sanitizeControlChars(firstBalancedObject(candidate)));
+          } catch {}
+        }
+      }
     }
   }
+  // 4. Final attempt: scan raw text for first balanced object directly
+  try {
+    return JSON.parse(sanitizeControlChars(firstBalancedObject(text)));
+  } catch {}
+  throw new Error("no JSON object found");
 }
 
 export function stripFences(raw) {

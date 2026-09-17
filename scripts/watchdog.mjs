@@ -156,6 +156,16 @@ export async function main() {
           }
         }
       }
+      // Active dispatch fallback: if workflows are stale, actively dispatch patrol and merge-gate
+      // so recovery does not wait indefinitely for GitHub's throttled cron engine.
+      for (const wf of ["patrol.yml", "merge.yml"]) {
+        try {
+          gh(["workflow", "run", wf, "-R", controlRepository], process.env);
+          audit.note("dispatch-stale", `${controlRepository}/${wf}`);
+        } catch (err) {
+          audit.note("dispatch-skip", `${controlRepository}/${wf}: ${String(err.message).slice(0, 80)}`);
+        }
+      }
     } else {
       audit.note("re-enable-skipped", "FLEET_WATCHDOG_AUTO_ENABLE is false");
     }

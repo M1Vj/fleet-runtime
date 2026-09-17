@@ -340,7 +340,7 @@ export function secretsInDiff(files) {
 // Untrusted-checkout execution: PR code (npm install/build/test,
 // visual-check) must never see secrets. Mirrors the model.mjs child-env
 // pattern, but also strips model auth — builds must still run.
-export function sanitizedExecEnv(env = process.env) {
+export function sanitizedExecEnv(env = process.env, workdir = null) {
   const out = { ...env };
   for (const key of Object.keys(out)) {
     if (/TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL/i.test(key)) delete out[key];
@@ -352,6 +352,10 @@ export function sanitizedExecEnv(env = process.env) {
   delete out.OPENCODE_API_KEY;
   delete out.GDRIVE_REFRESH_TOKEN;
   delete out.GDRIVE_CLIENT_SECRET;
+  if (workdir) {
+    const nodeBin = path.join(workdir, "node_modules", ".bin");
+    out.PATH = nodeBin + (out.PATH ? path.delimiter + out.PATH : "");
+  }
   return out;
 }
 
@@ -555,11 +559,11 @@ async function runDeterministicChecks(repo, headSha, audit) {
       scripts = JSON.parse(readFileSync(pkgPath, "utf8")).scripts || {};
     } catch {}
     if (Object.keys(scripts).length > 0) {
-      const inst = spawnSync("bash", ["-lc", "npm install --no-audit --no-fund"], { cwd: workdir, encoding: "utf8", timeout: 420000, env: sanitizedExecEnv(process.env) });
+      const inst = spawnSync("bash", ["-lc", "npm install --no-audit --no-fund"], { cwd: workdir, encoding: "utf8", timeout: 420000, env: sanitizedExecEnv(process.env, workdir) });
       evidenceLines.push(`npm install: exit=${inst.status}`);
       if (inst.status !== 0) return { ok: false, evidence: evidenceLines.join("\n") + `\n${String(inst.stderr).slice(-400)}` };
       if (scripts.build) {
-        const b = spawnSync("bash", ["-lc", "npm run build"], { cwd: workdir, encoding: "utf8", timeout: 600000, env: sanitizedExecEnv(process.env) });
+        const b = spawnSync("bash", ["-lc", "npm run build"], { cwd: workdir, encoding: "utf8", timeout: 600000, env: sanitizedExecEnv(process.env, workdir) });
         evidenceLines.push(`npm run build: exit=${b.status}`);
         if (b.status !== 0) return { ok: false, evidence: evidenceLines.join("\n") + `\n${String(b.stderr).slice(-600)}` };
       }
@@ -569,7 +573,7 @@ async function runDeterministicChecks(repo, headSha, audit) {
           evidenceLines.push("npm test: configured but empty");
           return { ok: false, evidence: evidenceLines.join("\n") };
         }
-        const t = spawnSync("bash", ["-lc", testScript], { cwd: workdir, encoding: "utf8", timeout: 420000, env: sanitizedExecEnv(process.env) });
+        const t = spawnSync("bash", ["-lc", "npm test"], { cwd: workdir, encoding: "utf8", timeout: 420000, env: sanitizedExecEnv(process.env, workdir) });
         const testVerdict = classifyTestResult(t);
         evidenceLines.push(`npm test: ${testVerdict.why}`);
         if (!testVerdict.ok) {

@@ -4,6 +4,8 @@
   "small_model": "opencode/union-alpha",
   "instructions": [
     "CONCRETE AUTONOMOUS MUTATION: Worker agents (@implementer, @code-simplifier, @refactorer, @test-engineer, @performance-engineer, @security-reviewer, @architect, @designer, @prompt-architect, @humanizer) possess full operational capability and directives to perform concrete actions—editing code, writing tests, refactoring modules, and committing verified changes autonomously rather than executing passive read-only inspections.",
+    "PARALLEL MULTI-AGENT FAN-OUT (/boost): Decompose substantive work across multiple specialized subagents running concurrently in parallel (e.g., @researcher, @architect, @implementer, @test-engineer, @security-reviewer, @reviewer, @critic). Parallel execution is substantially faster, more effective, and captures multifaceted angles simultaneously. Launch independent research, implementation, and review lanes concurrently rather than waiting sequentially.",
+    "LONG-RUNNING TASK ENDURANCE (1 HOUR OR MORE): Substantive engineering, refactoring, and verification tasks can and should run for 1 hour or more per task. Do not abort or terminate prematurely while making forward progress. Deep autonomous workflows are expected to sustain prolonged, rigorous execution until full verification and completion are achieved.",
     "NON-TERMINATION & TASK COMPLETION INVARIANT: Execute implementations, run automated verification tests live, and confirm outcomes completely within this task before finishing. An unfinished task is an invalid exit.",
     "HIGH-THROUGHPUT EXECUTION & SHORT WAIT TIME: Group operations into multi-tool batches. Keep turns brief, factual, and action-oriented."
   ],

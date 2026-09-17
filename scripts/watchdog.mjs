@@ -5,7 +5,8 @@ import path from "node:path";
 import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
-import { planWatchdogActions, WATCHDOG_WORKFLOWS } from "./lib/watchdog-decide.mjs";
+import { verifyCommit, verifyIssueAuthor } from "./lib/verify.mjs";
+import { planWatchdogActions, WATCHDOG_WORKFLOWS } from "./lib/watchdog-recipes.mjs";
 import {
   isPublicDataClass,
   makeExecutionTerminal,
@@ -137,12 +138,13 @@ export async function main() {
     // outage is visible in the status digest even if recovery below fails.
     terminal("STALLED", { runId, why: plan.reason, ageMinutes: plan.ageMinutes });
 
+    const controlRepository = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control);
+
     if (autoEnable) {
       const enablePlan = {
         "M1Vj/fleet-runtime": WATCHDOG_WORKFLOWS,
-        [privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control)]: WATCHDOG_WORKFLOWS,
+        [controlRepository]: WATCHDOG_WORKFLOWS,
       };
-      const controlRepository = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control);
       for (const [repoFullName, workflows] of Object.entries(enablePlan)) {
         for (const wf of workflows) {
           try {
@@ -185,11 +187,13 @@ export async function main() {
       if (dupe) {
         audit.note("alert-dedupe", `open watchdog alert #${dupe.number} already exists, skipping new issue`);
       } else {
+        const alertAction = plan.actions.find((a) => a.kind === "file-alert-issue");
+        const alertTitle = alertAction?.title || `[WATCHDOG] patrol stale since ${heartbeat?.lastRunUtc || "unknown"}`;
         const issue = gh(
           [
             "api", "-X", "POST", `/repos/${controlRepository}/issues`,
-            "-f", `title=${plan.actions.find((a) => a.kind === "file-alert-issue").title}`,
-            "-f", `body=Patrol heartbeat is stale (${plan.ageMinutes} minutes).\nRe-enable was attempted. Recent runs:\n${runsList}\n\nCheck model auth secret freshness and Actions quota.`,
+            "-f", `title=${alertTitle}`,
+            "-f", `body=Patrol heartbeat is stale (${plan.ageMinutes} minutes).\n${autoEnable ? "Re-enable was attempted." : "Re-enable was skipped (auto-enable disabled)."}\nRecent runs:\n${runsList}\n\nCheck model auth secret freshness and Actions quota.`,
           ],
           process.env,
         );

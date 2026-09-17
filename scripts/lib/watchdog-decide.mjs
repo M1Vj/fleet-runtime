@@ -1,6 +1,7 @@
 export function decideStale(lastRunUtc, nowMs = Date.now(), thresholdMs = 90 * 60 * 1000) {
-  if (!lastRunUtc) return { stale: true, ageMinutes: null, reason: "no-heartbeat" };
-  const last = Date.parse(lastRunUtc);
+  const stamp = typeof lastRunUtc === "string" ? lastRunUtc.trim() : "";
+  if (!stamp) return { stale: true, ageMinutes: null, reason: "no-heartbeat" };
+  const last = Date.parse(stamp);
   if (Number.isNaN(last)) return { stale: true, ageMinutes: null, reason: "bad-heartbeat" };
   const ageMinutes = Math.round(((nowMs - last) / 60000) * 10) / 10;
   return { stale: ageMinutes * 60000 > thresholdMs, ageMinutes, reason: ageMinutes * 60000 > thresholdMs ? "stale" : "fresh" };
@@ -19,9 +20,48 @@ export const WATCHDOG_WORKFLOWS = [
   "orchestrate.yml",
 ];
 
+const WATCHDOG_ALERT_TITLE = /^\[WATCHDOG\] patrol stale since (?:unknown|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z)$/;
+const CANONICAL_STAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
+export const MAX_WATCHDOG_ALERT_PAGES = 10;
+
+/** Malformed heartbeat timestamps collapse to one canonical alert identity. */
+export function canonicalHeartbeatStamp(value) {
+  if (typeof value !== "string") return "unknown";
+  const text = value.trim();
+  if (!CANONICAL_STAMP_RE.test(text) || Number.isNaN(Date.parse(text))) return "unknown";
+  return text;
+}
+
 /** Enable workflow recovery only when auto-enable is not explicitly disabled. */
 export function watchdogAutoEnableEnabled(value) {
   return value === "true" || value === true;
+}
+
+export function selectWatchdogAlertIssue(issues) {
+  const matches = (Array.isArray(issues) ? issues : []).filter((issue) => (
+    issue && issue.state === "open"
+      && typeof issue.title === "string"
+      && WATCHDOG_ALERT_TITLE.test(issue.title)
+      && issue.pull_request == null
+  ));
+  return matches.sort((left, right) => {
+    const leftNumber = Number(left.number);
+    const rightNumber = Number(right.number);
+    if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber) && leftNumber !== rightNumber) return leftNumber - rightNumber;
+    return String(left.id || left.number || "").localeCompare(String(right.id || right.number || ""));
+  })[0] || null;
+}
+
+export function findWatchdogAlertIssue(fetchPage, { maxPages = MAX_WATCHDOG_ALERT_PAGES } = {}) {
+  if (typeof fetchPage !== "function") return null;
+  const pages = [];
+  for (let page = 1; page <= Math.max(1, Math.min(MAX_WATCHDOG_ALERT_PAGES, Number(maxPages) || MAX_WATCHDOG_ALERT_PAGES)); page += 1) {
+    const issues = fetchPage(page);
+    if (!Array.isArray(issues)) break;
+    pages.push(...issues);
+    if (issues.length < 100) break;
+  }
+  return selectWatchdogAlertIssue(pages);
 }
 
 export function planWatchdogActions(heartbeat, nowMs = Date.now(), thresholdMs = 90 * 60 * 1000, options = {}) {
@@ -32,7 +72,7 @@ export function planWatchdogActions(heartbeat, nowMs = Date.now(), thresholdMs =
   if (!decision.stale) {
     return { ...decision, actions: [], alertIssue: false };
   }
-  const autoEnable = options?.autoEnable !== false;
+  const autoEnable = options?.autoEnable !== false && options?.autoEnable !== "false";
   const enableActions = autoEnable
     ? WATCHDOG_WORKFLOWS.map((wf) => ({ kind: "enable-workflow", workflow: wf }))
     : [];
@@ -41,7 +81,7 @@ export function planWatchdogActions(heartbeat, nowMs = Date.now(), thresholdMs =
     autoEnable,
     actions: [
       ...enableActions,
-      { kind: "file-alert-issue", title: `[WATCHDOG] patrol stale since ${heartbeat && heartbeat.lastRunUtc ? heartbeat.lastRunUtc : "unknown"}` },
+      { kind: "file-alert-issue", title: `[WATCHDOG] patrol stale since ${canonicalHeartbeatStamp(heartbeat && heartbeat.lastRunUtc)}` },
     ],
     alertIssue: true,
   };
@@ -54,4 +94,37 @@ export function shouldCoalesce(trigger, lastRunUtc, nowMs = Date.now(), minGapMi
   if (Number.isNaN(last)) return { coalesce: false, gapMinutes: null };
   const gapMinutes = Math.round(((nowMs - last) / 60000) * 10) / 10;
   return { coalesce: gapMinutes < minGapMinutes, gapMinutes };
+}
+
+/** The paired sentinel controller may revive exactly this minimum set so the primary watchdog can self-heal everything else. */
+export const SENTINEL_REVIVE_WORKFLOWS = ["watchdog.yml", "merge.yml"];
+export const SENTINEL_TARGET_REPO = "M1Vj/fleet-runtime";
+
+/**
+ * Pure planner for the paired sentinel controller: when the target repo's
+ * primary watchdog is stale, auto-enable is explicitly on, and no kill switch
+ * exists, revive exactly SENTINEL_REVIVE_WORKFLOWS on the target repo. Any
+ * uncertain input fails closed to zero actions.
+ */
+export function planSentinelActions({ lastRunUtc, nowMs = Date.now(), thresholdMs = 60 * 60 * 1000, autoEnable, killSwitchPresent } = {}) {
+  if (killSwitchPresent === true || autoEnable !== "true") {
+    return { stale: false, reason: killSwitchPresent === true ? "kill-switch-present" : "auto-enable-off", actions: [] };
+  }
+  const stamp = typeof lastRunUtc === "string" ? lastRunUtc.trim() : "";
+  let stale;
+  let reason;
+  if (!stamp) {
+    stale = true;
+    reason = "no-runs";
+  } else {
+    const decision = decideStale(stamp, nowMs, thresholdMs);
+    stale = decision.stale === true;
+    reason = decision.reason;
+  }
+  if (!stale) return { stale: false, reason, actions: [] };
+  return {
+    stale: true,
+    reason,
+    actions: SENTINEL_REVIVE_WORKFLOWS.map((workflow) => ({ kind: "enable-workflow", repo: SENTINEL_TARGET_REPO, workflow })),
+  };
 }

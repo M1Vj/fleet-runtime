@@ -799,7 +799,7 @@ async function main() {
   }
   audit.note("gate", `identity=${identity.login} target=${TARGET_REPO} pr=${PR_NUMBER}`);
   writeRevisionOutputs(process.env.GITHUB_OUTPUT, TARGET_REPO, PR_NUMBER, false);
-  writeQueueOutputs(process.env.GITHUB_OUTPUT, false);
+  writeQueueOutputs(process.env.GITHUB_OUTPUT, Boolean(INITIAL_TARGET.valid));
 
   if (!INITIAL_TARGET.valid && INITIAL_TARGET.provided) {
     audit.note("target", "invalid or incomplete target; scan and revision both refused");
@@ -1223,6 +1223,9 @@ async function main() {
   }
 
   async function finish(a, rid, stateName) {
+    if (stateName !== "MERGED" && stateName !== "NO-OP") {
+      writeQueueOutputs(process.env.GITHUB_OUTPUT, true);
+    }
     writeExecutionAudit(a, process.env, REPO_ROOT, rid, `Merge gate ${TARGET_REPO}#${PR_NUMBER}`, stateName);
     // Durable state (merges.jsonl) + audit live in the private control repository; commit and
     // push as M1Vj with attribution verify. Best-effort: the terminal state

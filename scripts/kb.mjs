@@ -83,7 +83,7 @@ async function modeInventory(audit) {
       "Key public excerpts:",
       fetchKeyKbText(treeInfo.files, repo, process.env),
     ].join("\n");
-    const result = await askModel({
+    const result = await askModelResilient({
       prompt: [
         `Review the public GitHub repository ${repo} using only the supplied public inventory and excerpts.`,
         "Return ONLY strict JSON {\"findings\":\"...\",\"opportunities\":[{\"title\":\"...\",\"kind\":\"improve-file|crosslink|docs\",\"target_path\":\"...\",\"plan\":\"...\"}]} max 10.",
@@ -101,7 +101,7 @@ async function modeInventory(audit) {
       count: treeInfo.files.length,
       summary: result.complete && result.reply ? "public inventory reviewed" : "model unavailable",
     }, { kind: "kb", status: result.complete && result.reply ? "ok" : "deferred", repository: repo });
-    audit.note("inventory", `public files=${treeInfo.files.length} complete=${result.complete}`);
+    audit.note("inventory", `public files=${treeInfo.files.length} complete=${result.complete} ladders=${result.ladders || 0}`);
     return result.complete && result.reply ? 0 : 6;
   }
   { const { gatewayDown } = await import("./lib/gateway-health.mjs"); if (gatewayDown(REPO_ROOT)) { console.log("KB_SKIPPED=circuit-open"); return 0; } }
@@ -119,8 +119,8 @@ async function modeInventory(audit) {
     "Return ONLY strict JSON: {\"findings\":\"...\",\"opportunities\":[{\"title\":\"...\",\"kind\":\"new-file|improve-file|merge|crosslink\",\"target_path\":\"<kb path>\",\"plan\":\"...\"}]} max 10, deepest synthesis quality.",
     digest,
   ].join("\n");
-  const result = await askModel({ prompt, timeoutMs: 600000, env: process.env, preferVariantMax: true, maxRounds: 4 });
-  audit.note("inventory", `complete=${result.complete}`);
+  const result = await askModelResilient({ prompt, timeoutMs: 600000, env: process.env, preferVariantMax: true, maxRounds: 5 });
+  audit.note("inventory", `complete=${result.complete} ladders=${result.ladders || 0}`);
   if (!result.complete || !result.reply) throw Object.assign(new Error("MODEL_UNAVAILABLE"), { code: 6, reason: "MODEL_UNAVAILABLE" });
   const dir = process.env.FLEET_ARTIFACT_DIR || ".";
   mkdirSync(dir, { recursive: true });

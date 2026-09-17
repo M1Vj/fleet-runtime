@@ -145,7 +145,7 @@ async function main() {
 
   const pr = gh(["api", `/repos/${repo}/pulls/${prNumber}`], process.env);
   const comments = gh(["api", `/repos/${repo}/issues/${prNumber}/comments?per_page=20`], process.env) || [];
-  const lastJudge = [...comments].reverse().find((c) => c.body && c.body.includes("fleet judge panel"));
+  const lastJudge = [...comments].reverse().find((c) => c.body && (c.body.includes("fleet multi-agent audit panel") || c.body.includes("fleet judge panel")));
   if (!lastJudge) throw new Error("no judge feedback found");
   const blockersSection = lastJudge.body.split("**Blockers:**")[1] || "";
   const blockerLines = blockersSection.split("\n").filter((l) => l.trim().startsWith("- ")).slice(0, 8);

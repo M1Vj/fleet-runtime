@@ -721,7 +721,9 @@ async function main() {
     for (const item of queue) {
       try {
         const { spawnSync } = await import("node:child_process");
-        const res = spawnSync("node", [path.join(REPO_ROOT, "scripts", "merge.mjs")], {
+        const { fileURLToPath } = await import("node:url");
+        const scriptPath = fileURLToPath(import.meta.url);
+        const res = spawnSync("node", [scriptPath], {
           encoding: "utf8",
           timeout: 3600000,
           env: {

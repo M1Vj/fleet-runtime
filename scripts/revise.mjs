@@ -145,10 +145,28 @@ async function main() {
 
   const pr = gh(["api", `/repos/${repo}/pulls/${prNumber}`], process.env);
   const comments = gh(["api", `/repos/${repo}/issues/${prNumber}/comments?per_page=20`], process.env) || [];
-  const lastJudge = [...comments].reverse().find((c) => c.body && (c.body.includes("fleet multi-agent audit panel") || c.body.includes("fleet judge panel")));
-  if (!lastJudge) throw new Error("no judge feedback found");
-  const blockersSection = lastJudge.body.split("**Blockers:**")[1] || "";
-  const blockerLines = blockersSection.split("\n").filter((l) => l.trim().startsWith("- ")).slice(0, 8);
+  const lastFeedback = [...comments].reverse().find((c) =>
+    c.body && (
+      c.body.includes("fleet multi-agent audit panel") ||
+      c.body.includes("fleet judge panel") ||
+      c.body.includes("deterministic checks FAILED")
+    )
+  );
+  if (!lastFeedback) throw new Error("no judge or deterministic feedback found");
+
+  const isDetFailure = lastFeedback.body.includes("deterministic checks FAILED");
+  let blockerLines = [];
+  if (isDetFailure) {
+    const codeBlockMatch = lastFeedback.body.match(/```(?:[\w-]+)?\n([\s\S]*?)\n```/);
+    const rawError = codeBlockMatch ? codeBlockMatch[1] : lastFeedback.body;
+    blockerLines = [
+      "DETERMINISTIC CHECKS FAILED (TEST/BUILD/LOCKFILE ERROR):",
+      ...rawError.split("\n").filter(Boolean).slice(-20).map((l) => `- ${l}`),
+    ];
+  } else {
+    const blockersSection = lastFeedback.body.split("**Blockers:**")[1] || "";
+    blockerLines = blockersSection.split("\n").filter((l) => l.trim().startsWith("- ")).slice(0, 8);
+  }
 
   const filesApi = gh(["api", `/repos/${repo}/pulls/${prNumber}/files?per_page=100`], process.env) || [];
   const changedPaths = filesApi.map((f) => f.filename);
@@ -158,8 +176,8 @@ async function main() {
     .slice(0, 30000);
 
   const promptV3 = [
-    `You are the REVISION agent for your own change to ${repo} (PR #${prNumber}). Independent judges REJECTED it.`,
-    "Fix every blocker below by returning corrected/new FULL files.",
+    `You are the REVISION agent for ${repo} (PR #${prNumber}). ${isDetFailure ? "Deterministic verification checks (install / build / test) FAILED." : "Independent judges REJECTED it."}`,
+    "Fix every blocker and error below by returning corrected/new FULL files so that tests and builds pass.",
     "Respond in EXACTLY this plain-text format:",
     "REVISED",
     "SUMMARY: <one line>",
@@ -170,14 +188,14 @@ async function main() {
     "```",
     "Rules: only files already present in the diff, plus at most 2 new supporting files; never delete documentation/security sections; make the required CI check hermetic or explicitly gated behind a repository variable with a clear skip reason; keep fail-fast guards.",
     "",
-    "JUDGE BLOCKERS:",
+    "BLOCKERS / FAILURE OUTPUT:",
     blockerLines.join("\n"),
     "",
     "CURRENT DIFF:",
     diffText,
     "",
-    "FULL JUDGE COMMENT:",
-    lastJudge.body.slice(0, 5000),
+    "FULL FEEDBACK COMMENT:",
+    lastFeedback.body.slice(0, 5000),
   ].join("\n");
 
   if (pr.state !== "open") {
@@ -250,6 +268,14 @@ async function main() {
         message: `[fleet-revise] update ${f.path} (round ${used + 1})`,
         content: Buffer.from(f.content, "utf8").toString("base64"),
         branch,
+        committer: {
+          name: identity.name,
+          email: identity.email,
+        },
+        author: {
+          name: identity.name,
+          email: identity.email,
+        },
         ...(sha ? { sha } : {}),
       },
       process.env,

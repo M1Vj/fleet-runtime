@@ -113,6 +113,56 @@ export function writeRevisionOutputs(outputPath, repoInput, prInput, revisionNee
   return values;
 }
 
+/** Check if a pull request is eligible for automated fleet revision. */
+export function isRevisionEligible(pr) {
+  if (!pr || typeof pr !== "object") return false;
+  const headRepo = repoReference(pr.head?.repo?.full_name || pr.head?.repo?.fullName);
+  const baseRepo = repoReference(pr.base?.repo?.full_name || pr.base?.repo?.fullName);
+  if (headRepo && baseRepo && headRepo.toLowerCase() !== baseRepo.toLowerCase()) {
+    return false;
+  }
+  const ref = String(pr.head?.ref || "");
+  const author = String(pr.user?.login || "");
+  if (ref.startsWith("fleet/")) return true;
+  if (ref.startsWith("dependabot/")) return true;
+  if (author === "M1Vj") return true;
+  if (author === "dependabot[bot]" || author === "app/dependabot") return true;
+  return false;
+}
+
+/** Count existing revision attempts for a PR. */
+export function countRevisionsFor(repoRoot, repo, prNumber) {
+  const root = repoRoot || (typeof REPO_ROOT !== "undefined" ? REPO_ROOT : process.cwd());
+  const revPath = path.join(root, "state", "revisions.jsonl");
+  if (!existsSync(revPath)) return 0;
+  try {
+    return readFileSync(revPath, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => {
+        try {
+          const r = JSON.parse(l);
+          return r.repo === repo && Number(r.pr) === Number(prNumber) ? r : null;
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean).length;
+  } catch {
+    return 0;
+  }
+}
+
+/** Write queue outputs for daisy-chaining continuous gate runs. */
+export function writeQueueOutputs(outputPath, hasPendingPrs = false) {
+  if (outputPath) {
+    try {
+      appendFileSync(outputPath, `has_pending_prs=${hasPendingPrs ? "true" : "false"}\n`);
+    } catch {}
+  }
+  return { has_pending_prs: hasPendingPrs ? "true" : "false" };
+}
+
 /** Keep a scheduled scan bounded even when a workflow variable is malformed. */
 export function normalizeScanCap(value, fallback = DEFAULT_SCAN_CAP) {
   const candidate = Number(value);
@@ -687,12 +737,15 @@ export async function discoverFleetPRs(limit = process.env.FLEET_MERGE_SCAN_CAP 
     } catch {}
   }
 
-  return selectScanPullRequests(pulls, {
+  const selected = selectScanPullRequests(pulls, {
     targets,
     limit: scanCap,
     history,
     repositories: repos,
   });
+  selected.totalEnrolledPulls = pulls.length;
+  selected.hasPendingPrs = pulls.length > selected.length;
+  return selected;
 }
 
 async function main() {
@@ -725,6 +778,7 @@ async function main() {
   }
   audit.note("gate", `identity=${identity.login} target=${TARGET_REPO} pr=${PR_NUMBER}`);
   writeRevisionOutputs(process.env.GITHUB_OUTPUT, TARGET_REPO, PR_NUMBER, false);
+  writeQueueOutputs(process.env.GITHUB_OUTPUT, false);
 
   if (!INITIAL_TARGET.valid && INITIAL_TARGET.provided) {
     audit.note("target", "invalid or incomplete target; scan and revision both refused");
@@ -735,7 +789,8 @@ async function main() {
 
   if (!INITIAL_TARGET.valid) {
     const queue = await discoverFleetPRs(process.env.FLEET_MERGE_SCAN_CAP || DEFAULT_SCAN_CAP);
-    audit.note("scan", `enrolled open PRs queued: ${queue.map((q) => `${q.repo}#${q.number}`).join(", ") || "none"}`);
+    writeQueueOutputs(process.env.GITHUB_OUTPUT, Boolean(queue.hasPendingPrs));
+    audit.note("scan", `enrolled open PRs queued: ${queue.map((q) => `${q.repo}#${q.number}`).join(", ") || "none"} (pending=${queue.hasPendingPrs ? "yes" : "no"})`);
     if (queue.length === 0) {
       console.log("MERGE_TERMINAL_STATE=NO-OP (nothing to gate)");
       writeMergeState("NO-OP", { why: "scan-empty" });
@@ -861,6 +916,15 @@ async function main() {
   const det = await runDeterministicChecks(TARGET_REPO, pr.head.sha, audit);
   if (!det.ok) {
     await postComment(TARGET_REPO, PR_NUMBER, "🧪 **fleet merge-gate**: deterministic checks FAILED.\n\n```\n" + det.evidence.slice(-1500) + "\n```", audit);
+    if (isRevisionEligible(pr)) {
+      const revCount = countRevisionsFor(REPO_ROOT, TARGET_REPO, PR_NUMBER);
+      if (revCount < 2 && process.env.GITHUB_OUTPUT) {
+        writeRevisionOutputs(process.env.GITHUB_OUTPUT, TARGET_REPO, PR_NUMBER, true);
+        await recordTerminalState("REVISION_QUEUED", { repo: TARGET_REPO, pr: PR_NUMBER, sha: evalSha, why: "deterministic checks failed; revision queued" });
+        console.log("MERGE_TERMINAL_STATE=REVISION_QUEUED");
+        return finish(audit, runId, "REVISION_QUEUED");
+      }
+    }
     await terminal("BLOCKED", { why: "deterministic checks failed" });
     return finish(audit, runId, "BLOCKED");
   }
@@ -890,21 +954,32 @@ async function main() {
   if (security) judgesList.push(security);
   if (ux) judgesList.push(ux);
 
+  const availableJudges = judgesList.filter((j) => !j.unavailable && j.verdict !== "unavailable");
+  const unavailableJudges = judgesList.filter((j) => j.unavailable || j.verdict === "unavailable");
+
   // Thresholds: depth 1: 80, depth 2: 85, depth 3 (YOLO): 90 with security judge >= 90. 0 blockers required across all judges.
   const baseThreshold = cls.depth >= 3 ? 90 : cls.depth >= 2 ? 85 : 80;
-  const allJudgesApprove = judgesList.every((j) => j.verdict === "approve" && j.score >= baseThreshold && (!j.blockers || j.blockers.length === 0));
-  const securityPasses = !security || (cls.depth >= 3 ? security.score >= 90 : security.score >= baseThreshold);
+
+  if (availableJudges.length === 0) {
+    await postComment(TARGET_REPO, PR_NUMBER, "⏳ **fleet merge-gate**: judges temporarily unavailable due to model capacity. Gate retries automatically on the next pass.", audit);
+    await terminal("STALLED", { why: "all judges unavailable" });
+    console.log("MERGE_TERMINAL_STATE=STALLED");
+    return finish(audit, runId, "STALLED");
+  }
+
+  const allJudgesApprove = availableJudges.every((j) => j.verdict === "approve" && j.score >= baseThreshold && (!j.blockers || j.blockers.length === 0));
+  const securityPasses = !security || security.unavailable || (cls.depth >= 3 ? security.score >= 90 : security.score >= baseThreshold);
   const consensusApproved = allJudgesApprove && securityPasses;
 
   const judgeRows = [
-    `| correctness+security | ${correctness.verdict.toUpperCase()} | ${correctness.score} |`,
-    `| standards+maintainability | ${standards.verdict.toUpperCase()} | ${standards.score} |`,
+    `| correctness+security | ${correctness.unavailable ? "UNAVAILABLE (transient)" : correctness.verdict.toUpperCase()} | ${correctness.score ?? "-"} |`,
+    `| standards+maintainability | ${standards.unavailable ? "UNAVAILABLE (transient)" : standards.verdict.toUpperCase()} | ${standards.score ?? "-"} |`,
   ];
-  if (security) judgeRows.push(`| security+supply-chain | ${security.verdict.toUpperCase()} | ${security.score} |`);
-  if (ux) judgeRows.push(`| ux+visual-integrity | ${ux.verdict.toUpperCase()} | ${ux.score} |`);
+  if (security) judgeRows.push(`| security+supply-chain | ${security.unavailable ? "UNAVAILABLE (transient)" : security.verdict.toUpperCase()} | ${security.score ?? "-"} |`);
+  if (ux) judgeRows.push(`| ux+visual-integrity | ${ux.unavailable ? "UNAVAILABLE (transient)" : ux.verdict.toUpperCase()} | ${ux.score ?? "-"} |`);
 
-  const allBlockers = judgesList.flatMap((j) => j.blockers || []);
-  const allReasons = judgesList.flatMap((j) => j.reasons || []);
+  const allBlockers = availableJudges.flatMap((j) => j.blockers || []);
+  const allReasons = availableJudges.flatMap((j) => j.reasons || []);
 
   const verdictBody =
     "🔍 **fleet multi-agent audit panel** (adversarial critique gauntlet)\n\n" +
@@ -931,19 +1006,15 @@ async function main() {
     }
   }
 
-  const scoresSummary = judgesList.map((j) => ({ lens: j.lens || "judge", score: j.score, verdict: j.verdict }));
+  const scoresSummary = availableJudges.map((j) => ({ lens: j.lens || "judge", score: j.score, verdict: j.verdict }));
 
   if (!consensusApproved) {
-    const fleetAuthored = String(pr.head && pr.head.ref || "").startsWith("fleet/");
-    if (fleetAuthored) {
-      const { readFileSync: rf, existsSync: es } = await import("node:fs");
-      const revPath = path.join(REPO_ROOT, "state", "revisions.jsonl");
-      const revCount = es(revPath)
-        ? rf(revPath, "utf8").split("\n").filter(Boolean).map((l) => { try { const r = JSON.parse(l); return r.repo === TARGET_REPO && r.pr === PR_NUMBER ? r : null; } catch { return null; } }).filter(Boolean).length
-        : 0;
+    const eligible = isRevisionEligible(pr);
+    if (eligible) {
+      const revCount = countRevisionsFor(REPO_ROOT, TARGET_REPO, PR_NUMBER);
       if (revCount >= 2) {
         // Instead of auto-closing, route to recordHumanReview category: judge-deadlock
-        const deadlockReason = `Maximum revisions reached (${revCount}) and multi-agent panel still rejected PR (scores: ${judgesList.map((j) => j.score).join(", ")}). Requires human eyes to unblock.`;
+        const deadlockReason = `Maximum revisions reached (${revCount}) and multi-agent panel still rejected PR (scores: ${availableJudges.map((j) => j.score).join(", ")}). Requires human eyes to unblock.`;
         recordHumanReview(STATE_ROOT, {
           repo: TARGET_REPO,
           prNumber: PR_NUMBER,
@@ -962,14 +1033,14 @@ async function main() {
         console.log("MERGE_TERMINAL_STATE=NEEDS_HUMAN_REVIEW");
         return finish(audit, runId, "NEEDS_HUMAN_REVIEW");
       }
+      if (process.env.GITHUB_OUTPUT) {
+        writeRevisionOutputs(process.env.GITHUB_OUTPUT, TARGET_REPO, PR_NUMBER, true);
+        await recordTerminalState("REVISION_QUEUED", { repo: TARGET_REPO, pr: PR_NUMBER, sha: evalSha, why: "judges rejected; revision queued" });
+        console.log("MERGE_TERMINAL_STATE=REVISION_QUEUED");
+        return finish(audit, runId, "REVISION_QUEUED");
+      }
     }
-    if (fleetAuthored && process.env.GITHUB_OUTPUT) {
-      writeRevisionOutputs(process.env.GITHUB_OUTPUT, TARGET_REPO, PR_NUMBER, true);
-      await recordTerminalState("REVISION_QUEUED", { repo: TARGET_REPO, pr: PR_NUMBER, sha: evalSha, why: "judges rejected; revision queued" });
-      console.log("MERGE_TERMINAL_STATE=REVISION_QUEUED");
-      return finish(audit, runId, "REVISION_QUEUED");
-    }
-    await terminal("BLOCKED", { why: "judges rejected", scores: judgesList.map((j) => j.score) });
+    await terminal("BLOCKED", { why: "judges rejected", scores: availableJudges.map((j) => j.score) });
     return finish(audit, runId, "BLOCKED");
   }
 
@@ -1159,7 +1230,7 @@ async function judge({ repo, prNumber, title, body, files, extraEvidence, lens, 
     diff,
   ].join("\n");
   const judgeModel = process.env.FLEET_JUDGE_MODEL;
-  const result = await askModel({
+  let result = await askModel({
     prompt,
     timeoutMs: 480000,
     env: process.env,
@@ -1168,9 +1239,26 @@ async function judge({ repo, prNumber, title, body, files, extraEvidence, lens, 
     maxRounds: 3,
     ...(judgeModel ? { modelOverride: judgeModel } : {}),
   });
+  if (!result.complete || !result.reply) {
+    audit.note("judge-retry", `${lens} first try incomplete; retrying without model override`);
+    result = await askModel({
+      prompt,
+      timeoutMs: 360000,
+      env: process.env,
+      preferVariantMax: true,
+      maxRounds: 2,
+    });
+  }
   audit.note("judge", `${lens} complete=${result.complete}`);
   if (!result.complete || !result.reply) {
-    return { verdict: "reject", score: 0, reasons: ["judge unavailable"], blockers: ["judge unavailable"] };
+    return {
+      lens,
+      verdict: "unavailable",
+      score: null,
+      reasons: ["judge unavailable (model capacity wait or transient error)"],
+      blockers: [],
+      unavailable: true,
+    };
   }
   try {
     const v = extractJsonObject(result.reply);

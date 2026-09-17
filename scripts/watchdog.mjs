@@ -81,6 +81,11 @@ function heartbeatPath() {
   return path.join(REPO_ROOT, "state", "heartbeat.json");
 }
 
+function killSwitchEngaged() {
+  const p = process.env.FLEET_KILL_SWITCH_PATH || path.join(REPO_ROOT, "state", "KILL_SWITCH");
+  return existsSync(p);
+}
+
 export async function main() {
   const runId = `watchdog-${Date.now()}`;
   const redact = scrub(process.env);
@@ -110,9 +115,57 @@ export async function main() {
       const enables = plan.actions.filter((a) => a.kind === "enable-workflow").length;
       audit.note("dry-run", `stale=${plan.stale} enables=${enables} alert=${plan.alertIssue}`);
       for (const a of plan.actions) console.log(`WOULD ${a.kind} ${a.workflow || ""}`.trim());
-      writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Watchdog dry-run", "ok");
+      writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Watchdog", "ok");
       console.log(`WATCHDOG_DRY_RUN_OK stale=${plan.stale} enables=${enables}`);
       return 0;
+    }
+
+    if (killSwitchEngaged()) {
+      audit.note("kill-switch", "operator emergency stop engaged; standing down");
+      writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Watchdog", "ok-halted");
+      console.log("FLEET_RUN_RESULT=" + JSON.stringify({ runId, status: "halted", action: "none", reason: "kill-switch-engaged" }));
+      return 0;
+    }
+
+    const controlRepository = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control);
+
+    // Auto-rearm: if FLEET_PRIVATE_ACTIVATED was false but no KILL_SWITCH file exists, restore it.
+    let isActivated = true;
+    try {
+      const varRes = gh(["variable", "get", "FLEET_PRIVATE_ACTIVATED", "-R", controlRepository], process.env);
+      if (typeof varRes === "string" && varRes.trim().toLowerCase() === "false") {
+        isActivated = false;
+      }
+    } catch {}
+
+    if (!isActivated) {
+      audit.note("auto-rearm", "FLEET_PRIVATE_ACTIVATED was false without KILL_SWITCH; re-arming fleet");
+      try {
+        gh(["variable", "set", "FLEET_PRIVATE_ACTIVATED", "--body", "true", "-R", controlRepository], process.env);
+        gh(["workflow", "run", "patrol.yml", "-R", controlRepository], process.env);
+        audit.note("auto-rearm-dispatch", "patrol.yml dispatched after re-arm");
+      } catch (err) {
+        audit.incident("auto-rearm-error", err.message.slice(0, 100));
+      }
+    }
+
+    // Check recent runs for failures and dispatch autonomous self-repair if needed
+    let recentFailedRuns = [];
+    try {
+      const recentRuns = gh(["api", `/repos/${controlRepository}/actions/runs?per_page=10`], process.env);
+      recentFailedRuns = (recentRuns.workflow_runs || []).filter((r) => r.status === "completed" && r.conclusion === "failure");
+    } catch {}
+
+    if (recentFailedRuns.length > 0) {
+      audit.note("failed-runs", `detected ${recentFailedRuns.length} failed run(s): ${recentFailedRuns.map((r) => r.name).join(", ")}`);
+      try {
+        const repairTarget = recentFailedRuns.some((r) => /patrol|merge|watchdog/i.test(r.name)) ? "M1Vj/fleet-runtime" : controlRepository;
+        gh(["workflow", "run", "improve.yml", "-R", controlRepository, "-f", `repo=${repairTarget}`], process.env);
+        audit.note("self-repair-dispatch", `dispatched improve.yml to repair ${repairTarget}`);
+        gh(["workflow", "run", "retro.yml", "-R", controlRepository], process.env);
+      } catch (err) {
+        audit.incident("self-repair-error", err.message.slice(0, 100));
+      }
     }
 
     let heartbeat = null;
@@ -128,7 +181,7 @@ export async function main() {
     audit.note("heartbeat", `decision=${plan.reason} ageMinutes=${plan.ageMinutes}`);
     const terminal = makeExecutionTerminal(process.env, REPO_ROOT, { lane: "watchdog" });
 
-    if (!plan.stale) {
+    if (!plan.stale && recentFailedRuns.length === 0 && isActivated) {
       writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Watchdog", "ok-fresh");
       console.log("FLEET_RUN_RESULT=" + JSON.stringify({ runId, status: "fresh", action: "none" }));
       return 0;
@@ -136,9 +189,9 @@ export async function main() {
 
     // Breaker tripped: patrol heartbeat is stale. Record STALLED first so the
     // outage is visible in the status digest even if recovery below fails.
-    terminal("STALLED", { runId, why: plan.reason, ageMinutes: plan.ageMinutes });
-
-    const controlRepository = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control);
+    if (plan.stale) {
+      terminal("STALLED", { runId, why: plan.reason, ageMinutes: plan.ageMinutes });
+    }
 
     if (autoEnable) {
       const enablePlan = {

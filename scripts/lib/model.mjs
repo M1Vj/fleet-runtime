@@ -373,6 +373,9 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
     delete childEnv.GDRIVE_CLIENT_SECRET;
     stripSlotKeys(childEnv);
     childEnv.OPENCODE_AUTH_CONTENT = authValue;
+    if (childEnv.OPENCODE_MODELS_URL && (childEnv.OPENCODE_MODELS_URL.startsWith("file:") || childEnv.OPENCODE_MODELS_URL.endsWith(".json"))) {
+      delete childEnv.OPENCODE_MODELS_URL;
+    }
     // Pin OpenCode's internal title/summary helpers to the same selected live
     // contributor model. Otherwise OpenCode may call its paid default small
     // model even though the primary `-m` argument is free and valid.

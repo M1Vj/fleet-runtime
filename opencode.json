@@ -148,13 +148,12 @@
       "reasoningEffort": "xhigh",
       "steps": 25,
       "permission": {
-        "*": "allow",
+        "*": "deny",
         "read": "allow",
         "glob": "allow",
         "grep": "allow",
         "list": "allow",
-        "lsp": "allow",
-        "doom_loop": "allow"
+        "lsp": "allow"
       }
     },
     "reviewer": {
@@ -162,13 +161,12 @@
       "reasoningEffort": "xhigh",
       "steps": 25,
       "permission": {
-        "*": "allow",
+        "*": "deny",
         "read": "allow",
         "glob": "allow",
         "grep": "allow",
         "list": "allow",
-        "lsp": "allow",
-        "doom_loop": "allow"
+        "lsp": "allow"
       }
     },
     "clerk": {
@@ -176,13 +174,12 @@
       "reasoningEffort": "xhigh",
       "steps": 20,
       "permission": {
-        "*": "allow",
+        "*": "deny",
         "read": "allow",
         "glob": "allow",
         "grep": "allow",
         "list": "allow",
-        "lsp": "allow",
-        "doom_loop": "allow"
+        "lsp": "allow"
       }
     },
     "researcher": {
@@ -190,15 +187,14 @@
       "reasoningEffort": "xhigh",
       "steps": 25,
       "permission": {
-        "*": "allow",
+        "*": "deny",
         "read": "allow",
         "glob": "allow",
         "grep": "allow",
         "list": "allow",
         "lsp": "allow",
         "webfetch": "allow",
-        "websearch": "allow",
-        "doom_loop": "allow"
+        "websearch": "allow"
       }
     }
   }

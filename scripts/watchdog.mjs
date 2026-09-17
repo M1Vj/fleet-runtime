@@ -5,8 +5,7 @@ import path from "node:path";
 import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
-import { verifyCommit, verifyIssueAuthor } from "./lib/verify.mjs";
-import { planWatchdogActions } from "./lib/watchdog-decide.mjs";
+import { planWatchdogActions, WATCHDOG_WORKFLOWS } from "./lib/watchdog-decide.mjs";
 import {
   isPublicDataClass,
   makeExecutionTerminal,
@@ -136,8 +135,8 @@ export async function main() {
     terminal("STALLED", { runId, why: plan.reason, ageMinutes: plan.ageMinutes });
 
     const enablePlan = {
-      "M1Vj/fleet-runtime": ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml", "merge.yml", "model-refresh.yml"],
-      [privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control)]: ["patrol.yml", "selftest.yml", "deep.yml", "improve.yml", "thesis.yml", "kb.yml", "retro.yml", "merge.yml", "model-refresh.yml", "orchestrate.yml"],
+      "M1Vj/fleet-runtime": WATCHDOG_WORKFLOWS,
+      [privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control)]: WATCHDOG_WORKFLOWS,
     };
     const controlRepository = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control);
     for (const [repoFullName, workflows] of Object.entries(enablePlan)) {

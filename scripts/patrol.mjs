@@ -496,7 +496,7 @@ export function planPatrolDispatches(signals, options = {}) {
 
   const priorityRepos = (Array.isArray(options.priorityRepos) && options.priorityRepos.length > 0)
     ? options.priorityRepos
-    : (Array.isArray(options.tier1) && options.tier1.length > 0 ? options.tier1.slice(0, 2) : ["VSU-SmartMap", "SangkAI-city"]);
+    : (Array.isArray(options.tier1) && options.tier1.length > 0 ? options.tier1 : []);
 
   function repoRank(repoName) {
     const norm = String(repoName || "").toLowerCase();

@@ -59,6 +59,7 @@ import {
 } from "../../packages/indefinite-core/index.mjs";
 import { publicModelEnv } from "./private-state.mjs";
 import { startIndefiniteDispatcher, getDispatcherInstance } from "./indefinite-dispatcher.mjs";
+import { getSystemPromptMemoryBlock, recordMistake, getRepoSlug } from "./persistent-memory.mjs";
 
 
 // Model-layer timeouts (ms): standard calls 480s, long-form 540s,
@@ -344,7 +345,9 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
     "EXACT SESSION / SINGLE WRITER: preserve the supplied session identity and do not create a competing writer for the same task.",
     "===================================================================="
   ].join("\n");
-  const effectivePrompt = `${antiDowngradeBlock}\n\n${prompt}`;
+  const repoRoot = workspace || env.FLEET_WORKSPACE_ROOT || process.cwd();
+  const memoryBlock = getSystemPromptMemoryBlock(repoRoot, env);
+  const effectivePrompt = [antiDowngradeBlock, memoryBlock, prompt].filter(Boolean).join("\n\n");
 
     args.push(effectivePrompt);
     const workspaceRoot = env.FLEET_WORKSPACE_ROOT || process.cwd();

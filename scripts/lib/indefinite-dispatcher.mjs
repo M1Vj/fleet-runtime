@@ -31,6 +31,64 @@ function normalizeProxyRoute(proxyUrl) {
   }
 }
 
+export const HARVEST_SOURCES = [
+  "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
+  "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+  "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+  "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+  "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+  "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/http_proxies.txt",
+  "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/http.txt",
+];
+
+export function isMitmOrCertError(reason = "") {
+  const r = String(reason || "").toLowerCase();
+  return (
+    r.includes("cert") ||
+    r.includes("self-signed") ||
+    r.includes("self_signed") ||
+    r.includes("self signed") ||
+    r.includes("unable to verify") ||
+    r.includes("unable_to_verify") ||
+    r.includes("eproto") ||
+    r.includes("depth_zero") ||
+    r.includes("tls") ||
+    r.includes("mitm")
+  );
+}
+
+export function harvestProxiesFromUrl(url, timeoutMs = 4000) {
+  return new Promise((resolve) => {
+    try {
+      const parsed = new URL(url);
+      const client = parsed.protocol === "http:" ? http : https;
+      const req = client.get(url, { timeout: timeoutMs }, (res) => {
+        if (res.statusCode !== 200) {
+          res.resume();
+          return resolve([]);
+        }
+        let data = "";
+        res.on("data", (chunk) => {
+          data += chunk;
+          if (data.length > 512 * 1024) {
+            req.destroy();
+            resolve([]);
+          }
+        });
+        res.on("end", () => {
+          const lines = data.split("\n").map((l) => l.trim()).filter(Boolean);
+          const parsedLines = lines.map(normalizeProxyRoute).filter(Boolean);
+          resolve(parsedLines);
+        });
+      });
+      req.on("error", () => resolve([]));
+      req.on("timeout", () => { req.destroy(); resolve([]); });
+    } catch {
+      resolve([]);
+    }
+  });
+}
+
 export class ProxyPool {
   constructor(filePath, options = {}) {
     this.filePath = filePath;
@@ -99,9 +157,14 @@ export class ProxyPool {
     const s = this.ensureStats(proxyUrl);
     s.failures++;
     s.lastFailureAt = this.now();
-    const cooldown = customCooldownMs > 0 ? customCooldownMs : Math.min(600000, this.defaultCooldownMs * Math.pow(2, Math.min(5, s.failures - 1)));
+    let cooldown = customCooldownMs > 0 ? customCooldownMs : Math.min(600000, this.defaultCooldownMs * Math.pow(2, Math.min(5, s.failures - 1)));
+    if (isMitmOrCertError(reason)) {
+      cooldown = Math.max(cooldown, 15 * 60 * 1000);
+      s.state = "open";
+    } else if (s.failures >= 3) {
+      s.state = "open";
+    }
     s.cooldownUntil = this.now() + cooldown;
-    if (s.failures >= 3) s.state = "open";
   }
 
   isDirectRateLimited() {
@@ -121,7 +184,16 @@ export class ProxyPool {
     });
   }
 
-  pickCandidate(excludeSet = null) {
+  pickCandidate(excludeSet = null, affinityKey = null) {
+    if (affinityKey && this.affinityMap.has(affinityKey)) {
+      const preferred = this.affinityMap.get(affinityKey);
+      if (!excludeSet || !excludeSet.has(preferred)) {
+        const s = this.stats.get(preferred);
+        if (s && s.cooldownUntil <= this.now() && s.latencyEwma <= this.maxAffinityLatencyMs) {
+          return preferred;
+        }
+      }
+    }
     const healthy = this.getHealthyProxies(excludeSet);
     if (healthy.length === 0) return null;
     healthy.sort((a, b) => {
@@ -129,7 +201,30 @@ export class ProxyPool {
       const sB = this.stats.get(b)?.latencyEwma ?? 1000;
       return sA - sB;
     });
-    return healthy[0];
+    const chosen = healthy[0];
+    if (affinityKey && chosen) {
+      this.affinityMap.set(affinityKey, chosen);
+    }
+    return chosen;
+  }
+
+  async harvest(sources = HARVEST_SOURCES, options = {}) {
+    const timeoutMs = options.timeoutMs || 4000;
+    const added = [];
+    const existing = new Set(this.proxies);
+    for (const src of sources) {
+      const candidates = await harvestProxiesFromUrl(src, timeoutMs);
+      for (const c of candidates) {
+        if (!existing.has(c)) {
+          existing.add(c);
+          this.proxies.push(c);
+          this.ensureStats(c);
+          added.push(c);
+        }
+      }
+      if (added.length >= 100) break;
+    }
+    return added;
   }
 }
 
@@ -187,6 +282,17 @@ export function startIndefiniteDispatcher(options = {}) {
         totalProxies: pool.proxies.length,
         directRateLimited: pool.isDirectRateLimited(),
       }));
+    }
+
+    if (url.pathname === "/harvest" && req.method === "POST") {
+      pool.harvest().then((added) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok", added: added.length, total: pool.proxies.length }));
+      }).catch((err) => {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      });
+      return;
     }
 
     const chunks = [];
@@ -249,6 +355,7 @@ export function startIndefiniteDispatcher(options = {}) {
     const targetHost = match[1];
     const targetPort = Number(match[2]);
     const target = `${targetHost}:${targetPort}`;
+    const affinityKey = req.headers ? (req.headers["x-session-id"] || req.headers["session-id"] || req.headers["x-correlation-id"] || null) : null;
 
     const useDirect = !pool.isDirectRateLimited() && (pool.proxies.length === 0 || targetHost !== "opencode.ai");
 
@@ -285,7 +392,7 @@ export function startIndefiniteDispatcher(options = {}) {
     function tryNextProxy() {
       if (connected || clientSocket.destroyed) return;
       attempt++;
-      const candidate = pool.pickCandidate(tried);
+      const candidate = pool.pickCandidate(tried, affinityKey);
       if (candidate) tried.add(candidate);
 
       if (!candidate || attempt > maxAttempts) {
@@ -322,7 +429,8 @@ export function startIndefiniteDispatcher(options = {}) {
         }
         if (res.statusCode !== 200) {
           proxySocket.destroy();
-          pool.recordFailure(candidate, `STATUS_${res.statusCode}`);
+          const customCooldown = (res.statusCode === 407 || res.statusCode === 403) ? 15 * 60 * 1000 : 0;
+          pool.recordFailure(candidate, `STATUS_${res.statusCode}`, customCooldown);
           tryNextProxy();
           return;
         }
@@ -350,7 +458,8 @@ export function startIndefiniteDispatcher(options = {}) {
       });
 
       proxyReq.on("error", (err) => {
-        pool.recordFailure(candidate, err.message);
+        const customCooldown = isMitmOrCertError(err.message) ? 15 * 60 * 1000 : 0;
+        pool.recordFailure(candidate, err.message, customCooldown);
         tryNextProxy();
       });
 

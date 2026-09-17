@@ -32,6 +32,27 @@ test("planWatchdogActions plans recovery for all 10 operational workflows when s
   assert.deepEqual(enabledWfs, [...WATCHDOG_WORKFLOWS].sort());
 });
 
+test("planWatchdogActions respects autoEnable=false and emits zero enable actions in fleet-runtime", () => {
+  const now = Date.now();
+  const heartbeat = { lastRunUtc: new Date(now - 3 * 3600 * 1000).toISOString() };
+  const plan = planWatchdogActions(heartbeat, now, 90 * 60 * 1000, { autoEnable: false });
+  assert.equal(plan.stale, true);
+  assert.equal(plan.alertIssue, true);
+  const enableActions = plan.actions.filter((a) => a.kind === "enable-workflow");
+  assert.equal(enableActions.length, 0);
+});
+
+test("watchdog-recipes.mjs exports all watchdog decision recipes and helpers in fleet-runtime", async () => {
+  const recipes = await import("../scripts/lib/watchdog-recipes.mjs");
+  const decide = await import("../scripts/lib/watchdog-decide.mjs");
+  assert.deepEqual(recipes.WATCHDOG_WORKFLOWS, decide.WATCHDOG_WORKFLOWS);
+  assert.equal(typeof recipes.planWatchdogActions, "function");
+  assert.equal(typeof recipes.watchdogAutoEnableEnabled, "function");
+  assert.equal(recipes.watchdogAutoEnableEnabled("true"), true);
+  assert.equal(recipes.watchdogAutoEnableEnabled("false"), false);
+  assert.equal(recipes.watchdogAutoEnableEnabled(undefined), false);
+});
+
 test("opencode.json defines all 14 agent roles with strict permission bounds in fleet-runtime", () => {
   const opencodePath = path.resolve("opencode.json");
   const config = JSON.parse(fs.readFileSync(opencodePath, "utf8"));

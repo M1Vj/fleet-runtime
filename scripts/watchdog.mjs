@@ -103,7 +103,9 @@ export async function main() {
 
     if (process.env.FLEET_WATCHDOG_DRY_RUN === "1") {
       const synthetic = { lastRunUtc: new Date(Date.now() - 4 * 3600 * 1000).toISOString() };
-      const plan = planWatchdogActions(synthetic, Date.now());
+      const plan = planWatchdogActions(synthetic, Date.now(), 90 * 60 * 1000, {
+        autoEnable: process.env.FLEET_WATCHDOG_AUTO_ENABLE !== "false",
+      });
       const enables = plan.actions.filter((a) => a.kind === "enable-workflow").length;
       audit.note("dry-run", `stale=${plan.stale} enables=${enables} alert=${plan.alertIssue}`);
       for (const a of plan.actions) console.log(`WOULD ${a.kind} ${a.workflow || ""}`.trim());
@@ -120,7 +122,8 @@ export async function main() {
         heartbeat = null;
       }
     }
-    const plan = planWatchdogActions(heartbeat, Date.now());
+    const autoEnable = process.env.FLEET_WATCHDOG_AUTO_ENABLE !== "false";
+    const plan = planWatchdogActions(heartbeat, Date.now(), 90 * 60 * 1000, { autoEnable });
     audit.note("heartbeat", `decision=${plan.reason} ageMinutes=${plan.ageMinutes}`);
     const terminal = makeExecutionTerminal(process.env, REPO_ROOT, { lane: "watchdog" });
 
@@ -134,21 +137,25 @@ export async function main() {
     // outage is visible in the status digest even if recovery below fails.
     terminal("STALLED", { runId, why: plan.reason, ageMinutes: plan.ageMinutes });
 
-    const enablePlan = {
-      "M1Vj/fleet-runtime": WATCHDOG_WORKFLOWS,
-      [privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control)]: WATCHDOG_WORKFLOWS,
-    };
-    const controlRepository = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control);
-    for (const [repoFullName, workflows] of Object.entries(enablePlan)) {
-      for (const wf of workflows) {
-        try {
-          gh(["api", "-X", "PUT", `/repos/${repoFullName}/actions/workflows/${wf}/enable`], process.env);
-          audit.note("re-enable", `${repoFullName}/${wf}`);
-        } catch (err) {
-          if (!/404|not found/i.test(String(err.message))) throw err;
-          audit.note("re-enable-skip", `${repoFullName}/${wf} absent`);
+    if (autoEnable) {
+      const enablePlan = {
+        "M1Vj/fleet-runtime": WATCHDOG_WORKFLOWS,
+        [privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control)]: WATCHDOG_WORKFLOWS,
+      };
+      const controlRepository = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control);
+      for (const [repoFullName, workflows] of Object.entries(enablePlan)) {
+        for (const wf of workflows) {
+          try {
+            gh(["api", "-X", "PUT", `/repos/${repoFullName}/actions/workflows/${wf}/enable`], process.env);
+            audit.note("re-enable", `${repoFullName}/${wf}`);
+          } catch (err) {
+            if (!/404|not found/i.test(String(err.message))) throw err;
+            audit.note("re-enable-skip", `${repoFullName}/${wf} absent`);
+          }
         }
       }
+    } else {
+      audit.note("re-enable-skipped", "FLEET_WATCHDOG_AUTO_ENABLE is false");
     }
     const queuePath = path.join(REPO_ROOT, "state", "queue.jsonl");
     let queueStats = { requeued: 0, stalled: 0 };

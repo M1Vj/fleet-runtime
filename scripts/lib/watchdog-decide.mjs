@@ -19,6 +19,11 @@ export const WATCHDOG_WORKFLOWS = [
   "orchestrate.yml",
 ];
 
+/** Enable workflow recovery only when auto-enable is not explicitly disabled. */
+export function watchdogAutoEnableEnabled(value) {
+  return value === "true" || value === true;
+}
+
 export function planWatchdogActions(heartbeat, nowMs = Date.now(), thresholdMs = 90 * 60 * 1000, options = {}) {
   const decision = decideStale(heartbeat && heartbeat.lastRunUtc, nowMs, thresholdMs);
   if (String(options?.dataClass || "").toLowerCase() === "public") {
@@ -27,10 +32,15 @@ export function planWatchdogActions(heartbeat, nowMs = Date.now(), thresholdMs =
   if (!decision.stale) {
     return { ...decision, actions: [], alertIssue: false };
   }
+  const autoEnable = options?.autoEnable !== false;
+  const enableActions = autoEnable
+    ? WATCHDOG_WORKFLOWS.map((wf) => ({ kind: "enable-workflow", workflow: wf }))
+    : [];
   return {
     ...decision,
+    autoEnable,
     actions: [
-      ...WATCHDOG_WORKFLOWS.map((wf) => ({ kind: "enable-workflow", workflow: wf })),
+      ...enableActions,
       { kind: "file-alert-issue", title: `[WATCHDOG] patrol stale since ${heartbeat && heartbeat.lastRunUtc ? heartbeat.lastRunUtc : "unknown"}` },
     ],
     alertIssue: true,

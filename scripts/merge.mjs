@@ -248,7 +248,7 @@ function scanPullSortKey(pull, history) {
   const created = parseTimestamp(pull?.created_at || pull?.createdAt || pull?.opened_at || pull?.openedAt, Number.POSITIVE_INFINITY);
   const visited = latestVisitTime(pull, history);
   const updated = parseTimestamp(pull?.updated_at || pull?.updatedAt || pull?.last_updated_at || pull?.lastUpdatedAt, Number.POSITIVE_INFINITY);
-  return [created, visited, updated, pullRepo(pull).toLowerCase(), pullNumber(pull)];
+  return [visited, created, updated, pullRepo(pull).toLowerCase(), pullNumber(pull)];
 }
 
 function compareScanPulls(a, b, history) {
@@ -407,6 +407,25 @@ export function mergeAlreadyRecorded(mergesPath, repo, prNumber, headSha) {
     }
   } catch {}
   return false;
+}
+
+// Read merges.jsonl history for LRU/fair round-robin PR scan rotation.
+export function readMergesHistory(mergesPath) {
+  try {
+    if (!mergesPath || !existsSync(mergesPath)) return [];
+    const entries = [];
+    for (const line of readFileSync(mergesPath, "utf8").split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const r = JSON.parse(trimmed);
+        if (r && typeof r === "object") entries.push(r);
+      } catch {}
+    }
+    return entries;
+  } catch {
+    return [];
+  }
 }
 
 const CI_BAD_CONCLUSIONS = new Set(["failure", "cancelled", "timed_out", "action_required", "stale"]);
@@ -629,6 +648,7 @@ async function runHygiene(identity, audit) {
 }
 
 export async function discoverFleetPRs(limit = process.env.FLEET_MERGE_SCAN_CAP || DEFAULT_SCAN_CAP, options = {}) {
+  const history = Array.isArray(options.history) ? options.history : readMergesHistory(MERGES_PATH);
   if (isPublicDataClass(process.env)) {
     const repository = publicRepository(process.env);
     const pulls = collectScanPages(
@@ -638,7 +658,7 @@ export async function discoverFleetPRs(limit = process.env.FLEET_MERGE_SCAN_CAP 
     return selectScanPullRequests(pulls, {
       targets: { tier1: [repository], excluded: [] },
       limit: normalizeScanCap(limit),
-      history: options.history || [],
+      history,
       repositories: [{ full_name: repository, private: false, visibility: "public" }],
     });
   }
@@ -666,7 +686,7 @@ export async function discoverFleetPRs(limit = process.env.FLEET_MERGE_SCAN_CAP 
   return selectScanPullRequests(pulls, {
     targets,
     limit: scanCap,
-    history: options.history || [],
+    history,
     repositories: repos,
   });
 }

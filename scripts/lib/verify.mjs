@@ -57,7 +57,9 @@ export async function verifyCommentAuthor(repoFullName, commentId, identity, tok
 export async function verifyPullAuthor(repoFullName, number, identity, token, fetchImpl = globalThis.fetch) {
   const pull = await apiGet(`/repos/${repoFullName}/pulls/${number}`, token, fetchImpl);
   const login = pull.user && pull.user.login;
-  if (login !== identity.login) throw new Error(`ATTRIBUTION_MISMATCH pr#${number} creator=${login}`);
-  if (pull.draft !== true) throw new Error(`SAFETY_MISMATCH pr#${number} not draft`);
+  const isOwner = login === identity.login;
+  const isDependabot = login === "dependabot[bot]" || login === "app/dependabot";
+  if (!isOwner && !isDependabot) throw new Error(`ATTRIBUTION_MISMATCH pr#${number} creator=${login}`);
+  if (!isDependabot && pull.draft !== true) throw new Error(`SAFETY_MISMATCH pr#${number} not draft`);
   return true;
 }

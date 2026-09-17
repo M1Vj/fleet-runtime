@@ -12,6 +12,7 @@ import {
   collectScanPages,
   classifyTestResult,
   mutationAllowed,
+  readMergesHistory,
 } from "../scripts/merge.mjs";
 
 const targets = {
@@ -206,3 +207,44 @@ test("merge gate keeps deterministic test failures blocking and persists scan-em
   assert.match(source, /const testVerdict = classifyTestResult\(t\)/);
   assert.match(source, /writeMergeState\("NO-OP", \{ why: "scan-empty" \}\);\s*return finish\(audit, runId, "NO-OP"\);/s);
 });
+
+test("readMergesHistory parses valid jsonl lines and ignores empty/malformed lines", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "merges-test-"));
+  const filePath = path.join(dir, "merges.jsonl");
+  try {
+    writeFileSync(filePath, '{"t":"2026-09-17T00:00:00Z","repo":"a/b","pr":1}\n\nnot-json\n{"t":"2026-09-17T01:00:00Z","repo":"c/d","pr":2}\n', "utf8");
+    const history = readMergesHistory(filePath);
+    assert.equal(history.length, 2);
+    assert.equal(history[0].repo, "a/b");
+    assert.equal(history[1].repo, "c/d");
+    assert.deepEqual(readMergesHistory("/nonexistent-path"), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("unvisited newer PRs are prioritized over older visited PRs to prevent queue starvation", () => {
+  const pulls = [
+    {
+      repo: "M1Vj/enrolled",
+      number: 1,
+      state: "open",
+      created_at: "2022-01-01T00:00:00Z",
+      updated_at: "2022-01-01T00:00:00Z",
+    },
+    {
+      repo: "M1Vj/enrolled",
+      number: 102,
+      state: "open",
+      created_at: "2026-09-15T00:00:00Z",
+      updated_at: "2026-09-15T00:00:00Z",
+    },
+  ];
+  const selected = selectScanPullRequests(pulls, {
+    targets,
+    limit: 1,
+    history: [{ repo: "M1Vj/enrolled", pr: 1, selectedAt: "2026-09-17T07:00:00Z" }],
+  });
+  assert.deepEqual(selected.map((pull) => pull.number), [102]);
+});
+

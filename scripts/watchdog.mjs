@@ -6,7 +6,7 @@ import { runGate } from "./lib/gate.mjs";
 import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
 import { verifyCommit, verifyIssueAuthor } from "./lib/verify.mjs";
-import { planWatchdogActions, WATCHDOG_WORKFLOWS } from "./lib/watchdog-recipes.mjs";
+import { planWatchdogActions, WATCHDOG_WORKFLOWS, DEFAULT_WATCHDOG_THRESHOLD_MS } from "./lib/watchdog-recipes.mjs";
 import {
   isPublicDataClass,
   makeExecutionTerminal,
@@ -177,7 +177,8 @@ export async function main() {
       }
     }
     const autoEnable = process.env.FLEET_WATCHDOG_AUTO_ENABLE !== "false";
-    const plan = planWatchdogActions(heartbeat, Date.now(), 90 * 60 * 1000, { autoEnable });
+    const staleThresholdMs = Number(process.env.FLEET_STALE_THRESHOLD_MS) || DEFAULT_WATCHDOG_THRESHOLD_MS;
+    const plan = planWatchdogActions(heartbeat, Date.now(), staleThresholdMs, { autoEnable });
     audit.note("heartbeat", `decision=${plan.reason} ageMinutes=${plan.ageMinutes}`);
     const terminal = makeExecutionTerminal(process.env, REPO_ROOT, { lane: "watchdog" });
 

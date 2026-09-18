@@ -1,4 +1,6 @@
-export function decideStale(lastRunUtc, nowMs = Date.now(), thresholdMs = 90 * 60 * 1000) {
+export const DEFAULT_WATCHDOG_THRESHOLD_MS = 25 * 60 * 1000;
+
+export function decideStale(lastRunUtc, nowMs = Date.now(), thresholdMs = DEFAULT_WATCHDOG_THRESHOLD_MS) {
   const stamp = typeof lastRunUtc === "string" ? lastRunUtc.trim() : "";
   if (!stamp) return { stale: true, ageMinutes: null, reason: "no-heartbeat" };
   const last = Date.parse(stamp);
@@ -64,7 +66,7 @@ export function findWatchdogAlertIssue(fetchPage, { maxPages = MAX_WATCHDOG_ALER
   return selectWatchdogAlertIssue(pages);
 }
 
-export function planWatchdogActions(heartbeat, nowMs = Date.now(), thresholdMs = 90 * 60 * 1000, options = {}) {
+export function planWatchdogActions(heartbeat, nowMs = Date.now(), thresholdMs = DEFAULT_WATCHDOG_THRESHOLD_MS, options = {}) {
   const decision = decideStale(heartbeat && heartbeat.lastRunUtc, nowMs, thresholdMs);
   if (String(options?.dataClass || "").toLowerCase() === "public") {
     return { ...decision, actions: [], alertIssue: false, dataClass: "public", readOnly: true };

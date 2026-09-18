@@ -242,6 +242,7 @@ export async function collectSignals(env, audit, options = {}) {
           title: p.title,
           draft: p.draft,
           updated: p.updated_at,
+          headSha: p.head?.sha || null,
           ...(p.created_at ? { created: p.created_at } : {}),
         })),
         activeIssues: issues.filter((i) => !i.pull_request).map((i) => ({ n: i.number, title: i.title, updated: i.updated_at })),
@@ -538,8 +539,10 @@ export function planPatrolDispatches(signals, options = {}) {
       if (!pr || pr.draft === true) continue;
       const prNumber = Number(pr.n ?? pr.number);
       if (!Number.isSafeInteger(prNumber) || prNumber <= 0) continue;
+      const headSha = pr.headSha || pr.head_sha || pr.head?.sha || "";
       const updated = String(pr.updated ?? pr.updated_at ?? "");
-      const key = eventKey("dispatch-merge", signal.repo, String(prNumber), updated);
+      const dispatchToken = headSha || updated;
+      const key = eventKey("dispatch-merge", signal.repo, String(prNumber), dispatchToken);
       const lastObserved = observedLedgerTime(ledger, key);
       if (lastObserved === undefined) {
         prDispatches.push({

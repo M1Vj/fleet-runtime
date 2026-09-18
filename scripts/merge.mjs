@@ -447,7 +447,7 @@ export function isTier1Eligible(targets, repo) {
   return Array.isArray(targets.tier1) && targets.tier1.includes(repo);
 }
 
-// Ledger idempotency: never re-gate an exact SHA already merged successfully.
+// Ledger idempotency: never re-gate an exact SHA already merged or terminal.
 export function mergeAlreadyRecorded(mergesPath, repo, prNumber, headSha) {
   try {
     if (!existsSync(mergesPath)) return false;
@@ -456,7 +456,7 @@ export function mergeAlreadyRecorded(mergesPath, repo, prNumber, headSha) {
       if (!trimmed) continue;
       try {
         const r = JSON.parse(trimmed);
-        if (r.repo === repo && Number(r.pr) === Number(prNumber) && r.sha === headSha && r.state === "SUCCESS") return true;
+        if (r.repo === repo && Number(r.pr) === Number(prNumber) && r.sha === headSha && (r.state === "SUCCESS" || r.state === "BLOCKED" || r.state === "NEEDS_HUMAN_REVIEW")) return true;
       } catch {}
     }
   } catch {}
@@ -872,9 +872,9 @@ async function main() {
   await verifyPullAuthor(TARGET_REPO, PR_NUMBER, identity, process.env.FLEET_GH_TOKEN);
   if (!pr.head || !pr.head.sha) throw new Error("no head sha");
   const evalSha = pr.head.sha;
-  // Ledger idempotency: an exact SHA already merged successfully is done.
+  // Ledger idempotency: an exact SHA already recorded with terminal state is done.
   if (mergeAlreadyRecorded(MERGES_PATH, TARGET_REPO, PR_NUMBER, evalSha)) {
-    audit.note("idempotency", `SUCCESS already recorded for ${TARGET_REPO}#${PR_NUMBER}@${evalSha.slice(0, 10)}`);
+    audit.note("idempotency", `terminal state already recorded for ${TARGET_REPO}#${PR_NUMBER}@${evalSha.slice(0, 10)}`);
     console.log("MERGE_TERMINAL_STATE=NO-OP");
     return finish(audit, runId, "NO-OP");
   }

@@ -13,6 +13,7 @@ import {
   classifyTestResult,
   mutationAllowed,
   readMergesHistory,
+  mergeAlreadyRecorded,
 } from "../scripts/merge.mjs";
 
 const targets = {
@@ -246,5 +247,29 @@ test("unvisited newer PRs are prioritized over older visited PRs to prevent queu
     history: [{ repo: "M1Vj/enrolled", pr: 1, selectedAt: "2026-09-17T07:00:00Z" }],
   });
   assert.deepEqual(selected.map((pull) => pull.number), [102]);
+});
+
+test("mergeAlreadyRecorded honors terminal states (SUCCESS, BLOCKED, NEEDS_HUMAN_REVIEW) for exact sha and invalidates on new sha", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "merges-recorded-"));
+  const filePath = path.join(dir, "merges.jsonl");
+  try {
+    writeFileSync(
+      filePath,
+      JSON.stringify({ t: "2026-09-18T00:00:00Z", state: "BLOCKED", repo: "M1Vj/VSU-SmartMap", pr: 103, sha: "sha-blocked-1" }) + "\n" +
+      JSON.stringify({ t: "2026-09-18T01:00:00Z", state: "SUCCESS", repo: "M1Vj/ConceptHub", pr: 5, sha: "sha-merged-1" }) + "\n" +
+      JSON.stringify({ t: "2026-09-18T02:00:00Z", state: "NEEDS_HUMAN_REVIEW", repo: "M1Vj/vsunavigator", pr: 3, sha: "sha-review-1" }) + "\n" +
+      JSON.stringify({ t: "2026-09-18T03:00:00Z", state: "REVISION_QUEUED", repo: "M1Vj/HydraLab", pr: 2, sha: "sha-rev-1" }) + "\n",
+      "utf8",
+    );
+
+    assert.equal(mergeAlreadyRecorded(filePath, "M1Vj/VSU-SmartMap", 103, "sha-blocked-1"), true);
+    assert.equal(mergeAlreadyRecorded(filePath, "M1Vj/VSU-SmartMap", 103, "sha-new-commit"), false);
+    assert.equal(mergeAlreadyRecorded(filePath, "M1Vj/ConceptHub", 5, "sha-merged-1"), true);
+    assert.equal(mergeAlreadyRecorded(filePath, "M1Vj/vsunavigator", 3, "sha-review-1"), true);
+    assert.equal(mergeAlreadyRecorded(filePath, "M1Vj/HydraLab", 2, "sha-rev-1"), false);
+    assert.equal(mergeAlreadyRecorded(filePath, "M1Vj/OtherRepo", 99, "sha-other"), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 

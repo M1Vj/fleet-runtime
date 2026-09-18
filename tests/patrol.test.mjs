@@ -278,6 +278,36 @@ test("planPatrolDispatches skips draft PRs and deduplicates against the ledger",
   assert.equal(dispatches.length, 0);
 });
 
+test("planPatrolDispatches deduplicates against ledger by headSha so comment updates do not loop", () => {
+  const openPrWithSha = {
+    n: 105,
+    title: "Open PR with head SHA",
+    draft: false,
+    updated: iso(NOW + 3600 * 1000),
+    headSha: "abc1234567890",
+  };
+  const key = eventKey("dispatch-merge", "M1Vj/VSU-SmartMap", "105", "abc1234567890");
+  const ledger = new Map([[key, NOW]]);
+
+  const dispatches = planPatrolDispatches([signal("M1Vj/VSU-SmartMap", { pulls: [openPrWithSha] })], {
+    now: NOW,
+    ledger,
+    tier1: ["VSU-SmartMap"],
+  });
+
+  assert.equal(dispatches.length, 0, "should not re-dispatch when headSha has not changed");
+
+  const newCommitPr = { ...openPrWithSha, headSha: "def9876543210" };
+  const dispatchesNewCommit = planPatrolDispatches([signal("M1Vj/VSU-SmartMap", { pulls: [newCommitPr] })], {
+    now: NOW,
+    ledger,
+    tier1: ["VSU-SmartMap"],
+  });
+  assert.equal(dispatchesNewCommit.length, 1);
+  assert.equal(dispatchesNewCommit[0].workflow, "merge.yml");
+  assert.equal(dispatchesNewCommit[0].pr, "105");
+});
+
 test("planPatrolDispatches plans improve.yml for idle tier-1 repo when no PRs are pending", () => {
   const dispatches = planPatrolDispatches([signal("M1Vj/CodexSwap", { pulls: [] })], {
     now: NOW,

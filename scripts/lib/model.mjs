@@ -447,6 +447,7 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
       }
       const rawTailSrc = stdout.split("\n").filter(Boolean).slice(-8).join("\n").slice(-1200);
       const tail = scrubTail(stderr).slice(-400);
+      const sessionNotFound = /session.*not found/i.test(`${stderr} ${stdout}`);
       // Pool bookkeeping: success clears the slot, auth-class failures cool
       // it down so the next call rotates. Slot number only — never values.
       if (poolSlot !== null && poolSlot !== undefined) {
@@ -467,6 +468,7 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
         authMissing: missing,
         model: selected,
         slot: usedSlot,
+        sessionNotFound,
         ...(exhaustedDegraded ? { exhausted: true, degraded: true, total: exhaustedTotal } : {}),
       });
     });
@@ -573,7 +575,7 @@ export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.s
     logModelAudit(stateRoot, { event: "model_try", model: chain[ci], index: ci, total: chain.length });
     const r = await askOnModel({ model: chain[ci], isPrimary: ci === 0, prompt, sessionId: lastSid || undefined, timeoutMs, env, preferVariantMax, maxRounds, files, workspace });
     allAttempts.push(...(r.attempts || []));
-    if (r.sessionId) lastSid = r.sessionId;
+    lastSid = r.sessionId || "";
     lastMode = r.modelMode || lastMode;
     // Preserve a surfaced credential/quota wait across the chain boundary.
     // Once an authenticated route is capacity-limited, never continue to a
@@ -651,7 +653,12 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
       await sleep(backoff);
     }
     const roundEnv = useAuth ? env : stripAuth(env);
-    const r = await runOnce({ prompt: promptNow, sessionId: sid || undefined, variant: mode === "plain" ? undefined : mode, timeoutMs, env: roundEnv, files, workspace, model });
+    let r = await runOnce({ prompt: promptNow, sessionId: sid || undefined, variant: mode === "plain" ? undefined : mode, timeoutMs, env: roundEnv, files, workspace, model });
+    if (sid && (r.sessionNotFound || /session.*not found/i.test(`${r.stderrTail || ""} ${r.rawTail || ""}`))) {
+      logModelAudit(stateRoot, { event: "session_not_found_cleared", staleSessionId: sid, model, round });
+      sid = "";
+      r = await runOnce({ prompt: promptNow, sessionId: undefined, variant: mode === "plain" ? undefined : mode, timeoutMs, env: roundEnv, files, workspace, model });
+    }
     const att = {
       round,
       model,
@@ -666,6 +673,7 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
       sessionReturned: r.sessionIdReturned === true,
       errTail: (r.stderrTail || "").slice(-160),
       rawTail: (r.rawTail || "").slice(-300),
+      sessionNotFound: r.sessionNotFound === true,
     };
     attempts.push(att);
     logModelAudit(stateRoot, { event: "round_attempt", ...att });

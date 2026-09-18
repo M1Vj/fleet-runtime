@@ -828,39 +828,40 @@ export async function main() {
         writeFileSync(sessionsPath(), JSON.stringify(sessions, null, 2));
       }
       if (!modelResult.complete || !modelResult.reply) {
-        throw Object.assign(new Error("MODEL_UNAVAILABLE after resume attempts"), { code: 6, reason: "MODEL_UNAVAILABLE" });
-      }
-      let validation = validateDirectives(modelResult.reply);
-      // Finish-loop: session-id capture + auto-resume up to 3 repair rounds.
-      // Each round reuses the captured sessionId so caps/revision stay
-      // consistent; every round is audited and the session is persisted.
-      let resumeSid = modelResult.sessionId || "";
-      for (let round = 1; round <= 3 && !validation.ok && resumeSid; round++) {
-        audit.note("validator", `repair round ${round}/3 requested`);
-        const repair = await askModel({
-          prompt: "Your previous reply was rejected because it was not a bare JSON array matching the directive schema. Re-output ONLY the strict JSON array now — no prose, no fences, no code.",
-          sessionId: resumeSid,
-          timeoutMs: 300000,
-          env: process.env,
-          preferVariantMax: true,
-        });
-        audit.note("repair", `round=${round} complete=${repair.complete} gotReply=${Boolean(repair.reply)}`);
-        if (repair.sessionId) {
-          resumeSid = repair.sessionId;
-          const sessions = readJson(sessionsPath(), {});
-          const row = { sessionId: resumeSid, updatedAt: new Date().toISOString(), repairRound: round };
-          sessions[runId] = row;
-          sessions["patrol-latest"] = row;
-          writeFileSync(sessionsPath(), JSON.stringify(sessions, null, 2));
+        audit.incident("model", "triage model unavailable or incomplete, continuing patrol without directives");
+      } else {
+        let validation = validateDirectives(modelResult.reply);
+        // Finish-loop: session-id capture + auto-resume up to 3 repair rounds.
+        // Each round reuses the captured sessionId so caps/revision stay
+        // consistent; every round is audited and the session is persisted.
+        let resumeSid = modelResult.sessionId || "";
+        for (let round = 1; round <= 3 && !validation.ok && resumeSid; round++) {
+          audit.note("validator", `repair round ${round}/3 requested`);
+          const repair = await askModel({
+            prompt: "Your previous reply was rejected because it was not a bare JSON array matching the directive schema. Re-output ONLY the strict JSON array now — no prose, no fences, no code.",
+            sessionId: resumeSid,
+            timeoutMs: 300000,
+            env: process.env,
+            preferVariantMax: true,
+          });
+          audit.note("repair", `round=${round} complete=${repair.complete} gotReply=${Boolean(repair.reply)}`);
+          if (repair.sessionId) {
+            resumeSid = repair.sessionId;
+            const sessions = readJson(sessionsPath(), {});
+            const row = { sessionId: resumeSid, updatedAt: new Date().toISOString(), repairRound: round };
+            sessions[runId] = row;
+            sessions["patrol-latest"] = row;
+            writeFileSync(sessionsPath(), JSON.stringify(sessions, null, 2));
+          }
+          if (repair.complete && repair.reply) validation = validateDirectives(repair.reply);
         }
-        if (repair.complete && repair.reply) validation = validateDirectives(repair.reply);
+        if (!validation.ok) {
+          audit.incident("validator", "model output rejected, skipping directives", { errors: validation.errors.slice(0, 10) });
+        } else {
+          directives = validation.directives;
+          audit.note("validator", `directives accepted=${directives.length}`);
+        }
       }
-      if (!validation.ok) {
-        audit.incident("validator", "model output rejected", { errors: validation.errors.slice(0, 10) });
-        throw Object.assign(new Error("DIRECTIVES_REJECTED"), { code: 5 });
-      }
-      directives = validation.directives;
-      audit.note("validator", `directives accepted=${directives.length}`);
     }
 
     const { mutations, results } = await executeDirectives(process.env, identity, directives, targets, audit);
@@ -893,6 +894,26 @@ export async function main() {
     const state = status === "ok" ? "SUCCESS" : "NO-OP";
     terminal(state, { runId, modelMode, mutations, trigger });
 
+    // Dynamic autonomous worker dispatch (Scout / Radar)
+    const targetsData = readJson(targetsPath(), {});
+    const scoutDispatches = planPatrolDispatches(signals, {
+      ledger: loadPatrolLedger(ledgerPath()),
+      priorityRepos: targetsData.priorityRepos || targetsData.tier1 || [],
+      tier1: targetsData.tier1 || [],
+    });
+    for (const d of scoutDispatches) {
+      try {
+        const args = ["workflow", "run", d.workflow, "-R", privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control)];
+        if (d.repo) args.push("-f", `repo=${d.repo}`);
+        if (d.pr) args.push("-f", `pr=${d.pr}`);
+        gh(args, process.env);
+        append(ledgerPath(), d.key, { workflow: d.workflow, repo: d.repo, pr: d.pr });
+        audit.note("scout-dispatch", `dispatched ${d.workflow} for ${d.repo}${d.pr ? `#${d.pr}` : ""}`);
+      } catch (err) {
+        audit.note("scout-dispatch", `dispatch ${d.workflow} failed: ${err.message.slice(0, 120)}`);
+      }
+    }
+
     const queued = enqueueDeepTasks(signals);
     audit.note("deep-queue", `tasks enqueued=${queued} (bounded cap=${DEEP_QUEUE_CAP})`);
     // Write once before persistence so the audit itself is included in the
@@ -911,27 +932,10 @@ export async function main() {
       statePushVerified = true;
       audit.note("push-verify", `attribution verified sha=${sha.slice(0, 10)}`);
       try {
-          gh(["workflow", "run", "deep.yml", "-R", privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control), "-f", "workers=3"], process.env);
+        gh(["workflow", "run", "deep.yml", "-R", privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control), "-f", "workers=3"], process.env);
         audit.note("deep-dispatch", "deep.yml dispatched");
       } catch (err) {
         audit.note("deep-dispatch", `dispatch skipped: ${err.message.slice(0, 120)}`);
-      }
-      // Dynamic autonomous worker dispatch (Scout / Radar)
-      const scoutDispatches = planPatrolDispatches(signals, {
-        ledger: loadPatrolLedger(ledgerPath()),
-        tier1: readJson(targetsPath(), {}).tier1 || [],
-      });
-      for (const d of scoutDispatches) {
-        try {
-          const args = ["workflow", "run", d.workflow, "-R", privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control)];
-          if (d.repo) args.push("-f", `repo=${d.repo}`);
-          if (d.pr) args.push("-f", `pr=${d.pr}`);
-          gh(args, process.env);
-          append(ledgerPath(), d.key, { workflow: d.workflow, repo: d.repo, pr: d.pr });
-          audit.note("scout-dispatch", `dispatched ${d.workflow} for ${d.repo}${d.pr ? `#${d.pr}` : ""}`);
-        } catch (err) {
-          audit.note("scout-dispatch", `dispatch ${d.workflow} failed: ${err.message.slice(0, 120)}`);
-        }
       }
     } else {
       status = "ok-no-changes";

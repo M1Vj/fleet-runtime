@@ -14,6 +14,7 @@ import {
   mutationAllowed,
   readMergesHistory,
   mergeAlreadyRecorded,
+  isNewFeature,
 } from "../scripts/merge.mjs";
 
 const targets = {
@@ -272,4 +273,42 @@ test("mergeAlreadyRecorded honors terminal states (SUCCESS, BLOCKED, NEEDS_HUMAN
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("isNewFeature identifies new feature PRs across titles, branches, labels, categories, and route additions", () => {
+  // Title tests
+  assert.equal(isNewFeature({ title: "feat: add user dark mode toggle" }), true);
+  assert.equal(isNewFeature({ title: "feat(auth): support passkey login" }), true);
+  assert.equal(isNewFeature({ title: "feature: export reports to csv" }), true);
+  assert.equal(isNewFeature({ title: "[fleet-improve] feat: add search filtering" }), true);
+  assert.equal(isNewFeature({ title: "fix: resolve memory leak on unmount" }), false);
+  assert.equal(isNewFeature({ title: "chore: bump dependencies" }), false);
+  assert.equal(isNewFeature({ title: "refactor: simplify query hooks" }), false);
+
+  // Branch tests
+  assert.equal(isNewFeature({ title: "add dark mode", head: { ref: "fleet/feat-darkmode" } }), true);
+  assert.equal(isNewFeature({ title: "add export", head: { ref: "fleet/feature-export" } }), true);
+  assert.equal(isNewFeature({ title: "fix crash", head: { ref: "fleet/improve-a1b2c3d4" } }), false);
+
+  // Label tests
+  assert.equal(isNewFeature({ title: "Campus building viewer", labels: [{ name: "enhancement" }] }), true);
+  assert.equal(isNewFeature({ title: "Event notifier", labels: ["feature"] }), true);
+  assert.equal(isNewFeature({ title: "Bug fix", labels: [{ name: "bug" }] }), false);
+
+  // Body category tests
+  assert.equal(isNewFeature({ title: "Custom calendar export", body: "Category: new-feature\nSummary: exports ics" }), true);
+  assert.equal(isNewFeature({ title: "Typo fix", body: "Category: docs\nSummary: fix typo" }), false);
+
+  // File addition tests (new routes / endpoints)
+  const filesWithNewRoute = [
+    { filename: "app/api/calendar/route.ts", status: "added", additions: 50, deletions: 0 },
+    { filename: "components/calendar/calendar-view.tsx", status: "added", additions: 80, deletions: 0 },
+  ];
+  assert.equal(isNewFeature({ title: "Calendar service" }, filesWithNewRoute), true);
+
+  const filesFixOnly = [
+    { filename: "components/ui/button.tsx", status: "modified", additions: 5, deletions: 2 },
+  ];
+  assert.equal(isNewFeature({ title: "Button styling adjustment" }, filesFixOnly), false);
+});
+
 

@@ -526,6 +526,40 @@ export function fetchCi(repo, sha, env = process.env) {
   return { state, runs, error };
 }
 
+export function isNewFeature(pr, files = []) {
+  if (!pr) return false;
+  const title = String(pr.title || "").trim();
+  const branch = String(pr.head?.ref || "").trim();
+  const body = String(pr.body || "").toLowerCase();
+
+  // 1. Explicit feature title prefix (strip any [tag] prefix)
+  const cleanTitle = title.replace(/^\[[a-zA-Z0-9_.-]+\]\s*/, "");
+  if (/^feat(\([a-zA-Z0-9_.-]+\))?:\s*/i.test(cleanTitle)) return true;
+  if (/^feature(\([a-zA-Z0-9_.-]+\))?:\s*/i.test(cleanTitle)) return true;
+
+  // 2. Feature branch convention
+  if (/^fleet\/feat(ure)?-/i.test(branch)) return true;
+
+  // 3. GitHub PR labels
+  const labels = Array.isArray(pr.labels)
+    ? pr.labels.map((l) => (typeof l === "string" ? l : l.name || ""))
+    : [];
+  if (labels.some((l) => /^(feature|enhancement|feat)$/i.test(l))) return true;
+
+  // 4. Body category annotation
+  if (/\bcategory:\s*(new-)?feature\b/i.test(body)) return true;
+
+  // 5. Significant new endpoint/page additions
+  const addedFiles = files.filter((f) => f && (f.status === "added" || ((f.additions || 0) > 0 && (f.deletions || 0) === 0)));
+  const hasNewRouteOrPage = addedFiles.some((f) => {
+    const filename = String(f.filename || f.path || "");
+    return /\b(app|pages|routes|api)\/.*\.(tsx|jsx|ts|js)$/i.test(filename) && !/\.test\.|\.spec\./i.test(filename);
+  });
+  if (hasNewRouteOrPage && addedFiles.length >= 2) return true;
+
+  return false;
+}
+
 // Post a marker-tagged comment at most once (scan recent comments for the
 // marker first) so 15-minute retries never spam the PR while CI runs.
 export async function postCommentOnce(repo, number, marker, body, audit, env = process.env) {
@@ -1127,6 +1161,28 @@ async function main() {
       console.log("MERGE_TERMINAL_STATE=NEEDS_HUMAN_REVIEW");
       return finish(audit, runId, "NEEDS_HUMAN_REVIEW");
     }
+  }
+
+  // New Feature Gate: all new feature additions REQUIRE user approval before merging.
+  if (isNewFeature(pr, files)) {
+    const whyStr = `New feature PR detected ("${pr.title}"). User approval is required before merging.`;
+    recordHumanReview(STATE_ROOT, {
+      repo: TARGET_REPO,
+      prNumber: PR_NUMBER,
+      title: pr.title,
+      headSha: evalSha,
+      author: pr.user ? pr.user.login : "M1Vj",
+      branch: pr.head ? pr.head.ref : "",
+      category: "new-feature",
+      why: whyStr,
+      scores: scoresSummary,
+      deterministic: det.ok,
+      visual: visualData ? { diffPct: maxDiffPct, consoleErrors: totalConsoleErrors, a11yBlocker: hasA11yBlocker, vlm: visualData.verdict && visualData.verdict.vlm } : null,
+    });
+    await tagPrNeedsHumanReview(TARGET_REPO, PR_NUMBER, "new-feature", whyStr, audit, process.env);
+    await recordTerminalState("NEEDS_HUMAN_REVIEW", { repo: TARGET_REPO, pr: PR_NUMBER, sha: evalSha, why: whyStr, category: "new-feature" });
+    console.log("MERGE_TERMINAL_STATE=NEEDS_HUMAN_REVIEW");
+    return finish(audit, runId, "NEEDS_HUMAN_REVIEW");
   }
 
   // If approved and not routed to human review: Proceed with Autonomous Merge!

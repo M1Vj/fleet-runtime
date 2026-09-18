@@ -675,8 +675,16 @@ async function modePick(audit) {
   return 0;
 }
 
-export function researchPromptHeader(repo, workdir, { publicMode = true } = {}) {
-  const base = `You are the research sub-agent for repo ${repo}. A full shallow clone is mounted at your working directory ('.')${workdir ? "" : " (digest-only mode)"} — use read/grep/glob on real code before concluding. Decide what would MOST improve this project right now (correctness, security, DX, performance, docs, CI).`;
+export function researchPromptHeader(repo, workdir, { publicMode = true, focus = process.env.FLEET_IMPROVE_FOCUS || "all" } = {}) {
+  let focusGuidance = "Decide what would MOST improve this project right now (correctness, security, UI/UX, features, DX, performance, docs, CI).";
+  if (focus === "security") {
+    focusGuidance = "Focus specifically on SECURITY: vulnerability hardening, safe input sanitization, secret hygiene, dependency safety, and auth guards.";
+  } else if (focus === "ui-ux") {
+    focusGuidance = "Focus specifically on UI/UX: visual design polish, accessibility (a11y), responsive layouts, and user interaction flow.";
+  } else if (focus === "feature") {
+    focusGuidance = "Focus specifically on high-value NEW FEATURES or capabilities that add significant utility and user value to the application.";
+  }
+  const base = `You are the research sub-agent for repo ${repo}. A full shallow clone is mounted at your working directory ('.')${workdir ? "" : " (digest-only mode)"} — use read/grep/glob on real code before concluding. ${focusGuidance}`;
   if (!publicMode) return `${base} You may use webfetch to consult authoritative sources.`;
   return `${base} Inspect at least one real source or test file for every idea; each evidence field must name the relative path and concrete symbol, test, or behavior you observed. Do not invent files, identities, or generic recommendations. You may use webfetch to consult authoritative sources.`;
 }
@@ -695,7 +703,7 @@ export function publicResearchCloneDisposition(workdir) {
     };
 }
 
-function buildResearchPrompt(repo, workdir, { publicMode = false } = {}) {
+function buildResearchPrompt(repo, workdir, { publicMode = false, focus = process.env.FLEET_IMPROVE_FOCUS || "all" } = {}) {
   const meta = gh(["api", `/repos/${repo}`], process.env);
   const commits = gh(["api", `/repos/${repo}/commits?per_page=15`], process.env) || [];
   const pulls = gh(["api", `/repos/${repo}/pulls?state=open&per_page=10`], process.env) || [];
@@ -708,10 +716,10 @@ function buildResearchPrompt(repo, workdir, { publicMode = false } = {}) {
     `Open issues: ${issuesRaw.filter((i) => !i.pull_request).map((i) => `#${i.number} ${i.title}`).join("; ") || "none"}`,
   ];
   return [
-    researchPromptHeader(repo, workdir, { publicMode }),
+    researchPromptHeader(repo, workdir, { publicMode, focus }),
     publicMode
-      ? "Return ONLY strict JSON: {\"ideas\":[{\"title\":\"...\",\"rationale\":\"...\",\"evidence\":\"relative/source/path.ext and the concrete symbol, test, or behavior observed\",\"impact\":\"high|medium|low\"}]} max 5 ideas."
-      : "Return ONLY strict JSON: {\"ideas\":[{\"title\":\"...\",\"rationale\":\"...\",\"evidence\":\"what you saw\",\"impact\":\"high|medium|low\"}]} max 5 ideas.",
+      ? "Return ONLY strict JSON: {\"ideas\":[{\"title\":\"...\",\"category\":\"security|ui-ux|feature|performance|fix\",\"rationale\":\"...\",\"evidence\":\"relative/source/path.ext and the concrete symbol, test, or behavior observed\",\"impact\":\"high|medium|low\"}]} max 5 ideas."
+      : "Return ONLY strict JSON: {\"ideas\":[{\"title\":\"...\",\"category\":\"security|ui-ux|feature|performance|fix\",\"rationale\":\"...\",\"evidence\":\"what you saw\",\"impact\":\"high|medium|low\"}]} max 5 ideas.",
     "Context:",
     lines.join("\n").slice(0, 14000),
   ].join("\n");
@@ -872,12 +880,13 @@ function normalizeIdea(idea, index = 0) {
   const rationale = idea.rationale.trim();
   const evidence = idea.evidence.trim();
   const impact = idea.impact.trim().toLowerCase();
+  const category = typeof idea.category === "string" ? idea.category.trim().toLowerCase() : undefined;
   if (!title || !rationale || !evidence) throw new Error(`idea ${index} missing fields`);
   if (!IDEA_IMPACTS.has(impact)) throw new Error(`idea ${index} impact invalid`);
   if (title.length > 240 || rationale.length > 2400 || evidence.length > 2400) {
     throw new Error(`idea ${index} exceeds size limit`);
   }
-  return { title, rationale, evidence, impact };
+  return { title, rationale, evidence, impact, ...(category ? { category } : {}) };
 }
 
 export function validateIdeasObject(value, { allowPartial = false } = {}) {
@@ -1729,11 +1738,15 @@ async function modeImplement(audit) {
     console.log(`IMPROVE_SKIP=${repo}:no-plan`);
     return 0;
   }
-  const { plan } = JSON.parse(readFileSync(planFile, "utf8"));
+  const planDoc = JSON.parse(readFileSync(planFile, "utf8"));
+  const plan = planDoc.plan || {};
+  const idea = planDoc.idea || {};
+  const isFeature = (idea && idea.category === "feature") || plan.category === "feature" || /^feat(\([a-zA-Z0-9_.-]+\))?:\s*/i.test(plan.title);
   const meta = gh(["api", `/repos/${repo}`], process.env);
   const base = meta.default_branch;
   const hash = sha256(JSON.stringify([plan.title, plan.files.map((f) => f.path)])).slice(0, 8);
-  const branch = `fleet/improve-${hash}`;
+  const branchPrefix = isFeature ? "fleet/feat-" : "fleet/improve-";
+  const branch = `${branchPrefix}${hash}`;
   const existing = gh(["api", `-X=GET`, `/repos/${repo}/pulls?head=${encodeURIComponent("M1Vj:" + branch)}&state=open`], process.env);
   if (Array.isArray(existing) && existing.length > 0) {
     console.log(`IMPROVE_DUPLICATE_PR=${existing[0].html_url}`);
@@ -1744,10 +1757,23 @@ async function modeImplement(audit) {
   for (const f of plan.files) {
     putFileContent(repo, f.path, f.content, branch, `[fleet-improve] ${plan.title}`, process.env);
   }
-  const body = [plan.prBody, "", "---", `**Summary:** ${plan.summary}`, "", `**Risks:** ${plan.risks}`, "", "_Generated autonomously by the private control-repository improve pipeline; review before merge._"].join("\n");
+  const prTitle = isFeature && !/^feat/i.test(plan.title) ? `feat: ${plan.title}` : (plan.title.startsWith("[fleet-improve]") ? plan.title : `[fleet-improve] ${plan.title}`);
+  const body = [
+    plan.prBody,
+    "",
+    "---",
+    `**Category:** ${isFeature ? "new-feature" : (plan.category || (idea && idea.category) || "improvement")}`,
+    `**Summary:** ${plan.summary}`,
+    "",
+    `**Risks:** ${plan.risks}`,
+    "",
+    isFeature
+      ? "⚠️ **New Feature Notice**: This autonomous improvement adds a new feature. Per fleet policy, it requires user review and approval before merging."
+      : "_Generated autonomously by the private control-repository improve pipeline; review before merge._",
+  ].join("\n");
   const pr = ghInput(
     ["api", "-X", "POST", `/repos/${repo}/pulls`],
-    { title: `[fleet-improve] ${plan.title}`, body, head: branch, base, draft: true },
+    { title: prTitle, body, head: branch, base, draft: true },
     process.env,
   );
   await verifyPullAuthor(repo, pr.number, identity, process.env.FLEET_GH_TOKEN);
@@ -1755,7 +1781,7 @@ async function modeImplement(audit) {
   await verifyCommit(repo, branchHead.sha, identity, process.env.FLEET_GH_TOKEN);
   audit.note("implement", `repo=${repo} pr=#${pr.number} branch=${branch} verified`);
   const outDir = process.env.FLEET_ARTIFACT_DIR || ".";
-  writeFileSync(path.join(outDir, `prmeta-${repo.replace("/", "__")}.json`), JSON.stringify({ repo, prNumber: pr.number, prUrl: pr.html_url, branch, title: plan.title }, null, 2));
+  writeFileSync(path.join(outDir, `prmeta-${repo.replace("/", "__")}.json`), JSON.stringify({ repo, prNumber: pr.number, prUrl: pr.html_url, branch, title: prTitle, category: isFeature ? "feature" : (plan.category || (idea && idea.category) || "improvement") }, null, 2));
   console.log(`IMPROVE_DONE=implement:${repo}:#${pr.number}`);
   return 0;
 }

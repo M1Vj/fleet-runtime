@@ -72,7 +72,7 @@ function sessionsPath() {
 }
 
 function loadPatrolSession() {
-  if (isPublicDataClass(process.env)) return "";
+  if (isPublicDataClass(process.env) || process.env.GITHUB_ACTIONS === "true" || process.env.CI === "true") return "";
   const data = readJson(sessionsPath(), {});
   const row = data?.["patrol-latest"];
   if (!row || typeof row !== "object") return "";

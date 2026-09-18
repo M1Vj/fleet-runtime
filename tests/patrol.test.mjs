@@ -9,6 +9,7 @@ import {
   applyPatrolLabels,
   canonicalizePatrolRepo,
   fencePatrolDirectives,
+  executeDirectives,
   loadPatrolLedger,
   planPatrolPersistence,
   planDeepQueueAdditions,
@@ -160,6 +161,7 @@ test("fencePatrolDirectives rejects foreign and malformed repos for every mutati
   const mutationDirectives = [
     { kind: "comment", repo: "other/repo", target: "pr", number: 1, body: "x" },
     { kind: "label", repo: "not-owner/repo", number: 2, labels: ["x"] },
+    { kind: "issue", repo: "other/repo", title: "Test Bug", body: "Issue body" },
     {
       kind: "draft_pr",
       repo: "M1Vj/../escape",
@@ -177,10 +179,20 @@ test("fencePatrolDirectives rejects foreign and malformed repos for every mutati
   }
 });
 
+test("fencePatrolDirectives validates issue directive title and body", () => {
+  assert.equal(fencePatrolDirectives([{ kind: "issue", repo: "m1vj/smartmap", title: "", body: "body" }]).ok, false);
+  assert.equal(fencePatrolDirectives([{ kind: "issue", repo: "m1vj/smartmap", title: "Bug", body: 123 }]).ok, false);
+  assert.equal(fencePatrolDirectives([{ kind: "issue", repo: "m1vj/smartmap", body: "body" }]).ok, false);
+  const valid = fencePatrolDirectives([{ kind: "issue", repo: "m1vj/smartmap", title: "Bug", body: "body", labels: ["bug"] }]);
+  assert.equal(valid.ok, true);
+  assert.equal(valid.directives[0].repo, "M1Vj/smartmap");
+});
+
 test("fencePatrolDirectives canonicalizes valid mutation repos before execution eligibility", () => {
   const fenced = fencePatrolDirectives([
     { kind: "comment", repo: "m1vj/runtime", target: "pr", number: 1, body: "x" },
     { kind: "label", repo: "M1VJ/runtime", number: 2, labels: ["x"] },
+    { kind: "issue", repo: "m1Vj/smartmap", title: "Title", body: "Body" },
     {
       kind: "draft_pr",
       repo: "m1Vj/runtime",
@@ -192,7 +204,12 @@ test("fencePatrolDirectives canonicalizes valid mutation repos before execution 
   ]);
 
   assert.equal(fenced.ok, true);
-  assert.deepEqual(fenced.directives.map((item) => item.repo), ["M1Vj/runtime", "M1Vj/runtime", "M1Vj/runtime"]);
+  assert.deepEqual(fenced.directives.map((item) => item.repo), [
+    "M1Vj/runtime",
+    "M1Vj/runtime",
+    "M1Vj/smartmap",
+    "M1Vj/runtime",
+  ]);
 });
 
 test("planDeepQueueAdditions rejects foreign and malformed signal repos while retaining valid work", () => {
@@ -333,5 +350,23 @@ test("planPatrolDispatches plans improve.yml for idle repo using priorityRepos o
   assert.equal(dispatches.length, 1);
   assert.equal(dispatches[0].workflow, "improve.yml");
   assert.equal(dispatches[0].repo, "M1Vj/VSU-SmartMap");
+});
+
+test("executeDirectives handles issue directive: public read-only suppression and non-tier1 downgrade", async () => {
+  const audit = { notes: [], incidents: [], note(k, v) { this.notes.push({ k, v }); }, incident(k, v) { this.incidents.push({ k, v }); } };
+  const directives = [
+    { kind: "issue", repo: "M1Vj/VSU-SmartMap", title: "Bug", body: "detail", labels: ["bug"] },
+  ];
+
+  // 1. In public data class, issue directive is suppressed with public-read-only
+  const publicRes = await executeDirectives({ FLEET_DATA_CLASS: "public" }, { name: "Vj" }, directives, { tier1: ["M1Vj/VSU-SmartMap"] }, audit);
+  assert.equal(publicRes.mutations, 0);
+  assert.equal(publicRes.results[0].skipped, "public-read-only");
+
+  // 2. Non-tier1 target is downgraded
+  const privateEnv = { FLEET_DATA_CLASS: "private", GITHUB_REPOSITORY: "M1Vj/private-test-repo" };
+  const nonTierRes = await executeDirectives(privateEnv, { name: "Vj" }, directives, { tier1: ["M1Vj/other"] }, audit);
+  assert.equal(nonTierRes.mutations, 0);
+  assert.equal(nonTierRes.results[0].downgraded, "M1Vj/VSU-SmartMap not tier1");
 });
 

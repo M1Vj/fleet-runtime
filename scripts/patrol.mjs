@@ -295,6 +295,7 @@ function buildPrompt(digest) {
     '{"kind":"report","section":"triage|security|standards|docs|testing|redteam","text":"..."}',
     '{"kind":"comment","repo":"owner/name","target":"issue|pr","number":N,"body":"..."}',
     '{"kind":"label","repo":"owner/name","target":"issue|pr","number":N,"labels":["..."]}',
+    '{"kind":"issue","repo":"owner/name","title":"...","body":"...","labels":["..."]}',
     '{"kind":"draft_pr","repo":"owner/name","title":"...","body":"...","branch":"fleet/<kebab>","files":[{"path":"docs/... or scripts/... etc","content":"..."}]}',
     '{"kind":"noop","reason":"..."}',
     "Rules: prioritize security > broken CI > stale PR review comments > standards/docs/testing findings.",
@@ -306,7 +307,7 @@ function buildPrompt(digest) {
 }
 
 const PATROL_REPO_NAME_RE = /^[A-Za-z0-9_.-]{1,100}$/;
-const PATROL_REPO_MUTATION_KINDS = new Set(["comment", "label", "draft_pr"]);
+const PATROL_REPO_MUTATION_KINDS = new Set(["comment", "label", "draft_pr", "issue"]);
 
 /**
  * Return the only repository form patrol may send to GitHub. GitHub treats
@@ -339,6 +340,16 @@ export function fencePatrolDirectives(directives) {
     if (!repo) {
       errors.push(`directive[${index}].repo must be a valid M1Vj repository`);
       return directive;
+    }
+    if (directive.kind === "issue") {
+      if (typeof directive.title !== "string" || !directive.title.trim()) {
+        errors.push(`directive[${index}].title must be a non-empty string for issue`);
+        return directive;
+      }
+      if (typeof directive.body !== "string") {
+        errors.push(`directive[${index}].body must be a string for issue`);
+        return directive;
+      }
     }
     return { ...directive, repo };
   });
@@ -713,6 +724,28 @@ export async function executeDirectives(env, identity, directives, targets, audi
         await verifyPullAuthor(d.repo, pr.number, identity, env.FLEET_GH_TOKEN);
         mutations += 1;
         results.push({ kind: d.kind, ok: true, pr: pr.number });
+      } else if (d.kind === "issue") {
+        if (!eligible(targets, d.repo)) {
+          results.push({ kind: d.kind, ok: true, downgraded: `${d.repo} not tier1` });
+          continue;
+        }
+        if (killSwitchEngaged()) {
+          audit.incident("kill-switch", `issue skipped on ${d.repo}: KILL_SWITCH engaged mid-run`);
+          results.push({ kind: d.kind, ok: true, skipped: "kill-switch" });
+          continue;
+        }
+        const issueArgs = ["api", "-X", "POST", `/repos/${d.repo}/issues`, "-f", `title=${d.title}`, "-f", `body=${d.body}`];
+        if (Array.isArray(d.labels) && d.labels.length > 0) {
+          for (const label of d.labels) {
+            if (label && typeof label === "string") {
+              issueArgs.push("-f", `labels[]=${label}`);
+            }
+          }
+        }
+        const created = gh(issueArgs, env);
+        await verifyIssueAuthor(d.repo, created.number, identity, env.FLEET_GH_TOKEN);
+        mutations += 1;
+        results.push({ kind: d.kind, ok: true, issue: created.number, repo: d.repo });
       } else {
         results.push({ kind: d.kind, ok: true });
       }

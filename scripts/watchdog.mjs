@@ -133,7 +133,7 @@ export async function main() {
     let isActivated = true;
     try {
       const varRes = gh(["variable", "get", "FLEET_PRIVATE_ACTIVATED", "-R", controlRepository], process.env);
-      if (typeof varRes === "string" && varRes.trim().toLowerCase() === "false") {
+      if (varRes === false || String(varRes ?? "").trim().toLowerCase() === "false") {
         isActivated = false;
       }
     } catch {}

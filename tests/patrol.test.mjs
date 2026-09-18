@@ -317,3 +317,21 @@ test("planPatrolDispatches enforces strict Top-2 priority ordering (VSU-SmartMap
   assert.equal(dispatches2[0].repo, "M1Vj/SangkAI-city");
   assert.equal(dispatches2[0].pr, "5");
 });
+
+test("planPatrolDispatches plans improve.yml for idle repo using priorityRepos or tier1", () => {
+  const dispatches = planPatrolDispatches(
+    [
+      signal("M1Vj/VSU-SmartMap", { pulls: [] }),
+      signal("M1Vj/SangkAI-city", { pulls: [] }),
+    ],
+    {
+      now: NOW,
+      ledger: new Map(),
+      priorityRepos: ["VSU-SmartMap", "SangkAI-city"],
+    },
+  );
+  assert.equal(dispatches.length, 1);
+  assert.equal(dispatches[0].workflow, "improve.yml");
+  assert.equal(dispatches[0].repo, "M1Vj/VSU-SmartMap");
+});
+

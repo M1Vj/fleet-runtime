@@ -618,3 +618,41 @@ test("askModel failing whole chain does trip the global gateway circuit breaker"
   assert.equal(res.complete, false);
   assert.equal(gatewayCircuitOpen(stateRoot), true);
 });
+
+test("askModel automatically recovers and retries when session not found occurs", async () => {
+  const { askModel } = await import("../scripts/lib/model.mjs");
+  const dir = mkdtempSync(path.join(tmpdir(), "fleetsession-"));
+  const bin = path.join(dir, "opencode");
+  // If called with -s, fail with "Session not found". Otherwise return success.
+  writeFileSync(bin, `#!/usr/bin/env node
+const args = process.argv;
+if (args.includes("-s")) {
+  process.stderr.write("Error: Session not found: ses_stale\\n");
+  process.exit(1);
+} else {
+  process.stdout.write(JSON.stringify({ type: "message", text: "recovered success", sessionID: "ses_fresh" }) + "\\n");
+  process.exit(0);
+}
+`);
+  chmodSync(bin, 0o755);
+  const stateRoot = mkdtempSync(path.join(tmpdir(), "fleetgw3-"));
+  const env = {
+    ...process.env,
+    PATH: `${dir}:${process.env.PATH}`,
+    FLEET_STATE_ROOT: stateRoot,
+    FLEET_MODEL_CHAIN: "opencode/muse-spark-1.3-contributor-free",
+  };
+  const res = await askModel({
+    prompt: "hi",
+    sessionId: "ses_stale",
+    timeoutMs: 5000,
+    env,
+    maxRounds: 1,
+  });
+  assert.equal(res.complete, true);
+  assert.equal(res.reply, "recovered success");
+  assert.equal(res.sessionId, "ses_fresh");
+  const clearedAudit = res.attempts.some((a) => a.sessionNotFound === true);
+  assert.equal(clearedAudit, true);
+});
+

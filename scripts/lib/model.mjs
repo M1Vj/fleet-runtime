@@ -656,6 +656,21 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
     let r = await runOnce({ prompt: promptNow, sessionId: sid || undefined, variant: mode === "plain" ? undefined : mode, timeoutMs, env: roundEnv, files, workspace, model });
     if (sid && (r.sessionNotFound || /session.*not found/i.test(`${r.stderrTail || ""} ${r.rawTail || ""}`))) {
       logModelAudit(stateRoot, { event: "session_not_found_cleared", staleSessionId: sid, model, round });
+      attempts.push({
+        round,
+        model,
+        mode,
+        auth: useAuth ? "yes" : "anon",
+        slot: r.slot ?? null,
+        exit: r.exitCode,
+        interrupted: r.interrupted,
+        gotReply: false,
+        hadSession: true,
+        sessionReturned: false,
+        sessionNotFound: true,
+        errTail: (r.stderrTail || "").slice(-160),
+        rawTail: (r.rawTail || "").slice(-300),
+      });
       sid = "";
       r = await runOnce({ prompt: promptNow, sessionId: undefined, variant: mode === "plain" ? undefined : mode, timeoutMs, env: roundEnv, files, workspace, model });
     }

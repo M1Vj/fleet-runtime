@@ -1,7 +1,7 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "opencode/union-alpha",
-  "small_model": "opencode/union-alpha",
+  "model": "opencode/muse-spark-1.3-contributor-free",
+  "small_model": "opencode/muse-spark-1.3-contributor-free",
   "instructions": [
     "CONCRETE AUTONOMOUS MUTATION: Worker agents (@implementer, @code-simplifier, @refactorer, @test-engineer, @performance-engineer, @security-reviewer, @architect, @designer, @prompt-architect, @humanizer) possess full operational capability and directives to perform concrete actions—editing code, writing tests, refactoring modules, and committing verified changes autonomously rather than executing passive read-only inspections.",
     "PARALLEL MULTI-AGENT FAN-OUT (/boost): Decompose substantive work across multiple specialized subagents running concurrently in parallel (e.g., @researcher, @architect, @implementer, @test-engineer, @security-reviewer, @reviewer, @critic). Parallel execution is substantially faster, more effective, and captures multifaceted angles simultaneously. Launch independent research, implementation, and review lanes concurrently rather than waiting sequentially.",

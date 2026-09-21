@@ -109,7 +109,7 @@ test("Request Sanitizer eliminates invalid_request_error artifacts", () => {
   // 2. Model Alias Normalization
   const modelPayload = Buffer.from(JSON.stringify({ model: "opencode/union-alpha", messages: [] }));
   const sanitizedModel = sanitizeRequestBody(modelPayload);
-  assert.equal(JSON.parse(sanitizedModel.toString()).model, "union-alpha");
+  assert.equal(JSON.parse(sanitizedModel.toString()).model, "muse-spark-1.3-contributor-free");
 
   // 3. Strip encrypted reasoning content on forceFullStrip
   const payloadWithReasoning = Buffer.from(JSON.stringify({

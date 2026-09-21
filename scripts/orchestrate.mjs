@@ -2817,6 +2817,27 @@ function safeModelReply(value) {
   return "";
 }
 
+function modelFailureDiagnostics(result, env = process.env) {
+  const attempts = Array.isArray(result?.attempts) ? result.attempts.slice(0, 8) : [];
+  return {
+    modelMode: redactText(result?.modelMode || "", env).slice(0, 160),
+    attemptCount: attempts.length,
+    attempts: attempts.map((attempt) => ({
+      round: Number.isSafeInteger(Number(attempt?.round)) ? Number(attempt.round) : null,
+      model: redactText(attempt?.model || "", env).slice(0, 160),
+      exit: Number.isSafeInteger(Number(attempt?.exit)) ? Number(attempt.exit) : null,
+      interrupted: attempt?.interrupted === true,
+      gotReply: attempt?.gotReply === true,
+      sessionNotFound: attempt?.sessionNotFound === true,
+      exhausted: attempt?.exhausted === true,
+    })),
+    blocked: result?.blocked === true,
+    circuitOpen: result?.circuitOpen === true,
+    waitingForCapacity: result?.waitingForCapacity === true,
+    waitingForQuota: result?.waitingForQuota === true,
+  };
+}
+
 function advisoryWorkspace(env = process.env) {
   const workspace = firstValue(env.FLEET_MODEL_WORKSPACE, env.FLEET_RUNTIME_WORKSPACE, process.cwd());
   return path.resolve(String(workspace));
@@ -3105,6 +3126,7 @@ async function executeReviewTask(task, { env = process.env, ghClient = defaultGh
       error: isPublicDataClass(env)
         ? "public model unavailable"
         : redactText(modelResult?.error || "no model reply", env).slice(0, 240),
+      diagnostics: modelFailureDiagnostics(modelResult, env),
       retryAt: firstValue(modelResult?.retryAt, env.FLEET_RETRY_AT, new Date(Date.now() + 5 * 60 * 1000).toISOString()),
       readOnly: true,
       postedComment: false,

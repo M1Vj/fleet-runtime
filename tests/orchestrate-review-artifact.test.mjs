@@ -118,6 +118,51 @@ test("private advisory model boundary strips controller credentials/state and us
   }
 });
 
+test("legacy review records bounded non-secret model failure diagnostics", async () => {
+  const root = makeRoot("fleet-review-model-diagnostics-");
+  try {
+    const env = advisoryEnv(root, {
+      FLEET_REVIEW_ADVISORY: "false",
+      FLEET_REQUEST_ID: undefined,
+      FLEET_REQUEST_REVISION: undefined,
+      FLEET_BOUND_HEAD_SHA: undefined,
+      FLEET_TASK_ID: "review-task-1",
+    });
+    const result = await orchestrate.executeTask(reviewTask(), {
+      env,
+      ghClient: ghFixture(),
+      modelRunner: async () => ({
+        complete: false,
+        modelMode: "opencode/test-model",
+        attempts: [{ round: 1, model: "opencode/test-model", exit: 143, interrupted: true, gotReply: false }],
+      }),
+    });
+    assert.equal(result.status, "deferred");
+    assert.equal(result.reason, "model-unavailable");
+    assert.deepEqual(result.diagnostics, {
+      modelMode: "opencode/test-model",
+      attemptCount: 1,
+      attempts: [{
+        round: 1,
+        model: "opencode/test-model",
+        exit: 143,
+        interrupted: true,
+        gotReply: false,
+        sessionNotFound: false,
+        exhausted: false,
+      }],
+      blocked: false,
+      circuitOpen: false,
+      waitingForCapacity: false,
+      waitingForQuota: false,
+    });
+    const artifact = JSON.parse(readFileSync(result.artifact, "utf8"));
+    assert.deepEqual(artifact.diagnostics, result.diagnostics);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("actual orchestrate workflow review environment derives the enforced advisory permission map", async () => {
   const runtimeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const controlRoot = process.env.FLEET_CONTROL_WORKTREE

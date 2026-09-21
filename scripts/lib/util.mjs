@@ -8,6 +8,7 @@ import {
   isPublicDataClass,
   publicStateRoot,
 } from "./private-state.mjs";
+import { isGitHubMutation } from "./kill-switch.mjs";
 
 export function sha256(s) {
   return createHash("sha256").update(String(s)).digest("hex");
@@ -76,17 +77,25 @@ function childEnv(env) {
     };
     return out;
   }
+  // Cloud-bound hosted jobs are advisory/read-only.  They may use the
+  // built-in Actions token for bounded public reads, but must never receive
+  // the private controller token.  Keep this switch explicit so a missing
+  // token fails closed instead of silently falling back to ambient auth.
+  const cloudReadOnly = String(env.FLEET_CLOUD_UNTRUSTED || "") === "true";
   return {
     PATH: env.PATH || "/usr/bin:/bin:/usr/local/bin",
     HOME: env.HOME || process.env.HOME || "/tmp",
     TMPDIR: env.TMPDIR || tmpdir(),
-    GH_TOKEN: env.FLEET_GH_TOKEN || "",
+    GH_TOKEN: cloudReadOnly ? (env.GITHUB_TOKEN || "") : (env.FLEET_GH_TOKEN || ""),
     GH_HOST: "github.com",
   };
 }
 
 export function gh(args, env = process.env, { input } = {}) {
   if (isPublicDataClass(env)) assertPublicGhReadOnly(args);
+  if (!isPublicDataClass(env) && isGitHubMutation(args)) {
+    assertMutationAllowed(env, `gh ${args.map((arg) => String(arg)).join(" ")}`);
+  }
   const redact = scrub(env);
   const res = spawnSync("gh", args, {
     env: childEnv(env),
@@ -95,7 +104,7 @@ export function gh(args, env = process.env, { input } = {}) {
     maxBuffer: 64 * 1024 * 1024,
   });
   if (res.status !== 0) {
-    throw new Error(`gh ${args.join(" ")} failed: ${redact(res.stderr || res.stdout || "unknown")}`);
+    throw classifyGitHubFailure(args, res, redact);
   }
   const out = (res.stdout || "").trim();
   if (!out) return null;
@@ -104,6 +113,135 @@ export function gh(args, env = process.env, { input } = {}) {
   } catch {
     return out;
   }
+}
+
+export class GitHubApiError extends Error {
+  constructor({ args, status = null, kind, authoritative, body, requestRef, detail }) {
+    super(`gh ${args.map((arg) => String(arg)).join(" ")} failed: ${detail || "unknown"}`);
+    this.name = "GitHubApiError";
+    this.status = status;
+    this.kind = kind;
+    this.authoritative = authoritative;
+    this.body = body;
+    this.requestRef = requestRef;
+  }
+}
+
+function parseHttpStatus(value) {
+  const status = Number(value);
+  return Number.isInteger(status) && status >= 100 && status <= 599 ? status : null;
+}
+
+function parseJsonObject(text) {
+  const source = String(text || "").trim();
+  if (!source) return null;
+  const candidates = [source];
+  const firstBrace = source.indexOf("{");
+  const lastBrace = source.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.push(source.slice(firstBrace, lastBrace + 1));
+  }
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch {}
+  }
+  return null;
+}
+
+function safeErrorBody(value, redact) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const body = {};
+  for (const key of ["message", "status", "documentation_url", "ref", "reference", "url"]) {
+    if (value[key] === undefined || value[key] === null) continue;
+    if (key === "status") {
+      const status = parseHttpStatus(value[key]);
+      if (status !== null) body.status = status;
+      continue;
+    }
+    if (typeof value[key] === "string") body[key] = redact(value[key]);
+  }
+  if (Array.isArray(value.errors)) {
+    body.errors = value.errors.slice(0, 16).map((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+      const safe = {};
+      for (const key of ["resource", "field", "code", "message", "ref", "reference"]) {
+        if (typeof entry[key] === "string") safe[key] = redact(entry[key]);
+      }
+      return safe;
+    }).filter(Boolean);
+  }
+  return Object.keys(body).length > 0 ? body : null;
+}
+
+function parseCliError(text) {
+  const source = String(text || "").trim();
+  if (!source) return null;
+  const patterns = [
+    /^gh:\s*(.+?)\s+\(HTTP\s+([1-5]\d{2})\)\s*$/im,
+    /^HTTP\s+([1-5]\d{2})(?::\s*(.+?))?\s*$/im,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(source);
+    if (!match) continue;
+    const status = parseHttpStatus(pattern === patterns[0] ? match[2] : match[1]);
+    const message = pattern === patterns[0] ? match[1].trim() : String(match[2] || "").trim();
+    if (status !== null && message) return { status, message };
+  }
+  return null;
+}
+
+function requestRefFromArgs(args) {
+  for (let index = 0; index < args.length - 1; index += 1) {
+    if (String(args[index]) !== "-f") continue;
+    const field = String(args[index + 1]);
+    if (field.startsWith("ref=")) return field.slice("ref=".length);
+  }
+  return null;
+}
+
+function classifyGitHubFailure(args, result, redact) {
+  const stderr = String(result.stderr || "");
+  const stdout = String(result.stdout || "");
+  const combined = [stderr, stdout].filter(Boolean).join("\n").trim();
+  const parsed = parseJsonObject(stderr) || parseJsonObject(stdout) || parseJsonObject(combined);
+  const body = safeErrorBody(parsed, redact);
+  const cli = parseCliError(stderr) || parseCliError(stdout) || parseCliError(combined);
+  const status = body?.status ?? cli?.status ?? null;
+  const message = body?.message || cli?.message || "";
+  const network = Boolean(result.error) || /(?:network|timed?\s*out|timeout|connection|dns|socket|econn|enotfound|offline|resolve|tls|proxy)/i.test(combined);
+  const kind = status === null ? (network ? "network" : "unknown") : "http";
+  const authoritative = status !== null && Boolean(message) && Boolean(body?.message || cli);
+  const detail = redact(combined || result.error?.message || "unknown");
+  return new GitHubApiError({
+    args,
+    status,
+    kind,
+    authoritative,
+    body: body || (cli ? { message: redact(cli.message), status: cli.status } : null),
+    requestRef: requestRefFromArgs(args),
+    detail,
+  });
+}
+
+function isAuthoritativeNotFound(err) {
+  return err instanceof GitHubApiError && err.status === 404 && err.authoritative === true;
+}
+
+function branchExistsError(err, expectedRef) {
+  if (!(err instanceof GitHubApiError) || err.status !== 422 || !err.authoritative) return false;
+  if (err.requestRef !== expectedRef) return false;
+  if (err.body?.message !== "Reference already exists") return false;
+  for (const ref of [err.body?.ref, err.body?.reference]) {
+    if (ref !== undefined && ref !== expectedRef) return false;
+  }
+  for (const entry of err.body?.errors || []) {
+    for (const ref of [entry?.ref, entry?.reference]) {
+      if (ref !== undefined && ref !== expectedRef) return false;
+    }
+  }
+  return true;
 }
 
 function assertPublicGhReadOnly(args = []) {
@@ -142,9 +280,20 @@ export function putFileContent(repo, filePath, contentUtf8, branch, message, env
   let sha;
   try {
     const existing = gh(["api", `/repos/${repo}/contents/${filePath}?ref=${branch}`], env);
-    if (existing && existing.sha) sha = existing.sha;
-  } catch {
-    sha = undefined;
+    if (!existing || typeof existing !== "object" || Array.isArray(existing) || typeof existing.sha !== "string" || !existing.sha) {
+      throw new GitHubApiError({
+        args: ["api", `/repos/${repo}/contents/${filePath}?ref=${branch}`],
+        status: null,
+        kind: "malformed",
+        authoritative: false,
+        body: null,
+        requestRef: null,
+        detail: "malformed contents response",
+      });
+    }
+    sha = existing.sha;
+  } catch (err) {
+    if (!isAuthoritativeNotFound(err)) throw err;
   }
   const body = {
     message,
@@ -166,11 +315,12 @@ export function putFileContent(repo, filePath, contentUtf8, branch, message, env
 
 export function ensureBranch(repo, branch, baseSha, env = process.env) {
   assertMutationAllowed(env, `create branch ${repo}:${branch}`);
+  const expectedRef = `refs/heads/${branch}`;
   try {
-    gh(["api", "-X", "POST", `/repos/${repo}/git/refs`, "-f", `ref=refs/heads/${branch}`, "-f", `sha=${baseSha}`], env);
+    gh(["api", "-X", "POST", `/repos/${repo}/git/refs`, "-f", `ref=${expectedRef}`, "-f", `sha=${baseSha}`], env);
     return "created";
   } catch (err) {
-    if (/422|already|exists/i.test(String(err.message))) return "exists";
+    if (branchExistsError(err, expectedRef)) return "exists";
     throw err;
   }
 }
@@ -180,6 +330,9 @@ export function ghInput(prefixArgs, bodyObj, env = process.env) {
   const tmp = path.join(mkdtempSync(path.join(tmpdir(), "ghin-")), "body.json");
   writeFileSync(tmp, JSON.stringify(bodyObj), "utf8");
   try {
+    // Re-check after local request preparation so a kill-switch engagement
+    // cannot be hidden behind the temporary body-file write.
+    assertMutationAllowed(env, `gh input ${prefixArgs.join(" ")}`);
     return gh([...prefixArgs, "--input", tmp], env);
   } finally {
     rmSync(tmp, { force: true });
@@ -198,6 +351,7 @@ export function gitPush(repoDir, branch, env = process.env, { retries = 3 } = {}
   );
   try {
     for (let attempt = 1; attempt <= retries; attempt++) {
+      assertMutationAllowed(env, `git push ${branch}`);
       const credArgs = ["-c", `credential.helper=${helper}`];
       const res = spawnSync("git", [...credArgs, "push", "origin", `HEAD:${branch}`], {
         cwd: repoDir,

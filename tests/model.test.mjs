@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cpSync, mkdtempSync, writeFileSync, readFileSync, chmodSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { cpSync, mkdtempSync, writeFileSync, readFileSync, chmodSync, existsSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -321,6 +321,232 @@ test("runOnce preserves the workspace permission boundary when pinning models", 
     model: "opencode/nemotron-3.5-lightning-free",
     small_model: "opencode/nemotron-3.5-lightning-free",
   });
+});
+
+test("read-only advisory runOnce strips controller state/tokens and forces deny permissions", async () => {
+  const { runOnce } = await import("../scripts/lib/model.mjs");
+  const root = mkdtempSync(path.join(tmpdir(), "fleet-advisory-model-"));
+  const binDir = mkdtempSync(path.join(tmpdir(), "fleet-advisory-bin-"));
+  const workspace = path.join(root, "runtime");
+  mkdirSync(workspace, { recursive: true });
+  const seen = path.join(binDir, "seen.json");
+  const bin = path.join(binDir, "opencode");
+  writeFileSync(
+    bin,
+    `#!/usr/bin/env node\nconst fs=require("fs");fs.writeFileSync(${JSON.stringify(seen)},JSON.stringify({env:{FLEET_GH_TOKEN:process.env.FLEET_GH_TOKEN,FLEET_READ_TOKEN:process.env.FLEET_READ_TOKEN,GH_TOKEN:process.env.GH_TOKEN,GITHUB_TOKEN:process.env.GITHUB_TOKEN,GITHUB_WORKSPACE:process.env.GITHUB_WORKSPACE,FLEET_STATE_ROOT:process.env.FLEET_STATE_ROOT,FLEET_WORKSPACE_ROOT:process.env.FLEET_WORKSPACE_ROOT,MY_PRIVATE:process.env.MY_PRIVATE,OPENCODE_AUTH_CONTENT:(process.env.OPENCODE_AUTH_CONTENT||"").slice(0,4)},cwd:process.cwd(),config:JSON.parse(process.env.OPENCODE_CONFIG_CONTENT||"{}")}));console.log(JSON.stringify({text:"ok",sessionID:"s-advisory-1"}));\n`,
+  );
+  chmodSync(bin, 0o755);
+  const env = {
+    PATH: `${binDir}:${process.env.PATH || ""}`,
+    RUNNER_TEMP: root,
+    TMPDIR: root,
+    FLEET_STATE_ROOT: path.join(root, "controller-state"),
+    FLEET_MODEL_WORKSPACE: workspace,
+    GITHUB_WORKSPACE: path.join(root, "controller-checkout"),
+    FLEET_GH_TOKEN: "publisher-secret",
+    FLEET_READ_TOKEN: "read-secret",
+    GITHUB_TOKEN: "actions-secret",
+    FLEET_OPENCODE_AUTH: "auth-secret",
+    MY_PRIVATE: "must-not-forward",
+    OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: { read: "allow", edit: "allow", write: "allow", bash: "allow" } }),
+    FLEET_INDEFINITE_DISABLE: "1",
+  };
+  try {
+    const result = await runOnce({ prompt: "bounded advisory", timeoutMs: 15000, env, workspace, model: PRIMARY_MODEL, readOnly: true });
+    assert.equal(result.reply, "ok");
+    const captured = JSON.parse(readFileSync(seen, "utf8"));
+    for (const key of ["FLEET_GH_TOKEN", "FLEET_READ_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "GITHUB_WORKSPACE", "MY_PRIVATE"]) {
+      assert.equal(captured.env[key], undefined, `${key} must not reach advisory model`);
+    }
+    assert.notEqual(captured.env.FLEET_STATE_ROOT, env.FLEET_STATE_ROOT);
+    assert.equal(captured.env.FLEET_WORKSPACE_ROOT.endsWith("/runtime"), true);
+    assert.equal(path.basename(captured.cwd), "runtime");
+    assert.doesNotMatch(captured.cwd, /controller/);
+    assert.equal(captured.env.OPENCODE_AUTH_CONTENT, "auth");
+    assert.deepEqual(captured.config.permission, {
+      edit: "deny",
+      write: "deny",
+      bash: "deny",
+      external_directory: "deny",
+      question: "deny",
+      todowrite: "deny",
+      read: "allow",
+      grep: "allow",
+      glob: "allow",
+      list: "allow",
+      webfetch: "deny",
+      websearch: "deny",
+    });
+    assert.doesNotMatch(JSON.stringify(captured.config), /controller-state|controller-checkout/);
+    const blocked = await runOnce({ prompt: "controller workspace must block", timeoutMs: 15000, env, workspace: env.GITHUB_WORKSPACE, model: PRIMARY_MODEL, readOnly: true });
+    assert.equal(blocked.blocked, true);
+    assert.equal(blocked.modelMode, "advisory-env-invalid");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test("read-only advisory askModel reuses one prepared authenticated environment", async () => {
+  const { askModel } = await import("../scripts/lib/model.mjs");
+  const root = mkdtempSync(path.join(tmpdir(), "fleet-advisory-ask-auth-"));
+  const binDir = mkdtempSync(path.join(tmpdir(), "fleet-advisory-ask-auth-bin-"));
+  const workspace = path.join(root, "runtime");
+  const seen = path.join(binDir, "seen.json");
+  mkdirSync(workspace, { recursive: true });
+  const bin = path.join(binDir, "opencode");
+  writeFileSync(
+    bin,
+    `#!/usr/bin/env node\nconst fs=require("fs");fs.writeFileSync(${JSON.stringify(seen)},JSON.stringify({authenticated:Boolean(process.env.OPENCODE_AUTH_CONTENT),slot:process.env.FLEET_OPENCODE_AUTH,slot2:process.env.FLEET_OPENCODE_AUTH_2,stateRoot:process.env.FLEET_STATE_ROOT,workspaceRoot:process.env.FLEET_WORKSPACE_ROOT}));console.log(JSON.stringify({text:"ok",sessionID:"s-readonly-auth"}));\n`,
+  );
+  chmodSync(bin, 0o755);
+  const env = {
+    PATH: `${binDir}:${process.env.PATH || ""}`,
+    RUNNER_TEMP: root,
+    TMPDIR: root,
+    FLEET_STATE_ROOT: path.join(root, "controller-state"),
+    FLEET_MODEL_WORKSPACE: workspace,
+    FLEET_OPENCODE_AUTH: "auth-secret",
+    FLEET_OPENCODE_AUTH_2: "auth-secret-2",
+    FLEET_MODEL_CHAIN: PRIMARY_MODEL,
+    FLEET_INDEFINITE_DISABLE: "1",
+  };
+  try {
+    const result = await askModel({
+      prompt: "bounded advisory",
+      timeoutMs: 15000,
+      env,
+      maxRounds: 1,
+      preferVariantMax: false,
+      skipCircuitCheck: true,
+      workspace,
+      readOnly: true,
+    });
+    assert.equal(result.complete, true);
+    assert.equal(result.reply, "ok");
+    assert.equal(result.attempts[0].auth, "yes");
+    assert.equal(JSON.stringify(result.attempts).includes("auth-secret"), false);
+    const captured = JSON.parse(readFileSync(seen, "utf8"));
+    assert.equal(captured.authenticated, true);
+    assert.equal(captured.slot, undefined);
+    assert.equal(captured.slot2, undefined);
+    assert.notEqual(captured.stateRoot, env.FLEET_STATE_ROOT);
+    assert.equal(captured.workspaceRoot, workspace);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test("read-only advisory askModel reuses one prepared anonymous environment", async () => {
+  const { askModel } = await import("../scripts/lib/model.mjs");
+  const root = mkdtempSync(path.join(tmpdir(), "fleet-advisory-ask-anon-"));
+  const binDir = mkdtempSync(path.join(tmpdir(), "fleet-advisory-ask-anon-bin-"));
+  const workspace = path.join(root, "runtime");
+  const seen = path.join(binDir, "seen.json");
+  mkdirSync(workspace, { recursive: true });
+  const bin = path.join(binDir, "opencode");
+  writeFileSync(
+    bin,
+    `#!/usr/bin/env node\nconst fs=require("fs");fs.writeFileSync(${JSON.stringify(seen)},JSON.stringify({authenticated:Boolean(process.env.OPENCODE_AUTH_CONTENT),slot:process.env.FLEET_OPENCODE_AUTH,slot2:process.env.FLEET_OPENCODE_AUTH_2,stateRoot:process.env.FLEET_STATE_ROOT,workspaceRoot:process.env.FLEET_WORKSPACE_ROOT}));console.log(JSON.stringify({text:"ok",sessionID:"s-readonly-anon"}));\n`,
+  );
+  chmodSync(bin, 0o755);
+  const env = {
+    PATH: `${binDir}:${process.env.PATH || ""}`,
+    RUNNER_TEMP: root,
+    TMPDIR: root,
+    FLEET_STATE_ROOT: path.join(root, "controller-state"),
+    FLEET_MODEL_WORKSPACE: workspace,
+    FLEET_MODEL_CHAIN: PRIMARY_MODEL,
+    FLEET_INDEFINITE_DISABLE: "1",
+  };
+  try {
+    const result = await askModel({
+      prompt: "bounded anonymous advisory",
+      timeoutMs: 15000,
+      env,
+      maxRounds: 1,
+      preferVariantMax: false,
+      skipCircuitCheck: true,
+      workspace,
+      readOnly: true,
+    });
+    assert.equal(result.complete, true);
+    assert.equal(result.reply, "ok");
+    assert.equal(result.attempts[0].auth, "anon");
+    const captured = JSON.parse(readFileSync(seen, "utf8"));
+    assert.equal(captured.authenticated, false);
+    assert.equal(captured.slot, undefined);
+    assert.equal(captured.slot2, undefined);
+    assert.equal(captured.workspaceRoot, workspace);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+test("advisory model workspace is canonically isolated from controller, state, and workflow roots", async () => {
+  const { advisoryModelEnv } = await import("../scripts/lib/model.mjs");
+  const root = mkdtempSync(path.join(tmpdir(), "fleet-advisory-isolation-"));
+  const outside = mkdtempSync(path.join(tmpdir(), "fleet-advisory-outside-"));
+  const controller = path.join(root, "controller");
+  const state = path.join(root, "state");
+  const workflow = path.join(root, "workflow");
+  const sibling = path.join(root, "model-sibling");
+  const nestedController = path.join(controller, "runtime");
+  const nestedState = path.join(state, "runtime");
+  const nestedWorkflow = path.join(workflow, "runtime");
+  const advisoryState = path.join(root, "fleet-advisory-model");
+  mkdirSync(controller, { recursive: true });
+  mkdirSync(state, { recursive: true });
+  mkdirSync(workflow, { recursive: true });
+  mkdirSync(sibling, { recursive: true });
+  const env = {
+    RUNNER_TEMP: root,
+    GITHUB_WORKSPACE: controller,
+    FLEET_STATE_ROOT: state,
+    FLEET_WORKFLOW_ROOT: workflow,
+  };
+  const blocked = (workspace) => assert.throws(
+    () => advisoryModelEnv(env, { workspace }),
+    /advisory model workspace may not overlap|symlink alias|RUNNER_TEMP/,
+  );
+  try {
+    // Nested, exact, and parent paths are all forbidden in either direction.
+    blocked(nestedController);
+    assert.equal(existsSync(advisoryState), false, "invalid workspace must not create advisory state");
+    blocked(controller);
+    blocked(root);
+    blocked(nestedState);
+    blocked(state);
+    blocked(nestedWorkflow);
+    blocked(workflow);
+
+    // A real sibling checkout is accepted and returned canonically.
+    const safe = advisoryModelEnv(env, { workspace: sibling });
+    assert.equal(safe.FLEET_WORKSPACE_ROOT.endsWith("/model-sibling"), true);
+    assert.equal(existsSync(advisoryState), true);
+    assert.throws(() => advisoryModelEnv(env, { workspace: outside }), /RUNNER_TEMP|symlink alias/);
+
+    // A symlink alias is rejected even when its target is an otherwise-safe sibling.
+    const alias = path.join(root, "model-alias");
+    symlinkSync(sibling, alias, "dir");
+    assert.throws(() => advisoryModelEnv(env, { workspace: alias }), /symlink alias/);
+
+    // Missing workspaces are created only beneath the explicit runner temp root.
+    const missing = path.join(root, "model-created");
+    assert.equal(existsSync(missing), false);
+    const created = advisoryModelEnv(env, { workspace: missing });
+    assert.equal(existsSync(missing), true);
+    assert.equal(created.FLEET_WORKSPACE_ROOT.endsWith("/model-created"), true);
+
+    const outsideMissing = path.join(outside, "model-created");
+    assert.throws(() => advisoryModelEnv(env, { workspace: outsideMissing }), /RUNNER_TEMP|symlink alias/);
+    assert.equal(existsSync(outsideMissing), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
 });
 
 test("public runOnce uses an allowlisted environment and ephemeral config roots", async () => {
@@ -655,4 +881,3 @@ if (args.includes("-s")) {
   const clearedAudit = res.attempts.some((a) => a.sessionNotFound === true);
   assert.equal(clearedAudit, true);
 });
-

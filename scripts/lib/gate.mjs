@@ -6,6 +6,7 @@ import {
   publicTargetDecision,
   resolveDataClass,
 } from "./private-state.mjs";
+import { assertKillSwitchClear } from "./kill-switch.mjs";
 
 export class GateError extends Error {
   constructor(code, reason, detail) {
@@ -95,8 +96,21 @@ export async function runPublicGate(env, deps = gateDeps(env)) {
 
 export async function runGate(env, deps = gateDeps(env)) {
   if (isPublicDataClass(env) || deps.dataClass === "public") return runPublicGate(env, deps);
-  if (deps.killSwitchPath && existsSync(deps.killSwitchPath)) {
-    throw new GateError(2, "KILL_SWITCH_ENGAGED", deps.killSwitchPath);
+  try {
+    const gateEnv = { ...env };
+    if (Object.prototype.hasOwnProperty.call(deps, "killSwitchPath")) {
+      if (deps.killSwitchPath) gateEnv.FLEET_KILL_SWITCH_PATH = deps.killSwitchPath;
+      else delete gateEnv.FLEET_KILL_SWITCH_PATH;
+    }
+    assertKillSwitchClear(gateEnv, {
+      // Keep dependency injection available for existing fixture tests while
+      // making the production gate use the shared local + central check.
+      exists: existsSync,
+      ...(typeof deps.killSwitchRun === "function" ? { run: deps.killSwitchRun } : {}),
+      codeRoot: process.cwd(),
+    });
+  } catch (error) {
+    throw new GateError(error?.code || 2, error?.reason || "KILL_SWITCH_SIGNAL_UNAVAILABLE", error?.message);
   }
   if (!deps.token) {
     throw new GateError(3, "IDENTITY_MISMATCH", "missing FLEET_GH_TOKEN");

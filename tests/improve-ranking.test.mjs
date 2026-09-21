@@ -7,6 +7,8 @@ import {
   validateIdeasObject,
   resolveRequestedRepo,
   researchCapacityOutcome,
+  parseCloudAgentBinding,
+  isAuthorizedCloudControlTarget,
 } from "../scripts/improve.mjs";
 
 const NOW = Date.parse("2026-09-13T00:00:00.000Z");
@@ -57,6 +59,47 @@ test("foreign or missing exact repo targets fail closed", () => {
   assert.throws(() => resolveRequestedRepo([target], "Other/target"));
   assert.throws(() => resolveRequestedRepo([target], "M1Vj/missing"));
   assert.throws(() => selectImprovementRepos([target], { requestedRepo: "not-a-repo", topK: 1 }));
+});
+
+test("legacy selection excludes control repo while a complete cloud proof may target it", () => {
+  const controlRepository = ["M1Vj", ["fleet", "control"].join("-")].join("/");
+  const control = repo(controlRepository);
+  const env = {
+    FLEET_CLOUD_AGENT_MODE: "cloud-agent",
+    FLEET_TARGET_ISSUE: "42",
+    FLEET_REQUEST_ID: "request-42",
+    FLEET_REQUEST_REVISION: "a".repeat(64),
+    FLEET_AUTHORIZATION_ID: "authorization-42",
+    FLEET_SOURCE_HEAD_SHA: "b".repeat(40),
+    FLEET_AUTH_POLICY_VERSION: "fleet-cloud-agent.v1",
+    FLEET_DRAFT_ONLY: "true",
+    FLEET_DISPATCH_PROOF_VERIFIED: "true",
+    FLEET_DISPATCH_PROOF_ID: `proof_${"c".repeat(64)}`,
+    FLEET_DISPATCH_PROOF_REPO: controlRepository,
+    FLEET_DISPATCH_PROOF_ISSUE: "42",
+    FLEET_ENROLLMENT_DIGEST: "d".repeat(64),
+    FLEET_REPO: controlRepository,
+  };
+  const binding = parseCloudAgentBinding(env);
+  assert.equal(binding.ok, true);
+  assert.equal(isAuthorizedCloudControlTarget(binding, controlRepository, controlRepository), true);
+
+  assert.throws(
+    () => resolveRequestedRepo([control], controlRepository, "M1Vj", { controlRepository }),
+    /repo target unavailable/,
+  );
+  const selected = selectImprovementRepos([control], {
+    requestedRepo: controlRepository,
+    controlRepository,
+    allowControlRepository: true,
+    topK: 1,
+    now: NOW,
+    history: [],
+  });
+  assert.deepEqual(selected.map((item) => item.full_name), [controlRepository]);
+
+  assert.equal(isAuthorizedCloudControlTarget({ ...binding, mode: "legacy" }, controlRepository, controlRepository), false);
+  assert.equal(isAuthorizedCloudControlTarget({ ...binding, proofRepository: "M1Vj/other" }, controlRepository, controlRepository), false);
 });
 
 test("private research circuit outage remains waiting for capacity", () => {

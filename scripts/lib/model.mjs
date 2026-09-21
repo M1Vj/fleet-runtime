@@ -28,7 +28,7 @@
  * ============================================================================
  */
 import { spawn } from "node:child_process";
-import { existsSync, copyFileSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
+import { existsSync, copyFileSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync, appendFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { gatewayCircuitOpen, markGatewayDown, markGatewayUp } from "./gateway-health.mjs";
@@ -125,11 +125,359 @@ export const PUBLIC_READ_ONLY_PERMISSIONS = Object.freeze({
   websearch: "allow",
 });
 
+export const ADVISORY_READ_ONLY_PERMISSIONS = Object.freeze({
+  ...PUBLIC_READ_ONLY_PERMISSIONS,
+  webfetch: "deny",
+  websearch: "deny",
+});
+
+const ADVISORY_ENV_ALLOWLIST = Object.freeze([
+  "PATH",
+  "LANG",
+  "LANGUAGE",
+  "LC_ALL",
+  "LC_CTYPE",
+  "LC_MESSAGES",
+  "TERM",
+  "CI",
+  "TZ",
+  "NO_COLOR",
+  "FORCE_COLOR",
+  "GITHUB_ACTIONS",
+  "GITHUB_SERVER_URL",
+  "GITHUB_API_URL",
+  "GITHUB_GRAPHQL_URL",
+  "GITHUB_REPOSITORY",
+  "GITHUB_REF",
+  "GITHUB_REF_NAME",
+  "GITHUB_SHA",
+  "GITHUB_RUN_ID",
+  "GITHUB_RUN_NUMBER",
+  "GITHUB_RUN_ATTEMPT",
+  "GITHUB_WORKFLOW",
+  "GITHUB_WORKFLOW_REF",
+  "GITHUB_WORKFLOW_SHA",
+  "RUNNER_OS",
+  "RUNNER_ARCH",
+  "RUNNER_NAME",
+  "RUNNER_ENVIRONMENT",
+  "FLEET_MODEL_CHAIN",
+  "FLEET_JUDGE_MODEL",
+  "FLEET_CHAIN_TTL_MS",
+  "FLEET_GATEWAY_RETRY_MS",
+  "FLEET_OPENCODE_DEBUG",
+]);
+
+const ADVISORY_AUTH_KEYS = Object.freeze([
+  "FLEET_OPENCODE_AUTH",
+  "FLEET_OPENCODE_AUTH_2",
+  "FLEET_OPENCODE_AUTH_3",
+  "FLEET_OPENCODE_AUTH_4",
+  "FLEET_OPENCODE_AUTH_5",
+  "FLEET_OPENCODE_AUTH_6",
+  "FLEET_OPENCODE_AUTH_7",
+  "FLEET_OPENCODE_AUTH_8",
+  "FLEET_OPENCODE_AUTH_9",
+]);
+
+// Read-only environments carry their isolation proof by object identity, not
+// by a caller-controlled marker in the environment.  This lets nested model
+// calls reuse one verified boundary without re-running containment checks
+// against the already-rewritten FLEET_STATE_ROOT.
+const PREPARED_ADVISORY_ENVS = new WeakSet();
+
+function isPreparedAdvisoryEnv(env) {
+  return Boolean(env && typeof env === "object" && !Array.isArray(env) && PREPARED_ADVISORY_ENVS.has(env));
+}
+
+function rememberPreparedAdvisoryEnv(env) {
+  if (env && typeof env === "object" && !Array.isArray(env)) PREPARED_ADVISORY_ENVS.add(env);
+  return env;
+}
+
+function hasModelAuth(env) {
+  if (!env || typeof env !== "object" || Array.isArray(env)) return false;
+  if (String(env.OPENCODE_AUTH_CONTENT || "")) return true;
+  return ADVISORY_AUTH_KEYS.some((key) => Boolean(String(env[key] || "")));
+}
+
+function boundedAdvisoryValue(value) {
+  if (value === undefined || value === null) return undefined;
+  const text = String(value);
+  if (!text || text.length > 4096 || /[\u0000-\u001f\u007f]/.test(text)) return undefined;
+  return text;
+}
+
+function advisoryRoot(env = process.env) {
+  const runnerTemp = path.resolve(String(env.RUNNER_TEMP || env.TMPDIR || os.tmpdir()));
+  const configured = String(env.FLEET_ADVISORY_STATE_ROOT || "").trim();
+  const root = path.resolve(configured || path.join(runnerTemp, "fleet-advisory-model"));
+  const relative = path.relative(runnerTemp, root);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error("advisory model state must stay under runner temp");
+  }
+  for (const privateRoot of [
+    env.FLEET_PRIVATE_STATE_ROOT,
+    env.FLEET_STATE_ROOT ? path.join(String(env.FLEET_STATE_ROOT), "state") : "",
+  ]) {
+    const candidate = String(privateRoot || "").trim();
+    if (!candidate) continue;
+    const normalized = path.resolve(candidate);
+    const privateRelative = path.relative(normalized, root);
+    if (privateRelative === "" || (!privateRelative.startsWith("..") && !path.isAbsolute(privateRelative))) {
+      throw new Error("advisory model state may not overlap controller state");
+    }
+  }
+  return { runnerTemp, root };
+}
+
+function advisoryPathInfo(value, label = "path") {
+  const lexical = path.resolve(String(value || ""));
+  let probe = lexical;
+  const missing = [];
+  while (true) {
+    try {
+      const stat = lstatSync(probe);
+      const baseReal = realpathSync.native(probe);
+      const real = missing.length > 0 ? path.join(baseReal, ...missing.reverse()) : baseReal;
+      if (stat.isSymbolicLink()) {
+        return { label, lexical, real, exists: missing.length === 0, directory: false, symlink: true };
+      }
+      const exists = probe === lexical;
+      return {
+        label,
+        lexical,
+        real,
+        exists,
+        directory: exists && stat.isDirectory(),
+        symlink: false,
+      };
+    } catch (error) {
+      if (!error || !["ENOENT", "ENOTDIR"].includes(error.code)) {
+        throw new Error(`${label} could not be verified`);
+      }
+      const parent = path.dirname(probe);
+      if (parent === probe) return { label, lexical, real: undefined, exists: false, directory: false, symlink: false };
+      missing.push(path.basename(probe));
+      probe = parent;
+    }
+  }
+}
+
+function advisoryPathWithin(base, candidate) {
+  const relative = path.relative(base, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function advisoryPathsOverlap(left, right) {
+  return advisoryPathWithin(left, right) || advisoryPathWithin(right, left);
+}
+
+/**
+ * Reject symlink aliases introduced below a trusted runner-temp prefix.  The
+ * macOS /var -> /private/var alias is allowed as part of the trusted prefix;
+ * a task-created alias inside that prefix is not.
+ */
+function assertAdvisoryWorkspaceSymlinkFree(workspace, runnerTemp) {
+  const target = path.resolve(workspace);
+  const trusted = path.resolve(runnerTemp);
+  const relative = path.relative(trusted, target);
+  const start = relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))
+    ? trusted
+    : path.parse(target).root;
+  let current = start;
+  for (const segment of path.relative(start, target).split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    try {
+      if (lstatSync(current).isSymbolicLink()) throw new Error("advisory model workspace may not use a symlink alias");
+    } catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") break;
+      throw error;
+    }
+  }
+}
+
+function advisoryForbiddenRoots(source, advisoryStateRoot) {
+  const entries = [];
+  const seen = new Set();
+  const add = (label, value) => {
+    const raw = String(value || "").trim();
+    if (!raw) return;
+    const lexical = path.resolve(raw);
+    const key = `${label}:${lexical}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    entries.push(advisoryPathInfo(lexical, label));
+  };
+  add("controller checkout", source.GITHUB_WORKSPACE);
+  add("workflow checkout", source.FLEET_WORKFLOW_ROOT);
+  add("controller workspace", source.FLEET_CONTROLLER_WORKSPACE);
+  add("runtime checkout", source.FLEET_RUNTIME_CHECKOUT_ROOT);
+  add("controller state", source.FLEET_STATE_ROOT);
+  if (source.FLEET_STATE_ROOT) add("controller state tree", path.join(String(source.FLEET_STATE_ROOT), "state"));
+  add("private state", source.FLEET_PRIVATE_STATE_ROOT);
+  add("public state", source.FLEET_PUBLIC_STATE_ROOT);
+  add("advisory state", advisoryStateRoot);
+  return entries;
+}
+
+function assertAdvisoryWorkspaceSeparated(workspaceInfo, forbiddenRoots) {
+  for (const root of forbiddenRoots) {
+    const left = workspaceInfo.real || workspaceInfo.lexical;
+    const right = root.real || root.lexical;
+    if (advisoryPathsOverlap(left, right) || advisoryPathsOverlap(workspaceInfo.lexical, root.lexical)) {
+      throw new Error(`advisory model workspace may not overlap ${root.label}`);
+    }
+  }
+}
+
+function ensureAdvisoryWorkspace(source, workspaceInfo, runnerTempInfo) {
+  // Existing checkouts are constrained just like newly created workspaces:
+  // advisory analysis must run inside the dedicated runner-temp fence.
+  if (!runnerTempInfo.exists || !runnerTempInfo.directory || runnerTempInfo.symlink) {
+    throw new Error("runner temp root could not be verified");
+  }
+  if (runnerTempInfo.lexical === path.parse(runnerTempInfo.lexical).root) {
+    throw new Error("runner temp root must be dedicated");
+  }
+  const lexicalWithin = advisoryPathWithin(runnerTempInfo.lexical, workspaceInfo.lexical);
+  const canonicalWithin = runnerTempInfo.real && workspaceInfo.real
+    ? advisoryPathWithin(runnerTempInfo.real, workspaceInfo.real)
+    : false;
+  if ((!lexicalWithin && !canonicalWithin) || workspaceInfo.lexical === runnerTempInfo.lexical) {
+    throw new Error("advisory model workspace must stay under RUNNER_TEMP");
+  }
+  if (workspaceInfo.exists) {
+    if (!workspaceInfo.directory || workspaceInfo.symlink) throw new Error("advisory model workspace must be a real directory");
+    if (workspaceInfo.lexical === runnerTempInfo.lexical || (workspaceInfo.real && runnerTempInfo.real && workspaceInfo.real === runnerTempInfo.real)) {
+      throw new Error("advisory model workspace must be a dedicated directory under runner temp");
+    }
+    return workspaceInfo;
+  }
+  const configuredRunnerTemp = String(source.RUNNER_TEMP || "").trim();
+  if (!configuredRunnerTemp) {
+    throw new Error("advisory model workspace must exist or be created under RUNNER_TEMP");
+  }
+  mkdirSync(workspaceInfo.lexical, { recursive: true, mode: 0o700 });
+  const created = advisoryPathInfo(workspaceInfo.lexical, "advisory model workspace");
+  if (!created.exists || !created.directory || created.symlink) {
+    throw new Error("advisory model workspace could not be safely created");
+  }
+  return created;
+}
+
+function ensureAdvisoryRoot(runnerTemp, root, forbiddenRoots) {
+  const runnerTempInfo = advisoryPathInfo(runnerTemp, "runner temp root");
+  if (!runnerTempInfo.exists || !runnerTempInfo.directory || runnerTempInfo.symlink) {
+    throw new Error("runner temp root could not be verified");
+  }
+  if (runnerTempInfo.lexical === path.parse(runnerTempInfo.lexical).root) {
+    throw new Error("runner temp root must be dedicated");
+  }
+  const rootInfo = advisoryPathInfo(root, "advisory model state");
+  const lexicalWithin = advisoryPathWithin(runnerTempInfo.lexical, rootInfo.lexical);
+  const canonicalWithin = runnerTempInfo.real && rootInfo.real
+    ? advisoryPathWithin(runnerTempInfo.real, rootInfo.real)
+    : false;
+  if ((!lexicalWithin && !canonicalWithin) || rootInfo.lexical === runnerTempInfo.lexical) {
+    throw new Error("advisory model state must stay under runner temp");
+  }
+  assertAdvisoryWorkspaceSymlinkFree(rootInfo.lexical, runnerTempInfo.lexical);
+  for (const entry of forbiddenRoots) {
+    if (entry.label === "advisory state") continue;
+    const left = rootInfo.real || rootInfo.lexical;
+    const right = entry.real || entry.lexical;
+    if (advisoryPathsOverlap(left, right) || advisoryPathsOverlap(rootInfo.lexical, entry.lexical)) {
+      throw new Error(`advisory model state may not overlap ${entry.label}`);
+    }
+  }
+  if (rootInfo.exists && (!rootInfo.directory || rootInfo.symlink)) {
+    throw new Error("advisory model state must be a real directory");
+  }
+  mkdirSync(rootInfo.lexical, { recursive: true, mode: 0o700 });
+  const verified = advisoryPathInfo(rootInfo.lexical, "advisory model state");
+  if (!verified.exists || !verified.directory || verified.symlink) {
+    throw new Error("advisory model state could not be safely created");
+  }
+  assertAdvisoryWorkspaceSymlinkFree(verified.lexical, runnerTempInfo.lexical);
+  for (const directory of ["home", "tmp", "xdg-config", "xdg-data", "xdg-cache"]) {
+    mkdirSync(path.join(verified.lexical, directory), { recursive: true, mode: 0o700 });
+  }
+  return verified.lexical;
+}
+
+/**
+ * Build the environment visible to the hosted advisory model runner.
+ *
+ * This boundary is deliberately independent from FLEET_DATA_CLASS.  Private
+ * reviews still use private controller code and bounded GitHub reads, but the
+ * model child receives only provider auth plus a dedicated runtime workspace.
+ * Controller tokens, checkout/state paths, and inherited OpenCode config are
+ * omitted before spawn; runOnce adds the fixed read-only permission policy.
+ */
+export function advisoryModelEnv(env = process.env, { workspace } = {}) {
+  const source = env && typeof env === "object" && !Array.isArray(env) ? env : {};
+  const { runnerTemp, root } = advisoryRoot(source);
+  const suppliedWorkspace = String(workspace || "").trim();
+  const configuredWorkspace = suppliedWorkspace || String(source.FLEET_MODEL_WORKSPACE || source.FLEET_RUNTIME_WORKSPACE || "").trim();
+  // Older callers passed process.cwd() when no workflow workspace contract
+  // existed.  Fail closed against that controller checkout by materializing a
+  // dedicated sibling under RUNNER_TEMP instead; an explicitly configured
+  // workspace is always validated and never silently substituted.
+  const implicitControllerWorkspace = !suppliedWorkspace && !String(source.FLEET_MODEL_WORKSPACE || source.FLEET_RUNTIME_WORKSPACE || "").trim();
+  const requestedWorkspace = path.resolve(String(configuredWorkspace || (implicitControllerWorkspace ? path.join(runnerTemp, "fleet-advisory-workspace") : workspace) || path.join(runnerTemp, "fleet-advisory-workspace")));
+  if (!requestedWorkspace.startsWith("/") || requestedWorkspace === "/") {
+    throw new Error("advisory model workspace must be an absolute path");
+  }
+  const workspaceInfo = advisoryPathInfo(requestedWorkspace, "advisory model workspace");
+  assertAdvisoryWorkspaceSymlinkFree(requestedWorkspace, runnerTemp);
+  const forbiddenRoots = advisoryForbiddenRoots(source, root);
+  // Check lexical paths before creating a missing workspace so an invalid
+  // controller/state path is never materialized as a model directory.
+  assertAdvisoryWorkspaceSeparated(workspaceInfo, forbiddenRoots);
+  const runnerTempInfo = advisoryPathInfo(runnerTemp, "runner temp root");
+  const verifiedWorkspace = ensureAdvisoryWorkspace(source, workspaceInfo, runnerTempInfo);
+  assertAdvisoryWorkspaceSymlinkFree(verifiedWorkspace.lexical, runnerTemp);
+  assertAdvisoryWorkspaceSeparated(verifiedWorkspace, forbiddenRoots);
+  const verifiedRoot = ensureAdvisoryRoot(runnerTemp, root, forbiddenRoots);
+  // Keep the caller's verified lexical path for cwd/config semantics.  The
+  // canonical path was used above for all isolation decisions and symlink
+  // aliases are rejected before this point.
+  const modelWorkspace = verifiedWorkspace.lexical;
+  const output = {};
+  for (const key of ADVISORY_ENV_ALLOWLIST) {
+    const safe = boundedAdvisoryValue(source[key]);
+    if (safe !== undefined) output[key] = safe;
+  }
+  for (const key of ADVISORY_AUTH_KEYS) {
+    const safe = boundedAdvisoryValue(source[key]);
+    if (safe !== undefined) output[key] = safe;
+  }
+  if (String(source.FLEET_DATA_CLASS || "").trim().toLowerCase() === "public") {
+    for (const key of ["FLEET_DATA_CLASS", "FLEET_PUBLIC_OWNER", "FLEET_PUBLIC_REPOSITORY", "FLEET_PUBLIC_STATE_ROOT", "FLEET_PUBLIC_ARTIFACT_MANIFEST"]) {
+      const safe = boundedAdvisoryValue(source[key]);
+      if (safe !== undefined) output[key] = safe;
+    }
+  }
+  output.FLEET_ADVISORY_READ_ONLY = "1";
+  output.FLEET_STATE_ROOT = verifiedRoot;
+  output.FLEET_WORKSPACE_ROOT = modelWorkspace;
+  output.RUNNER_TEMP = runnerTemp;
+  output.HOME = path.join(verifiedRoot, "home");
+  output.TMPDIR = path.join(verifiedRoot, "tmp");
+  output.XDG_CONFIG_HOME = path.join(verifiedRoot, "xdg-config");
+  output.XDG_DATA_HOME = path.join(verifiedRoot, "xdg-data");
+  output.XDG_CACHE_HOME = path.join(verifiedRoot, "xdg-cache");
+  output.GIT_TERMINAL_PROMPT = "0";
+  return rememberPreparedAdvisoryEnv(output);
+}
+
 export function buildOpenCodeConfigContent(selectedModel, existing = "", workspace = "", options = {}) {
   const publicMode = options && options.publicMode === true;
+  const readOnly = options && options.readOnly === true;
   let config = {};
   try {
-    if (!publicMode) {
+    if (!publicMode && !readOnly) {
       const workspaceConfigPath = workspace ? path.join(workspace, "opencode.json") : "";
       const workspaceConfig = workspaceConfigPath && existsSync(workspaceConfigPath)
         ? parseConfigObject(readFileSync(workspaceConfigPath, "utf8"))
@@ -138,6 +486,7 @@ export function buildOpenCodeConfigContent(selectedModel, existing = "", workspa
     }
   } catch {}
   if (publicMode) config = { permission: { ...PUBLIC_READ_ONLY_PERMISSIONS } };
+  if (readOnly) config = { permission: { ...ADVISORY_READ_ONLY_PERMISSIONS } };
   config.model = selectedModel;
   config.small_model = selectedModel;
   return JSON.stringify(stripSecretConfig(config));
@@ -280,16 +629,26 @@ export function writeAuthExhaustedFlag({ stateRoot, total, cooldownMs }) {
   return true;
 }
 
-export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS.standard, env = process.env, files = [], model, modelOverride, workspace }) {
+export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS.standard, env = process.env, files = [], model, modelOverride, workspace, readOnly = false }) {
   return new Promise((resolve) => {
     // Honor the requested model via the provider allowlist; fall back to the
     // chain primary. (Upstream opencode#47120: 1.18 discovery omits models, so
     // explicit `-m` IDs are passed through here rather than discovered.)
     const requested = String(modelOverride || model || DEFAULT_MODEL_CHAIN[0]).trim();
     const selected = isAllowedModel(requested) ? requested : DEFAULT_MODEL_CHAIN[0];
+    if (readOnly) {
+      try {
+        if (!isPreparedAdvisoryEnv(env)) env = advisoryModelEnv(env, { workspace });
+        workspace = env.FLEET_WORKSPACE_ROOT;
+      } catch (error) {
+        resolve({ reply: "", sessionId: "", exitCode: -1, interrupted: false, stderrTail: String(error?.message || error).slice(0, 240), spawnFailed: false, blocked: true, modelMode: "advisory-env-invalid", model: selected });
+        return;
+      }
+    }
     if (String(env?.FLEET_DATA_CLASS || "").trim().toLowerCase() === "public") {
       try {
         env = publicModelEnv(env);
+        if (readOnly) workspace = env.FLEET_WORKSPACE_ROOT;
       } catch {
         resolve({ reply: "", sessionId: "", exitCode: -1, interrupted: false, stderrTail: "public environment unavailable", spawnFailed: false, blocked: true, modelMode: "public-env-invalid", model: selected });
         return;
@@ -387,7 +746,10 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
       selected,
       childEnv.OPENCODE_CONFIG_CONTENT,
       workspace,
-      { publicMode: String(env?.FLEET_DATA_CLASS || "").trim().toLowerCase() === "public" },
+      {
+        publicMode: String(env?.FLEET_DATA_CLASS || "").trim().toLowerCase() === "public",
+        readOnly,
+      },
     );
     childEnv.OPENCODE_DISABLE_AUTOUPDATE = "1";
     if (env.FLEET_INDEFINITE_DISABLE !== "1") {
@@ -549,7 +911,23 @@ function allAttemptsQuotaLimited(attempts = []) {
   });
 }
 
-export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.standard, env = process.env, preferVariantMax = true, maxRounds = 4, files = [], modelOverride, workspace, skipCircuitCheck = false, pinModel = false }) {
+export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.standard, env = process.env, preferVariantMax = true, maxRounds = 4, files = [], modelOverride, workspace, skipCircuitCheck = false, pinModel = false, readOnly = false }) {
+  if (readOnly) {
+    try {
+      if (!isPreparedAdvisoryEnv(env)) env = advisoryModelEnv(env, { workspace });
+      workspace = env.FLEET_WORKSPACE_ROOT;
+    } catch (error) {
+      return {
+        reply: "",
+        sessionId: "",
+        modelMode: "advisory-env-invalid",
+        attempts: [],
+        complete: false,
+        blocked: true,
+        error: String(error?.message || error).slice(0, 240),
+      };
+    }
+  }
   const stateRoot = env.FLEET_STATE_ROOT || process.cwd();
   const coreRoot = String(env.FLEET_CORE_ROOT || "").trim();
   if (!CORE_INTEGRITY_OK || !verifyCoreIntegrity(coreRoot || undefined)) return coreParityBlocked(stateRoot);
@@ -573,7 +951,7 @@ export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.s
   let chainExhausted = false;
   for (let ci = 0; ci < chain.length; ci++) {
     logModelAudit(stateRoot, { event: "model_try", model: chain[ci], index: ci, total: chain.length });
-    const r = await askOnModel({ model: chain[ci], isPrimary: ci === 0, prompt, sessionId: lastSid || undefined, timeoutMs, env, preferVariantMax, maxRounds, files, workspace });
+    const r = await askOnModel({ model: chain[ci], isPrimary: ci === 0, prompt, sessionId: lastSid || undefined, timeoutMs, env, preferVariantMax, maxRounds, files, workspace, readOnly });
     allAttempts.push(...(r.attempts || []));
     lastSid = r.sessionId || "";
     lastMode = r.modelMode || lastMode;
@@ -630,12 +1008,13 @@ function stripAuth(env) {
   const clone = { ...env };
   delete clone.OPENCODE_AUTH_CONTENT;
   // Numbered slots included: anon rounds must not leak any slot key.
-  return stripSlotKeys(clone);
+  const stripped = stripSlotKeys(clone);
+  return isPreparedAdvisoryEnv(env) ? rememberPreparedAdvisoryEnv(stripped) : stripped;
 }
 
-async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env, preferVariantMax, maxRounds, files, workspace }) {
+async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env, preferVariantMax, maxRounds, files, workspace, readOnly = false }) {
   const stateRoot = env.FLEET_STATE_ROOT || process.cwd();
-  const startedAuthenticated = collectSlots(env).length > 0 || Boolean(env.OPENCODE_AUTH_CONTENT);
+  const startedAuthenticated = hasModelAuth(env);
   let sid = sessionId || "";
   let sessionReturned = false;
   // Contributor-tier thinking caps at xhigh (Standard-tier max is rejected on
@@ -653,7 +1032,7 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
       await sleep(backoff);
     }
     const roundEnv = useAuth ? env : stripAuth(env);
-    let r = await runOnce({ prompt: promptNow, sessionId: sid || undefined, variant: mode === "plain" ? undefined : mode, timeoutMs, env: roundEnv, files, workspace, model });
+    let r = await runOnce({ prompt: promptNow, sessionId: sid || undefined, variant: mode === "plain" ? undefined : mode, timeoutMs, env: roundEnv, files, workspace, model, readOnly });
     if (sid && (r.sessionNotFound || /session.*not found/i.test(`${r.stderrTail || ""} ${r.rawTail || ""}`))) {
       logModelAudit(stateRoot, { event: "session_not_found_cleared", staleSessionId: sid, model, round });
       attempts.push({
@@ -672,7 +1051,7 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
         rawTail: (r.rawTail || "").slice(-300),
       });
       sid = "";
-      r = await runOnce({ prompt: promptNow, sessionId: undefined, variant: mode === "plain" ? undefined : mode, timeoutMs, env: roundEnv, files, workspace, model });
+      r = await runOnce({ prompt: promptNow, sessionId: undefined, variant: mode === "plain" ? undefined : mode, timeoutMs, env: roundEnv, files, workspace, model, readOnly });
     }
     const att = {
       round,
@@ -712,7 +1091,7 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
     // retries that round once WITHOUT --variant before falling through
     // the ladder. No ladder redesign.
     if (mode !== "plain" && /variant/i.test(r.stderrTail || "")) {
-      const vr = await runOnce({ prompt: promptNow, sessionId: sid || undefined, variant: undefined, timeoutMs, env: roundEnv, files, workspace, model });
+      const vr = await runOnce({ prompt: promptNow, sessionId: sid || undefined, variant: undefined, timeoutMs, env: roundEnv, files, workspace, model, readOnly });
       if (vr.exhausted) ladderExhausted = true;
       attempts.push({
         round,

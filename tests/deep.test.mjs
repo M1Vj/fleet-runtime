@@ -179,7 +179,7 @@ test("provider outage stays pending without consuming a validation attempt", () 
 test("successful artifacts complete one task and artifact names cannot collide by kind", () => {
   const queue = [{ id: "task-1", repo: "M1Vj/a", kind: "code-review", status: "in_progress", attempts: 1, claimRunId: "run-1", claimAttempt: 1 }];
   assert.equal(
-    applyArtifactToQueue(queue, successfulArtifact({ finishedUtc: "2026-09-12T09:00:00Z" }), "2026-09-12T09:00:00Z"),
+    applyArtifactToQueue(queue, successfulArtifact(), "2026-09-12T09:00:00Z"),
     "done",
   );
   assert.equal(queue[0].status, "done");
@@ -326,7 +326,7 @@ test("successful sibling artifacts apply even when another selected task fails o
       claimRunId: "deep-run-1",
       repo: "M1Vj/a",
       kind: "code-review",
-      finishedUtc: new Date(now).toISOString(),
+      finishedUtc: new Date().toISOString(),
     }),
     {
       taskId: "two",
@@ -363,7 +363,7 @@ test("missing selected artifacts stay retryable while completed siblings remain 
       claimRunId: "deep-run-1",
       repo: "M1Vj/a",
       kind: "code-review",
-      finishedUtc: new Date(now).toISOString(),
+      finishedUtc: new Date().toISOString(),
     }),
   ], { now, updatedUtc: new Date(now).toISOString() });
 

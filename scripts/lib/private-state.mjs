@@ -2,6 +2,10 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync,
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { makeTerminal as privateMakeTerminal } from "./terminal.mjs";
+import {
+  assertKillSwitchClear,
+  CANONICAL_KILL_SWITCH_PATH,
+} from "./kill-switch.mjs";
 
 /**
  * Execution data-class helpers.
@@ -26,6 +30,7 @@ export const PRIVATE_REPOSITORY_ENV = Object.freeze({
 
 const REPOSITORY_RE = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
 const PATH_SEGMENT_RE = /^[A-Za-z0-9_.-]+$/;
+const CLOUD_PUBLISHER_KILL_SWITCH_PATH = CANONICAL_KILL_SWITCH_PATH;
 
 export class DataClassError extends Error {
   constructor(code, reason, detail = "") {
@@ -233,6 +238,26 @@ export function publicModelEnv(env = process.env) {
 export function assertMutationAllowed(env = process.env, action = "mutation") {
   if (isPublicDataClass(env)) {
     throw new DataClassError(4, "PUBLIC_WRITE_BLOCKED", String(action));
+  }
+  if (String(env?.FLEET_CLOUD_UNTRUSTED || "") === "true") {
+    throw new DataClassError(4, "CLOUD_UNTRUSTED_WRITE_BLOCKED", String(action));
+  }
+  if (String(env?.FLEET_CLOUD_TRUSTED_PUBLISHER || "") === "true") {
+    // The private publisher must consult the durable VM marker immediately
+    // before each external write.  A workflow workspace marker is not shared
+    // with the controller and therefore fails closed instead of being trusted.
+    if (String(env?.FLEET_CLOUD_PUBLISHER || "") !== "fleet-runner"
+      || String(env?.FLEET_KILL_SWITCH_PATH || "") !== CLOUD_PUBLISHER_KILL_SWITCH_PATH) {
+      throw new DataClassError(4, "CLOUD_PUBLISHER_STATE_INVALID", String(action));
+    }
+    if (existsSync(CLOUD_PUBLISHER_KILL_SWITCH_PATH)) {
+      throw new DataClassError(2, "KILL_SWITCH_ENGAGED", CLOUD_PUBLISHER_KILL_SWITCH_PATH);
+    }
+  }
+  try {
+    assertKillSwitchClear(env);
+  } catch (error) {
+    throw new DataClassError(error?.code || 2, error?.reason || "KILL_SWITCH_SIGNAL_UNAVAILABLE", String(action));
   }
   return true;
 }

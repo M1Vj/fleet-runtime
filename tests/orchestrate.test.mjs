@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import * as orchestrate from "../scripts/orchestrate.mjs";
 import { buildFleetPlan } from "../scripts/lib/fleet-scheduler.mjs";
 
@@ -24,6 +24,18 @@ const MINUTE_MS = 60 * 1000;
 const DAY_MS = 24 * 60 * MINUTE_MS;
 const NOW = Date.parse("2026-09-13T00:00:00.000Z");
 const OWNER_REPO = "M1Vj/fleet-fixture";
+
+function advisoryFixtureEnv(root, overrides = {}) {
+  return {
+    RUNNER_TEMP: root,
+    FLEET_STATE_ROOT: path.join(root, "controller-state"),
+    FLEET_ADVISORY_STATE_ROOT: path.join(root, "advisory-state"),
+    FLEET_MODEL_WORKSPACE: path.join(root, "model-workspace"),
+    FLEET_RUNTIME_CHECKOUT_ROOT: path.join(root, "runtime-checkout"),
+    FLEET_ARTIFACT_DIR: path.join(root, "fleet-task-results"),
+    ...overrides,
+  };
+}
 
 function iso(at) {
   return new Date(at).toISOString();
@@ -711,6 +723,403 @@ test("durable planning suppresses duplicate delivery across separate processes",
   }
 });
 
+test("rejects an oversized lifetime journal instead of truncating newer state", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-journal-oversize-"));
+  const stateDir = path.join(root, "state");
+  mkdirSync(stateDir, { recursive: true });
+  const workKey = "review-M1Vj-fleet-fixture-42-security";
+  const base = {
+    workKey,
+    effectKey: "effect-old",
+    generation: 0,
+    state: "registered",
+    status: "registered",
+    task: { type: "review", role: "security", repo: OWNER_REPO, pr: 42 },
+    repo: OWNER_REPO,
+    pr: 42,
+    action: "review",
+  };
+  const oldRecord = `${JSON.stringify(base)}\n`;
+  const filler = `${JSON.stringify({ padding: "x".repeat(4096) })}\n`;
+  let journal = oldRecord;
+  while (Buffer.byteLength(journal) <= 1024 * 1024) journal += filler;
+  const latestRecord = `${JSON.stringify({
+    ...base,
+    effectKey: "effect-new",
+    state: "completed",
+    status: "completed",
+  })}\n`;
+  journal += latestRecord;
+  writeFileSync(path.join(stateDir, "orchestrate-state.jsonl"), journal);
+  try {
+    assert.ok(Buffer.byteLength(journal) > 1024 * 1024);
+    assert.throws(
+      () => loadOrchestrationState(root),
+      /state (?:journal|file) (?:exceeds|too large|oversize)/i,
+      "a lifetime journal must not be read as a truncated prefix",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("blocks execution before an external effect when the lifetime journal is oversized", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-journal-block-"));
+  const stateDir = path.join(root, "state");
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(path.join(stateDir, "orchestrate-state.jsonl"), "x".repeat(1024 * 1024 + 1));
+  let effectCalls = 0;
+  try {
+    const result = await orchestrate.executeTask(
+      { id: "oversized-journal-effect", type: "upgrade", role: "upgrade", repo: "M1Vj/fleet-runtime" },
+      {
+        env: { FLEET_STATE_ROOT: root },
+        ghClient() {
+          effectCalls += 1;
+          return { runId: "must-not-run" };
+        },
+      },
+    );
+    assert.equal(result.status, "deferred");
+    assert.equal(result.reason, "transaction-prepare-failed");
+    assert.equal(result.effectState, "unknown_effect");
+    assert.equal(effectCalls, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects a symlinked lifetime journal instead of reading or appending through it", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-journal-symlink-"));
+  const stateDir = path.join(root, "state");
+  const external = path.join(root, "external-state.jsonl");
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(external, `${JSON.stringify({ workKey: "external-work", state: "completed" })}\n`);
+  symlinkSync(external, path.join(stateDir, "orchestrate-state.jsonl"));
+  try {
+    assert.throws(
+      () => loadOrchestrationState(root),
+      /state file unreadable|symlink|regular file/i,
+      "lifetime state must not follow a symlink",
+    );
+    assert.equal(readFileSync(external, "utf8"), `${JSON.stringify({ workKey: "external-work", state: "completed" })}\n`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects a symlinked lock even when its target looks stale", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-lock-symlink-"));
+  const stateDir = path.join(root, "state");
+  const external = path.join(root, "external-lock");
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(external, "owner-sentinel\n");
+  const stale = new Date(Date.now() - 120_000);
+  utimesSync(external, stale, stale);
+  symlinkSync(external, path.join(stateDir, ".orchestrate.lock"));
+  let effectCalls = 0;
+  try {
+    const result = await orchestrate.executeTask(
+      { id: "symlink-lock-target", type: "upgrade", role: "upgrade", repo: "M1Vj/fleet-runtime" },
+      {
+        env: { FLEET_STATE_ROOT: root },
+        ghClient() {
+          effectCalls += 1;
+          return { runId: "must-not-run" };
+        },
+      },
+    );
+    assert.equal(result.status, "deferred");
+    assert.equal(result.reason, "transaction-prepare-failed");
+    assert.equal(effectCalls, 0);
+    assert.equal(readFileSync(external, "utf8"), "owner-sentinel\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fails closed when the lock fsync fails before any external effect", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-fsync-fault-"));
+  const workflowPath = path.join(root, "improve.yml");
+  writeFileSync(workflowPath, [
+    "on:",
+    "  workflow_dispatch:",
+    "    inputs:",
+    "      repo:",
+    "        type: string",
+  ].join("\n"));
+  const modulePath = path.join(process.cwd(), "scripts", "orchestrate.mjs");
+  const task = { id: "fsync-fault-target", type: "upgrade", role: "upgrade", repo: "M1Vj/fleet-runtime" };
+  const childSource = `
+    import { createRequire, syncBuiltinESMExports } from "node:module";
+    const require = createRequire(import.meta.url);
+    const fs = require("node:fs");
+    const originalFsync = fs.fsyncSync;
+    let fsyncCalls = 0;
+    fs.fsyncSync = (fd) => {
+      fsyncCalls += 1;
+      if (fsyncCalls === 1) throw new Error("injected-fsync-failure");
+      return originalFsync(fd);
+    };
+    syncBuiltinESMExports();
+    const orchestrate = await import(${JSON.stringify(modulePath)});
+    let effectCalls = 0;
+    const result = await orchestrate.executeTask(${JSON.stringify(task)}, {
+      workflowPath: ${JSON.stringify(workflowPath)},
+      env: { FLEET_STATE_ROOT: ${JSON.stringify(root)} },
+      ghClient() {
+        effectCalls += 1;
+        return { runId: "must-not-run" };
+      },
+    });
+    process.stdout.write(JSON.stringify({ result, effectCalls, fsyncCalls }));
+  `;
+  try {
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", childSource], {
+      cwd: process.cwd(),
+      env: { ...process.env, FLEET_STATE_ROOT: root },
+      encoding: "utf8",
+    });
+    assert.equal(child.status, 0, child.stderr);
+    const output = JSON.parse(child.stdout);
+    assert.equal(output.fsyncCalls, 1);
+    assert.equal(output.effectCalls, 0);
+    assert.equal(output.result.status, "deferred");
+    assert.equal(output.result.reason, "transaction-prepare-failed");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("keeps a later prepared transaction unknown after an earlier transaction commits", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-tx-recovery-"));
+  const stateDir = path.join(root, "state");
+  mkdirSync(stateDir, { recursive: true });
+  const workKey = "upgrade-M1Vj-fleet-runtime-upgrade";
+  const task = { type: "upgrade", role: "upgrade", repo: "M1Vj/fleet-runtime", pr: null };
+  const first = {
+    schema: "fleet-orchestrate-transaction-v1",
+    txId: "tx-v1-first",
+    workKey,
+    effectKey: "effect-first",
+    generation: 0,
+    at: "2026-09-21T00:00:00.000Z",
+  };
+  const later = {
+    ...first,
+    txId: "tx-v1-later",
+    effectKey: "effect-later",
+    generation: 1,
+  };
+  writeFileSync(path.join(stateDir, "orchestrate-transactions.jsonl"), [
+    { ...first, phase: "prepared" },
+    { ...first, phase: "committed" },
+    { ...later, phase: "prepared" },
+  ].map((row) => `${JSON.stringify(row)}\n`).join(""));
+  writeFileSync(path.join(stateDir, "orchestrate-state.jsonl"), `${JSON.stringify({
+    workKey,
+    effectKey: first.effectKey,
+    generation: first.generation,
+    state: "registered",
+    status: "registered",
+    task,
+    repo: task.repo,
+    pr: null,
+    action: "upgrade",
+  })}\n`);
+  writeFileSync(path.join(stateDir, "orchestrate-outbox.jsonl"), `${JSON.stringify({
+    ...later,
+    event: "effect_prepared",
+    operation: "dispatch",
+    state: "awaiting_receipt",
+    task,
+  })}\n`);
+  writeFileSync(path.join(stateDir, "orchestrate-history.jsonl"), `${JSON.stringify({
+    ...later,
+    event: "effect_prepared",
+    operation: "dispatch",
+    state: "awaiting_receipt",
+    repo: task.repo,
+    action: "upgrade",
+  })}\n`);
+  try {
+    const current = loadOrchestrationState(root).records.find((row) => row.workKey === workKey);
+    assert.equal(current.state, "unknown_effect");
+    assert.equal(current.generation, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("recovers UNKNOWN_EFFECT after a simulated power loss during a later transaction", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-power-loss-"));
+  const workflowPath = path.join(root, "improve.yml");
+  writeFileSync(workflowPath, [
+    "on:",
+    "  workflow_dispatch:",
+    "    inputs:",
+    "      repo:",
+    "        type: string",
+  ].join("\n"));
+  const modulePath = path.join(process.cwd(), "scripts", "orchestrate.mjs");
+  const task = { id: "power-loss-target", type: "upgrade", role: "upgrade", repo: "M1Vj/fleet-runtime" };
+  const childSource = `
+    import { createRequire, syncBuiltinESMExports } from "node:module";
+    const require = createRequire(import.meta.url);
+    const fs = require("node:fs");
+    const originalFsync = fs.fsyncSync;
+    let fsyncCalls = 0;
+    fs.fsyncSync = (fd) => {
+      fsyncCalls += 1;
+      if (fsyncCalls === 20) process.kill(process.pid, "SIGKILL");
+      return originalFsync(fd);
+    };
+    syncBuiltinESMExports();
+    const orchestrate = await import(${JSON.stringify(modulePath)});
+    const env = {
+      FLEET_STATE_ROOT: ${JSON.stringify(root)},
+      RUNNER_TEMP: ${JSON.stringify(root)},
+      FLEET_ARTIFACT_DIR: ${JSON.stringify(path.join(root, "fleet-task-results"))},
+    };
+    const task = ${JSON.stringify(task)};
+    await orchestrate.planFleet({
+      env: { ...env, FLEET_EVENT_NAME: "schedule", FLEET_EVENT_ACTION: "schedule", FLEET_EVENT_PAYLOAD: "{}" },
+      ghClient: () => [],
+      logger: () => {},
+      planBuilder: () => ({ allTasks: [task] }),
+    });
+    await orchestrate.executeTask(task, {
+      env,
+      workflowPath: ${JSON.stringify(workflowPath)},
+      ghClient: () => ({ runId: "must-not-run" }),
+    });
+  `;
+  try {
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", childSource], {
+      cwd: process.cwd(),
+      env: { ...process.env, FLEET_STATE_ROOT: root },
+      encoding: "utf8",
+    });
+    assert.equal(child.signal, "SIGKILL", child.stderr);
+    const current = loadOrchestrationState(root).records.find((row) => row.workKey === stableWorkKey(task));
+    assert.equal(current.state, "unknown_effect");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("uses distinct transaction ids for same-millisecond state transitions", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-tx-unique-"));
+  const workflowPath = path.join(root, "improve.yml");
+  writeFileSync(workflowPath, [
+    "on:",
+    "  workflow_dispatch:",
+    "    inputs:",
+    "      repo:",
+    "        type: string",
+  ].join("\n"));
+  const task = { id: "same-ms-tx", type: "upgrade", role: "upgrade", repo: "M1Vj/fleet-runtime" };
+  const env = {
+    FLEET_STATE_ROOT: root,
+    RUNNER_TEMP: root,
+    FLEET_ARTIFACT_DIR: path.join(root, "fleet-task-results"),
+    FLEET_EVENT_NAME: "schedule",
+    FLEET_EVENT_ACTION: "schedule",
+    FLEET_EVENT_PAYLOAD: "{}",
+  };
+  const RealDate = globalThis.Date;
+  const fixedMs = Date.parse("2026-09-21T00:00:00.000Z");
+  class FixedDate extends RealDate {
+    constructor(...args) {
+      super(...(args.length === 0 ? [fixedMs] : args));
+    }
+
+    static now() {
+      return fixedMs;
+    }
+  }
+  globalThis.Date = FixedDate;
+  try {
+    await orchestrate.planFleet({
+      env,
+      now: fixedMs,
+      ghClient: () => [],
+      logger: () => {},
+      planBuilder: () => ({ allTasks: [task] }),
+    });
+    await orchestrate.executeTask(task, {
+      env,
+      workflowPath,
+      ghClient: () => ({ runId: "same-ms-run" }),
+    });
+    const committed = loadOrchestrationState(root).transactions.filter((row) => row.phase === "committed");
+    assert.ok(committed.length >= 2);
+    assert.equal(new Set(committed.map((row) => row.txId)).size, committed.length);
+  } finally {
+    globalThis.Date = RealDate;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects malformed and partial lifetime journal records", () => {
+  const cases = [
+    {
+      name: "malformed middle line",
+      content: `${JSON.stringify({ workKey: "work-1", state: "registered" })}\n{not-json}\n${JSON.stringify({ workKey: "work-2", state: "completed" })}\n`,
+    },
+    {
+      name: "partial final line",
+      content: `${JSON.stringify({ workKey: "work-1", state: "registered" })}\n{"workKey":"work-2","state":"completed"`,
+    },
+    {
+      name: "partial first line",
+      content: `{"workKey":"work-1","state":"registered"\n${JSON.stringify({ workKey: "work-2", state: "completed" })}\n`,
+    },
+  ];
+  for (const entry of cases) {
+    const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-journal-corrupt-"));
+    const stateDir = path.join(root, "state");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(path.join(stateDir, "orchestrate-state.jsonl"), entry.content);
+    try {
+      assert.throws(
+        () => loadOrchestrationState(root),
+        /state journal (?:record|line|corrupt|invalid)/i,
+        entry.name,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("retains a current lifetime record older than the former row window", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-journal-rows-"));
+  const stateDir = path.join(root, "state");
+  mkdirSync(stateDir, { recursive: true });
+  const workKey = "review-M1Vj-fleet-fixture-43-tests";
+  const current = {
+    workKey,
+    effectKey: "effect-current",
+    generation: 0,
+    state: "awaiting_receipt",
+    status: "awaiting_receipt",
+    task: { type: "review", role: "tests", repo: OWNER_REPO, pr: 43 },
+    repo: OWNER_REPO,
+    pr: 43,
+    action: "review",
+  };
+  const filler = `${JSON.stringify({ padding: "row" })}\n`;
+  const journal = `${JSON.stringify(current)}\n${filler.repeat(20_001)}`;
+  writeFileSync(path.join(stateDir, "orchestrate-state.jsonl"), journal);
+  try {
+    assert.ok(Buffer.byteLength(journal) < 1024 * 1024);
+    assert.equal(loadOrchestrationState(root).records.find((row) => row.workKey === workKey).state, "awaiting_receipt");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("work lifecycle rejects downgrades and exposes explicit unknown-effect recovery", () => {
   const base = {
     workKey: "work-v1-test",
@@ -919,11 +1328,7 @@ test("Given deferred, no-op, and awaiting-receipt stages, when the envelope is b
 test("Given a valid receipt, when goal, session, generation, artifact, check, or verifier drifts, then completion is rejected", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-receipt-binding-"));
   const task = { id: "receipt-binding", type: "review", role: "review", repo: OWNER_REPO, pr: 51 };
-  const env = {
-    FLEET_STATE_ROOT: root,
-    RUNNER_TEMP: root,
-    FLEET_ARTIFACT_DIR: path.join(root, "fleet-task-results"),
-  };
+  const env = advisoryFixtureEnv(root);
   try {
     const result = await orchestrate.executeTask(task, {
       env,
@@ -934,7 +1339,7 @@ test("Given a valid receipt, when goal, session, generation, artifact, check, or
       },
       modelRunner: async () => ({ complete: true, reply: "bounded review evidence", modelMode: "test" }),
     });
-    const record = loadOrchestrationState(root).records.find((row) => row.workKey === stableWorkKey(task));
+    const record = loadOrchestrationState(env.FLEET_STATE_ROOT).records.find((row) => row.workKey === stableWorkKey(task));
     assert.equal(record.state, "awaiting_receipt");
     const binding = record.receiptBinding;
     assert.ok(binding);
@@ -946,7 +1351,7 @@ test("Given a valid receipt, when goal, session, generation, artifact, check, or
       status: "completed",
       ...binding,
     };
-    assert.equal(applyEffectReceipt(root, base).accepted, true);
+    assert.equal(applyEffectReceipt(env.FLEET_STATE_ROOT, base).accepted, true);
     for (const [field, value] of [
       ["goal", "review M1Vj/other#51"],
       ["session", "session-drift"],
@@ -957,8 +1362,9 @@ test("Given a valid receipt, when goal, session, generation, artifact, check, or
     ]) {
       const isolatedRoot = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-receipt-binding-case-"));
       try {
+        const isolatedEnv = advisoryFixtureEnv(isolatedRoot);
         const isolated = await orchestrate.executeTask(task, {
-          env: { ...env, RUNNER_TEMP: isolatedRoot, FLEET_STATE_ROOT: isolatedRoot, FLEET_ARTIFACT_DIR: path.join(isolatedRoot, "fleet-task-results") },
+          env: isolatedEnv,
           ghClient(args) {
             const endpoint = String(args.at(-1) ?? "");
             if (endpoint.includes("/pulls/51")) return { number: 51, state: "open", base: { ref: "main" } };
@@ -966,13 +1372,13 @@ test("Given a valid receipt, when goal, session, generation, artifact, check, or
           },
           modelRunner: async () => ({ complete: true, reply: "bounded review evidence", modelMode: "test" }),
         });
-        const current = loadOrchestrationState(isolatedRoot).records.find((row) => row.workKey === stableWorkKey(task));
+        const current = loadOrchestrationState(isolatedEnv.FLEET_STATE_ROOT).records.find((row) => row.workKey === stableWorkKey(task));
         const receipt = { ...base, workKey: current.workKey, effectKey: current.effectKey, generation: current.generation, ...current.receiptBinding };
         receipt[field] = value;
-        const rejected = applyEffectReceipt(isolatedRoot, receipt);
+        const rejected = applyEffectReceipt(isolatedEnv.FLEET_STATE_ROOT, receipt);
         assert.equal(rejected.accepted, false, `${field} drift must reject`);
         assert.ok(["receipt-binding-mismatch", "late-receipt"].includes(rejected.reason), `${field} drift reason`);
-        assert.equal(loadOrchestrationState(isolatedRoot).records.find((row) => row.workKey === current.workKey).state, "awaiting_receipt");
+        assert.equal(loadOrchestrationState(isolatedEnv.FLEET_STATE_ROOT).records.find((row) => row.workKey === current.workKey).state, "awaiting_receipt");
         assert.equal(isolated.processSuccess, true);
       } finally {
         rmSync(isolatedRoot, { recursive: true, force: true });
@@ -1317,11 +1723,7 @@ test("model capacity exhaustion waits durably and resumes the same generation af
   const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-capacity-"));
   const task = { id: "capacity-target", type: "review", role: "tests", repo: OWNER_REPO, pr: 9 };
   const retryAt = "2026-09-13T00:01:00.000Z";
-  const env = {
-    FLEET_STATE_ROOT: root,
-    RUNNER_TEMP: root,
-    FLEET_ARTIFACT_DIR: path.join(root, "fleet-task-results"),
-  };
+  const env = advisoryFixtureEnv(root);
   try {
     const exhausted = await orchestrate.executeTask(task, {
       env,
@@ -1333,11 +1735,11 @@ test("model capacity exhaustion waits durably and resumes the same generation af
       modelRunner: async () => ({ complete: false, error: "quota exhausted", retryAt }),
     });
     assert.equal(exhausted.effectState, "waiting_for_capacity");
-    const waiting = loadOrchestrationState(root).records.find((row) => row.workKey === stableWorkKey(task));
+    const waiting = loadOrchestrationState(env.FLEET_STATE_ROOT).records.find((row) => row.workKey === stableWorkKey(task));
     assert.equal(waiting.state, "waiting_for_capacity");
     assert.equal(waiting.retryAt, retryAt);
 
-    writeFileSync(path.join(root, "state", "orchestrate-desired.json"), JSON.stringify({ tasks: [{ ...task, desiredState: "active" }] }));
+    writeFileSync(path.join(env.FLEET_STATE_ROOT, "state", "orchestrate-desired.json"), JSON.stringify({ tasks: [{ ...task, desiredState: "active" }] }));
     const beforeDue = await orchestrate.planFleet({
       env: {
         ...env,
@@ -1372,7 +1774,7 @@ test("model capacity exhaustion waits durably and resumes the same generation af
       logger: () => {},
     });
     assert.ok(afterDue.include.length > 0);
-    const resumed = loadOrchestrationState(root).records.find((row) => row.workKey === stableWorkKey(task));
+    const resumed = loadOrchestrationState(env.FLEET_STATE_ROOT).records.find((row) => row.workKey === stableWorkKey(task));
     assert.equal(resumed.generation, waiting.generation);
     assert.equal(resumed.state, "registered");
   } finally {
@@ -1383,11 +1785,7 @@ test("model capacity exhaustion waits durably and resumes the same generation af
 test("completed local analysis does not complete durable work without an observed receipt", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-analysis-receipt-"));
   const task = { id: "analysis-target", type: "review", role: "review", repo: OWNER_REPO, pr: 12 };
-  const env = {
-    FLEET_STATE_ROOT: root,
-    RUNNER_TEMP: root,
-    FLEET_ARTIFACT_DIR: path.join(root, "fleet-task-results"),
-  };
+  const env = advisoryFixtureEnv(root);
   try {
     const result = await orchestrate.executeTask(task, {
       env,
@@ -1400,9 +1798,9 @@ test("completed local analysis does not complete durable work without an observe
     });
     assert.equal(result.status, "completed");
     assert.equal(result.effectState, "awaiting_receipt");
-    const record = loadOrchestrationState(root).records.find((row) => row.workKey === stableWorkKey(task));
+    const record = loadOrchestrationState(env.FLEET_STATE_ROOT).records.find((row) => row.workKey === stableWorkKey(task));
     assert.equal(record.state, "awaiting_receipt");
-    const receipt = applyEffectReceipt(root, {
+    const receipt = applyEffectReceipt(env.FLEET_STATE_ROOT, {
       workKey: record.workKey,
       effectKey: record.effectKey,
       generation: record.generation,
@@ -1415,7 +1813,7 @@ test("completed local analysis does not complete durable work without an observe
       status: "completed",
     });
     assert.equal(receipt.accepted, true);
-    assert.equal(loadOrchestrationState(root).records.find((row) => row.workKey === record.workKey).state, "completed");
+    assert.equal(loadOrchestrationState(env.FLEET_STATE_ROOT).records.find((row) => row.workKey === record.workKey).state, "completed");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

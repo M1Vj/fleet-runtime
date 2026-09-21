@@ -333,7 +333,7 @@ test("read-only advisory runOnce strips controller state/tokens and forces deny 
   const bin = path.join(binDir, "opencode");
   writeFileSync(
     bin,
-    `#!/usr/bin/env node\nconst fs=require("fs");fs.writeFileSync(${JSON.stringify(seen)},JSON.stringify({env:{FLEET_GH_TOKEN:process.env.FLEET_GH_TOKEN,FLEET_READ_TOKEN:process.env.FLEET_READ_TOKEN,GH_TOKEN:process.env.GH_TOKEN,GITHUB_TOKEN:process.env.GITHUB_TOKEN,GITHUB_WORKSPACE:process.env.GITHUB_WORKSPACE,FLEET_STATE_ROOT:process.env.FLEET_STATE_ROOT,FLEET_WORKSPACE_ROOT:process.env.FLEET_WORKSPACE_ROOT,MY_PRIVATE:process.env.MY_PRIVATE,OPENCODE_AUTH_CONTENT:(process.env.OPENCODE_AUTH_CONTENT||"").slice(0,4)},cwd:process.cwd(),config:JSON.parse(process.env.OPENCODE_CONFIG_CONTENT||"{}")}));console.log(JSON.stringify({text:"ok",sessionID:"s-advisory-1"}));\n`,
+    `#!/usr/bin/env node\nconst fs=require("fs");fs.writeFileSync(${JSON.stringify(seen)},JSON.stringify({env:{FLEET_GH_TOKEN:process.env.FLEET_GH_TOKEN,FLEET_READ_TOKEN:process.env.FLEET_READ_TOKEN,GH_TOKEN:process.env.GH_TOKEN,GITHUB_TOKEN:process.env.GITHUB_TOKEN,GITHUB_WORKSPACE:process.env.GITHUB_WORKSPACE,FLEET_STATE_ROOT:process.env.FLEET_STATE_ROOT,FLEET_WORKSPACE_ROOT:process.env.FLEET_WORKSPACE_ROOT,FLEET_INDEFINITE_DISABLE:process.env.FLEET_INDEFINITE_DISABLE,MY_PRIVATE:process.env.MY_PRIVATE,OPENCODE_AUTH_CONTENT:(process.env.OPENCODE_AUTH_CONTENT||"").slice(0,4)},cwd:process.cwd(),config:JSON.parse(process.env.OPENCODE_CONFIG_CONTENT||"{}")}));console.log(JSON.stringify({text:"ok",sessionID:"s-advisory-1"}));\n`,
   );
   chmodSync(bin, 0o755);
   const env = {
@@ -360,6 +360,7 @@ test("read-only advisory runOnce strips controller state/tokens and forces deny 
     }
     assert.notEqual(captured.env.FLEET_STATE_ROOT, env.FLEET_STATE_ROOT);
     assert.equal(captured.env.FLEET_WORKSPACE_ROOT.endsWith("/runtime"), true);
+    assert.equal(captured.env.FLEET_INDEFINITE_DISABLE, "1");
     assert.equal(path.basename(captured.cwd), "runtime");
     assert.doesNotMatch(captured.cwd, /controller/);
     assert.equal(captured.env.OPENCODE_AUTH_CONTENT, "auth");

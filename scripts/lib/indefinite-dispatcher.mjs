@@ -17,9 +17,12 @@ const DEFAULT_PORT = 58444;
 const DEFAULT_HOST = "127.0.0.1";
 
 export function isPrivateOrReservedHost(hostname) {
-  const host = String(hostname || "").toLowerCase().trim().replace(/^\[|\]$/g, "");
+  let host = String(hostname || "").toLowerCase().trim().replace(/^\[|\]$/g, "");
   if (!host || host === "localhost" || host === "metadata.google.internal" || host.endsWith(".local") || host.endsWith(".internal")) {
     return true;
+  }
+  if (host.startsWith("::ffff:")) {
+    host = host.slice(7);
   }
   const ipv4Match = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (ipv4Match) {
@@ -477,7 +480,7 @@ export function startIndefiniteDispatcher(options = {}) {
 
     const match = /^([^\s:/?#@]+):(\d{1,5})$/.exec(req.url);
     if (!match) {
-      clientSocket.destroy();
+      clientSocket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
       return;
     }
     const targetHost = match[1];
@@ -486,8 +489,7 @@ export function startIndefiniteDispatcher(options = {}) {
 
     if (!targetHost || targetPort <= 0 || targetPort > 65535 || isPrivateOrReservedHost(targetHost)) {
       logger("WARN", `Blocked CONNECT to invalid or private/reserved target: ${target}`);
-      clientSocket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
-      clientSocket.destroy();
+      clientSocket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
       return;
     }
 

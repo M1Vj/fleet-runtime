@@ -44,8 +44,12 @@ test("isPrivateOrReservedHost blocks loopback, RFC1918, link-local, and cloud me
   assert.equal(isPrivateOrReservedHost("172.16.0.1"), true);
   assert.equal(isPrivateOrReservedHost("192.168.1.1"), true);
   assert.equal(isPrivateOrReservedHost("::1"), true);
+  assert.equal(isPrivateOrReservedHost("::ffff:127.0.0.1"), true);
+  assert.equal(isPrivateOrReservedHost("::ffff:10.0.0.1"), true);
+  assert.equal(isPrivateOrReservedHost("::ffff:169.254.169.254"), true);
   assert.equal(isPrivateOrReservedHost("198.51.100.1"), false);
   assert.equal(isPrivateOrReservedHost("203.0.113.2"), false);
+  assert.equal(isPrivateOrReservedHost("::ffff:198.51.100.1"), false);
 });
 
 test("ProxyPool tracks latency EWMA and isolates failing proxies", () => {

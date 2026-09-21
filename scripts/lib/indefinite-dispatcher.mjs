@@ -324,35 +324,136 @@ export function startIndefiniteDispatcher(options = {}) {
       const rawBody = Buffer.concat(chunks);
       const sanitizedBody = sanitizeRequestBody(rawBody, "req_" + Date.now());
 
-      const targetHost = req.headers.host || "opencode.ai";
       const forwardHeaders = { ...req.headers };
-      delete forwardHeaders.host;
-      forwardHeaders["content-length"] = sanitizedBody.length;
+      forwardHeaders.host = "opencode.ai";
+      delete forwardHeaders["content-length"];
+      if (sanitizedBody.length > 0) {
+        forwardHeaders["content-length"] = sanitizedBody.length;
+      }
 
-      const directOptions = {
-        hostname: targetHost,
-        port: 80,
-        path: req.url,
-        method: req.method,
-        headers: forwardHeaders,
-        timeout: 120000,
+      const sendDirect = () => {
+        const directOptions = {
+          hostname: "opencode.ai",
+          port: 443,
+          path: req.url,
+          method: req.method,
+          headers: forwardHeaders,
+          timeout: 120000,
+        };
+
+        const directReq = https.request(directOptions, (directRes) => {
+          if (directRes.statusCode === 429) {
+            pool.recordDirectRateLimited(60000);
+          }
+          res.writeHead(directRes.statusCode, directRes.headers);
+          directRes.pipe(res);
+        });
+
+        directReq.on("error", (err) => {
+          logger("WARN", `HTTP direct forward error: ${err.message}`);
+          if (!res.headersSent) {
+            res.writeHead(502, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: { type: "BadGateway", message: err.message } }));
+          }
+        });
+
+        directReq.write(sanitizedBody);
+        directReq.end();
       };
 
-      const forwardReq = http.request(directOptions, (forwardRes) => {
-        res.writeHead(forwardRes.statusCode, forwardRes.headers);
-        forwardRes.pipe(res);
-      });
+      if (!pool.isDirectRateLimited() || pool.getHealthyProxies().length === 0) {
+        sendDirect();
+        return;
+      }
 
-      forwardReq.on("error", (err) => {
-        logger("WARN", `HTTP forward error: ${err.message}`);
-        if (!res.headersSent) {
-          res.writeHead(502, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: { type: "BadGateway", message: err.message } }));
-        }
-      });
+      const candidate = pool.pickCandidate();
+      if (!candidate) {
+        sendDirect();
+        return;
+      }
 
-      forwardReq.write(sanitizedBody);
-      forwardReq.end();
+      try {
+        const pu = new URL(candidate);
+        const connectReq = http.request({
+          host: pu.hostname,
+          port: pu.port,
+          method: "CONNECT",
+          path: "opencode.ai:443",
+          timeout: 4000,
+        });
+
+        let handled = false;
+        const fallbackOnce = () => {
+          if (!handled) {
+            handled = true;
+            sendDirect();
+          }
+        };
+
+        connectReq.on("connect", (connectRes, proxySocket) => {
+          if (connectRes.statusCode !== 200) {
+            proxySocket.destroy();
+            pool.recordFailure(candidate, `CONNECT_STATUS_${connectRes.statusCode}`, 60000);
+            fallbackOnce();
+            return;
+          }
+
+          const tlsSocket = tls.connect({
+            socket: proxySocket,
+            servername: "opencode.ai",
+          }, () => {
+            handled = true;
+            const proxiedReq = https.request({
+              createConnection: () => tlsSocket,
+              path: req.url,
+              method: req.method,
+              headers: forwardHeaders,
+              timeout: 120000,
+            }, (upstreamRes) => {
+              if (upstreamRes.statusCode === 429) {
+                pool.recordFailure(candidate, "HTTP_429", 120000);
+              } else {
+                pool.recordSuccess(candidate, 500);
+              }
+              res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
+              upstreamRes.pipe(res);
+            });
+
+            proxiedReq.on("error", (err) => {
+              logger("WARN", `Proxied forward error: ${err.message}`);
+              if (!res.headersSent) {
+                res.writeHead(502, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: { type: "BadGateway", message: err.message } }));
+              }
+            });
+
+            proxiedReq.write(sanitizedBody);
+            proxiedReq.end();
+          });
+
+          tlsSocket.on("error", (err) => {
+            pool.recordFailure(candidate, `TLS_ERROR_${err.code || err.message}`, 60000);
+            proxySocket.destroy();
+            fallbackOnce();
+          });
+        });
+
+        connectReq.on("error", (err) => {
+          pool.recordFailure(candidate, `CONNECT_ERROR_${err.code || err.message}`, 60000);
+          fallbackOnce();
+        });
+
+        connectReq.on("timeout", () => {
+          connectReq.destroy();
+          pool.recordFailure(candidate, "CONNECT_TIMEOUT", 60000);
+          fallbackOnce();
+        });
+
+        connectReq.end();
+      } catch (err) {
+        logger("WARN", `Proxy dispatch error: ${err.message}`);
+        sendDirect();
+      }
     });
   });
 

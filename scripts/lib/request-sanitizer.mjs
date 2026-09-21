@@ -116,7 +116,7 @@ export function sanitizeRequestBody(bodyBuffer, requestId = "", options = {}) {
     if (typeof parsed.model === "string") {
       const cleanModel = parsed.model.replace(/^opencode\//, "").trim();
       if (cleanModel === "union-alpha" || cleanModel === "union" || cleanModel === "alpha") {
-        parsed.model = "muse-spark-1.3-contributor-free";
+        parsed.model = "opencode/muse-spark-1.3-contributor-free";
         bodyModified = true;
       }
     }

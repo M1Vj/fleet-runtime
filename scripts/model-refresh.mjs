@@ -40,6 +40,7 @@ import {
   isAllowedModel,
   sanitizeModelChain,
   getModelCapabilityScore,
+  isContributorTier,
 } from "./lib/provider-registry.mjs";
 import { CORE_INTEGRITY_OK, CORE_LOCK_DIGEST, CORE_MANIFEST } from "../packages/indefinite-core/index.mjs";
 import { makeTerminal } from "./lib/terminal.mjs";
@@ -177,6 +178,10 @@ export function rankChain(candidates) {
   free.sort((a, b) => {
     if (a.id === PRIMARY_MODEL) return -1;
     if (b.id === PRIMARY_MODEL) return 1;
+
+    const contribA = isContributorTier(a.id);
+    const contribB = isContributorTier(b.id);
+    if (contribA !== contribB) return contribB ? 1 : -1;
 
     const scoreA = getModelCapabilityScore(a.id);
     const scoreB = getModelCapabilityScore(b.id);

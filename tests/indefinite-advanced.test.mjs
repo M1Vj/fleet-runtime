@@ -16,11 +16,11 @@ test("indefinite advanced: isMitmOrCertError detection and quarantine", () => {
   assert.equal(isMitmOrCertError("ECONNRESET"), false);
 
   const pool = new ProxyPool(null);
-  pool.loadProxiesFromLines(["http://127.0.0.1:8080"]);
+  pool.loadProxiesFromLines(["http://93.184.216.34:8080"]);
 
   // Trigger MITM error
-  pool.recordFailure("http://127.0.0.1:8080", "DEPTH_ZERO_SELF_SIGNED_CERT");
-  const stats = pool.stats.get("http://127.0.0.1:8080");
+  pool.recordFailure("http://93.184.216.34:8080", "DEPTH_ZERO_SELF_SIGNED_CERT");
+  const stats = pool.stats.get("http://93.184.216.34:8080");
   assert.equal(stats.state, "open");
   // Cooldown should be at least 15 minutes (900,000ms)
   assert.ok(stats.cooldownUntil >= Date.now() + 890000);
@@ -29,28 +29,28 @@ test("indefinite advanced: isMitmOrCertError detection and quarantine", () => {
 test("indefinite advanced: session affinity maintains preferred route", () => {
   const pool = new ProxyPool(null);
   pool.loadProxiesFromLines([
-    "http://127.0.0.1:8001",
-    "http://127.0.0.1:8002",
-    "http://127.0.0.1:8003",
+    "http://93.184.216.34:8001",
+    "http://93.184.216.34:8002",
+    "http://93.184.216.34:8003",
   ]);
 
   // Set different latencies
-  pool.recordSuccess("http://127.0.0.1:8001", 100);
-  pool.recordSuccess("http://127.0.0.1:8002", 500);
-  pool.recordSuccess("http://127.0.0.1:8003", 900);
+  pool.recordSuccess("http://93.184.216.34:8001", 100);
+  pool.recordSuccess("http://93.184.216.34:8002", 500);
+  pool.recordSuccess("http://93.184.216.34:8003", 900);
 
   // First pick with session A
   const pickedA1 = pool.pickCandidate(null, "session-A");
-  assert.equal(pickedA1, "http://127.0.0.1:8001");
+  assert.equal(pickedA1, "http://93.184.216.34:8001");
 
   // Subsequent pick with session A should return the affinity route
   const pickedA2 = pool.pickCandidate(null, "session-A");
-  assert.equal(pickedA2, "http://127.0.0.1:8001");
+  assert.equal(pickedA2, "http://93.184.216.34:8001");
 
   // If session A's proxy fails, it fails over to the next best
-  pool.recordFailure("http://127.0.0.1:8001", "TIMEOUT", 60000);
+  pool.recordFailure("http://93.184.216.34:8001", "TIMEOUT", 60000);
   const pickedA3 = pool.pickCandidate(null, "session-A");
-  assert.equal(pickedA3, "http://127.0.0.1:8002");
+  assert.equal(pickedA3, "http://93.184.216.34:8002");
 });
 
 test("indefinite advanced: HARVEST_SOURCES definition and parsing", () => {

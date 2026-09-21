@@ -50,6 +50,27 @@ function ghFixture(headSha = HEAD) {
   };
 }
 
+test("legacy review accepts its task identity without advisory binding fields", () => {
+  assert.deepEqual(
+    orchestrate.parseReviewBinding(reviewTask(), {
+      FLEET_REVIEW_ADVISORY: "false",
+      FLEET_TASK_ID: "review-task-1",
+    }),
+    { advisory: false, binding: null },
+  );
+});
+
+test("legacy review still rejects advisory binding fields without the advisory marker", () => {
+  assert.deepEqual(
+    orchestrate.parseReviewBinding(reviewTask(), {
+      FLEET_REVIEW_ADVISORY: "false",
+      FLEET_TASK_ID: "review-task-1",
+      FLEET_REQUEST_ID: "req-review-1",
+    }),
+    { advisory: true, error: "advisory marker is required" },
+  );
+});
+
 test("private advisory model boundary strips controller credentials/state and uses the runtime workspace", async () => {
   const root = makeRoot("fleet-review-model-boundary-");
   let captured;
@@ -104,9 +125,9 @@ test("actual orchestrate workflow review environment derives the enforced adviso
   const controlWorkflow = path.join(controlRoot, ".github/workflows/orchestrate.yml");
   const workflow = readFileSync(controlWorkflow, "utf8");
   const reviewStart = workflow.indexOf("      - name: execute orchestration task");
-  const upgradeStart = workflow.indexOf("      - name: execute bounded upgrade dispatch", reviewStart);
-  assert.ok(reviewStart >= 0 && upgradeStart > reviewStart);
-  const reviewStep = workflow.slice(reviewStart, upgradeStart);
+  const cleanupStart = workflow.indexOf("      - name: cleanup advisory model workspace", reviewStart);
+  assert.ok(reviewStart >= 0 && cleanupStart > reviewStart);
+  const reviewStep = workflow.slice(reviewStart, cleanupStart);
   assert.match(reviewStep, /FLEET_READ_TOKEN:\s*\$\{\{\s*github\.token\s*\}\}/);
   assert.match(reviewStep, /working-directory:\s*runtime/);
   assert.doesNotMatch(reviewStep, /FLEET_GH_TOKEN:/);

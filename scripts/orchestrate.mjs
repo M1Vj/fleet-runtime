@@ -2365,13 +2365,18 @@ function advisoryReviewFlag(value) {
 
 /** Parse the private advisory binding; completely absent values preserve legacy mode. */
 export function parseReviewBinding(task, env = process.env) {
-  const names = ["FLEET_REQUEST_ID", "FLEET_REQUEST_REVISION", "FLEET_TASK_ID", "FLEET_BOUND_HEAD_SHA"];
-  const present = names.filter((name) => env[name] !== undefined && String(env[name]).trim() !== "");
+  const bindingNames = ["FLEET_REQUEST_ID", "FLEET_REQUEST_REVISION", "FLEET_BOUND_HEAD_SHA"];
+  const requiredNames = [...bindingNames, "FLEET_TASK_ID"];
+  const presentBinding = bindingNames.filter((name) => env[name] !== undefined && String(env[name]).trim() !== "");
+  const presentRequired = requiredNames.filter((name) => env[name] !== undefined && String(env[name]).trim() !== "");
   const advisory = advisoryReviewFlag(env.FLEET_REVIEW_ADVISORY);
-  if (!advisory && present.length === 0) return { advisory: false, binding: null };
+  // Every executor task carries FLEET_TASK_ID for task routing. It becomes
+  // part of a private advisory binding only when the advisory marker or one
+  // of the revision/head binding fields is present.
+  if (!advisory && presentBinding.length === 0) return { advisory: false, binding: null };
   if (!advisory) return { advisory: true, error: "advisory marker is required" };
   if (isPublicDataClass(env)) return { advisory: true, error: "advisory review is private-only" };
-  if (present.length !== names.length) return { advisory: true, error: "advisory binding is incomplete" };
+  if (presentRequired.length !== requiredNames.length) return { advisory: true, error: "advisory binding is incomplete" };
   const requestId = String(env.FLEET_REQUEST_ID).trim();
   const requestRevision = String(env.FLEET_REQUEST_REVISION).trim();
   const taskId = String(env.FLEET_TASK_ID).trim();

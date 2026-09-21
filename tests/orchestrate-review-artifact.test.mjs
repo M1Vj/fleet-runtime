@@ -134,7 +134,14 @@ test("legacy review records bounded non-secret model failure diagnostics", async
       modelRunner: async () => ({
         complete: false,
         modelMode: "opencode/test-model",
-        attempts: [{ round: 1, model: "opencode/test-model", exit: 143, interrupted: true, gotReply: false }],
+        attempts: [{
+          round: 1,
+          model: "opencode/test-model",
+          exit: 1,
+          interrupted: false,
+          gotReply: false,
+          errTail: "ProviderModelNotFoundError secret=must-not-survive",
+        }],
       }),
     });
     assert.equal(result.status, "deferred");
@@ -145,11 +152,12 @@ test("legacy review records bounded non-secret model failure diagnostics", async
       attempts: [{
         round: 1,
         model: "opencode/test-model",
-        exit: 143,
-        interrupted: true,
+        exit: 1,
+        interrupted: false,
         gotReply: false,
         sessionNotFound: false,
         exhausted: false,
+        failureKind: "model-not-found",
       }],
       blocked: false,
       circuitOpen: false,
@@ -158,6 +166,7 @@ test("legacy review records bounded non-secret model failure diagnostics", async
     });
     const artifact = JSON.parse(readFileSync(result.artifact, "utf8"));
     assert.deepEqual(artifact.diagnostics, result.diagnostics);
+    assert.doesNotMatch(JSON.stringify(artifact.diagnostics), /must-not-survive|ProviderModelNotFoundError/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

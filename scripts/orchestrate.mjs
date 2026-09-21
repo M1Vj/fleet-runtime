@@ -2817,8 +2817,20 @@ function safeModelReply(value) {
   return "";
 }
 
+function modelFailureKind(attempt) {
+  if (attempt?.interrupted === true) return "timeout";
+  const detail = `${attempt?.errTail || ""} ${attempt?.rawTail || ""}`.toLowerCase();
+  if (/providermodelnotfound|model(?:\s+is)?\s+not\s+found|unknown\s+model|invalid\s+model/.test(detail)) return "model-not-found";
+  if (/\b429\b|quota|rate[ -]?limit|usage\s+limit|free\s+usage/.test(detail)) return "rate-limited";
+  if (/\b401\b|\b403\b|unauthori[sz]ed|authentication|invalid\s+(?:auth|token|credential)/.test(detail)) return "authentication";
+  if (/econn|enotfound|etimedout|socket|network|fetch\s+failed|connection/.test(detail)) return "network";
+  if (/permission\s+denied|configuration|config\s+error/.test(detail)) return "configuration";
+  if (/provider|upstream|api\s+error/.test(detail)) return "provider";
+  return "unknown";
+}
+
 function modelFailureDiagnostics(result, env = process.env) {
-  const attempts = Array.isArray(result?.attempts) ? result.attempts.slice(0, 8) : [];
+  const attempts = Array.isArray(result?.attempts) ? result.attempts.slice(0, 16) : [];
   return {
     modelMode: redactText(result?.modelMode || "", env).slice(0, 160),
     attemptCount: attempts.length,
@@ -2830,6 +2842,7 @@ function modelFailureDiagnostics(result, env = process.env) {
       gotReply: attempt?.gotReply === true,
       sessionNotFound: attempt?.sessionNotFound === true,
       exhausted: attempt?.exhausted === true,
+      failureKind: modelFailureKind(attempt),
     })),
     blocked: result?.blocked === true,
     circuitOpen: result?.circuitOpen === true,

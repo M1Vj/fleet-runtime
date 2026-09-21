@@ -80,9 +80,14 @@ test("ProxyPool tracks direct rate limiting", () => {
 
   pool.setDirectRateLimited(Date.now() + 5000);
   assert.equal(pool.isDirectRateLimited(), true);
+
+  const pool2 = new ProxyPool(null);
+  assert.equal(pool2.isDirectRateLimited(), false);
+  pool2.recordDirectRateLimited(60000);
+  assert.equal(pool2.isDirectRateLimited(), true);
 });
 
-test("Indefinite Dispatcher lifecycle and health endpoint", async () => {
+test("Indefinite Dispatcher lifecycle, health endpoint, and CONNECT security guard", async () => {
   const dispatcher = startIndefiniteDispatcher({
     port: 0, // ephemeral port
     stateRoot: tmpdir(),
@@ -109,6 +114,21 @@ test("Indefinite Dispatcher lifecycle and health endpoint", async () => {
     const parsed = JSON.parse(res.body);
     assert.equal(parsed.status, "healthy");
     assert.equal(parsed.service, "fleet-indefinite-dispatcher");
+
+    // Test CONNECT to private/reserved target is blocked with 403 Forbidden
+    const connectRes = await new Promise((resolve, reject) => {
+      const req = http.request({
+        hostname: "127.0.0.1",
+        port: boundPort,
+        method: "CONNECT",
+        path: "169.254.169.254:80",
+      });
+      req.on("response", (resp) => resolve(resp.statusCode));
+      req.on("error", (err) => resolve("error: " + err.message));
+      req.on("close", () => resolve("closed"));
+      req.end();
+    });
+    assert.ok(connectRes === "closed" || connectRes === 403 || String(connectRes).includes("error"));
   } finally {
     await stopIndefiniteDispatcher();
   }

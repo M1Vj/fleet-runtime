@@ -198,6 +198,10 @@ export class ProxyPool {
     this.directRateLimitedUntil = Math.max(this.directRateLimitedUntil, Number(retryAtMs) || (this.now() + 60000));
   }
 
+  recordDirectRateLimited(cooldownMs = 60000) {
+    this.setDirectRateLimited(this.now() + (Number(cooldownMs) || 60000));
+  }
+
   getHealthyProxies(excludeSet = null) {
     const now = this.now();
     return this.proxies.filter((p) => {
@@ -479,6 +483,14 @@ export function startIndefiniteDispatcher(options = {}) {
     const targetHost = match[1];
     const targetPort = Number(match[2]);
     const target = `${targetHost}:${targetPort}`;
+
+    if (!targetHost || targetPort <= 0 || targetPort > 65535 || isPrivateOrReservedHost(targetHost)) {
+      logger("WARN", `Blocked CONNECT to invalid or private/reserved target: ${target}`);
+      clientSocket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+      clientSocket.destroy();
+      return;
+    }
+
     const affinityKey = req.headers ? (req.headers["x-session-id"] || req.headers["session-id"] || req.headers["x-correlation-id"] || null) : null;
 
     const isApiHost = targetHost === "opencode.ai";

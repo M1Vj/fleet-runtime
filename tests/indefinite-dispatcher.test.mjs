@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 
 import {
   ProxyPool,
+  isPrivateOrReservedHost,
   startIndefiniteDispatcher,
   stopIndefiniteDispatcher,
 } from "../scripts/lib/indefinite-dispatcher.mjs";
@@ -18,12 +19,12 @@ import {
 
 test("ProxyPool handles empty and commented proxy lists gracefully", () => {
   const tmpFile = path.join(tmpdir(), `test-proxies-${Date.now()}.txt`);
-  fs.writeFileSync(tmpFile, "# Comment line\n\nhttp://127.0.0.1:8080\n# Another comment\n127.0.0.2:3128\n", "utf8");
+  fs.writeFileSync(tmpFile, "# Comment line\n\nhttp://198.51.100.1:8080\n# Another comment\n203.0.113.2:3128\n", "utf8");
   try {
     const pool = new ProxyPool(tmpFile);
     assert.equal(pool.proxies.length, 2);
-    assert.equal(pool.proxies[0], "http://127.0.0.1:8080");
-    assert.equal(pool.proxies[1], "http://127.0.0.2:3128");
+    assert.equal(pool.proxies[0], "http://198.51.100.1:8080");
+    assert.equal(pool.proxies[1], "http://203.0.113.2:3128");
 
     const candidate = pool.pickCandidate();
     assert.ok(candidate);
@@ -31,6 +32,20 @@ test("ProxyPool handles empty and commented proxy lists gracefully", () => {
   } finally {
     fs.rmSync(tmpFile, { force: true });
   }
+});
+
+test("isPrivateOrReservedHost blocks loopback, RFC1918, link-local, and cloud metadata", () => {
+  assert.equal(isPrivateOrReservedHost("127.0.0.1"), true);
+  assert.equal(isPrivateOrReservedHost("127.0.0.2"), true);
+  assert.equal(isPrivateOrReservedHost("localhost"), true);
+  assert.equal(isPrivateOrReservedHost("169.254.169.254"), true);
+  assert.equal(isPrivateOrReservedHost("metadata.google.internal"), true);
+  assert.equal(isPrivateOrReservedHost("10.0.0.5"), true);
+  assert.equal(isPrivateOrReservedHost("172.16.0.1"), true);
+  assert.equal(isPrivateOrReservedHost("192.168.1.1"), true);
+  assert.equal(isPrivateOrReservedHost("::1"), true);
+  assert.equal(isPrivateOrReservedHost("198.51.100.1"), false);
+  assert.equal(isPrivateOrReservedHost("203.0.113.2"), false);
 });
 
 test("ProxyPool tracks latency EWMA and isolates failing proxies", () => {

@@ -16,6 +16,28 @@ import {
 const DEFAULT_PORT = 58444;
 const DEFAULT_HOST = "127.0.0.1";
 
+export function isPrivateOrReservedHost(hostname) {
+  const host = String(hostname || "").toLowerCase().trim().replace(/^\[|\]$/g, "");
+  if (!host || host === "localhost" || host === "metadata.google.internal" || host.endsWith(".local") || host.endsWith(".internal")) {
+    return true;
+  }
+  const ipv4Match = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4Match) {
+    const [_, a, b, c, d] = ipv4Match.map(Number);
+    if (a > 255 || b > 255 || c > 255 || d > 255) return true;
+    if (a === 0 || a === 127) return true;
+    if (a === 10) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 169 && b === 254) return true;
+    if (a >= 224) return true;
+  }
+  if (host === "::1" || host.startsWith("fe80:") || host.startsWith("fc00:") || host.startsWith("fd00:")) {
+    return true;
+  }
+  return false;
+}
+
 function normalizeProxyRoute(proxyUrl) {
   if (typeof proxyUrl !== "string") return null;
   const value = proxyUrl.trim();
@@ -25,6 +47,7 @@ function normalizeProxyRoute(proxyUrl) {
     const parsed = new URL(raw);
     const port = Number(parsed.port) || 80;
     if (!parsed.hostname || port <= 0 || port > 65535) return null;
+    if (isPrivateOrReservedHost(parsed.hostname)) return null;
     return `http://${parsed.hostname.toLowerCase()}:${port}`;
   } catch {
     return null;

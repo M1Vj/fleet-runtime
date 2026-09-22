@@ -15,6 +15,9 @@ import {
   readMergesHistory,
   mergeAlreadyRecorded,
   isNewFeature,
+  mergeExitCode,
+  mergeChildExitCode,
+  mergePersistenceExitCode,
 } from "../scripts/merge.mjs";
 
 const targets = {
@@ -22,6 +25,43 @@ const targets = {
   tier1: ["M1Vj/enrolled"],
   excluded: ["M1Vj/excluded"],
 };
+
+test("merge gate exposes non-success terminal states as failed process outcomes", () => {
+  for (const state of ["SUCCESS", "MERGED", "NO-OP"]) assert.equal(mergeExitCode(state), 0);
+  for (const state of ["BLOCKED", "REVISION_QUEUED", "EXHAUSTED", "UNKNOWN"]) {
+    assert.notEqual(mergeExitCode(state), 0, state);
+  }
+});
+
+test("merge persistence failures are non-green without rewriting the terminal result", () => {
+  assert.equal(mergePersistenceExitCode("committed"), 0);
+  assert.equal(mergePersistenceExitCode("no-changes"), 0);
+  assert.equal(mergePersistenceExitCode("push-failed"), 1);
+});
+
+test("merge scan propagates every failed or interrupted child", () => {
+  assert.equal(mergeChildExitCode({ status: 0, error: undefined, signal: null }), 0);
+  assert.equal(mergeChildExitCode({ status: 1, error: undefined, signal: null }), 1);
+  assert.equal(mergeChildExitCode({ status: null, error: new Error("spawn failed"), signal: null }), 1);
+  assert.equal(mergeChildExitCode({ status: null, error: undefined, signal: "SIGTERM" }), 1);
+});
+
+test("merge CLI propagates the semantic exit code returned by main", () => {
+  const source = readFileSync(new URL("../scripts/merge.mjs", import.meta.url), "utf8");
+  assert.match(source, /\.then\(\(code\)\s*=>\s*process\.exit\(code\)\)/);
+  assert.doesNotMatch(source, /\.then\(\(\)\s*=>\s*process\.exit\(0\)\)/);
+});
+
+test("merge completion does not hide persistence or attribution failures", () => {
+  const source = readFileSync(new URL("../scripts/merge.mjs", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /try \{\s*await commitPushVerify\([\s\S]{0,400}?\}\s*catch \{\}/);
+  assert.match(source, /const persistence = await commitPushVerify\([\s\S]{0,300}?mergePersistenceExitCode\(persistence\)/);
+  assert.match(source, /scanExitCode = Math\.max\(scanExitCode, mergeChildExitCode\(res\)\)/);
+  assert.match(source, /"Merge gate scan", scanExitCode === 0 \? "ok" : "failed-child"/);
+  assert.match(source, /"Merge gate scan", "failed-persistence"/);
+  assert.match(source, /MERGE_TERMINAL_STATE=\$\{resultCode === 0 \? "SCAN-DONE" : "SCAN-FAILED"\}/);
+  assert.match(source, /return resultCode/);
+});
 
 test("parseMergeTarget accepts only a repo and positive integer PR", () => {
   assert.deepEqual(parseMergeTarget("M1Vj/fleet-runtime", "42"), {
@@ -310,5 +350,3 @@ test("isNewFeature identifies new feature PRs across titles, branches, labels, c
   ];
   assert.equal(isNewFeature({ title: "Button styling adjustment" }, filesFixOnly), false);
 });
-
-

@@ -55,6 +55,30 @@ export function patrolFailureReason(error, env = process.env) {
   return String(error?.reason || error?.message || "unknown").slice(0, 200);
 }
 
+export function requirePatrolModelResult(modelResult) {
+  if (!modelResult?.complete || !modelResult?.reply) {
+    throw Object.assign(new Error("MODEL_UNAVAILABLE after resume attempts"), {
+      code: 6,
+      reason: "MODEL_UNAVAILABLE",
+    });
+  }
+  return modelResult.reply;
+}
+
+export function requirePatrolDirectiveValidation(validation) {
+  if (!validation?.ok) {
+    throw Object.assign(new Error("DIRECTIVES_REJECTED"), {
+      code: 5,
+      reason: "DIRECTIVES_REJECTED",
+    });
+  }
+  return validation.directives;
+}
+
+export function patrolExecutorExitCode(results = []) {
+  return results.some((result) => result?.ok === false) ? 1 : 0;
+}
+
 function targetsPath() {
   return path.join(STATE_DIR, "targets.json");
 }
@@ -802,13 +826,18 @@ export async function main() {
           maxRounds: 3,
         });
         modelStatus = modelResult.modelMode || (modelResult.complete ? "model" : "model-unavailable");
-        if (modelResult.complete && modelResult.reply) {
-          const validation = validateDirectives(modelResult.reply);
-          if (validation.ok) directives = validation.directives;
-          else audit.note("validator", "public directive output rejected; no mutations attempted");
-        }
+        requirePatrolModelResult(modelResult);
+        const validation = validateDirectives(modelResult.reply);
+        if (!validation.ok) audit.note("validator", "public directive output rejected");
+        directives = requirePatrolDirectiveValidation(validation);
       }
       const result = await executeDirectives(process.env, identity, directives, { tier1: [repo], excluded: [] }, audit);
+      if (patrolExecutorExitCode(result.results) !== 0) {
+        throw Object.assign(new Error("PATROL_DIRECTIVE_EXECUTION_FAILED"), {
+          code: 1,
+          reason: "PATROL_DIRECTIVE_EXECUTION_FAILED",
+        });
+      }
       writePublicArtifact(process.env, { mode: "patrol", status: "ok", repository: repo, count: signals.length, results: result.results, checks: { model: modelStatus, digestBytes: digest.length } }, { kind: "patrol", status: "ok", repository: repo, runId });
       writePatrolAudit("ok-public-read-only");
       console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "public-read-only", directives: directives.length, mutations: 0 })}`);
@@ -863,9 +892,8 @@ export async function main() {
         sessions["patrol-latest"] = row;
         writeFileSync(sessionsPath(), JSON.stringify(sessions, null, 2));
       }
-      if (!modelResult.complete || !modelResult.reply) {
-        audit.incident("model", "triage model unavailable or incomplete, continuing patrol without directives");
-      } else {
+      requirePatrolModelResult(modelResult);
+      {
         let validation = validateDirectives(modelResult.reply);
         // Finish-loop: session-id capture + auto-resume up to 3 repair rounds.
         // Each round reuses the captured sessionId so caps/revision stay
@@ -891,12 +919,9 @@ export async function main() {
           }
           if (repair.complete && repair.reply) validation = validateDirectives(repair.reply);
         }
-        if (!validation.ok) {
-          audit.incident("validator", "model output rejected, skipping directives", { errors: validation.errors.slice(0, 10) });
-        } else {
-          directives = validation.directives;
-          audit.note("validator", `directives accepted=${directives.length}`);
-        }
+        if (!validation.ok) audit.incident("validator", "model output rejected", { errors: validation.errors.slice(0, 10) });
+        directives = requirePatrolDirectiveValidation(validation);
+        audit.note("validator", `directives accepted=${directives.length}`);
       }
     }
 
@@ -916,6 +941,12 @@ export async function main() {
         for (const i of group.activeIssues || []) append(ledgerPath(), eventKey("sig-issue", group.repo, String(i.n), String(i.updated)), {});
         for (const r of group.failingRuns24h || []) append(ledgerPath(), eventKey("sig-run", group.repo, String(r.id), String(r.created)), {});
       }
+    }
+    if (patrolExecutorExitCode(results) !== 0) {
+      throw Object.assign(new Error("PATROL_DIRECTIVE_EXECUTION_FAILED"), {
+        code: 1,
+        reason: "PATROL_DIRECTIVE_EXECUTION_FAILED",
+      });
     }
 
     // Heartbeat + revision persistence: model chain revision and caps travel

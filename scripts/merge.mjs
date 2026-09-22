@@ -18,6 +18,7 @@ import {
   privateRepository,
   PRIVATE_REPOSITORY_ENV,
   resolveStateRoot,
+  makeExecutionTerminal,
   writeExecutionAudit,
   writePublicArtifact,
 } from "./lib/private-state.mjs";
@@ -58,6 +59,41 @@ const MAX_SCAN_CAP = 15;
 const DEFAULT_SCAN_PAGES = 3;
 const MAX_SCAN_PAGES = 5;
 const SCAN_PAGE_SIZE = 100;
+
+export function mergeExitCode(state) {
+  return new Set(["SUCCESS", "MERGED", "NO-OP"]).has(String(state || "")) ? 0 : 1;
+}
+
+export function mergePersistenceExitCode(outcome) {
+  return outcome === "push-failed" ? 1 : 0;
+}
+
+/**
+ * Leave an append-only terminal record when the one allowed state push fails.
+ * The marker stays in the local state tree for the next bounded retry; this
+ * function never performs another push and therefore cannot create a retry
+ * loop.
+ */
+export function recordMergePersistenceFailure(root, details = {}, env = process.env) {
+  const stateRoot = root || REPO_ROOT;
+  const terminalState = String(details.terminalState || "BLOCKED");
+  const runId = String(details.runId || "unknown");
+  const reason = String(details.reason || "push-failed");
+  const extra = { ...details };
+  delete extra.terminalState;
+  delete extra.runId;
+  delete extra.reason;
+  return makeExecutionTerminal(env, stateRoot, { lane: "merge" })(terminalState, {
+    runId,
+    persistence: "failed",
+    reason,
+    ...extra,
+  });
+}
+
+export function mergeChildExitCode(result) {
+  return result?.status === 0 && !result?.error && !result?.signal ? 0 : 1;
+}
 
 function isM1VjRepo(value) {
   const repo = String(value || "").trim();
@@ -581,9 +617,6 @@ export async function postCommentOnce(repo, number, marker, body, audit, env = p
   return c;
 }
 
-// Attributable state push: commit + push as M1Vj, then verify the SHA landed
-// under the configured owner in the private control repository. Bookkeeping only — never throws; the merge
-// outcome itself is enforced separately via verifyCommit on the merge commit.
 export async function commitPushVerify(repoDir, subpaths, message, identity, audit, env = process.env) {
   try {
     const existing = subpaths.filter((p2) => existsSync(path.join(repoDir, p2)));
@@ -598,7 +631,7 @@ export async function commitPushVerify(repoDir, subpaths, message, identity, aud
     audit.note("push-verify", `state committed+verified sha=${sha.slice(0, 10)}`);
     return outcome;
   } catch (err) {
-    audit.incident("push-verify", `bookkeeping push failed (merge outcome unaffected): ${String(err.message).slice(0, 160)}`);
+    audit.incident("push-verify", `bookkeeping push failed: ${String(err.message).slice(0, 160)}`);
     return "push-failed";
   }
 }
@@ -806,6 +839,7 @@ export async function discoverFleetPRs(limit = process.env.FLEET_MERGE_SCAN_CAP 
 async function main() {
   const runId = `merge-${Date.now()}`;
   const audit = new AuditBuffer(scrub(process.env));
+  const executionTerminal = makeExecutionTerminal(process.env, STATE_ROOT, { lane: "merge" });
   // M2: unexpected throws (SHA-moved, merge-not-merged, post-verify, …)
   // must still land a terminal BLOCKED event + audit finish + ledger
   // entry via the existing helpers — never a bare MERGE_GATE_FAILED.
@@ -852,6 +886,7 @@ async function main() {
       return finish(audit, runId, "NO-OP");
     }
     mkdirSync(AUDIT_DIR, { recursive: true });
+    let scanExitCode = 0;
     for (const item of queue) {
       try {
         const { spawnSync } = await import("node:child_process");
@@ -867,6 +902,7 @@ async function main() {
           },
         });
         audit.note("child", `${item.repo}#${item.number} exit=${res.status}`);
+        scanExitCode = Math.max(scanExitCode, mergeChildExitCode(res));
         if (res.stdout && res.stdout.includes("MERGE_TERMINAL_STATE=REVISION_QUEUED")) {
           writeRevisionOutputs(process.env.GITHUB_OUTPUT, item.repo, item.number, true);
           writeQueueOutputs(process.env.GITHUB_OUTPUT, true);
@@ -874,6 +910,7 @@ async function main() {
         }
       } catch (err) {
         audit.incident("child", `${item.repo}#${item.number}: ${err.message}`);
+        scanExitCode = 1;
       }
     }
     try {
@@ -884,10 +921,22 @@ async function main() {
     }
     await runHygiene(identity, audit);
 
-    writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Merge gate scan", "ok");
-    await commitPushVerify(STATE_ROOT, ["state", "audit"], `[fleet] merge-gate scan ${runId}`, identity, audit, process.env);
-    console.log("MERGE_TERMINAL_STATE=SCAN-DONE");
-    return;
+    writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Merge gate scan", scanExitCode === 0 ? "ok" : "failed-child");
+    const scanTerminalState = scanExitCode === 0 ? "SCAN-DONE" : "SCAN-FAILED";
+    executionTerminal(scanTerminalState, { runId, scanExitCode });
+    const persistence = await commitPushVerify(STATE_ROOT, ["state", "audit"], `[fleet] merge-gate scan ${runId}`, identity, audit, process.env);
+    const resultCode = Math.max(scanExitCode, mergePersistenceExitCode(persistence));
+    if (mergePersistenceExitCode(persistence) !== 0) {
+      writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Merge gate scan", "failed-persistence");
+      recordMergePersistenceFailure(STATE_ROOT, {
+        runId,
+        terminalState: "SCAN-FAILED",
+        reason: "push-failed",
+        scanExitCode,
+      }, process.env);
+    }
+    console.log(`MERGE_TERMINAL_STATE=${resultCode === 0 ? "SCAN-DONE" : "SCAN-FAILED"}`);
+    return resultCode;
   }
 
   const { pr, files } = await getPr();
@@ -1288,13 +1337,19 @@ async function main() {
       writeQueueOutputs(process.env.GITHUB_OUTPUT, true);
     }
     writeExecutionAudit(a, process.env, REPO_ROOT, rid, `Merge gate ${TARGET_REPO}#${PR_NUMBER}`, stateName);
-    // Durable state (merges.jsonl) + audit live in the private control repository; commit and
-    // push as M1Vj with attribution verify. Best-effort: the terminal state
-    // above is already recorded locally.
-    try {
-      await commitPushVerify(STATE_ROOT, ["state", "audit"], `[fleet] merge-gate ${rid} ${stateName}`, identity, a, process.env);
-    } catch {}
-    return 0;
+    const persistence = await commitPushVerify(STATE_ROOT, ["state", "audit"], `[fleet] merge-gate ${rid} ${stateName}`, identity, a, process.env);
+    if (mergePersistenceExitCode(persistence) !== 0) {
+      writeExecutionAudit(a, process.env, REPO_ROOT, rid, `Merge gate ${TARGET_REPO}#${PR_NUMBER}`, "failed-persistence");
+      recordMergePersistenceFailure(STATE_ROOT, {
+        runId: rid,
+        terminalState: "BLOCKED",
+        reason: "push-failed",
+        originalState: stateName,
+        repo: TARGET_REPO,
+        pr: PR_NUMBER,
+      }, process.env);
+    }
+    return Math.max(mergeExitCode(stateName), mergePersistenceExitCode(persistence));
   }
 }
 
@@ -1361,7 +1416,7 @@ async function judge({ repo, prNumber, title, body, files, extraEvidence, lens, 
 
 if (process.argv[1] && import.meta.url.endsWith(path.basename(process.argv[1]))) {
   main()
-    .then(() => process.exit(0))
+    .then((code) => process.exit(code))
     .catch((err) => {
       console.error(`MERGE_GATE_FAILED reason=${err.message}`);
       process.exit(err.code && Number.isInteger(err.code) ? err.code : 1);

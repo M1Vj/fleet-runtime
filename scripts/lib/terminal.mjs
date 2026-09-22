@@ -1,7 +1,7 @@
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import path from "node:path";
 
-export const TERMINAL_STATES = ["SUCCESS", "NO-OP", "BLOCKED", "STALLED", "EXHAUSTED", "REVISION_QUEUED", "SCAN-DONE"];
+export const TERMINAL_STATES = ["SUCCESS", "NO-OP", "BLOCKED", "STALLED", "EXHAUSTED", "REVISION_QUEUED", "SCAN-DONE", "SCAN-FAILED"];
 
 export function makeTerminal(root, { lane = "unknown", requireWrite = false } = {}) {
   const eventsPath = path.join(root, "state", "events.jsonl");

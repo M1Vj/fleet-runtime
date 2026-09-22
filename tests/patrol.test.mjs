@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -15,6 +15,9 @@ import {
   planDeepQueueAdditions,
   planPatrolDispatches,
   DEEP_QUEUE_CAP,
+  requirePatrolModelResult,
+  requirePatrolDirectiveValidation,
+  patrolExecutorExitCode,
 } from "../scripts/patrol.mjs";
 import { eventKey } from "../scripts/lib/ledger.mjs";
 
@@ -42,6 +45,30 @@ function signal(repo, { pulls = [], failures = [] } = {}) {
 function task(repo, kind, status = "pending") {
   return { id: `${repo}-${kind}`, repo, kind, status, attempts: 0 };
 }
+
+test("patrol fails closed when model work or directive validation is incomplete", () => {
+  assert.throws(
+    () => requirePatrolModelResult({ complete: false, reply: "", modelMode: "waiting_for_capacity" }),
+    (error) => error?.code === 6 && error?.reason === "MODEL_UNAVAILABLE",
+  );
+  assert.throws(
+    () => requirePatrolDirectiveValidation({ ok: false, errors: ["bad shape"] }),
+    (error) => error?.code === 5 && error?.reason === "DIRECTIVES_REJECTED",
+  );
+  assert.equal(requirePatrolModelResult({ complete: true, reply: "[]" }), "[]");
+});
+
+test("patrol executor failures cannot be reported as a successful run", () => {
+  assert.equal(patrolExecutorExitCode([{ ok: true }]), 0);
+  assert.equal(patrolExecutorExitCode([{ ok: false, error: "temporary" }]), 1);
+});
+
+test("public patrol checks directive outcomes before writing success", () => {
+  const source = readFileSync(new URL("../scripts/patrol.mjs", import.meta.url), "utf8");
+  const publicBranch = source.slice(source.indexOf("if (isPublicDataClass(process.env))"), source.indexOf("const { gatewayDown }"));
+  assert.match(publicBranch, /patrolExecutorExitCode\(result\.results\)/);
+  assert.ok(publicBranch.indexOf("patrolExecutorExitCode(result.results)") < publicBranch.indexOf("writePublicArtifact"));
+});
 
 test("buildDigest rediscover unchanged open PRs after the bounded revisit TTL", () => {
   const pr = pull("M1Vj/aging", 7, NOW - 25 * HOUR_MS);
@@ -249,6 +276,13 @@ test("planPatrolPersistence bounds the lifecycle to one initial push plus one fi
   assert.deepEqual(planPatrolPersistence({ changed: true, pushes: 2 }), { persist: false, reason: "push-cap" });
 });
 
+test("patrol failure recovery stages durable state artifacts with the audit", () => {
+  const source = readFileSync(new URL("../scripts/patrol.mjs", import.meta.url), "utf8");
+  const recovery = source.slice(source.indexOf("if (identity && !statePushAttempted"));
+  assert.match(recovery, /gitHasChanges\(REPO_ROOT, \["state", "audit"\]\)/);
+  assert.match(recovery, /gitAdd\(REPO_ROOT, \["state", "audit"\]\)/);
+});
+
 test("planPatrolDispatches detects open non-draft PR and plans targeted merge.yml", () => {
   const pr = pull("M1Vj/VSU-SmartMap", 102, NOW);
   const dispatches = planPatrolDispatches([signal("M1Vj/VSU-SmartMap", { pulls: [pr] })], {
@@ -399,4 +433,3 @@ test("executeDirectives handles issue directive: public read-only suppression an
   assert.equal(nonTierRes.mutations, 0);
   assert.equal(nonTierRes.results[0].downgraded, "M1Vj/VSU-SmartMap not tier1");
 });
-

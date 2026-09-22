@@ -10,8 +10,8 @@ export function summarizeEvents(lines, nowMs = Date.now(), windowMs = 7 * 24 * 3
       if (nowMs - Date.parse(e.t) > windowMs) continue;
       inWindow += 1;
       const lane = e.lane || e.mode || "unknown";
-      perLane[lane] = perLane[lane] || { SUCCESS: 0, NOOP: 0, BLOCKED: 0, STALLED: 0, EXHAUSTED: 0 };
-      const key = e.state === "NO-OP" ? "NOOP" : e.state;
+      perLane[lane] = perLane[lane] || { SUCCESS: 0, NOOP: 0, BLOCKED: 0, STALLED: 0, EXHAUSTED: 0, SCANFAILED: 0 };
+      const key = e.state === "NO-OP" ? "NOOP" : e.state === "SCAN-FAILED" ? "SCANFAILED" : e.state;
       if (perLane[lane][key] !== undefined) perLane[lane][key] += 1;
     } catch {}
   }
@@ -39,13 +39,13 @@ export function renderStatusMd({ eventsLines, mergesLines, heartbeat, queueLines
     "",
     `## Terminal states (last ${summary.windowDays} days)`,
     "",
-    "| lane | SUCCESS | NO-OP | BLOCKED | STALLED | EXHAUSTED |",
-    "| --- | --- | --- | --- | --- | --- |",
+    "| lane | SUCCESS | NO-OP | BLOCKED | STALLED | EXHAUSTED | SCAN-FAILED |",
+    "| --- | --- | --- | --- | --- | --- | --- |",
   ];
   for (const [lane, c] of Object.entries(summary.perLane)) {
-    lines.push(`| ${lane} | ${c.SUCCESS} | ${c.NOOP} | ${c.BLOCKED} | ${c.STALLED} | ${c.EXHAUSTED} |`);
+    lines.push(`| ${lane} | ${c.SUCCESS} | ${c.NOOP} | ${c.BLOCKED} | ${c.STALLED} | ${c.EXHAUSTED} | ${c.SCANFAILED} |`);
   }
-  if (Object.keys(summary.perLane).length === 0) lines.push("| (none) | 0 | 0 | 0 | 0 | 0 |");
+  if (Object.keys(summary.perLane).length === 0) lines.push("| (none) | 0 | 0 | 0 | 0 | 0 | 0 |");
   lines.push("");
   return lines.join("\n");
 }

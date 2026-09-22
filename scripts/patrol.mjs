@@ -1057,9 +1057,9 @@ export async function main() {
       } catch {}
     }
     terminal(err.reason === "MODEL_UNAVAILABLE" ? "EXHAUSTED" : "BLOCKED", { runId, code, trigger });
-    if (identity && !statePushAttempted && gitHasChanges(REPO_ROOT, ["audit"])) {
+    if (identity && !statePushAttempted && gitHasChanges(REPO_ROOT, ["state", "audit"])) {
       try {
-        gitAdd(REPO_ROOT, ["audit"]);
+        gitAdd(REPO_ROOT, ["state", "audit"]);
         gitCommit(REPO_ROOT, `[fleet] patrol-failure-audit ${runId}`, identity);
         audit.note("push", "failure audit push attempted once");
         statePushAttempted = true;

@@ -276,6 +276,13 @@ test("planPatrolPersistence bounds the lifecycle to one initial push plus one fi
   assert.deepEqual(planPatrolPersistence({ changed: true, pushes: 2 }), { persist: false, reason: "push-cap" });
 });
 
+test("patrol failure recovery stages durable state artifacts with the audit", () => {
+  const source = readFileSync(new URL("../scripts/patrol.mjs", import.meta.url), "utf8");
+  const recovery = source.slice(source.indexOf("if (identity && !statePushAttempted"));
+  assert.match(recovery, /gitHasChanges\(REPO_ROOT, \["state", "audit"\]\)/);
+  assert.match(recovery, /gitAdd\(REPO_ROOT, \["state", "audit"\]\)/);
+});
+
 test("planPatrolDispatches detects open non-draft PR and plans targeted merge.yml", () => {
   const pr = pull("M1Vj/VSU-SmartMap", 102, NOW);
   const dispatches = planPatrolDispatches([signal("M1Vj/VSU-SmartMap", { pulls: [pr] })], {

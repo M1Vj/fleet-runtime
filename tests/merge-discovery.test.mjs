@@ -18,7 +18,10 @@ import {
   mergeExitCode,
   mergeChildExitCode,
   mergePersistenceExitCode,
+  recordMergePersistenceFailure,
 } from "../scripts/merge.mjs";
+import { TERMINAL_STATES, makeTerminal } from "../scripts/lib/terminal.mjs";
+import { renderStatusMd, summarizeEvents } from "../scripts/lib/status.mjs";
 
 const targets = {
   allOwned: false,
@@ -37,6 +40,45 @@ test("merge persistence failures are non-green without rewriting the terminal re
   assert.equal(mergePersistenceExitCode("committed"), 0);
   assert.equal(mergePersistenceExitCode("no-changes"), 0);
   assert.equal(mergePersistenceExitCode("push-failed"), 1);
+});
+
+test("merge persistence failures leave a durable terminal event for the next retry", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "merge-persistence-failure-"));
+  try {
+    const named = recordMergePersistenceFailure(root, {
+      runId: "merge-scan-1",
+      terminalState: "SCAN-FAILED",
+      reason: "push-failed",
+    });
+    assert.equal(named, "SCAN-FAILED");
+    const events = readFileSync(path.join(root, "state", "events.jsonl"), "utf8")
+      .trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(events.at(-1), {
+      t: events.at(-1).t,
+      lane: "merge",
+      state: "SCAN-FAILED",
+      runId: "merge-scan-1",
+      persistence: "failed",
+      reason: "push-failed",
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("SCAN-FAILED is a recognized terminal state and status consumer count", () => {
+  assert.ok(TERMINAL_STATES.includes("SCAN-FAILED"));
+  const root = mkdtempSync(path.join(tmpdir(), "merge-terminal-state-"));
+  try {
+    const terminal = makeTerminal(root, { lane: "merge" });
+    assert.equal(terminal("SCAN-FAILED", { runId: "scan-1" }), "SCAN-FAILED");
+    const lines = readFileSync(path.join(root, "state", "events.jsonl"), "utf8").trim().split("\n");
+    const summary = summarizeEvents(lines, Date.now(), 24 * 60 * 60 * 1000);
+    assert.equal(summary.perLane.merge.SCANFAILED, 1);
+    assert.match(renderStatusMd({ eventsLines: lines, mergesLines: [], heartbeat: null, queueLines: [] }), /SCAN-FAILED/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("merge scan propagates every failed or interrupted child", () => {
@@ -61,6 +103,7 @@ test("merge completion does not hide persistence or attribution failures", () =>
   assert.match(source, /"Merge gate scan", "failed-persistence"/);
   assert.match(source, /MERGE_TERMINAL_STATE=\$\{resultCode === 0 \? "SCAN-DONE" : "SCAN-FAILED"\}/);
   assert.match(source, /return resultCode/);
+  assert.match(source, /recordMergePersistenceFailure\(STATE_ROOT/);
 });
 
 test("parseMergeTarget accepts only a repo and positive integer PR", () => {

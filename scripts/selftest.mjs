@@ -268,19 +268,19 @@ export async function main() {
       }
     }
 
-    // T12 (lane B): terminal accepts the full 7-state set incl. merge-gate states.
+    // T12 (lane B): terminal accepts the full 8-state set incl. merge-gate states.
     try {
       const { TERMINAL_STATES } = await import("./lib/terminal.mjs");
       const tdir = mkdtempSync(path.join(tmpdir(), "fleetterm-"));
       const term = makeExecutionTerminal(process.env, tdir, { lane: "selftest" });
-      const got = [term("REVISION_QUEUED", { probe: 1 }), term("SCAN-DONE", { probe: 1 }), term("BOGUS-STATE", { probe: 1 })];
+      const got = [term("REVISION_QUEUED", { probe: 1 }), term("SCAN-DONE", { probe: 1 }), term("SCAN-FAILED", { probe: 1 }), term("BOGUS-STATE", { probe: 1 })];
       const lines = (await import("node:fs")).readFileSync(path.join(tdir, "state", "events.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l).state);
       if (
-        TERMINAL_STATES.length === 7 &&
-        got[0] === "REVISION_QUEUED" && got[1] === "SCAN-DONE" && got[2] === "BLOCKED" &&
-        lines.includes("REVISION_QUEUED") && lines.includes("SCAN-DONE")
+        TERMINAL_STATES.length === 8 &&
+        got[0] === "REVISION_QUEUED" && got[1] === "SCAN-DONE" && got[2] === "SCAN-FAILED" && got[3] === "BLOCKED" &&
+        lines.includes("REVISION_QUEUED") && lines.includes("SCAN-DONE") && lines.includes("SCAN-FAILED")
       ) {
-        audit.note("T12", "PASS terminal 7-state set (REVISION_QUEUED/SCAN-DONE kept, unknown fails closed to BLOCKED)");
+        audit.note("T12", "PASS terminal 8-state set (REVISION_QUEUED/SCAN-DONE/SCAN-FAILED kept, unknown fails closed to BLOCKED)");
       } else {
         audit.incident("T12", `terminal states wrong: ${JSON.stringify({ got, lines })}`);
         failed = true;

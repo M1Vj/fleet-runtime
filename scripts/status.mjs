@@ -49,8 +49,8 @@ const md = renderStatusMd({
   queueLines: readLines(path.join(REPO_ROOT, "state", "queue.jsonl")),
 });
 // The shared renderer only tabulates the five classic states; count the newer
-// terminal states (REVISION_QUEUED / SCAN-DONE) here so the digest stays whole.
-const extraStates = ["REVISION_QUEUED", "SCAN-DONE", "SUCCESS", "BLOCKED", "EXHAUSTED", "STALLED", "NO-OP"];
+// terminal states (REVISION_QUEUED / SCAN-DONE / SCAN-FAILED) here so the digest stays whole.
+const extraStates = ["REVISION_QUEUED", "SCAN-DONE", "SCAN-FAILED", "SUCCESS", "BLOCKED", "EXHAUSTED", "STALLED", "NO-OP"];
 const windowMs = 7 * 24 * 3600 * 1000;
 const nowMs = Date.now();
 const counts = Object.fromEntries(extraStates.map((s) => [s, 0]));

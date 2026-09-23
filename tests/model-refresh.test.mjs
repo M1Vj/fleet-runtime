@@ -95,6 +95,22 @@ test("rankChain strictly filters out forbidden Gemini models", () => {
   }
 });
 
+test("rankChain produces exact benchmark and sentiment fallback ladder", () => {
+  const candidates = [
+    { id: "opencode/nemotron-3-ultra-free", entry: { free: true, limit: { context: 1000000 } } },
+    { id: "opencode/jev-1.13-free", entry: { free: true, limit: { context: 262144 } } },
+    { id: "opencode/mimo-v2.6-flash-free", entry: { free: true, limit: { context: 262144 } } },
+    { id: PRIMARY_MODEL, entry: { free: true, limit: { context: 1048576 } } },
+    { id: "opencode/muse-spark-1.2-contributor-free", entry: { free: true, limit: { context: 1048576 } } },
+  ];
+  const chain = rankChain(candidates);
+  assert.equal(chain[0], "opencode/muse-spark-1.3-contributor-free");
+  assert.equal(chain[1], "opencode/mimo-v2.6-flash-free");
+  assert.equal(chain[2], "opencode/jev-1.13-free");
+  assert.equal(chain[3], "opencode/nemotron-3-ultra-free");
+  assert.equal(chain[4], "opencode/muse-spark-1.2-contributor-free");
+});
+
 test("validateChain validates proper chain lengths and contents", () => {
   assert.equal(validateChain(["opencode/nemotron-3-ultra-free"]), true);
   assert.equal(validateChain([]), false);

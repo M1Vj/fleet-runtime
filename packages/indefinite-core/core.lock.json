@@ -1,10 +1,10 @@
 {
   "name": "opencode-indefinite-core",
   "coreVersion": "1.0.0",
-  "digest": "075cbbcd887993265c47470d0ee19985003e618d1c7a76d65a4751408670d14e",
+  "digest": "8058739fbd139d5b8f384c0bea71615daec2ccab95d99448fbd8633e42807cdd",
   "algorithm": "sha256",
   "files": {
-    "manifest.json": "70570fcdb7c90ec39cc792a2371bf439de17ed5851eb7c340b4b6db807f9cb1b",
+    "manifest.json": "c657e6d7d16ae703a04459c73a5ee7d4b7628d54a9e2f52fcc9503c8559de420",
     "schema.json": "799738d89156ee5454a4092d493efd78226092c58c8adb1f7a9c3058ce93b1df",
     "golden-vectors.json": "07a24d2e4899cff320d535791036f1eb64017cca35d1d821f24cd0b7f952ad1e"
   }

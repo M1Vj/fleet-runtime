@@ -17,10 +17,10 @@ import { publicModelEnv } from "../scripts/lib/private-state.mjs";
 
 const EXPECTED_CHAIN = [
   "opencode/muse-spark-1.3-contributor-free",
+  "opencode/mimo-v2.6-flash-free",
+  "opencode/jev-1.13-free",
   "opencode/nemotron-3-ultra-free",
   "opencode/muse-spark-1.2-contributor-free",
-  "opencode/nemotron-3.5-lightning-free",
-  "opencode/mimo-v2.5-free",
 ];
 
 test("default chain is the verified-live free chain (muse-spark primary)", () => {

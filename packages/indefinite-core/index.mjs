@@ -6,9 +6,9 @@ import { fileURLToPath } from "node:url";
 export const CORE_ROOT = path.dirname(fileURLToPath(import.meta.url));
 export const CORE_VERSION = "1.0.0";
 
-export const CORE_LOCK_DIGEST = "075cbbcd887993265c47470d0ee19985003e618d1c7a76d65a4751408670d14e";
+export const CORE_LOCK_DIGEST = "8058739fbd139d5b8f384c0bea71615daec2ccab95d99448fbd8633e42807cdd";
 export const CORE_FILE_DIGESTS = Object.freeze({
-  "manifest.json": "70570fcdb7c90ec39cc792a2371bf439de17ed5851eb7c340b4b6db807f9cb1b",
+  "manifest.json": "c657e6d7d16ae703a04459c73a5ee7d4b7628d54a9e2f52fcc9503c8559de420",
   "schema.json": "799738d89156ee5454a4092d493efd78226092c58c8adb1f7a9c3058ce93b1df",
   "golden-vectors.json": "07a24d2e4899cff320d535791036f1eb64017cca35d1d821f24cd0b7f952ad1e",
 });
@@ -18,15 +18,17 @@ const FALLBACK_CAPABILITIES = Object.freeze({
   paidFallbackModel: null,
   defaultModelChain: Object.freeze([
     "opencode/muse-spark-1.3-contributor-free",
+    "opencode/mimo-v2.6-flash-free",
+    "opencode/jev-1.13-free",
     "opencode/nemotron-3-ultra-free",
     "opencode/muse-spark-1.2-contributor-free",
-    "opencode/nemotron-3.5-lightning-free",
-    "opencode/mimo-v2.5-free",
   ]),
   dynamicModelPool: Object.freeze([
     "opencode/muse-spark-1.3-contributor-free",
-    "opencode/muse-spark-1.2-contributor-free",
+    "opencode/mimo-v2.6-flash-free",
+    "opencode/jev-1.13-free",
     "opencode/nemotron-3-ultra-free",
+    "opencode/muse-spark-1.2-contributor-free",
     "opencode/nemotron-3.5-lightning-free",
     "opencode/mimo-v2.5-free",
     "opencode/ling-3.0-flash-fin-free",
@@ -55,6 +57,8 @@ const FALLBACK_MODEL_POLICY = Object.freeze({
   contributorTierPattern: "contributor",
   forbiddenPatterns: Object.freeze(["gemini", "google"]),
   deadModelIds: Object.freeze([
+    "opencode/union-alpha",
+    "union-alpha",
     "opencode/x-preview-f-free",
     "opencode/minimax-m3-free",
     "codexswap-alpha/x-preview-f-free",
@@ -230,8 +234,10 @@ export const DYNAMIC_MODEL_POOL = Object.freeze([...(capabilities.dynamicModelPo
 export const DEFAULT_JUDGE_MODEL = PRIMARY_MODEL;
 export const MODEL_CAPABILITY_SCORES = Object.freeze({
   "opencode/muse-spark-1.3-contributor-free": 100,
-  "opencode/muse-spark-1.2-contributor-free": 92,
+  "opencode/mimo-v2.6-flash-free": 98,
+  "opencode/jev-1.13-free": 96,
   "opencode/nemotron-3-ultra-free": 95,
+  "opencode/muse-spark-1.2-contributor-free": 90,
   "opencode/nemotron-3.5-lightning-free": 85,
   "opencode/mimo-v2.5-free": 75,
   "opencode/hy3-free": 70,

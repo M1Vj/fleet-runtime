@@ -22,6 +22,8 @@ try {
 
 export const {
   DEFAULT_MODEL_CHAIN,
+  DYNAMIC_MODEL_POOL,
+  PRIMARY_MODEL,
   classifyProviderResponse,
 } = coreModule;
 
@@ -81,6 +83,10 @@ export const HARVEST_SOURCES = [
   "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/https.txt",
   "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/master/proxy_files/http_proxies.txt",
   "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt",
+  "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+  "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/http.txt",
+  "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt",
+  "https://raw.githubusercontent.com/tuanminpay/live-proxy/master/http.txt",
 ];
 
 export function isMitmOrCertError(reason = "") {
@@ -245,7 +251,19 @@ export class ProxyPool {
       }
     }
 
+    if (pruned.length > 0 && this.filePath) {
+      this.saveToFile();
+    }
+
     return pruned;
+  }
+
+  saveToFile() {
+    if (!this.filePath) return;
+    try {
+      const content = this.proxies.join("\n") + (this.proxies.length ? "\n" : "");
+      fs.writeFileSync(this.filePath, content, "utf8");
+    } catch {}
   }
 
   isDirectRateLimited() {
@@ -275,7 +293,7 @@ export class ProxyPool {
       const preferred = this.affinityMap.get(affinityKey);
       if (!excludeSet || !excludeSet.has(preferred)) {
         const s = this.stats.get(preferred);
-        if (s && s.cooldownUntil <= this.now() && s.latencyEwma <= this.maxAffinityLatencyMs) {
+        if (s && !s.mitm && s.cooldownUntil <= this.now() && s.latencyEwma <= this.maxAffinityLatencyMs) {
           return preferred;
         }
       }
@@ -309,6 +327,9 @@ export class ProxyPool {
         }
       }
       if (added.length >= 100) break;
+    }
+    if (added.length > 0 && this.filePath) {
+      this.saveToFile();
     }
     return added;
   }
@@ -446,18 +467,24 @@ export function startIndefiniteDispatcher(options = {}) {
         });
 
         let handled = false;
-        const fallbackOnce = () => {
+        const fallbackOnce = (errReason = null, cooldown = 60000) => {
           if (!handled) {
             handled = true;
+            if (errReason) {
+              pool.recordFailure(candidate, errReason, cooldown);
+            }
             sendDirect();
           }
         };
 
         connectReq.on("connect", (connectRes, proxySocket) => {
+          if (handled) {
+            try { proxySocket.destroy(); } catch {}
+            return;
+          }
           if (connectRes.statusCode !== 200) {
-            proxySocket.destroy();
-            pool.recordFailure(candidate, `CONNECT_STATUS_${connectRes.statusCode}`, 60000);
-            fallbackOnce();
+            try { proxySocket.destroy(); } catch {}
+            fallbackOnce(`CONNECT_STATUS_${connectRes.statusCode}`, 60000);
             return;
           }
 
@@ -495,21 +522,18 @@ export function startIndefiniteDispatcher(options = {}) {
           });
 
           tlsSocket.on("error", (err) => {
-            pool.recordFailure(candidate, `TLS_ERROR_${err.code || err.message}`, 60000);
-            proxySocket.destroy();
-            fallbackOnce();
+            try { proxySocket.destroy(); } catch {}
+            fallbackOnce(`TLS_ERROR_${err.code || err.message}`, 60000);
           });
         });
 
         connectReq.on("error", (err) => {
-          pool.recordFailure(candidate, `CONNECT_ERROR_${err.code || err.message}`, 60000);
-          fallbackOnce();
+          fallbackOnce(`CONNECT_ERROR_${err.code || err.message}`, 60000);
         });
 
         connectReq.on("timeout", () => {
-          connectReq.destroy();
-          pool.recordFailure(candidate, "CONNECT_TIMEOUT", 60000);
-          fallbackOnce();
+          try { connectReq.destroy(); } catch {}
+          fallbackOnce("CONNECT_TIMEOUT", 60000);
         });
 
         connectReq.end();
@@ -617,84 +641,97 @@ export function startIndefiniteDispatcher(options = {}) {
         timeout: 3500,
       });
 
+      let reqHandled = false;
+      const finishReq = (fn) => {
+        if (reqHandled) return;
+        reqHandled = true;
+        fn();
+      };
+
       proxyReq.on("connect", (res, proxySocket) => {
-        if (connected || clientSocket.destroyed) {
-          proxySocket.destroy();
-          return;
-        }
-        if (res.statusCode !== 200) {
-          proxySocket.destroy();
-          const customCooldown = (res.statusCode === 407 || res.statusCode === 403) ? 15 * 60 * 1000 : 0;
-          pool.recordFailure(candidate, `STATUS_${res.statusCode}`, customCooldown);
-          tryNextProxy();
-          return;
-        }
-
-        connected = true;
-        if (proxySocket.unref) proxySocket.unref();
-        const latency = Date.now() - t0;
-        pool.recordSuccess(candidate, latency);
-        logger("INFO", `[TUNNEL_ESTABLISHED] Connected via ${candidate} (${latency}ms) to ${target}`);
-
-        let firstByteReceived = false;
-        clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-        if (head && head.length > 0) proxySocket.write(head);
-        proxySocket.pipe(clientSocket);
-        clientSocket.pipe(proxySocket);
-
-        // Fast-fail handshake watchdog: if proxy stalls on TLS handshake after 200 CONNECT, kill in 3000ms
-        const handshakeTimer = setTimeout(() => {
-          if (!firstByteReceived) {
-            pool.recordFailure(candidate, "TLS_HANDSHAKE_STALL", 300000);
-            proxySocket.destroy();
-            clientSocket.destroy();
+        finishReq(() => {
+          if (connected || clientSocket.destroyed) {
+            try { proxySocket.destroy(); } catch {}
+            return;
           }
-        }, 3000);
+          if (res.statusCode !== 200) {
+            try { proxySocket.destroy(); } catch {}
+            const customCooldown = (res.statusCode === 407 || res.statusCode === 403) ? 15 * 60 * 1000 : 0;
+            pool.recordFailure(candidate, `STATUS_${res.statusCode}`, customCooldown);
+            tryNextProxy();
+            return;
+          }
 
-        proxySocket.once("data", () => {
-          firstByteReceived = true;
-          clearTimeout(handshakeTimer);
-        });
+          connected = true;
+          if (proxySocket.unref) proxySocket.unref();
+          const latency = Date.now() - t0;
+          pool.recordSuccess(candidate, latency);
+          logger("INFO", `[TUNNEL_ESTABLISHED] Connected via ${candidate} (${latency}ms) to ${target}`);
 
-        proxySocket.setTimeout(180000, () => {
-          clearTimeout(handshakeTimer);
-          proxySocket.destroy();
-          clientSocket.destroy();
-        });
-        clientSocket.setTimeout(180000, () => {
-          clearTimeout(handshakeTimer);
-          clientSocket.destroy();
-          proxySocket.destroy();
-        });
+          let firstByteReceived = false;
+          clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+          if (head && head.length > 0) proxySocket.write(head);
+          proxySocket.pipe(clientSocket);
+          clientSocket.pipe(proxySocket);
 
-        proxySocket.on("error", () => {
-          clearTimeout(handshakeTimer);
-          clientSocket.destroy();
-        });
-        clientSocket.on("error", () => {
-          clearTimeout(handshakeTimer);
-          proxySocket.destroy();
-        });
-        proxySocket.on("close", () => {
-          clearTimeout(handshakeTimer);
-          clientSocket.destroy();
-        });
-        clientSocket.on("close", () => {
-          clearTimeout(handshakeTimer);
-          proxySocket.destroy();
+          // Fast-fail handshake watchdog: if proxy stalls on TLS handshake after 200 CONNECT, kill in 3000ms
+          const handshakeTimer = setTimeout(() => {
+            if (!firstByteReceived) {
+              pool.recordFailure(candidate, "TLS_HANDSHAKE_STALL", 300000);
+              try { proxySocket.destroy(); } catch {}
+              try { clientSocket.destroy(); } catch {}
+            }
+          }, 3000);
+
+          proxySocket.once("data", () => {
+            firstByteReceived = true;
+            clearTimeout(handshakeTimer);
+          });
+
+          proxySocket.setTimeout(180000, () => {
+            clearTimeout(handshakeTimer);
+            try { proxySocket.destroy(); } catch {}
+            try { clientSocket.destroy(); } catch {}
+          });
+          clientSocket.setTimeout(180000, () => {
+            clearTimeout(handshakeTimer);
+            try { clientSocket.destroy(); } catch {}
+            try { proxySocket.destroy(); } catch {}
+          });
+
+          proxySocket.on("error", () => {
+            clearTimeout(handshakeTimer);
+            try { clientSocket.destroy(); } catch {}
+          });
+          clientSocket.on("error", () => {
+            clearTimeout(handshakeTimer);
+            try { proxySocket.destroy(); } catch {}
+          });
+          proxySocket.on("close", () => {
+            clearTimeout(handshakeTimer);
+            try { clientSocket.destroy(); } catch {}
+          });
+          clientSocket.on("close", () => {
+            clearTimeout(handshakeTimer);
+            try { proxySocket.destroy(); } catch {}
+          });
         });
       });
 
       proxyReq.on("timeout", () => {
-        proxyReq.destroy();
-        pool.recordFailure(candidate, "TIMEOUT");
-        tryNextProxy();
+        finishReq(() => {
+          try { proxyReq.destroy(); } catch {}
+          pool.recordFailure(candidate, "TIMEOUT");
+          tryNextProxy();
+        });
       });
 
       proxyReq.on("error", (err) => {
-        const customCooldown = isMitmOrCertError(err.message) ? 15 * 60 * 1000 : 0;
-        pool.recordFailure(candidate, err.message, customCooldown);
-        tryNextProxy();
+        finishReq(() => {
+          const customCooldown = isMitmOrCertError(err.message) ? 15 * 60 * 1000 : 0;
+          pool.recordFailure(candidate, err.message, customCooldown);
+          tryNextProxy();
+        });
       });
 
       proxyReq.end();

@@ -223,3 +223,32 @@ test("ProxyPool pruneDeadProxies cycles out dead, MITM, and latency-spiking prox
   assert.equal(pool.affinityMap.has("session-dead"), false);
   assert.equal(pool.affinityMap.get("session-good"), "http://good-proxy:8080");
 });
+
+test("ProxyPool saveToFile persists pruned proxy list to disk", () => {
+  const tmpFile = path.join(tmpdir(), `prune-persist-${Date.now()}.txt`);
+  fs.writeFileSync(tmpFile, "http://survivor:8080\nhttp://dead:8080\n", "utf8");
+
+  try {
+    const pool = new ProxyPool(tmpFile);
+    assert.equal(pool.proxies.length, 2);
+
+    // Fail dead proxy 3 times with 0 successes
+    pool.recordFailure("http://dead:8080", "ECONNRESET");
+    pool.recordFailure("http://dead:8080", "ECONNRESET");
+    pool.recordFailure("http://dead:8080", "ECONNRESET");
+
+    // Success on survivor
+    pool.recordSuccess("http://survivor:8080", 150);
+
+    const pruned = pool.pruneDeadProxies();
+    assert.equal(pruned.length, 1);
+    assert.equal(pruned[0], "http://dead:8080");
+
+    // Read file from disk to verify persistence
+    const saved = fs.readFileSync(tmpFile, "utf8").trim();
+    assert.equal(saved, "http://survivor:8080");
+  } finally {
+    fs.rmSync(tmpFile, { force: true });
+  }
+});
+

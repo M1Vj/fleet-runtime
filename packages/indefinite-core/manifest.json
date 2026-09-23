@@ -8,15 +8,17 @@
     "paidFallbackModel": null,
     "defaultModelChain": [
       "opencode/muse-spark-1.3-contributor-free",
+      "opencode/mimo-v2.6-flash-free",
+      "opencode/jev-1.13-free",
       "opencode/nemotron-3-ultra-free",
-      "opencode/muse-spark-1.2-contributor-free",
-      "opencode/nemotron-3.5-lightning-free",
-      "opencode/mimo-v2.5-free"
+      "opencode/muse-spark-1.2-contributor-free"
     ],
     "dynamicModelPool": [
       "opencode/muse-spark-1.3-contributor-free",
-      "opencode/muse-spark-1.2-contributor-free",
+      "opencode/mimo-v2.6-flash-free",
+      "opencode/jev-1.13-free",
       "opencode/nemotron-3-ultra-free",
+      "opencode/muse-spark-1.2-contributor-free",
       "opencode/nemotron-3.5-lightning-free",
       "opencode/mimo-v2.5-free",
       "opencode/ling-3.0-flash-fin-free"
@@ -47,6 +49,8 @@
     "contributorTierPattern": "contributor",
     "forbiddenPatterns": ["gemini", "google"],
     "deadModelIds": [
+      "opencode/union-alpha",
+      "union-alpha",
       "opencode/x-preview-f-free",
       "opencode/minimax-m3-free",
       "codexswap-alpha/x-preview-f-free",

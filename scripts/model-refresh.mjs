@@ -179,13 +179,13 @@ export function rankChain(candidates) {
     if (a.id === PRIMARY_MODEL) return -1;
     if (b.id === PRIMARY_MODEL) return 1;
 
-    const contribA = isContributorTier(a.id);
-    const contribB = isContributorTier(b.id);
-    if (contribA !== contribB) return contribB ? 1 : -1;
-
     const scoreA = getModelCapabilityScore(a.id);
     const scoreB = getModelCapabilityScore(b.id);
     if (scoreA !== scoreB) return scoreB - scoreA;
+
+    const contribA = isContributorTier(a.id);
+    const contribB = isContributorTier(b.id);
+    if (contribA !== contribB) return contribB ? 1 : -1;
 
     const ctxA = a.entry?.limit?.context || 0;
     const ctxB = b.entry?.limit?.context || 0;

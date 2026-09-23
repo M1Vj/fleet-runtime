@@ -92,6 +92,7 @@ function isPrivateOrReservedIpv4(a, b, c, d) {
 
 export function isPrivateOrReservedHost(hostname) {
   let host = String(hostname || "").toLowerCase().trim().replace(/^\[|\]$/g, "");
+  if (host.endsWith(".")) host = host.slice(0, -1);
   if (!host || host === "localhost" || host === "metadata" || host === "metadata.google.internal") {
     return true;
   }
@@ -99,18 +100,7 @@ export function isPrivateOrReservedHost(hostname) {
     return true;
   }
 
-  // Dword / Integer / Hex representation of IPv4
-  if (/^(?:0x[0-9a-f]+|\d+)$/i.test(host)) {
-    const num = Number(host);
-    if (!Number.isFinite(num) || num < 0 || num > 0xffffffff) return true;
-    const a = (num >>> 24) & 0xff;
-    const b = (num >>> 16) & 0xff;
-    const c = (num >>> 8) & 0xff;
-    const d = num & 0xff;
-    return isPrivateOrReservedIpv4(a, b, c, d);
-  }
-
-  // IPv6
+  // IPv6: inspect standard, loopback, link-local, ULA, multicast, IPv4-mapped and IPv4-compatible
   if (net.isIPv6(host)) {
     const words = parseIPv6Words(host);
     if (!words) return true;
@@ -118,8 +108,8 @@ export function isPrivateOrReservedHost(hostname) {
     if (words.every((w) => w === 0)) return true;
     // Loopback ::1 or 0:0:0:0:0:0:0:1
     if (words.slice(0, 7).every((w) => w === 0) && words[7] === 1) return true;
-    // IPv4-mapped IPv6 (::ffff:a.b.c.d or ::ffff:xxxx:xxxx)
-    if (words.slice(0, 5).every((w) => w === 0) && words[5] === 0xffff) {
+    // IPv4-mapped (::ffff:a.b.c.d) AND IPv4-compatible (::a.b.c.d)
+    if (words.slice(0, 5).every((w) => w === 0) && (words[5] === 0xffff || words[5] === 0)) {
       const a = (words[6] >> 8) & 0xff;
       const b = words[6] & 0xff;
       const c = (words[7] >> 8) & 0xff;
@@ -135,11 +125,34 @@ export function isPrivateOrReservedHost(hostname) {
     return false;
   }
 
-  // IPv4 dotted decimal
-  const ipv4Match = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (ipv4Match) {
-    const [_, a, b, c, d] = ipv4Match.map(Number);
-    return isPrivateOrReservedIpv4(a, b, c, d);
+  // Robust IPv4 parsing: handles dotted decimal, octal, hex, dword, and POSIX shorthand (1, 2, 3 parts)
+  const ipv4Parts = host.split(".");
+  if (ipv4Parts.length >= 1 && ipv4Parts.length <= 4) {
+    const numbers = [];
+    for (const part of ipv4Parts) {
+      if (/^0x[0-9a-f]+$/i.test(part)) numbers.push(parseInt(part, 16));
+      else if (/^0[0-7]+$/.test(part)) numbers.push(parseInt(part, 8));
+      else if (/^\d+$/.test(part)) numbers.push(parseInt(part, 10));
+      else { numbers.length = 0; break; }
+    }
+    if (numbers.length > 0 && numbers.every(n => Number.isFinite(n) && n >= 0)) {
+      let val;
+      if (numbers.length === 1) val = numbers[0];
+      else if (numbers.length === 2) {
+        if (numbers[0] > 0xff || numbers[1] > 0xffffff) return true;
+        val = (numbers[0] * 0x1000000) + numbers[1];
+      } else if (numbers.length === 3) {
+        if (numbers[0] > 0xff || numbers[1] > 0xff || numbers[2] > 0xffff) return true;
+        val = (numbers[0] * 0x1000000) + (numbers[1] * 0x10000) + numbers[2];
+      } else if (numbers.length === 4) {
+        if (numbers[0] > 0xff || numbers[1] > 0xff || numbers[2] > 0xff || numbers[3] > 0xff) return true;
+        val = (numbers[0] * 0x1000000) + (numbers[1] * 0x10000) + (numbers[2] * 0x100) + numbers[3];
+      }
+      if (typeof val === "number" && Number.isFinite(val) && val >= 0 && val <= 0xffffffff) {
+        const a = (val >>> 24) & 0xff, b = (val >>> 16) & 0xff, c = (val >>> 8) & 0xff, d = val & 0xff;
+        return isPrivateOrReservedIpv4(a, b, c, d);
+      }
+    }
   }
 
   return false;
@@ -336,9 +349,16 @@ export class ProxyPool {
 
     // CRITICAL INVARIANT: DO NOT REMOVE OR DOWNGRADE
     // Trigger autonomous replenishment if healthy routes drop below safe threshold
-    const healthyCount = this.getHealthyProxies().length;
-    if (healthyCount < 8 && this.triggerAutoReplenish) {
-      this.triggerAutoReplenish(`ROUTE_FAILURE_${reason}_HEALTHY_${healthyCount}`);
+    if (this.triggerAutoReplenish) {
+      let healthyCount = 0;
+      const now = this.now();
+      for (const p of this.proxies) {
+        const st = this.stats.get(p);
+        if (st && !st.mitm && st.cooldownUntil <= now) healthyCount++;
+      }
+      if (healthyCount < 8) {
+        this.triggerAutoReplenish(`ROUTE_FAILURE_${reason}_HEALTHY_${healthyCount}`);
+      }
     }
   }
 
@@ -411,7 +431,6 @@ export class ProxyPool {
 
   getHealthyProxies(excludeSet = null) {
     const now = this.now();
-    this.pruneDeadProxies(now);
     return this.proxies.filter((p) => {
       if (excludeSet && excludeSet.has(p)) return false;
       const s = this.stats.get(p);
@@ -650,7 +669,7 @@ export class DynamicProxyHarvester {
     const healthyCount = this.pool ? this.pool.getHealthyProxies().length : 0;
     const isCritical = healthyCount < 4 || (this.pool && this.pool.proxies.length === 0);
     const isDegraded = healthyCount < 8;
-    const lastRun = this.lastHarvestAt ? Date.parse(this.lastHarvestAt) : 0;
+    const lastRun = this.lastHarvestAt ? (typeof this.lastHarvestAt === "number" ? this.lastHarvestAt : (Date.parse(this.lastHarvestAt) || 0)) : 0;
     const timeSinceLast = now - lastRun;
 
     if (isCritical) {
@@ -774,6 +793,277 @@ export class DynamicProxyHarvester {
   }
 }
 
+/**
+ * ============================================================================
+ * FLEET DISTRIBUTED FLOW CONTROL — TOKEN BUCKET RATE LIMITER
+ * ============================================================================
+ * ANTI-DOWNGRADE INVARIANT: DO NOT REMOVE, BYPASS, OR WEAKEN THIS FLOW LIMITER.
+ * Smooths traffic bursts, prevents upstream provider 429 penalties, and ensures
+ * orderly request processing across concurrent agent workloads.
+ */
+export class TokenBucketLimiter {
+  constructor(options = {}) {
+    this.capacity = options.capacity || 10;
+    this.tokens = this.capacity;
+    this.refillRatePerSec = options.refillRatePerSec || 8;
+    this.lastRefill = Date.now();
+    this.queue = [];
+    this.drainTimer = null;
+  }
+
+  refill() {
+    const now = Date.now();
+    const elapsed = (now - this.lastRefill) / 1000;
+    this.tokens = Math.min(this.capacity, this.tokens + elapsed * this.refillRatePerSec);
+    this.lastRefill = now;
+  }
+
+  async acquire(abortSignal = null) {
+    this.refill();
+    if (this.tokens >= 1 && this.queue.length === 0) {
+      this.tokens -= 1;
+      return;
+    }
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const onAbort = () => {
+        if (!settled) {
+          settled = true;
+          const idx = this.queue.indexOf(run);
+          if (idx !== -1) this.queue.splice(idx, 1);
+          const err = new Error("Request aborted in token bucket queue");
+          err.name = "AbortError";
+          reject(err);
+        }
+      };
+
+      const run = () => {
+        if (settled) return;
+        settled = true;
+        abortSignal?.removeEventListener?.("abort", onAbort);
+        this.tokens -= 1;
+        resolve();
+      };
+
+      abortSignal?.addEventListener?.("abort", onAbort, { once: true });
+      this.queue.push(run);
+      this.scheduleDrain();
+    });
+  }
+
+  scheduleDrain() {
+    if (this.drainTimer || this.queue.length === 0) return;
+    this.drainTimer = setTimeout(() => {
+      this.drainTimer = null;
+      this.refill();
+      while (this.tokens >= 1 && this.queue.length > 0) {
+        const next = this.queue.shift();
+        next();
+      }
+      if (this.queue.length > 0) {
+        this.scheduleDrain();
+      }
+    }, 25);
+  }
+}
+
+/**
+ * ============================================================================
+ * SINGLEFLIGHT REQUEST COALESCING (MSHR) ENGINE
+ * ============================================================================
+ * ANTI-DOWNGRADE INVARIANT: DO NOT REMOVE OR BYPASS SINGLEFLIGHT MULTICASTING.
+ * Deduplicates identical in-flight requests, avoiding redundant upstream calls
+ * and conserving proxy quota and rate limits.
+ */
+export class SingleflightMulticaster {
+  constructor() {
+    this.inFlight = new Map();
+  }
+
+  getKey(method, path, body) {
+    return crypto.createHash("sha256")
+      .update(String(method))
+      .update(String(path))
+      .update(body || "")
+      .digest("hex");
+  }
+
+  register(key, res, req) {
+    if (!this.inFlight.has(key)) {
+      const entry = {
+        leader: res,
+        subscribers: new Set(),
+        pipeStarted: false,
+        headers: null,
+        statusCode: null,
+        chunks: [],
+      };
+      this.inFlight.set(key, entry);
+      return { isLeader: true, entry };
+    }
+    const entry = this.inFlight.get(key);
+    entry.subscribers.add(res);
+    if (entry.pipeStarted && entry.statusCode && entry.headers) {
+      try {
+        if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+          res.writeHead(entry.statusCode, entry.headers);
+          if (typeof res.flushHeaders === "function") res.flushHeaders();
+          for (const chunk of entry.chunks) {
+            if (!res.destroyed && !res.writableEnded) {
+              res.write(chunk);
+            }
+          }
+        }
+      } catch {}
+    }
+    const onSubClose = () => {
+      entry.subscribers.delete(res);
+      if (entry.subscribers.size === 0 && (!entry.leader || entry.leader.destroyed || entry.leader.writableEnded)) {
+        this.inFlight.delete(key);
+      }
+    };
+    res.once("close", onSubClose);
+    req.once("aborted", onSubClose);
+    return { isLeader: false, entry };
+  }
+
+  broadcastHeaders(entry, statusCode, headers) {
+    if (!entry) return;
+    entry.pipeStarted = true;
+    entry.statusCode = statusCode;
+    entry.headers = headers;
+    for (const sub of entry.subscribers) {
+      if (sub === entry.leader) continue;
+      try {
+        if (!sub.headersSent && !sub.writableEnded && !sub.destroyed) {
+          sub.writeHead(statusCode, headers);
+          if (typeof sub.flushHeaders === "function") sub.flushHeaders();
+        }
+      } catch {}
+    }
+  }
+
+  broadcastData(entry, chunk) {
+    if (!entry) return;
+    if (chunk) entry.chunks.push(chunk);
+    for (const sub of entry.subscribers) {
+      if (sub === entry.leader) continue;
+      try {
+        if (!sub.destroyed && !sub.writableEnded) {
+          sub.write(chunk);
+        }
+      } catch {}
+    }
+  }
+
+  broadcastEnd(key, entry) {
+    if (!entry) return;
+    for (const sub of entry.subscribers) {
+      if (sub === entry.leader) continue;
+      try {
+        if (!sub.writableEnded && !sub.destroyed) {
+          sub.end();
+        }
+      } catch {}
+    }
+    this.inFlight.delete(key);
+  }
+
+  broadcastError(key, entry, err) {
+    if (!entry) return;
+    for (const sub of entry.subscribers) {
+      if (sub === entry.leader) continue;
+      try {
+        if (!sub.headersSent && !sub.writableEnded && !sub.destroyed) {
+          sub.writeHead(502, { "Content-Type": "application/json", "X-Fleet-Indefinite-State": "upstream-midstream-error" });
+          sub.end(JSON.stringify({ error: { type: "UpstreamMidstreamError", message: "Upstream response stream failed; retry may succeed." } }));
+        } else if (!sub.writableEnded && !sub.destroyed) {
+          sub.destroy(err);
+        }
+      } catch {}
+    }
+    this.inFlight.delete(key);
+  }
+}
+
+/**
+ * ============================================================================
+ * UNBUFFERED ZERO-LATENCY STREAMING PIPELINE
+ * ============================================================================
+ * ANTI-DOWNGRADE INVARIANT: DO NOT REMOVE OR DOWNGRADE TO BUFFERED PIPING.
+ * Eliminates TTFB stalls by flushing response headers immediately, disables
+ * Nagle's algorithm (TCP_NODELAY), broadcasts chunks through singleflight MSHR,
+ * and handles midstream aborts and errors cleanly.
+ */
+export function pipeUnbuffered(upstreamRes, downstreamRes, options = {}) {
+  const { singleflightKey, singleflightEntry, singleflight, onMidstreamError } = options;
+  if (downstreamRes.socket && downstreamRes.socket.setNoDelay) downstreamRes.socket.setNoDelay(true);
+  let headersCommitted = false;
+  let bytesStreamed = 0;
+  let errorSettled = false;
+
+  const commitHeaders = () => {
+    if (headersCommitted || downstreamRes.writableEnded || downstreamRes.destroyed) return;
+    headersCommitted = true;
+    downstreamRes.writeHead(upstreamRes.statusCode, upstreamRes.headers);
+    if (typeof downstreamRes.flushHeaders === "function") downstreamRes.flushHeaders();
+    if (singleflightEntry && singleflight) {
+      singleflight.broadcastHeaders(singleflightEntry, upstreamRes.statusCode, upstreamRes.headers);
+    }
+  };
+
+  commitHeaders();
+
+  const abortCleanlyWithError = (err) => {
+    if (errorSettled) return;
+    errorSettled = true;
+    const genuineErr = err instanceof Error ? err : new Error(String((err && err.message) || err || "upstream stream error"));
+    if (singleflightKey && singleflightEntry && singleflight) {
+      singleflight.broadcastError(singleflightKey, singleflightEntry, genuineErr);
+    }
+    try {
+      if (!headersCommitted && !downstreamRes.headersSent && !downstreamRes.writableEnded && !downstreamRes.destroyed) {
+        downstreamRes.writeHead(502, { "Content-Type": "application/json", "X-Fleet-Indefinite-State": "upstream-midstream-error" });
+        downstreamRes.end(JSON.stringify({ error: { type: "UpstreamMidstreamError", message: "Upstream response stream failed; retry may succeed." } }));
+      } else if (!downstreamRes.writableEnded) {
+        downstreamRes.destroy(genuineErr);
+      }
+    } catch {
+      try { if (!downstreamRes.writableEnded) downstreamRes.destroy(genuineErr); } catch {}
+    }
+    if (typeof onMidstreamError === "function") onMidstreamError(genuineErr, bytesStreamed);
+  };
+
+  upstreamRes.on("data", (chunk) => {
+    commitHeaders();
+    bytesStreamed += chunk ? chunk.length : 0;
+    if (!downstreamRes.destroyed && !downstreamRes.writableEnded) {
+      try { downstreamRes.write(chunk); } catch {}
+    }
+    if (singleflightEntry && singleflight) {
+      singleflight.broadcastData(singleflightEntry, chunk);
+    }
+  });
+
+  upstreamRes.on("end", () => {
+    if (!headersCommitted) commitHeaders();
+    if (!downstreamRes.writableEnded) {
+      try { downstreamRes.end(); } catch {}
+    }
+    if (singleflightKey && singleflightEntry && singleflight) {
+      singleflight.broadcastEnd(singleflightKey, singleflightEntry);
+    }
+  });
+
+  upstreamRes.on("error", (err) => {
+    abortCleanlyWithError(err);
+  });
+}
+
+export const flowLimiter = new TokenBucketLimiter({ capacity: 10, refillRatePerSec: 8 });
+export const singleflight = new SingleflightMulticaster();
+
 let activeDispatcherInstance = null;
 
 export function getDispatcherInstance() {
@@ -785,7 +1075,7 @@ export function startIndefiniteDispatcher(options = {}) {
     return activeDispatcherInstance;
   }
 
-  const port = Number(options.port || process.env.FLEET_DISPATCHER_PORT || DEFAULT_PORT);
+  const port = Number(options.port !== undefined ? options.port : (process.env.FLEET_DISPATCHER_PORT || DEFAULT_PORT));
   const host = options.host || DEFAULT_HOST;
   const stateRoot = options.stateRoot || process.env.FLEET_STATE_ROOT || process.cwd();
   const logger = typeof options.logger === "function" ? options.logger : (level, msg) => {
@@ -872,8 +1162,7 @@ export function startIndefiniteDispatcher(options = {}) {
           if (directRes.statusCode === 429) {
             pool.recordDirectRateLimited(60000);
           }
-          res.writeHead(directRes.statusCode, directRes.headers);
-          directRes.pipe(res);
+          pipeUnbuffered(directRes, res);
         });
 
         directReq.on("error", (err) => {
@@ -951,8 +1240,7 @@ export function startIndefiniteDispatcher(options = {}) {
               } else {
                 pool.recordSuccess(candidate, 500);
               }
-              res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
-              upstreamRes.pipe(res);
+              pipeUnbuffered(upstreamRes, res);
             });
 
             proxiedReq.on("error", (err) => {
@@ -1259,6 +1547,9 @@ export function startIndefiniteDispatcher(options = {}) {
         try { s.destroy(); } catch {}
       }
       activeSockets.clear();
+      if (typeof server.closeAllConnections === "function") {
+        try { server.closeAllConnections(); } catch {}
+      }
       try {
         server.close(() => {
           if (activeDispatcherInstance === instance) {

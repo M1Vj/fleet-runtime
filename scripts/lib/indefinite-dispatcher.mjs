@@ -30,28 +30,95 @@ export const {
 const DEFAULT_PORT = 58444;
 const DEFAULT_HOST = "127.0.0.1";
 
+function parseIPv6Words(ip) {
+  if (!net.isIPv6(ip)) return null;
+  let normalized = ip.toLowerCase();
+  const v4Part = normalized.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (v4Part) {
+    const octets = v4Part[2].split(".").map(Number);
+    if (octets.some((o) => o > 255 || o < 0)) return null;
+    const hex1 = ((octets[0] << 8) | octets[1]).toString(16).padStart(4, "0");
+    const hex2 = ((octets[2] << 8) | octets[3]).toString(16).padStart(4, "0");
+    normalized = `${v4Part[1]}${hex1}:${hex2}`;
+  }
+  const parts = normalized.split("::");
+  if (parts.length > 2) return null;
+  let words = [];
+  if (parts.length === 1) {
+    words = parts[0].split(":").map((w) => parseInt(w || "0", 16));
+  } else {
+    const left = parts[0] ? parts[0].split(":").map((w) => parseInt(w, 16)) : [];
+    const right = parts[1] ? parts[1].split(":").map((w) => parseInt(w, 16)) : [];
+    const middle = new Array(8 - left.length - right.length).fill(0);
+    words = [...left, ...middle, ...right];
+  }
+  return words.length === 8 ? words : null;
+}
+
+function isPrivateOrReservedIpv4(a, b, c, d) {
+  if (a > 255 || b > 255 || c > 255 || d > 255) return true;
+  if (a === 0 || a === 127) return true; // 0.0.0.0/8, 127.0.0.0/8
+  if (a === 10) return true; // 10.0.0.0/8
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+  if (a === 192 && b === 168) return true; // 192.168.0.0/16
+  if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local
+  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
+  if (a >= 224) return true; // multicast / reserved
+  return false;
+}
+
 export function isPrivateOrReservedHost(hostname) {
   let host = String(hostname || "").toLowerCase().trim().replace(/^\[|\]$/g, "");
-  if (!host || host === "localhost" || host === "metadata.google.internal" || host.endsWith(".local") || host.endsWith(".internal")) {
+  if (!host || host === "localhost" || host === "metadata" || host === "metadata.google.internal") {
     return true;
   }
-  if (host.startsWith("::ffff:")) {
-    host = host.slice(7);
+  if (host.endsWith(".local") || host.endsWith(".internal") || host.endsWith(".localhost") || host.endsWith(".google.internal")) {
+    return true;
   }
+
+  // Dword / Integer / Hex representation of IPv4
+  if (/^(?:0x[0-9a-f]+|\d+)$/i.test(host)) {
+    const num = Number(host);
+    if (!Number.isFinite(num) || num < 0 || num > 0xffffffff) return true;
+    const a = (num >>> 24) & 0xff;
+    const b = (num >>> 16) & 0xff;
+    const c = (num >>> 8) & 0xff;
+    const d = num & 0xff;
+    return isPrivateOrReservedIpv4(a, b, c, d);
+  }
+
+  // IPv6
+  if (net.isIPv6(host)) {
+    const words = parseIPv6Words(host);
+    if (!words) return true;
+    // Unspecified ::
+    if (words.every((w) => w === 0)) return true;
+    // Loopback ::1 or 0:0:0:0:0:0:0:1
+    if (words.slice(0, 7).every((w) => w === 0) && words[7] === 1) return true;
+    // IPv4-mapped IPv6 (::ffff:a.b.c.d or ::ffff:xxxx:xxxx)
+    if (words.slice(0, 5).every((w) => w === 0) && words[5] === 0xffff) {
+      const a = (words[6] >> 8) & 0xff;
+      const b = words[6] & 0xff;
+      const c = (words[7] >> 8) & 0xff;
+      const d = words[7] & 0xff;
+      return isPrivateOrReservedIpv4(a, b, c, d);
+    }
+    // Link-local (fe80::/10)
+    if ((words[0] & 0xffc0) === 0xfe80) return true;
+    // Unique local / Private (fc00::/7 -> covers fc00::/8 and fd00::/8)
+    if ((words[0] & 0xfe00) === 0xfc00) return true;
+    // Multicast (ff00::/8)
+    if ((words[0] & 0xff00) === 0xff00) return true;
+    return false;
+  }
+
+  // IPv4 dotted decimal
   const ipv4Match = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (ipv4Match) {
     const [_, a, b, c, d] = ipv4Match.map(Number);
-    if (a > 255 || b > 255 || c > 255 || d > 255) return true;
-    if (a === 0 || a === 127) return true;
-    if (a === 10) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 169 && b === 254) return true;
-    if (a >= 224) return true;
+    return isPrivateOrReservedIpv4(a, b, c, d);
   }
-  if (host === "::1" || host.startsWith("fe80:") || host.startsWith("fc00:") || host.startsWith("fd00:")) {
-    return true;
-  }
+
   return false;
 }
 

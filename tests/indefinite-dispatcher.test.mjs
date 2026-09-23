@@ -168,3 +168,58 @@ test("Request Sanitizer eliminates invalid_request_error artifacts", () => {
   // Encrypted content should be deleted
   assert.equal(parsedClean.input[0].encrypted_content, undefined);
 });
+
+test("ProxyPool pruneDeadProxies cycles out dead, MITM, and latency-spiking proxies", () => {
+  const pool = new ProxyPool(null);
+  pool.loadProxiesFromLines([
+    "http://good-proxy:8080",
+    "http://failing-proxy:8080",
+    "http://mitm-proxy:8080",
+    "http://lagging-proxy:8080",
+    "http://extreme-latency-proxy:8080",
+  ]);
+
+  assert.equal(pool.proxies.length, 5);
+
+  // 1. Good proxy
+  pool.recordSuccess("http://good-proxy:8080", 250);
+
+  // 2. Failing proxy (3 failures, 0 successes)
+  pool.recordFailure("http://failing-proxy:8080", "ECONNRESET");
+  pool.recordFailure("http://failing-proxy:8080", "ECONNRESET");
+  pool.recordFailure("http://failing-proxy:8080", "ECONNRESET");
+
+  // 3. MITM proxy
+  pool.recordFailure("http://mitm-proxy:8080", "DEPTH_ZERO_SELF_SIGNED_CERT");
+
+  // 4. Lagging proxy (latency > 6000 with multiple failures)
+  const lagStats = pool.ensureStats("http://lagging-proxy:8080");
+  lagStats.latencyEwma = 7500;
+  lagStats.failures = 2;
+
+  // 5. Extreme latency proxy (> 10000)
+  const extStats = pool.ensureStats("http://extreme-latency-proxy:8080");
+  extStats.latencyEwma = 12000;
+
+  // Set affinity to failing proxy
+  pool.affinityMap.set("session-dead", "http://failing-proxy:8080");
+  pool.affinityMap.set("session-good", "http://good-proxy:8080");
+
+  // Prune dead proxies
+  const pruned = pool.pruneDeadProxies();
+  assert.equal(pruned.length, 4);
+  assert.ok(pruned.includes("http://failing-proxy:8080"));
+  assert.ok(pruned.includes("http://mitm-proxy:8080"));
+  assert.ok(pruned.includes("http://lagging-proxy:8080"));
+  assert.ok(pruned.includes("http://extreme-latency-proxy:8080"));
+
+  // Only good-proxy remains in pool
+  assert.equal(pool.proxies.length, 1);
+  assert.equal(pool.proxies[0], "http://good-proxy:8080");
+  assert.equal(pool.getHealthyProxies().length, 1);
+  assert.equal(pool.pickCandidate(), "http://good-proxy:8080");
+
+  // Dead affinity is cleaned up, good affinity is preserved
+  assert.equal(pool.affinityMap.has("session-dead"), false);
+  assert.equal(pool.affinityMap.get("session-good"), "http://good-proxy:8080");
+});

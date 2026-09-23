@@ -403,13 +403,16 @@ export function classifyProviderResponse(statusCode, headers = {}, body = Buffer
     };
   }
   if (statusCode === 401 || statusCode === 403) {
-    const routeFailover = statusCode === 403;
+    const isFreeTierClient = /free tier can only be used from within|freetiererror/i.test(text);
+    const routeFailover = statusCode === 403 && !isFreeTierClient;
     return {
       kind: "access_rejected",
       retryAt: null,
       retryAfterSec: null,
       routeFailover,
-      reason: /country|region|geographic|location/i.test(text) ? "country_restricted" : "route_forbidden",
+      reason: isFreeTierClient
+        ? "free_tier_client_required"
+        : (/country|region|geographic|location/i.test(text) ? "country_restricted" : "route_forbidden"),
     };
   }
   if (statusCode === 400 && /encrypted_content/i.test(text)) {

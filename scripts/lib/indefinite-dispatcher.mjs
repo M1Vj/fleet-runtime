@@ -8,10 +8,22 @@ import crypto from "node:crypto";
 import { URL, fileURLToPath } from "node:url";
 
 import { sanitizeRequestBody } from "./request-sanitizer.mjs";
-import {
+
+let coreModule;
+try {
+  coreModule = await import("../../packages/indefinite-core/index.mjs");
+} catch {
+  try {
+    coreModule = await import("./core/index.mjs");
+  } catch {
+    coreModule = await import("../packages/indefinite-core/index.mjs");
+  }
+}
+
+export const {
   DEFAULT_MODEL_CHAIN,
   classifyProviderResponse,
-} from "../../packages/indefinite-core/index.mjs";
+} = coreModule;
 
 const DEFAULT_PORT = 58444;
 const DEFAULT_HOST = "127.0.0.1";
@@ -65,6 +77,10 @@ export const HARVEST_SOURCES = [
   "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
   "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/http_proxies.txt",
   "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/http.txt",
+  "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
+  "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/https.txt",
+  "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/master/proxy_files/http_proxies.txt",
+  "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt",
 ];
 
 export function isMitmOrCertError(reason = "") {
@@ -187,10 +203,49 @@ export class ProxyPool {
     if (isMitmOrCertError(reason)) {
       cooldown = Math.max(cooldown, 15 * 60 * 1000);
       s.state = "open";
+      s.mitm = true;
     } else if (s.failures >= 3) {
       s.state = "open";
     }
     s.cooldownUntil = this.now() + cooldown;
+  }
+
+  pruneDeadProxies(now = this.now(), options = {}) {
+    const maxFailures = options.maxFailures ?? 3;
+    const maxLatencyMs = options.maxLatencyMs ?? 6000;
+    const maxTotalFailures = options.maxTotalFailures ?? 5;
+    const staleMs = options.staleMs ?? (10 * 60 * 1000);
+    const pruned = [];
+
+    this.proxies = this.proxies.filter((proxyUrl) => {
+      const s = this.stats.get(proxyUrl);
+      if (!s) return false;
+      const isDead =
+        s.mitm === true ||
+        (s.failures >= maxFailures && s.successes === 0) ||
+        (s.failures >= maxTotalFailures) ||
+        (s.latencyEwma > maxLatencyMs && s.failures >= 2) ||
+        (s.latencyEwma > 10000) ||
+        (s.lastFailureAt > 0 && s.successes === 0 && (now - s.lastFailureAt >= staleMs));
+
+      if (isDead) {
+        pruned.push(proxyUrl);
+        this.stats.delete(proxyUrl);
+        return false;
+      }
+      return true;
+    });
+
+    if (this.affinityMap && this.affinityMap.size > 0) {
+      for (const [key, val] of this.affinityMap.entries()) {
+        const route = typeof val === "string" ? val : val?.proxyUrl;
+        if (pruned.includes(route) || !this.stats.has(route)) {
+          this.affinityMap.delete(key);
+        }
+      }
+    }
+
+    return pruned;
   }
 
   isDirectRateLimited() {
@@ -207,10 +262,11 @@ export class ProxyPool {
 
   getHealthyProxies(excludeSet = null) {
     const now = this.now();
+    this.pruneDeadProxies(now);
     return this.proxies.filter((p) => {
       if (excludeSet && excludeSet.has(p)) return false;
       const s = this.stats.get(p);
-      return s && s.cooldownUntil <= now;
+      return s && !s.mitm && s.cooldownUntil <= now;
     });
   }
 
@@ -691,7 +747,18 @@ export function startIndefiniteDispatcher(options = {}) {
     }
   }
 
+  const pruneInterval = setInterval(() => {
+    try {
+      pool.pruneDeadProxies();
+      if (pool.getHealthyProxies().length < 4) {
+        pool.harvest().catch(() => {});
+      }
+    } catch {}
+  }, 30000);
+  if (pruneInterval.unref) pruneInterval.unref();
+
   const stop = () => {
+    clearInterval(pruneInterval);
     return new Promise((resolve) => {
       for (const s of activeSockets) {
         try { s.destroy(); } catch {}

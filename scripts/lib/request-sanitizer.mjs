@@ -1,8 +1,19 @@
-import {
+let coreModule;
+try {
+  coreModule = await import("../../packages/indefinite-core/index.mjs");
+} catch {
+  try {
+    coreModule = await import("./core/index.mjs");
+  } catch {
+    coreModule = await import("../packages/indefinite-core/index.mjs");
+  }
+}
+
+export const {
   CORE_INTEGRITY_OK,
   CORE_LOCK_DIGEST,
   applyRequestCapabilities,
-} from "../../packages/indefinite-core/index.mjs";
+} = coreModule;
 
 export const CORE_SANITIZER_DIGEST = CORE_LOCK_DIGEST;
 

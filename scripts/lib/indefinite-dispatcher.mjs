@@ -1,4 +1,5 @@
 /**
+ * DEPRECATED — not loaded by any live process
  * ============================================================================
  * FLEET INDEFINITE DISPATCHER & PROXY HARVESTER ENGINE — PERMANENT CORE INVARIANT
  * ============================================================================

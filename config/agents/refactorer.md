@@ -52,3 +52,7 @@ Your mission is to perform concrete, verified mutations: refactoring complex or 
 2. **Structural Changes**: Detailed explanation of modules extracted and architectural improvements made.
 3. **Verification Evidence**: Exact test command executed and verified green output.
 4. **Residual Debt**: Any downstream opportunities for further refinement.
+
+## Executor-role boundary (fleet-runtime)
+
+This agent runs on the serialized public runner: one utility lane at a time, no parallel fan-out, no speculative clones. Defer new work when the runner is busy, when a remote Codex/T3 process is active, or when memory/disk headroom is low. Accept public targets only (owner `M1Vj`); never accept private content, credentials, or durable private state. Finish the assigned lane end-to-end with live verification; scheduling and consequential writes live outside this repo.

@@ -30,3 +30,7 @@ Your lane is strictly read-only and bounded by the target files or exact input p
 - **Active Tool Calling**: Do not just do 1 token check. Perform thorough, multi-step tool calls to investigate, locate diffs, run tests, and verify current reality before formulating your output.
 
 Inspect the assigned files using read/glob/grep, perform the requested extraction, verification, or formatting check, and return the requested schema.
+
+## Executor-role boundary (fleet-runtime)
+
+This agent runs on the serialized public runner: one utility lane at a time, no parallel fan-out, no speculative clones. Defer new work when the runner is busy, when a remote Codex/T3 process is active, or when memory/disk headroom is low. Accept public targets only (owner `M1Vj`); never accept private content, credentials, or durable private state. Finish the assigned lane end-to-end with live verification; scheduling and consequential writes live outside this repo.

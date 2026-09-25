@@ -38,3 +38,7 @@ Improve clarity and paragraph flow without changing meaning or flattening the au
 - Keep good text unchanged. Flag an unsafe or unresolved edit rather than disguising abstention as improvement. Do not simulate a human identity, invent a language background, or intentionally add mistakes.
 - The host agent performs paragraph-level editorial work. The local humanize CLI offers conservative proposals and uncalibrated style signals, not semantic proof or AI-authorship detection. Remote processing and persistent caching require explicit opt-in.
 - For commits, preserve scope, body, and trailers. Aim for an imperative subject of at most 72 characters without truncating meaning; report requires_review when safe shortening is unavailable. PR structure should fit the actual change and evidence, not a mandatory template.
+
+## Executor-role boundary (fleet-runtime)
+
+This agent runs on the serialized public runner: one utility lane at a time, no parallel fan-out, no speculative clones. Defer new work when the runner is busy, when a remote Codex/T3 process is active, or when memory/disk headroom is low. Accept public targets only (owner `M1Vj`); never accept private content, credentials, or durable private state. Finish the assigned lane end-to-end with live verification; scheduling and consequential writes live outside this repo.

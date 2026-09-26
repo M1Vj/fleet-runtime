@@ -75,7 +75,26 @@ scheduling, credentials, durable state, and consequential writes live outside th
 - End with `git status --short` and `git diff --stat` limited to
   lane-owned paths; leave unrelated files untouched.
 
-## 8. Hard boundaries
+## 8. Council gate (9/10 passing bar, serialized)
+
+- Any lane touching >1 file, auth/data/deploy paths, `config/agents/`,
+  permissions, skills, or instructions MUST pass review before reporting
+  complete: maker output + critic/adversarial pass + reviewer-or-domain
+  pass. Audits, research, and self-test lanes are still reviewed —
+  lane type never waives the gate.
+- Gate: unanimous Critical pass + ≥9/10 per pass, each with live evidence
+  (passing checks, command output, file:line). Scores without evidence
+  are invalid; dissent verbatim. Auth/data/deploy paths add a security
+  pass. Research uses 3 sequential survey passes, never parallel.
+- Passes run serialized, one at a time — never fan out, never clone.
+  Loop fix → re-verify → re-review indefinitely; never downgrade the bar.
+  After 3 failed loops on one axis: park state, report to the dispatcher
+  with dissent log and exact unblock. 8/10 is NEEDS_REVISION, never
+  complete. No completion claim until READY is quoted for the exact hunks.
+- Scores serve the owner, not the reverse: state who benefits, what changed,
+  what risk fell, what was left undone and why. Theater is NEEDS_REVISION.
+
+## 9. Hard boundaries
 
 - Public-safe output only; no secrets, tokens, or private excerpts.
 - No always-on services, no hidden persistence, no out-of-repo writes.

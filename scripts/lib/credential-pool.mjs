@@ -27,6 +27,44 @@ export const MAX_AUTH_SLOTS = 9;
 export const DEFAULT_AUTH_COOLDOWN_MS = 15 * 60 * 1000;
 export const AUTH_COOLDOWN_ENV = "FLEET_AUTH_COOLDOWN_MS";
 
+// Mid-run transport faults (port of the local indefinite MIDSTREAM_ lesson):
+// a slot whose model call dies mid-run on a genuine transport error gets a
+// SHORT cooldown so the next call rotates, instead of retrying the same
+// broken slot. Deliberately narrow: bare "timeout" never matches (a slow
+// model killed by our own watchdog is caller-caused, not slot fault — the
+// same guard as the local !req.aborted rule), and auth-class strings stay
+// with recordFailure (checked first by callers).
+export const TRANSPORT_FAILURE_RE = /socket hang up|ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|connect timeout|socket timeout|handshake (timeout|failure)|read ECONNRESET|broken pipe|stream error|connection reset by peer|connection refused/i;
+export const DEFAULT_TRANSPORT_COOLDOWN_MS = 5 * 60 * 1000;
+export const TRANSPORT_COOLDOWN_ENV = "FLEET_TRANSPORT_COOLDOWN_MS";
+
+export function isTransportFailure(stderrTail) {
+  return TRANSPORT_FAILURE_RE.test(String(stderrTail || ""));
+}
+
+export function resolveTransportCooldownMs(env = process.env) {
+  const raw = Number.parseInt(String(env[TRANSPORT_COOLDOWN_ENV] || ""), 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TRANSPORT_COOLDOWN_MS;
+}
+
+// Cools the slot briefly on genuine mid-run transport failures. Returns true
+// when the slot was cooled down. Auth-class input is refused here (use
+// recordFailure); caller-caused kills must be filtered by the caller via
+// the timedOut flag before calling.
+export function recordTransportFailure(stateRoot, slot, stderrTail, { nowMs = Date.now(), cooldownMs = DEFAULT_TRANSPORT_COOLDOWN_MS } = {}) {
+  if (!isTransportFailure(stderrTail) || isAuthFailure(stderrTail)) return false;
+  const health = loadHealth(stateRoot);
+  const prev = health[String(slot)] || {};
+  health[String(slot)] = {
+    ...prev,
+    cooldownUntil: nowMs + cooldownMs,
+    consecutiveErrors: (Number(prev.consecutiveErrors) || 0) + 1,
+    lastTransportError: scrubTail(stderrTail).slice(-200),
+  };
+  saveHealth(stateRoot, health);
+  return true;
+}
+
 // Auth/quota/429-class failure signatures, matched against scrubbed stderr
 // tails (covers CreditsError/credits-exhausted, 429 rate limits, 401/403).
 // Tightened: bare 'auth' overmatched ('author'); use explicit auth tokens

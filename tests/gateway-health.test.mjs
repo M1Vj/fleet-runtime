@@ -62,3 +62,16 @@ test("recorded reasons are secret-scrubbed", () => {
   assert.ok(!stored.includes(token));
   assert.ok(stored.includes("[redacted]"));
 });
+
+test("onExhausted fires on exhausted (open) snapshot", () => {
+  const root = freshRoot();
+  markGatewayDown(root, "boom", { attempts: 1 });
+  let seen = null;
+  const snap = healthSnapshot(root, (info) => {
+    seen = info;
+  });
+  assert.equal(snap.open, true);
+  assert.ok(seen);
+  assert.equal(seen.reason, "boom");
+  assert.equal(seen.ageMs, snap.ageMs);
+});

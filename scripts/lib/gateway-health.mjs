@@ -64,12 +64,26 @@ export function readHealth(root = process.cwd()) {
 }
 
 // Telemetry snapshot for status reporters: open flag + age + stored fields.
-export function healthSnapshot(root = process.cwd()) {
+// onExhausted is an optional exhaustion-reprobe hook, invoked when the
+// breaker would otherwise just wait (open snapshot) with { reason, ageMs }.
+// Callers should trigger harvest/replenish (proxy harvest / credential
+// replenish) from this hook instead of busy-waiting on the open circuit.
+// Defaults to a no-op so existing callers are unaffected.
+export function healthSnapshot(root = process.cwd(), onExhausted = undefined) {
+  if (typeof root === "function" && onExhausted === undefined) {
+    onExhausted = root;
+    root = process.cwd();
+  }
   const data = readHealth(root);
   if (!data) return { open: false, ageMs: -1, data: null };
   const stamp = data.downSince || data.recoveredAt;
   const ageMs = stamp ? Date.now() - Date.parse(stamp) : -1;
   const open = Boolean(data.downSince) && ageMs >= 0 && ageMs < CIRCUIT_OPEN_MS;
+  if (open && typeof onExhausted === "function") {
+    try {
+      onExhausted({ reason: data.reason, ageMs });
+    } catch {}
+  }
   return { open, ageMs, data };
 }
 

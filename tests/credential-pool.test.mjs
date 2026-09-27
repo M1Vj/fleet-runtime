@@ -5,14 +5,18 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   DEFAULT_AUTH_COOLDOWN_MS,
+  DEFAULT_TRANSPORT_COOLDOWN_MS,
   collectSlots,
   hasNumberedSlots,
   healthPath,
   isAuthFailure,
+  isTransportFailure,
   loadHealth,
   recordFailure,
   recordSuccess,
+  recordTransportFailure,
   resolveCooldownMs,
+  resolveTransportCooldownMs,
   selectSlot,
   slotEnvName,
   stripSlotKeys,
@@ -215,4 +219,33 @@ test("exhausted pool signals without throwing; flag writer files async alert-int
   assert.ok(!JSON.stringify(flag).includes("test-slot-"));
   const events = readFileSync(path.join(root, "state", "events.jsonl"), "utf8");
   assert.ok(events.includes("credential-pool-exhausted"));
+});
+
+test("mid-run transport failure cools briefly; caller kills and auth stay out", () => {
+  const root = freshRoot();
+  for (const tail of ["socket hang up", "read ECONNRESET", "connect ECONNREFUSED 1.2.3.4:3128", "Proxy CONNECT timeout (2000ms)".replace("CONNECT timeout", "connect timeout"), "broken pipe"]) {
+    assert.equal(isTransportFailure(tail), true, tail);
+  }
+  for (const tail of ["timeout after 480s with no output", "aborted by client", "SIGTERM", "exit code 1", "", "model hung with no output"]) {
+    assert.equal(isTransportFailure(tail), false, JSON.stringify(tail));
+  }
+  // Transport cools slot 1 briefly; next call rotates to slot 2.
+  assert.equal(recordTransportFailure(root, 1, "socket hang up", { nowMs: T0 }), true);
+  // Auth-class input refused here (belongs to recordFailure).
+  assert.equal(recordTransportFailure(root, 2, "429 rate limit", { nowMs: T0 }), false);
+  const health = loadHealth(root);
+  assert.equal(health["1"].consecutiveErrors, 1);
+  assert.equal(health["1"].cooldownUntil, T0 + DEFAULT_TRANSPORT_COOLDOWN_MS);
+  assert.equal(health["2"], undefined);
+  assert.equal(selectSlot({ env: env3(), stateRoot: root, nowMs: T0 + 1000 }).slot, 2);
+  // Short cooldown rejoins well before the 15-min auth cooldown.
+  assert.equal(selectSlot({ env: env3(), stateRoot: root, nowMs: T0 + DEFAULT_TRANSPORT_COOLDOWN_MS + 1000 }).slot, 1);
+});
+
+test("transport cooldown defaults to 5 min and honors FLEET_TRANSPORT_COOLDOWN_MS", () => {
+  assert.equal(DEFAULT_TRANSPORT_COOLDOWN_MS, 5 * 60 * 1000);
+  assert.equal(resolveTransportCooldownMs({}), DEFAULT_TRANSPORT_COOLDOWN_MS);
+  assert.equal(resolveTransportCooldownMs({ FLEET_TRANSPORT_COOLDOWN_MS: "60000" }), 60000);
+  assert.equal(resolveTransportCooldownMs({ FLEET_TRANSPORT_COOLDOWN_MS: "soon" }), DEFAULT_TRANSPORT_COOLDOWN_MS);
+  assert.equal(resolveTransportCooldownMs({ FLEET_TRANSPORT_COOLDOWN_MS: "0" }), DEFAULT_TRANSPORT_COOLDOWN_MS);
 });

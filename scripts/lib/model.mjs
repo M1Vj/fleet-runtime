@@ -31,7 +31,7 @@ import { spawn } from "node:child_process";
 import { existsSync, copyFileSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync, appendFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { gatewayCircuitOpen, markGatewayDown, markGatewayUp } from "./gateway-health.mjs";
+import { gatewayCircuitOpen, healthSnapshot, markGatewayDown, markGatewayUp } from "./gateway-health.mjs";
 import {
   DEFAULT_MODEL_CHAIN,
   DYNAMIC_MODEL_POOL,
@@ -42,9 +42,12 @@ import {
 import {
   collectSlots,
   isAuthFailure,
+  isTransportFailure,
   recordFailure,
   recordSuccess,
+  recordTransportFailure,
   resolveCooldownMs,
+  resolveTransportCooldownMs,
   selectSlot,
   stripSlotKeys,
 } from "./credential-pool.mjs";
@@ -65,6 +68,17 @@ import { getSystemPromptMemoryBlock, recordMistake, getRepoSlug } from "./persis
 // Model-layer timeouts (ms): standard calls 480s, long-form 540s,
 // extended/vision 600s. Callers pick the tier that fits the task.
 export const MODEL_TIMEOUTS = { standard: 480000, long: 540000, extended: 600000 };
+// Payload-scaled timeout: base tier plus bytes-based growth (+1s per 8KB,
+// up to +120s), with a 60s floor and capped at the extended tier so large
+// prompts/files get more time without exceeding the max tier.
+export const MODEL_TIMEOUT_FLOOR_MS = 60000;
+export const MODEL_TIMEOUT_CAP_MS = MODEL_TIMEOUTS.extended;
+export function effectiveTimeoutMs(baseMs = MODEL_TIMEOUTS.standard, payloadBytes = 0) {
+  const base = Number.isFinite(baseMs) ? baseMs : MODEL_TIMEOUTS.standard;
+  const bytes = Number.isFinite(payloadBytes) && payloadBytes > 0 ? Math.floor(payloadBytes) : 0;
+  const extra = Math.min(120000, Math.floor(bytes / 8192) * 1000);
+  return Math.min(MODEL_TIMEOUT_CAP_MS, Math.max(MODEL_TIMEOUT_FLOOR_MS, base + extra));
+}
 // Whole-chain cooldown before a second ladder pass: 90s default,
 // 120s for long-form calls.
 export const CHAIN_RETRY_COOLDOWN_MS = 90000;
@@ -767,10 +781,12 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
       } catch {}
     }
     const child = spawn("opencode", args, { env: childEnv, stdio: ["ignore", "pipe", "pipe"], cwd: workspace || undefined });
+    // Payload-scaled timeout: large prompts get extra time (60s floor, extended-tier cap).
+    const effectiveMs = effectiveTimeoutMs(timeoutMs, Buffer.byteLength(effectivePrompt || "", "utf8"));
     const timer = setTimeout(() => {
       timedOut = true;
       try { child.kill("SIGTERM"); } catch {}
-    }, timeoutMs);
+    }, effectiveMs);
     child.stdout.on("data", (d) => { stdout += d.toString(); });
     child.stderr.on("data", (d) => { stderr += d.toString(); });
     child.on("error", (err) => {
@@ -812,11 +828,15 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
       const tail = scrubTail(stderr).slice(-400);
       const sessionNotFound = /session.*not found/i.test(`${stderr} ${stdout}`);
       // Pool bookkeeping: success clears the slot, auth-class failures cool
-      // it down so the next call rotates. Slot number only — never values.
+      // it down so the next call rotates. Mid-run transport failures earn a
+      // SHORT cooldown (local indefinite MIDSTREAM_ lesson); our own
+      // watchdog kills (timedOut) are caller-caused and never penalized.
+      // Slot number only — never values.
       if (poolSlot !== null && poolSlot !== undefined) {
         try {
           if (!timedOut && (code ?? -1) === 0 && reply) recordSuccess(poolRoot, poolSlot);
           else if (isAuthFailure(tail)) recordFailure(poolRoot, poolSlot, tail, { cooldownMs: resolveCooldownMs(env) });
+          else if (!timedOut && isTransportFailure(tail)) recordTransportFailure(poolRoot, poolSlot, tail, { cooldownMs: resolveTransportCooldownMs(env) });
         } catch {}
       }
       resolve({
@@ -870,7 +890,26 @@ function credentialCapacityRetryAt(stateRoot, env = process.env, now = Date.now(
   return now + resolveCooldownMs(env);
 }
 
-function credentialCapacityWait(stateRoot, env, total) {
+export function credentialCapacityWait(stateRoot, env, total, onExhausted) {
+  // Exhaustion-reprobe: fire the gateway onExhausted hook (slot re-check)
+  // instead of blind waiting — expired cooldowns rejoin via selectSlot, so
+  // re-check capacity once, then wait. An explicit caller hook is chained
+  // after the re-check; open-circuit absence still re-checks once.
+  let probed = false;
+  const probeOnce = () => {
+    if (probed) return;
+    probed = true;
+    try { selectSlot({ env, stateRoot }); } catch {}
+  };
+  try {
+    const snap = healthSnapshot(stateRoot, (info) => {
+      probeOnce();
+      if (typeof onExhausted === "function") { try { onExhausted(info); } catch {} }
+    });
+    if (!snap?.open) probeOnce();
+  } catch {
+    try { probeOnce(); } catch {}
+  }
   const now = Date.now();
   const retryAt = credentialCapacityRetryAt(stateRoot, env, now);
   const retryAfterSec = Math.max(0, Math.ceil((retryAt - now) / 1000));

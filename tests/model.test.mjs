@@ -12,7 +12,7 @@ import {
   resolveJudgeModel,
   DEFAULT_JUDGE_MODEL,
 } from "../scripts/lib/provider-registry.mjs";
-import { resolveModelChain, MODEL_TIMEOUTS } from "../scripts/lib/model.mjs";
+import { resolveModelChain, MODEL_TIMEOUTS, effectiveTimeoutMs } from "../scripts/lib/model.mjs";
 import { publicModelEnv } from "../scripts/lib/private-state.mjs";
 
 const EXPECTED_CHAIN = [
@@ -68,6 +68,13 @@ test("judge model defaults with stale-value fallback", () => {
 
 test("model timeout tiers are 480/540/600s", () => {
   assert.deepEqual(MODEL_TIMEOUTS, { standard: 480000, long: 540000, extended: 600000 });
+});
+
+test("payload-scaled timeout has 60s floor, bytes-based growth, and cap", () => {
+  assert.equal(effectiveTimeoutMs(5000, 0), 60000);
+  assert.equal(effectiveTimeoutMs(MODEL_TIMEOUTS.standard, 0), MODEL_TIMEOUTS.standard);
+  assert.ok(effectiveTimeoutMs(MODEL_TIMEOUTS.standard, 64 * 1024) > MODEL_TIMEOUTS.standard);
+  assert.equal(effectiveTimeoutMs(9999999, 99999999), MODEL_TIMEOUTS.extended);
 });
 
 test("askModel waits for cooling credential capacity without spawning anonymous OpenCode", async () => {
@@ -216,7 +223,9 @@ process.exitCode = 1;
     FLEET_MODEL_CHAIN: PRIMARY_MODEL,
   };
   const originalSetTimeout = globalThis.setTimeout;
-  globalThis.setTimeout = (fn, ms, ...args) => originalSetTimeout(fn, Number(ms) >= 20_000 ? 0 : ms, ...args);
+  // Fast-forward only the 20-35s ladder backoff; leave the payload-scaled
+  // runOnce kill timer (60s floor) intact so the fake CLI can reply.
+  globalThis.setTimeout = (fn, ms, ...args) => originalSetTimeout(fn, Number(ms) >= 20_000 && Number(ms) < 40_000 ? 0 : ms, ...args);
   let result;
   try {
     result = await askModel({
@@ -881,4 +890,64 @@ if (args.includes("-s")) {
   assert.equal(res.sessionId, "ses_fresh");
   const clearedAudit = res.attempts.some((a) => a.sessionNotFound === true);
   assert.equal(clearedAudit, true);
+});
+
+test("runOnce cools the slot on mid-run transport failure so the next call rotates", async () => {
+  const { runOnce } = await import("../scripts/lib/model.mjs");
+  const dir = mkdtempSync(path.join(tmpdir(), "fleetmodel-transport-"));
+  const seen = path.join(dir, "auth.jsonl");
+  const marker = path.join(dir, "failed-once");
+  const bin = path.join(dir, "opencode");
+  const script = [
+    "#!/usr/bin/env node",
+    'const fs = require("fs");',
+    `fs.appendFileSync(${JSON.stringify(seen)}, (process.env.OPENCODE_AUTH_CONTENT || "") + "\\n");`,
+    `if (!fs.existsSync(${JSON.stringify(marker)})) {`,
+    `  fs.writeFileSync(${JSON.stringify(marker)}, "1");`,
+    '  process.stderr.write("socket hang up\\n");',
+    "  process.exit(1);",
+    "}",
+    'console.log(JSON.stringify({ text: "recovered", sessionID: "s-transport-2" }));',
+    "",
+  ].join("\n");
+  writeFileSync(bin, script);
+  chmodSync(bin, 0o755);
+  const stateRoot = mkdtempSync(path.join(tmpdir(), "fleetpool-transport-"));
+  const env = {
+    ...process.env,
+    PATH: `${dir}:${process.env.PATH}`,
+    FLEET_STATE_ROOT: stateRoot,
+    FLEET_OPENCODE_AUTH: "test-slot-1",
+    FLEET_OPENCODE_AUTH_2: "test-slot-2",
+  };
+  const first = await runOnce({ prompt: "hi", timeoutMs: 15000, env });
+  assert.equal(first.reply, "");
+  assert.equal(first.slot, 1);
+  const health = JSON.parse(readFileSync(path.join(stateRoot, "state", "credential-health.json"), "utf8"));
+  assert.ok(Number(health.slots["1"].cooldownUntil) > Date.now());
+  const second = await runOnce({ prompt: "hi", timeoutMs: 15000, env });
+  assert.equal(second.reply, "recovered");
+  assert.equal(second.slot, 2);
+  const used = readFileSync(seen, "utf8").trim().split("\n");
+  assert.deepEqual(used, ["test-slot-1", "test-slot-2"]);
+});
+
+test("credentialCapacityWait fires the exhaustion-reprobe hook instead of blind waiting", async () => {
+  const { credentialCapacityWait } = await import("../scripts/lib/model.mjs");
+  const { markGatewayDown } = await import("../scripts/lib/gateway-health.mjs");
+  const stateRoot = mkdtempSync(path.join(tmpdir(), "fleetwait-hook-"));
+  markGatewayDown(stateRoot, "test outage");
+  const env = { ...process.env, FLEET_STATE_ROOT: stateRoot };
+  const calls = [];
+  const wait = credentialCapacityWait(stateRoot, env, 2, (info) => { calls.push(info); });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].reason, "test outage");
+  assert.equal(wait.waitingForCapacity, true);
+  assert.equal(wait.quotaDisposition.reason, "credential_capacity_exhausted");
+  assert.ok(wait.retryAt > Date.now());
+  const freshRoot = mkdtempSync(path.join(tmpdir(), "fleetwait-quiet-"));
+  const quietCalls = [];
+  const quiet = credentialCapacityWait(freshRoot, { ...process.env, FLEET_STATE_ROOT: freshRoot }, 0, (info) => { quietCalls.push(info); });
+  assert.equal(quietCalls.length, 0);
+  assert.equal(quiet.waitingForCapacity, true);
 });

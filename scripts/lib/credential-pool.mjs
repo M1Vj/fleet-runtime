@@ -19,8 +19,9 @@
 // except the in-memory `value` handed to the model caller carry slot NUMBERS
 // only — never key material. Failure tails are scrubbed before persisting.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { atomicWriteJsonSync } from "./util.mjs";
 
 export const LEGACY_AUTH_ENV = "FLEET_OPENCODE_AUTH";
 export const MAX_AUTH_SLOTS = 9;
@@ -57,7 +58,7 @@ export function recordTransportFailure(stateRoot, slot, stderrTail, { nowMs = Da
   const prev = health[String(slot)] || {};
   health[String(slot)] = {
     ...prev,
-    cooldownUntil: nowMs + cooldownMs,
+    cooldownUntil: nowMs + clampCooldownMs(cooldownMs),
     consecutiveErrors: (Number(prev.consecutiveErrors) || 0) + 1,
     lastTransportError: scrubTail(stderrTail).slice(-200),
   };
@@ -102,6 +103,156 @@ export function resolveCooldownMs(env = process.env) {
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_AUTH_COOLDOWN_MS;
 }
 
+// --- Retry clamp + per-class cooldowns (fleet-local port, no daemon) ---
+// Computed cooldowns are clamped to PROVIDER_RETRY_MAX_MS (15 min,
+// env-overridable via FLEET_RETRY_MAX_MS) so a misconfigured override can
+// never park the pool for hours. Per-class split:
+//   auth          -> FLEET_AUTH_COOLDOWN_MS (default 15 min)
+//   quota         -> 30-min reserve (FLEET_QUOTA_COOLDOWN_MS, default 30 min)
+//   transport     -> 5-min (FLEET_TRANSPORT_COOLDOWN_MS, default 5 min)
+//   rate_limited  -> short model-level only (FLEET_RATE_LIMIT_COOLDOWN_MS)
+//   unknown       -> short model-level only (FLEET_UNKNOWN_COOLDOWN_MS)
+// Text-only 429 evidence is rate_limited ONLY: it cools the model retry map
+// briefly and must NEVER set a quota-class (30-min) slot cooldown.
+export const PROVIDER_RETRY_MAX_MS = 15 * 60 * 1000;
+export const RETRY_MAX_ENV = "FLEET_RETRY_MAX_MS";
+export const DEFAULT_QUOTA_COOLDOWN_MS = 30 * 60 * 1000;
+export const QUOTA_COOLDOWN_ENV = "FLEET_QUOTA_COOLDOWN_MS";
+export const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 2 * 60 * 1000;
+export const RATE_LIMIT_COOLDOWN_ENV = "FLEET_RATE_LIMIT_COOLDOWN_MS";
+export const DEFAULT_UNKNOWN_COOLDOWN_MS = 60 * 1000;
+export const UNKNOWN_COOLDOWN_ENV = "FLEET_UNKNOWN_COOLDOWN_MS";
+
+export function resolveRetryMaxMs(env = process.env) {
+  const raw = Number.parseInt(String(env[RETRY_MAX_ENV] || ""), 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : PROVIDER_RETRY_MAX_MS;
+}
+
+export function clampCooldownMs(ms, env = process.env) {
+  return Math.min(Number(ms) || 0, resolveRetryMaxMs(env));
+}
+
+function resolvePositive(env, name, fallback) {
+  const raw = Number.parseInt(String(env[name] || ""), 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+
+export function resolveQuotaCooldownMs(env = process.env) {
+  return resolvePositive(env, QUOTA_COOLDOWN_ENV, DEFAULT_QUOTA_COOLDOWN_MS);
+}
+
+export function resolveRateLimitCooldownMs(env = process.env) {
+  return resolvePositive(env, RATE_LIMIT_COOLDOWN_ENV, DEFAULT_RATE_LIMIT_COOLDOWN_MS);
+}
+
+export function resolveUnknownCooldownMs(env = process.env) {
+  return resolvePositive(env, UNKNOWN_COOLDOWN_ENV, DEFAULT_UNKNOWN_COOLDOWN_MS);
+}
+
+// kind: "auth" | "quota" | "transport" | "rate_limited" | "unknown".
+// Returns the class cooldown clamped to the retry max.
+export function resolveCooldownForClass(kind, env = process.env) {
+  switch (kind) {
+    case "quota": return clampCooldownMs(resolveQuotaCooldownMs(env), env);
+    case "transport": return clampCooldownMs(resolveTransportCooldownMs(env), env);
+    case "rate_limited": return clampCooldownMs(resolveRateLimitCooldownMs(env), env);
+    case "unknown": return clampCooldownMs(resolveUnknownCooldownMs(env), env);
+    case "auth":
+    default: return clampCooldownMs(resolveCooldownMs(env), env);
+  }
+}
+
+// Bare-429 / rate-limit text evidence (quota-class must NOT match here).
+export const RATE_LIMIT_429_RE = /429|too many requests|rate.?limit/i;
+// Strong quota evidence only: exhausted credits, billing, usage caps.
+// A bare "429" never matches — it stays rate_limited per the product rule.
+export const QUOTA_CLASS_RE = /quota|credits?\s*(exhausted|insufficient)|out of credits|billing|payment|usage.?limit|free\s*usage/i;
+
+export function isRateLimitedText(stderrTail) {
+  return RATE_LIMIT_429_RE.test(String(stderrTail || ""));
+}
+
+export function isQuotaClassFailure(stderrTail) {
+  return QUOTA_CLASS_RE.test(String(stderrTail || ""));
+}
+
+// classifyFailure(text) -> "auth" | "quota" | "transport" | "rate_limited" | "unknown".
+// Precedence mirrors the runOnce bookkeeping order: auth-class text wins
+// over transport (checked first by callers), and 429/rate-limit text WITHOUT
+// strong quota evidence is rate_limited ONLY — never quota.
+export function classifyFailure(stderrTail) {
+  const text = String(stderrTail || "");
+  if (isTransportFailure(text) && !isAuthFailure(text)) return "transport";
+  if (isQuotaClassFailure(text)) return "quota";
+  if (isAuthFailure(text)) return isRateLimitedText(text) ? "rate_limited" : "auth";
+  return "unknown";
+}
+
+// --- Per-model retry map (fleet-local, in-memory, 256-key cap) ---
+// Consulted before each ladder round so a rate-limited model is skipped
+// without burning a slot attempt. Unknown/empty model IDs share a single
+// global fallback entry. Only sanitized IDs are stored.
+export const MODEL_RETRY_MAX_KEYS = 256;
+export const UNKNOWN_MODEL_KEY = "unknown-model";
+
+const modelRetryAt = new Map();
+let globalRetryAt = 0;
+
+export function sanitizeModelId(modelId) {
+  const clean = String(modelId || "").trim().slice(0, 160).replace(/[^A-Za-z0-9/_@.:-]/g, "_");
+  return clean || UNKNOWN_MODEL_KEY;
+}
+
+function evictModelRetries() {
+  while (modelRetryAt.size > MODEL_RETRY_MAX_KEYS) {
+    const oldest = modelRetryAt.keys().next().value;
+    modelRetryAt.delete(oldest);
+  }
+}
+
+export function recordModelRetry(modelId, retryAtMs, { nowMs = Date.now(), cooldownMs = DEFAULT_RATE_LIMIT_COOLDOWN_MS } = {}) {
+  const at = Number.isFinite(Number(retryAtMs)) ? Number(retryAtMs) : nowMs + cooldownMs;
+  const key = sanitizeModelId(modelId);
+  if (key === UNKNOWN_MODEL_KEY) {
+    globalRetryAt = at;
+    return { key, retryAt: at };
+  }
+  modelRetryAt.set(key, at);
+  evictModelRetries();
+  return { key, retryAt: at };
+}
+
+export function modelRetryWaitMs(modelId, { nowMs = Date.now() } = {}) {
+  const key = sanitizeModelId(modelId);
+  const at = key === UNKNOWN_MODEL_KEY ? globalRetryAt : (modelRetryAt.get(key) || 0);
+  return Math.max(0, at - nowMs);
+}
+
+export function isModelCoolingDown(modelId, opts = {}) {
+  return modelRetryWaitMs(modelId, opts) > 0;
+}
+
+export function clearModelRetry(modelId) {
+  const key = sanitizeModelId(modelId);
+  if (key === UNKNOWN_MODEL_KEY) {
+    globalRetryAt = 0;
+    return true;
+  }
+  return modelRetryAt.delete(key);
+}
+
+export function clearAllModelRetries() {
+  modelRetryAt.clear();
+  globalRetryAt = 0;
+}
+
+export function snapshotModelRetries({ nowMs = Date.now() } = {}) {
+  const out = {};
+  for (const [key, at] of modelRetryAt) out[key] = Math.max(0, at - nowMs);
+  out[UNKNOWN_MODEL_KEY] = Math.max(0, globalRetryAt - nowMs);
+  return out;
+}
+
 export function healthPath(stateRoot) {
   return path.join(stateRoot || process.cwd(), "state", "credential-health.json");
 }
@@ -123,8 +274,7 @@ export function loadHealth(stateRoot) {
 
 export function saveHealth(stateRoot, slots) {
   const p = healthPath(stateRoot);
-  mkdirSync(path.dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify({ updatedUtc: new Date().toISOString(), slots: slots || {} }));
+  atomicWriteJsonSync(p, { updatedUtc: new Date().toISOString(), slots: slots || {} });
 }
 
 // Scrub secret-shaped substrings before persisting failure tails. Pool state
@@ -191,7 +341,7 @@ export function recordFailure(stateRoot, slot, stderrTail, { nowMs = Date.now(),
   const prev = health[String(slot)] || {};
   health[String(slot)] = {
     ...prev,
-    cooldownUntil: nowMs + cooldownMs,
+    cooldownUntil: nowMs + clampCooldownMs(cooldownMs),
     consecutiveErrors: (Number(prev.consecutiveErrors) || 0) + 1,
     lastAuthError: scrubTail(stderrTail).slice(-200),
   };

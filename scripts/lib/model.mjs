@@ -40,18 +40,21 @@ import {
   sanitizeModelChain,
 } from "./provider-registry.mjs";
 import {
+  classifyFailure,
   collectSlots,
-  isAuthFailure,
-  isTransportFailure,
+  modelRetryWaitMs,
   recordFailure,
+  recordModelRetry,
   recordSuccess,
   recordTransportFailure,
+  resolveCooldownForClass,
   resolveCooldownMs,
   resolveTransportCooldownMs,
   selectSlot,
   stripSlotKeys,
 } from "./credential-pool.mjs";
 import { makeTerminal } from "./terminal.mjs";
+import { recordModelOutcome, saveModelMetricsSnapshot } from "./model-metrics.mjs";
 
 import {
   CORE_INTEGRITY_OK,
@@ -646,6 +649,7 @@ export function writeAuthExhaustedFlag({ stateRoot, total, cooldownMs }) {
 
 export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS.standard, env = process.env, files = [], model, modelOverride, workspace, readOnly = false }) {
   return new Promise((resolve) => {
+    const startedAt = Date.now();
     // Honor the requested model via the provider allowlist; fall back to the
     // chain primary. (Upstream opencode#47120: 1.18 discovery omits models, so
     // explicit `-m` IDs are passed through here rather than discovered.)
@@ -791,6 +795,7 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
     child.stderr.on("data", (d) => { stderr += d.toString(); });
     child.on("error", (err) => {
       clearTimeout(timer);
+      try { recordModelOutcome(selected, { ok: false, limited429: false, error5xx: false, latencyMs: Date.now() - startedAt }); } catch {}
       resolve({ reply: "", sessionId: "", exitCode: -1, interrupted: false, stderrTail: scrubTail(err.message).slice(-400), spawnFailed: true, slot: usedSlot, ...(exhaustedDegraded ? { exhausted: true, degraded: true, total: exhaustedTotal } : {}) });
     });
     child.on("close", (code) => {
@@ -827,18 +832,48 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
       const rawTailSrc = stdout.split("\n").filter(Boolean).slice(-8).join("\n").slice(-1200);
       const tail = scrubTail(stderr).slice(-400);
       const sessionNotFound = /session.*not found/i.test(`${stderr} ${stdout}`);
-      // Pool bookkeeping: success clears the slot, auth-class failures cool
-      // it down so the next call rotates. Mid-run transport failures earn a
-      // SHORT cooldown (local indefinite MIDSTREAM_ lesson); our own
+      // Pool bookkeeping: success clears the slot; auth/quota-class failures
+      // cool it down so the next call rotates. Mid-run transport failures
+      // earn a SHORT cooldown (local indefinite MIDSTREAM_ lesson); our own
       // watchdog kills (timedOut) are caller-caused and never penalized.
       // Slot number only — never values.
+      // Approved product rule (daemon core forbids body-text-only quota
+      // classification): stderr-text 429 evidence is rate_limited ONLY — a
+      // short model-level cooldown, NEVER a slot-level quota cooldown.
+      // Text-only unknown failures likewise cool only the model entry.
+      const failureClass = classifyFailure(tail);
+      try {
+        recordModelOutcome(selected, {
+          ok: !timedOut && (code ?? -1) === 0 && Boolean(reply),
+          limited429: failureClass === "rate_limited",
+          error5xx: /5\d\d/.test(`${stderr} ${stdout}`),
+          latencyMs: Date.now() - startedAt,
+        });
+      } catch {}
+      // Structured-429 evidence (a parsed provider event carrying a 429
+      // status) is the ONLY trigger for the per-model retry map. Text-only
+      // failures keep exact HEAD behavior so in-call retries, session
+      // preservation, and slot disposition are unchanged.
+      let structured429 = false;
+      try {
+        structured429 = events.some((e) => {
+          const vals = deepFind(e, "statusCode").concat(deepFind(e, "status"));
+          return vals.flat().some((v) => Number(v) === 429);
+        });
+      } catch {}
+      const modelShortWait = () => {
+        if (!structured429) return;
+        try { recordModelRetry(selected, Date.now() + resolveCooldownForClass(failureClass, env)); } catch {}
+      };
       if (poolSlot !== null && poolSlot !== undefined) {
         try {
           if (!timedOut && (code ?? -1) === 0 && reply) recordSuccess(poolRoot, poolSlot);
-          else if (isAuthFailure(tail)) recordFailure(poolRoot, poolSlot, tail, { cooldownMs: resolveCooldownMs(env) });
-          else if (!timedOut && isTransportFailure(tail)) recordTransportFailure(poolRoot, poolSlot, tail, { cooldownMs: resolveTransportCooldownMs(env) });
+          else if (failureClass === "quota" || failureClass === "auth") recordFailure(poolRoot, poolSlot, tail, { cooldownMs: resolveCooldownForClass(failureClass, env) });
+          else if (!timedOut && failureClass === "transport") recordTransportFailure(poolRoot, poolSlot, tail, { cooldownMs: resolveTransportCooldownMs(env) });
+          else if (failureClass === "rate_limited") recordFailure(poolRoot, poolSlot, tail, { cooldownMs: resolveCooldownMs(env) });
         } catch {}
       }
+      modelShortWait();
       resolve({
         reply,
         sessionId: sid,
@@ -989,7 +1024,18 @@ export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.s
   let lastSid = sessionId || "";
   let lastMode = "";
   let chainExhausted = false;
+  let chainCooled = 0;
   for (let ci = 0; ci < chain.length; ci++) {
+    // Per-model 429 map consulted before each ladder round: a cooling model
+    // entry is skipped so the chain fails over instead of busy-retrying it.
+    const chainCoolingMs = modelRetryWaitMs(chain[ci]);
+    if (chainCoolingMs > 0) {
+      chainCooled += 1;
+      logModelAudit(stateRoot, { event: "model_cooldown_skip", model: chain[ci], index: ci, retryAfterMs: chainCoolingMs });
+      allAttempts.push({ round: 0, model: chain[ci], skipped: "model-cooldown", retryAfterMs: chainCoolingMs });
+      logModelAudit(stateRoot, { event: "model_failover", model: chain[ci], nextModel: chain[ci + 1] || null, attempts: 0 });
+      continue;
+    }
     logModelAudit(stateRoot, { event: "model_try", model: chain[ci], index: ci, total: chain.length });
     const r = await askOnModel({ model: chain[ci], isPrimary: ci === 0, prompt, sessionId: lastSid || undefined, timeoutMs, env, preferVariantMax, maxRounds, files, workspace, readOnly });
     allAttempts.push(...(r.attempts || []));
@@ -1000,6 +1046,7 @@ export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.s
     // later anonymous or otherwise unauthorized attempt; callers must receive
     // the durable retry disposition and retryAt unchanged.
     if (r.waitingForCapacity || (r.waitingForQuota && r.surfaced && r.retryAt)) {
+      try { saveModelMetricsSnapshot(stateRoot); } catch {}
       return {
         ...r,
         sessionId: lastSid,
@@ -1015,6 +1062,7 @@ export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.s
     if (r.complete) {
       try { markGatewayUp(stateRoot); } catch {}
       logModelAudit(stateRoot, { event: "model_success", model: chain[ci], mode: r.modelMode, attempts: r.attempts?.length });
+      try { saveModelMetricsSnapshot(stateRoot); } catch {}
       return { reply: r.reply, sessionId: lastSid, sessionIdReturned: r.sessionIdReturned === true, modelMode: lastMode, attempts: allAttempts, complete: true, ...(chainExhausted ? { degraded: true, exhausted: true } : {}) };
     }
     logModelAudit(stateRoot, { event: "model_failover", model: chain[ci], nextModel: chain[ci + 1] || null, attempts: r.attempts?.length });
@@ -1025,6 +1073,7 @@ export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.s
     try { markGatewayDown(stateRoot, allAttempts.map((x) => x.errTail || "").join(" ").slice(-200), { attempts: allAttempts.length, modelMode: lastMode, chain }); } catch {}
   }
   logModelAudit(stateRoot, { event: "chain_failed", attempts: allAttempts.length, chain });
+  try { saveModelMetricsSnapshot(stateRoot); } catch {}
   const quotaUnavailable = allAttemptsQuotaLimited(allAttempts);
   const quotaDisposition = quotaUnavailable
     ? classifyQuotaAvailability({
@@ -1032,6 +1081,7 @@ export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.s
       now: Date.now(),
     })
     : null;
+  const allCooling = chain.length > 0 && chainCooled >= chain.length;
   return {
     reply: "",
     sessionId: lastSid,
@@ -1039,6 +1089,7 @@ export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.s
     attempts: allAttempts,
     complete: false,
     ...(chainExhausted ? { degraded: true, exhausted: true } : {}),
+    ...(allCooling ? { modelCoolingDown: true } : {}),
     ...(quotaDisposition ? { waitingForQuota: true, surfaced: true, quotaDisposition } : {}),
     sessionIdReturned: allAttempts.some((attempt) => attempt.sessionReturned === true),
   };
@@ -1067,6 +1118,14 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
   const attempts = [];
   let ladderExhausted = false;
   for (let round = 1; round <= maxRounds; round++) {
+    // Per-model 429 cooldown (fleet-local P0-1 map): skip rounds while this
+    // model entry is cooling so the chain fails over instead of busy-retrying.
+    const coolingMs = modelRetryWaitMs(model);
+    if (coolingMs > 0) {
+      logModelAudit(stateRoot, { event: "model_cooldown_skip", model, round, retryAfterMs: coolingMs });
+      attempts.push({ round, model, mode, auth: useAuth ? "yes" : "anon", skipped: "model-cooldown", retryAfterMs: coolingMs });
+      return { reply: "", sessionId: sid, modelMode: `${model}`, attempts, model, complete: false, modelCoolingDown: true, retryAt: Date.now() + coolingMs };
+    }
     if (round > 1) {
       const backoff = Math.round(20000 + Math.random() * 15000);
       await sleep(backoff);
@@ -1114,10 +1173,17 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
     if (r.waitingForCapacity || r.waitingForQuota) {
       return { ...r, sessionId: r.sessionId || sid || "", attempts, modelMode: "waiting_for_capacity", complete: false };
     }
-    if (startedAuthenticated && isAuthFailure(`${r.stderrTail || ""} ${r.rawTail || ""}`)) {
-      const wait = credentialCapacityWait(stateRoot, env, collectSlots(env).length || 1);
-      return { ...wait, sessionId: r.sessionId || sid || "", attempts, model: model, complete: false };
-    }
+      const rClass = classifyFailure(`${r.stderrTail || ""} ${r.rawTail || ""}`);
+      // HEAD parity: authenticated text-only 429 (rate_limited) waits on
+      // credential capacity like auth/quota, never falls back to anonymous.
+      if (startedAuthenticated && (rClass === "auth" || rClass === "quota" || rClass === "rate_limited")) {
+        const wait = credentialCapacityWait(stateRoot, env, collectSlots(env).length || 1);
+        return { ...wait, sessionId: r.sessionId || sid || "", attempts, model, complete: false };
+      }
+      if (rClass === "rate_limited") {
+        logModelAudit(stateRoot, { event: "model_rate_limited", model });
+        return { reply: "", sessionId: r.sessionId || sid || "", modelMode: `${model}`, attempts, model, complete: false, modelRateLimited: true };
+      }
     // A non-capacity failure can retry the same authorized route; never switch
     // an authenticated invocation to an anonymous route.
     if (r.exhausted) ladderExhausted = true;
@@ -1149,9 +1215,15 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
         rawTail: (vr.rawTail || "").slice(-300),
         variantRetry: true,
       });
-      if (startedAuthenticated && isAuthFailure(`${vr.stderrTail || ""} ${vr.rawTail || ""}`)) {
+      const vrClass = classifyFailure(`${vr.stderrTail || ""} ${vr.rawTail || ""}`);
+      // HEAD parity: same authenticated text-only 429 rule on variant retry.
+      if (startedAuthenticated && (vrClass === "auth" || vrClass === "quota" || vrClass === "rate_limited")) {
         const wait = credentialCapacityWait(stateRoot, env, collectSlots(env).length || 1);
         return { ...wait, sessionId: vr.sessionId || sid || "", attempts, model, complete: false };
+      }
+      if (vrClass === "rate_limited") {
+        logModelAudit(stateRoot, { event: "model_rate_limited", model });
+        return { reply: "", sessionId: vr.sessionId || sid || "", modelMode: `${model}`, attempts, model, complete: false, modelRateLimited: true };
       }
       if (vr.sessionId) sid = vr.sessionId;
       if (vr.sessionIdReturned === true) sessionReturned = true;

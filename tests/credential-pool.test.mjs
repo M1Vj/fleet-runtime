@@ -5,20 +5,37 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   DEFAULT_AUTH_COOLDOWN_MS,
+  DEFAULT_QUOTA_COOLDOWN_MS,
+  DEFAULT_RATE_LIMIT_COOLDOWN_MS,
   DEFAULT_TRANSPORT_COOLDOWN_MS,
+  DEFAULT_UNKNOWN_COOLDOWN_MS,
+  PROVIDER_RETRY_MAX_MS,
+  clampCooldownMs,
+  classifyFailure,
+  clearAllModelRetries,
   collectSlots,
   hasNumberedSlots,
   healthPath,
   isAuthFailure,
+  isModelCoolingDown,
+  isQuotaClassFailure,
+  isRateLimitedText,
   isTransportFailure,
   loadHealth,
+  modelRetryWaitMs,
   recordFailure,
+  recordModelRetry,
   recordSuccess,
   recordTransportFailure,
+  resolveCooldownForClass,
   resolveCooldownMs,
+  resolveRateLimitCooldownMs,
+  resolveRetryMaxMs,
   resolveTransportCooldownMs,
+  resolveUnknownCooldownMs,
   selectSlot,
   slotEnvName,
+  snapshotModelRetries,
   stripSlotKeys,
 } from "../scripts/lib/credential-pool.mjs";
 
@@ -248,4 +265,73 @@ test("transport cooldown defaults to 5 min and honors FLEET_TRANSPORT_COOLDOWN_M
   assert.equal(resolveTransportCooldownMs({ FLEET_TRANSPORT_COOLDOWN_MS: "60000" }), 60000);
   assert.equal(resolveTransportCooldownMs({ FLEET_TRANSPORT_COOLDOWN_MS: "soon" }), DEFAULT_TRANSPORT_COOLDOWN_MS);
   assert.equal(resolveTransportCooldownMs({ FLEET_TRANSPORT_COOLDOWN_MS: "0" }), DEFAULT_TRANSPORT_COOLDOWN_MS);
+  assert.equal(resolveTransportCooldownMs({ FLEET_TRANSPORT_COOLDOWN_MS: "-5" }), DEFAULT_TRANSPORT_COOLDOWN_MS);
+});
+
+test("failure classification: 429 text is rate_limited ONLY, never quota-class", () => {
+  assert.equal(classifyFailure("opencode run failed: 429 Too Many Requests"), "rate_limited");
+  assert.equal(classifyFailure("429 rate limit exceeded, retry later"), "rate_limited");
+  assert.equal(classifyFailure("quota exceeded for this account"), "quota");
+  assert.equal(classifyFailure("CreditsError: out of credits"), "quota");
+  assert.equal(classifyFailure("401 Unauthorized"), "auth");
+  assert.equal(classifyFailure("socket hang up"), "transport");
+  assert.equal(classifyFailure("429 socket hang up"), "rate_limited");
+  assert.equal(classifyFailure("timeout after 480s with no output"), "unknown");
+  assert.equal(isRateLimitedText("Error 429, slow down"), true);
+  assert.equal(isQuotaClassFailure("429 Too Many Requests"), false);
+  assert.equal(isQuotaClassFailure("quota exceeded"), true);
+});
+
+test("class cooldown split: quota 30-min reserve, transport 5-min, unknown short", () => {
+  assert.equal(DEFAULT_QUOTA_COOLDOWN_MS, 30 * 60 * 1000);
+  assert.equal(resolveCooldownForClass("quota", {}), PROVIDER_RETRY_MAX_MS);
+  assert.equal(resolveCooldownForClass("quota", { FLEET_QUOTA_COOLDOWN_MS: "60000" }), 60000);
+  assert.equal(resolveCooldownForClass("auth", {}), DEFAULT_AUTH_COOLDOWN_MS);
+  assert.equal(resolveCooldownForClass("auth", { FLEET_AUTH_COOLDOWN_MS: "60000" }), 60000);
+  assert.equal(resolveCooldownForClass("transport", {}), DEFAULT_TRANSPORT_COOLDOWN_MS);
+  assert.equal(resolveCooldownForClass("rate_limited", {}), DEFAULT_RATE_LIMIT_COOLDOWN_MS);
+  assert.equal(resolveCooldownForClass("unknown", {}), DEFAULT_UNKNOWN_COOLDOWN_MS);
+  assert.equal(resolveCooldownForClass("nope", {}), DEFAULT_AUTH_COOLDOWN_MS);
+});
+
+test("retry clamp caps computed cooldowns at 15 min (env-overridable)", () => {
+  assert.equal(PROVIDER_RETRY_MAX_MS, 15 * 60 * 1000);
+  assert.equal(resolveRetryMaxMs({}), PROVIDER_RETRY_MAX_MS);
+  assert.equal(resolveRetryMaxMs({ FLEET_RETRY_MAX_MS: "60000" }), 60000);
+  assert.equal(clampCooldownMs(30 * 60 * 1000, {}), 15 * 60 * 1000);
+  assert.equal(clampCooldownMs(60 * 1000, {}), 60 * 1000);
+  // Quota reserve (30 min) is clamped to the 15-min retry max on write.
+  const root = freshRoot();
+  recordFailure(root, 1, "quota exceeded", { nowMs: T0, cooldownMs: resolveCooldownForClass("quota", {}) });
+  assert.equal(loadHealth(root)["1"].cooldownUntil, T0 + 15 * 60 * 1000);
+  // A raised max lets the full quota reserve through.
+  process.env.FLEET_RETRY_MAX_MS = String(45 * 60 * 1000);
+  const root2 = freshRoot();
+  try {
+    recordFailure(root2, 1, "quota exceeded", { nowMs: T0, cooldownMs: resolveCooldownForClass("quota", process.env) });
+  } finally {
+    delete process.env.FLEET_RETRY_MAX_MS;
+  }
+  assert.equal(loadHealth(root2)["1"].cooldownUntil, T0 + 30 * 60 * 1000);
+});
+
+test("model retry map: per-model cooldown, 256-key cap, unknown fallback", () => {
+  clearAllModelRetries();
+  assert.equal(modelRetryWaitMs("opencode/a", { nowMs: T0 }), 0);
+  assert.ok(recordModelRetry("opencode/a", T0 + 120000, { nowMs: T0 }));
+  assert.equal(modelRetryWaitMs("opencode/a", { nowMs: T0 + 1000 }), 119000);
+  assert.equal(isModelCoolingDown("opencode/a", { nowMs: T0 + 1000 }), true);
+  assert.equal(modelRetryWaitMs("opencode/b", { nowMs: T0 + 1000 }), 0);
+  assert.equal(modelRetryWaitMs("opencode/a", { nowMs: T0 + 120001 }), 0);
+  // Key hygiene: hostile ids sanitize, empties share the global fallback.
+  assert.ok(recordModelRetry("", T0 + 60000, { nowMs: T0 }));
+  assert.equal(modelRetryWaitMs("", { nowMs: T0 + 1000 }), 59000);
+  assert.equal(modelRetryWaitMs("   ", { nowMs: T0 + 1000 }), 59000);
+  clearAllModelRetries();
+  for (let i = 0; i < 260; i++) recordModelRetry(`opencode/m${i}`, T0 + 60000, { nowMs: T0 });
+  // 256 capped map entries + the always-present unknown-model fallback key.
+  assert.equal(Object.keys(snapshotModelRetries({ nowMs: T0 })).length, 257);
+  assert.equal(modelRetryWaitMs("opencode/m0", { nowMs: T0 }), 0);
+  assert.equal(modelRetryWaitMs("opencode/m259", { nowMs: T0 }), 60000);
+  clearAllModelRetries();
 });

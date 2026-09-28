@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, mkdtempSync, openSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -466,4 +466,33 @@ export function installCredentialHelper(repoDir, env = process.env) {
   const res = spawnSync("git", ["config", "credential.helper", helperPath], { cwd: repoDir, encoding: "utf8", env: childEnv(env) });
   void res;
   return helperPath;
+}
+
+// Shared atomic JSON writer for fleet-local state files (health snapshots,
+// pool health, metrics). Tmp-file (0600) + fsync + rename so a crash or
+// concurrent reader never observes a half-written document. FLEET_TEST_MODE=1
+// skips the fsync only (faster, less durable — tests assert content, not
+// durability); atomicity via rename is always preserved.
+export function atomicWriteJsonSync(filePath, value, { spaces = 0 } = {}) {
+  const target = String(filePath);
+  mkdirSync(path.dirname(target), { recursive: true });
+  const tmp = target + ".tmp-" + process.pid + "-" + Date.now();
+  writeFileSync(tmp, JSON.stringify(value, null, spaces), { mode: 0o600 });
+  try {
+    if (process.env.FLEET_TEST_MODE !== "1") {
+      const fd = openSync(tmp, "r");
+      try {
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+    }
+    renameSync(tmp, target);
+  } catch (err) {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {}
+    throw err;
+  }
+  return target;
 }

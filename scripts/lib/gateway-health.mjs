@@ -1,6 +1,6 @@
-import { existsSync, readFileSync, writeFileSync, utimesSync, mkdirSync } from "node:fs";
-import * as fs from "node:fs";
+import { existsSync, readFileSync, utimesSync } from "node:fs";
 import path from "node:path";
+import { atomicWriteJsonSync } from "./util.mjs";
 
 import {
   CIRCUIT_OPEN_MS as CORE_CIRCUIT_OPEN_MS,
@@ -30,14 +30,13 @@ function scrubReason(reason) {
 export function markGatewayDown(root = process.cwd(), reason = "model unavailable", details = {}) {
   try {
     const p = filePath(root);
-    mkdirSyncSafe(p);
     // Telemetry allowlist: model IDs, attempt counts, mode labels only.
     // Never prompt text, env dumps, or auth material.
     const telemetry = {};
     if (Array.isArray(details.chain)) telemetry.chain = details.chain.map(String).slice(0, 6);
     if (Number.isFinite(details.attempts)) telemetry.attempts = details.attempts;
     if (details.modelMode) telemetry.modelMode = String(details.modelMode).slice(0, 120);
-    writeFileSync(p, JSON.stringify({ downSince: new Date().toISOString(), reason: scrubReason(reason), ...telemetry }));
+    atomicWriteJsonSync(p, { downSince: new Date().toISOString(), reason: scrubReason(reason), ...telemetry });
   } catch {}
 }
 
@@ -46,8 +45,8 @@ export function markGatewayUp(root = process.cwd()) {
     const p = filePath(root);
     if (existsSync(p)) {
       const t = new Date().toISOString();
+      atomicWriteJsonSync(p, { recoveredAt: t });
       utimesSync(p, new Date(t), new Date(t));
-      writeFileSync(p, JSON.stringify({ recoveredAt: t }));
     }
   } catch {}
 }
@@ -89,10 +88,6 @@ export function healthSnapshot(root = process.cwd(), onExhausted = undefined) {
 
 export function gatewayCircuitOpen(root = process.cwd()) {
   return healthSnapshot(root).open;
-}
-
-function mkdirSyncSafe(p) {
-  fs.mkdirSync(path.dirname(p), { recursive: true });
 }
 
 export function gatewayDown(root = process.cwd()) {

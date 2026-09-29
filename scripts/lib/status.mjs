@@ -18,7 +18,7 @@ export function summarizeEvents(lines, nowMs = Date.now(), windowMs = 7 * 24 * 3
   return { windowDays: windowMs / 86400000, total: inWindow, perLane };
 }
 
-export function renderStatusMd({ eventsLines, mergesLines, heartbeat, queueLines }) {
+export function renderStatusMd({ eventsLines, mergesLines, heartbeat, queueLines, modelMetrics = {} }) {
   const summary = summarizeEvents(eventsLines);
   const merges = mergesLines.filter(Boolean).length;
   const queuePending = queueLines.filter((l) => {
@@ -46,6 +46,17 @@ export function renderStatusMd({ eventsLines, mergesLines, heartbeat, queueLines
     lines.push(`| ${lane} | ${c.SUCCESS} | ${c.NOOP} | ${c.BLOCKED} | ${c.STALLED} | ${c.EXHAUSTED} | ${c.SCANFAILED} |`);
   }
   if (Object.keys(summary.perLane).length === 0) lines.push("| (none) | 0 | 0 | 0 | 0 | 0 | 0 |");
+  lines.push("");
+  lines.push("## Model outcomes (fleet-local runOnce telemetry)");
+  lines.push("");
+  lines.push("| model | attempt | success | limited429 | error5xx | latencyEwmaMs |");
+  lines.push("| --- | --- | --- | --- | --- | --- |");
+  const names = Object.keys(modelMetrics || {});
+  if (names.length === 0) lines.push("| (none) | 0 | 0 | 0 | 0 | 0 |");
+  for (const name of names.sort()) {
+    const m = modelMetrics[name] || {};
+    lines.push(`| ${name} | ${m.attempt || 0} | ${m.success || 0} | ${m.limited429 || 0} | ${m.error5xx || 0} | ${m.latencyEwmaMs || 0} |`);
+  }
   lines.push("");
   return lines.join("\n");
 }

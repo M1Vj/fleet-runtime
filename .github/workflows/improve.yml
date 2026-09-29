@@ -156,7 +156,7 @@ jobs:
           node-version: "20"
           package-manager-cache: false
       - name: install pinned opencode cli
-        run: npm install -g opencode-ai@1.18.30
+        run: npm install -g opencode-ai@1.18.33
       - name: research public target
         env:
           FLEET_PUBLIC_REPOSITORY: ${{ steps.public-target.outputs.repository }}
@@ -230,7 +230,7 @@ jobs:
           node-version: "20"
           package-manager-cache: false
       - name: install pinned opencode cli
-        run: npm install -g opencode-ai@1.18.30
+        run: npm install -g opencode-ai@1.18.33
       - name: download public research manifests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -314,7 +314,7 @@ jobs:
           node-version: "20"
           package-manager-cache: false
       - name: install pinned opencode cli
-        run: npm install -g opencode-ai@1.18.30
+        run: npm install -g opencode-ai@1.18.33
       - name: implement public result
         env:
           FLEET_PUBLIC_REPOSITORY: ${{ steps.public-target.outputs.repository }}
@@ -391,7 +391,7 @@ jobs:
           node-version: "20"
           package-manager-cache: false
       - name: install pinned opencode cli
-        run: npm install -g opencode-ai@1.18.30
+        run: npm install -g opencode-ai@1.18.33
       - name: download public research manifests for review
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:

@@ -6,6 +6,7 @@ import { runGate } from "./lib/gate.mjs";
 import { configureIdentity, safeCommitState, gitRevParse } from "./lib/util.mjs";
 import { verifyCommit } from "./lib/verify.mjs";
 import { renderStatusMd } from "./lib/status.mjs";
+import { loadModelMetricsSnapshot } from "./lib/model-metrics.mjs";
 import {
   isPublicDataClass,
   makeExecutionTerminal,
@@ -47,6 +48,7 @@ const md = renderStatusMd({
     ? JSON.parse(readFileSync(path.join(REPO_ROOT, "state", "heartbeat.json"), "utf8"))
     : null,
   queueLines: readLines(path.join(REPO_ROOT, "state", "queue.jsonl")),
+  modelMetrics: loadModelMetricsSnapshot(REPO_ROOT),
 });
 // The shared renderer only tabulates the five classic states; count the newer
 // terminal states (REVISION_QUEUED / SCAN-DONE / SCAN-FAILED) here so the digest stays whole.

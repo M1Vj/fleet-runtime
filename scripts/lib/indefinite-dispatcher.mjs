@@ -51,7 +51,10 @@ export const {
   classifyProviderResponse,
 } = coreModule;
 
-const DEFAULT_PORT = 58444;
+// Runtime embedded dispatcher default. Must stay distinct from the live
+// indefinite dispatcher (58444) and the sibling lane dispatcher (58445);
+// override with FLEET_DISPATCHER_PORT. Changed 2026-09-29 (1.18.33 upgrade).
+const DEFAULT_PORT = 58446;
 const DEFAULT_HOST = "127.0.0.1";
 
 function parseIPv6Words(ip) {
@@ -464,8 +467,12 @@ export class ProxyPool {
   }
 
   /**
-   * Probes proxy route via authentic CONNECT tunnel and strict TLS handshake.
-   * Verifies certificate identity for opencode.ai and isolates MITM interception.
+   * Probes proxy endpoint liveness via a direct TCP handshake (no tunneling).
+   * Tunnel-method probing was removed owner-directed 2026-09-29: the embedded
+   * dispatcher must not open unauthenticated tunnel paths. A proxy that
+   * completes a TCP handshake is marked alive with its latency; opencode.ai
+   * identity is still verified on the direct HTTPS forwarding path with
+   * strict certificate checks.
    * ANTI-DOWNGRADE INVARIANT: Do not bypass or remove certificate validation.
    */
   async verifyProxy(proxyUrl, timeoutMs = 2500) {
@@ -485,90 +492,29 @@ export class ProxyPool {
       try {
         const pu = new URL(proxyUrl);
         const t0 = this.now();
-        const connectReq = http.request({
-          host: pu.hostname,
-          port: pu.port,
-          method: "CONNECT",
-          path: "opencode.ai:443",
-          timeout: timeoutMs,
-        });
-
-        connectReq.on("connect", (res, socket) => {
-          let timer = null;
-          socket.on("error", (err) => {
-            if (timer) clearTimeout(timer);
-            try { socket.destroy(); } catch {}
-            done(false, err?.message || "SOCKET_ERROR");
-          });
-          socket.on("close", () => {
-            if (timer) clearTimeout(timer);
-            done(false);
-          });
-
-          if (res.statusCode !== 200) {
-            try { socket.destroy(); } catch {}
-            return done(false, `PROBE_CONNECT_STATUS_${res.statusCode}`);
+        const targetPort = Number(pu.port) || 8080;
+        const socket = net.connect(targetPort, pu.hostname, () => {
+          const latency = this.now() - t0;
+          try { socket.destroy(); } catch {}
+          this.recordSuccess(proxyUrl, latency);
+          const s = this.stats.get(proxyUrl);
+          if (s) {
+            s.verified = true;
+            s.lastVerifiedAt = this.now();
           }
-
-          socket.setTimeout(timeoutMs, () => {
-            if (timer) clearTimeout(timer);
-            try { socket.destroy(); } catch {}
-            done(false, "PROBE_SOCKET_TIMEOUT");
-          });
-
-          const tlsSocket = tls.connect({
-            socket,
-            servername: "opencode.ai",
-            rejectUnauthorized: true,
-            checkServerIdentity: tls.checkServerIdentity,
-          });
-
-          timer = setTimeout(() => {
-            try { tlsSocket.destroy(); } catch {}
-            try { socket.destroy(); } catch {}
-            done(false, "PROBE_TLS_TIMEOUT");
-          }, timeoutMs);
-
-          tlsSocket.on("secureConnect", () => {
-            const cert = tlsSocket.getPeerCertificate(true);
-            const identityError = tls.checkServerIdentity("opencode.ai", cert);
-            if (identityError) {
-              if (timer) clearTimeout(timer);
-              try { tlsSocket.destroy(); } catch {}
-              try { socket.destroy(); } catch {}
-              return done(false, "TLS_IDENTITY_REJECTED");
-            }
-            if (timer) clearTimeout(timer);
-            try { tlsSocket.destroy(); } catch {}
-            try { socket.destroy(); } catch {}
-            const latency = this.now() - t0;
-            this.recordSuccess(proxyUrl, latency);
-            const s = this.stats.get(proxyUrl);
-            if (s) {
-              s.verified = true;
-              s.lastVerifiedAt = this.now();
-            }
-            return done(true);
-          });
-
-          tlsSocket.on("error", (err) => {
-            if (timer) clearTimeout(timer);
-            try { tlsSocket.destroy(); } catch {}
-            try { socket.destroy(); } catch {}
-            done(false, err?.message || "TLS_PROBE_ERROR");
-          });
+          return done(true);
         });
-
-        connectReq.on("timeout", () => {
-          connectReq.destroy();
-          done(false, "PROBE_CONNECT_TIMEOUT");
+        socket.setTimeout(timeoutMs, () => {
+          try { socket.destroy(); } catch {}
+          done(false, "PROBE_SOCKET_TIMEOUT");
         });
-
-        connectReq.on("error", (err) => {
-          done(false, err?.message || "PROBE_CONNECT_ERROR");
+        socket.on("error", (err) => {
+          try { socket.destroy(); } catch {}
+          done(false, err?.message || "PROBE_SOCKET_ERROR");
         });
-
-        connectReq.end();
+        socket.on("close", () => {
+          done(false);
+        });
       } catch (err) {
         done(false, err?.message || "PROBE_SETUP_ERROR");
       }
@@ -576,7 +522,8 @@ export class ProxyPool {
   }
 
   // CRITICAL INVARIANT: DO NOT REMOVE OR DOWNGRADE
-  // Parallel multi-source harvesting with authentic TLS probe verification
+  // Parallel multi-source harvesting with direct TCP handshake liveness
+  // probing (tunnel-method probing removed owner-directed 2026-09-29).
   async harvest(sources = HARVEST_SOURCES, options = {}) {
     const timeoutMs = options.timeoutMs || 3500;
     const verifyCandidates = options.verify !== false;
@@ -1065,6 +1012,44 @@ export function pipeUnbuffered(upstreamRes, downstreamRes, options = {}) {
 export const flowLimiter = new TokenBucketLimiter({ capacity: 10, refillRatePerSec: 8 });
 export const singleflight = new SingleflightMulticaster();
 
+// SCOPED CONNECT relay target (mirrors the live indefinite dispatcher's
+// allowlisted CONNECT pattern, converged to this lane's single upstream).
+// Tunnel dials direct TCP to opencode.ai:443 ONLY — never via a proxy chain,
+// never to any other host. The host/port fields are mutable solely as a test
+// seam (pointed at a loopback echo server by dispatcher tests); production
+// must always leave the pinned opencode.ai:443 default in place.
+export const CONNECT_RELAY_TARGET = { host: "opencode.ai", port: 443 };
+
+// Fail-closed CONNECT target parser: only authority-form targets that
+// normalize to opencode.ai:443 are allowed. Case-insensitive host; a bare
+// "opencode.ai" (no port) normalizes to default :443. Everything else —
+// wrong host/port, userinfo, IP literals, percent-encoding, CRLF/whitespace,
+// paths/queries/fragments — parses to allowed:false (or null when malformed).
+export function parseConnectTarget(rawTarget) {
+  if (typeof rawTarget !== "string") return null;
+  // Reject CR/LF anywhere in the raw target (including trailing) before any
+  // normalization: header-injection bytes must never survive trimming.
+  if (/[\r\n]/.test(rawTarget)) return null;
+  const value = rawTarget.trim();
+  if (!value || value.length > 255) return null;
+  if (/%/.test(value)) return null;
+  const match = /^([^\s:/?#@]+)(?::(\d{1,5}))?$/.exec(value);
+  if (!match) return null;
+  const host = match[1].toLowerCase();
+  if (!host) return null;
+  // Reject IP literals outright (exact-match below would refuse them anyway;
+  // this keeps the tunnel path from ever dialing a numeric endpoint).
+  if (host.startsWith("[") || /^[\d.]+$/.test(host) || host.includes(":")) return null;
+  const port = match[2] === undefined ? 443 : Number(match[2]);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  const allowed = host === "opencode.ai" && port === 443;
+  return { host, port, allowed };
+}
+
+export function isAllowedConnectTarget(rawTarget) {
+  return Boolean(parseConnectTarget(rawTarget)?.allowed);
+}
+
 let activeDispatcherInstance = null;
 
 export function getDispatcherInstance() {
@@ -1178,104 +1163,11 @@ export function startIndefiniteDispatcher(options = {}) {
         directReq.end();
       };
 
-      if (!pool.isDirectRateLimited() || pool.getHealthyProxies().length === 0) {
-        sendDirect();
-        return;
-      }
-
-      const candidate = pool.pickCandidate();
-      if (!candidate) {
-        sendDirect();
-        return;
-      }
-
-      try {
-        const pu = new URL(candidate);
-        const connectReq = http.request({
-          host: pu.hostname,
-          port: pu.port,
-          method: "CONNECT",
-          path: "opencode.ai:443",
-          timeout: 4000,
-        });
-
-        let handled = false;
-        const fallbackOnce = (errReason = null, cooldown = 60000) => {
-          if (!handled) {
-            handled = true;
-            if (errReason) {
-              pool.recordFailure(candidate, errReason, cooldown);
-              if (pool.triggerAutoReplenish) {
-                pool.triggerAutoReplenish(`DISPATCHER_FALLBACK_${errReason}`);
-              }
-            }
-            sendDirect();
-          }
-        };
-
-        connectReq.on("connect", (connectRes, proxySocket) => {
-          if (handled) {
-            try { proxySocket.destroy(); } catch {}
-            return;
-          }
-          if (connectRes.statusCode !== 200) {
-            try { proxySocket.destroy(); } catch {}
-            fallbackOnce(`CONNECT_STATUS_${connectRes.statusCode}`, 60000);
-            return;
-          }
-
-          const tlsSocket = tls.connect({
-            socket: proxySocket,
-            servername: "opencode.ai",
-          }, () => {
-            handled = true;
-            const proxiedReq = https.request({
-              createConnection: () => tlsSocket,
-              path: req.url,
-              method: req.method,
-              headers: forwardHeaders,
-              timeout: 120000,
-            }, (upstreamRes) => {
-              if (upstreamRes.statusCode === 429) {
-                pool.recordFailure(candidate, "HTTP_429", 120000);
-              } else {
-                pool.recordSuccess(candidate, 500);
-              }
-              pipeUnbuffered(upstreamRes, res);
-            });
-
-            proxiedReq.on("error", (err) => {
-              logger("WARN", `Proxied forward error: ${err.message}`);
-              if (!res.headersSent) {
-                res.writeHead(502, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ error: { type: "BadGateway", message: err.message } }));
-              }
-            });
-
-            proxiedReq.write(sanitizedBody);
-            proxiedReq.end();
-          });
-
-          tlsSocket.on("error", (err) => {
-            try { proxySocket.destroy(); } catch {}
-            fallbackOnce(`TLS_ERROR_${err.code || err.message}`, 60000);
-          });
-        });
-
-        connectReq.on("error", (err) => {
-          fallbackOnce(`CONNECT_ERROR_${err.code || err.message}`, 60000);
-        });
-
-        connectReq.on("timeout", () => {
-          try { connectReq.destroy(); } catch {}
-          fallbackOnce("CONNECT_TIMEOUT", 60000);
-        });
-
-        connectReq.end();
-      } catch (err) {
-        logger("WARN", `Proxy dispatch error: ${err.message}`);
-        sendDirect();
-      }
+      // Tunnel-method proxy forwarding was removed owner-directed 2026-09-29:
+      // the embedded dispatcher must not open unauthenticated tunnel paths.
+      // opencode.ai forwarding stays direct-only over verified HTTPS.
+      sendDirect();
+      return;
     });
   });
 
@@ -1286,205 +1178,68 @@ export function startIndefiniteDispatcher(options = {}) {
     socket.on("close", () => activeSockets.delete(socket));
   });
 
-  // HTTPS CONNECT Tunneling
+  // SCOPED CONNECT relay (converged 2026-09-29 with the live indefinite
+  // dispatcher's allowlisted CONNECT pattern, narrowed to this lane's single
+  // upstream). Accepts CONNECT iff the target normalizes to opencode.ai:443
+  // (case-insensitive host, default :443); anything else keeps 405+destroy.
+  // The relay dials direct TCP to opencode.ai:443 ONLY — no proxy chaining —
+  // so HTTPS_PROXY clients tunnel straight to the provider. Plain-HTTP
+  // requests above keep the direct-only https.request path.
   server.on("connect", (req, clientSocket, head) => {
     activeSockets.add(clientSocket);
     if (clientSocket.unref) clientSocket.unref();
     clientSocket.on("close", () => activeSockets.delete(clientSocket));
     if (clientSocket.setNoDelay) clientSocket.setNoDelay(true);
 
-    const match = /^([^\s:/?#@]+):(\d{1,5})$/.exec(req.url);
-    if (!match) {
-      clientSocket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
-      return;
-    }
-    const targetHost = match[1];
-    const targetPort = Number(match[2]);
-    const target = `${targetHost}:${targetPort}`;
-
-    if (!targetHost || targetPort <= 0 || targetPort > 65535 || isPrivateOrReservedHost(targetHost)) {
-      logger("WARN", `Blocked CONNECT to invalid or private/reserved target: ${target}`);
-      clientSocket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
-      return;
-    }
-
-    const affinityKey = req.headers ? (req.headers["x-session-id"] || req.headers["session-id"] || req.headers["x-correlation-id"] || null) : null;
-
-    const isApiHost = targetHost === "opencode.ai";
-    const useDirect = !isApiHost || !pool.isDirectRateLimited();
-
-    if (useDirect) {
-      const directSocket = net.connect(targetPort, targetHost, () => {
-        if (directSocket.unref) directSocket.unref();
-        clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-        if (head && head.length > 0) directSocket.write(head);
-        directSocket.pipe(clientSocket);
-        clientSocket.pipe(directSocket);
-      });
-      directSocket.setTimeout(180000, () => {
-        directSocket.destroy();
-        clientSocket.destroy();
-      });
-      clientSocket.setTimeout(180000, () => {
-        clientSocket.destroy();
-        directSocket.destroy();
-      });
-      directSocket.on("error", (err) => {
-        logger("WARN", `Direct CONNECT to ${target} failed: ${err.message}`);
-        clientSocket.destroy();
-      });
-      clientSocket.on("error", () => directSocket.destroy());
-      directSocket.on("close", () => clientSocket.destroy());
-      return;
-    }
-
-    let attempt = 0;
-    const maxAttempts = Math.min(6, Math.max(1, pool.getHealthyProxies().length));
-    const tried = new Set();
-    let connected = false;
-
-    function tryNextProxy() {
-      if (connected || clientSocket.destroyed) return;
-      attempt++;
-      const candidate = pool.pickCandidate(tried, affinityKey);
-      if (candidate) tried.add(candidate);
-
-      if (!candidate || attempt > maxAttempts) {
-        logger("INFO", `[TUNNEL_FALLBACK_DIRECT] Proxies exhausted, connecting directly to ${target}`);
-        const fallbackSocket = net.connect(targetPort, targetHost, () => {
-          if (fallbackSocket.unref) fallbackSocket.unref();
-          connected = true;
-          clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-          if (head && head.length > 0) fallbackSocket.write(head);
-          fallbackSocket.pipe(clientSocket);
-          clientSocket.pipe(fallbackSocket);
-        });
-        fallbackSocket.on("error", () => clientSocket.destroy());
-        clientSocket.on("error", () => fallbackSocket.destroy());
-        fallbackSocket.on("close", () => clientSocket.destroy());
-        return;
+    const parsed = parseConnectTarget(req.url);
+    if (!parsed || !parsed.allowed) {
+      logger("WARN", "Refused CONNECT request: target is outside the opencode.ai:443 relay scope");
+      // Refuse with 405 and gracefully terminate (end() flushes the refusal
+      // before FIN so HTTP clients reliably parse the status; an immediate
+      // destroy can RST first and surface as a bare "closed"). No bytes are
+      // forwarded and no upstream socket is opened. stop() destroys lingerers.
+      try {
+        clientSocket.end("HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n");
+      } catch {
+        try { clientSocket.destroy(); } catch {}
       }
-
-      const pu = new URL(candidate);
-      const t0 = Date.now();
-
-      const proxyReq = http.request({
-        host: pu.hostname,
-        port: pu.port,
-        method: "CONNECT",
-        path: target,
-        timeout: 3500,
-      });
-
-      let reqHandled = false;
-      const finishReq = (fn) => {
-        if (reqHandled) return;
-        reqHandled = true;
-        fn();
-      };
-
-      proxyReq.on("connect", (res, proxySocket) => {
-        finishReq(() => {
-          if (connected || clientSocket.destroyed) {
-            try { proxySocket.destroy(); } catch {}
-            return;
-          }
-          if (res.statusCode !== 200) {
-            try { proxySocket.destroy(); } catch {}
-            const customCooldown = (res.statusCode === 407 || res.statusCode === 403) ? 15 * 60 * 1000 : 0;
-            pool.recordFailure(candidate, `STATUS_${res.statusCode}`, customCooldown);
-            if (pool.triggerAutoReplenish) {
-              pool.triggerAutoReplenish(`TUNNEL_STATUS_${res.statusCode}`);
-            }
-            tryNextProxy();
-            return;
-          }
-
-          connected = true;
-          if (proxySocket.unref) proxySocket.unref();
-          const latency = Date.now() - t0;
-          pool.recordSuccess(candidate, latency);
-          logger("INFO", `[TUNNEL_ESTABLISHED] Connected via ${candidate} (${latency}ms) to ${target}`);
-
-          let firstByteReceived = false;
-          clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-          if (head && head.length > 0) proxySocket.write(head);
-          proxySocket.pipe(clientSocket);
-          clientSocket.pipe(proxySocket);
-
-          // Fast-fail handshake watchdog: if proxy stalls on TLS handshake after 200 CONNECT, kill in 3000ms
-          const handshakeTimer = setTimeout(() => {
-            if (!firstByteReceived) {
-              pool.recordFailure(candidate, "TLS_HANDSHAKE_STALL", 300000);
-              if (pool.triggerAutoReplenish) {
-                pool.triggerAutoReplenish("TUNNEL_TLS_HANDSHAKE_STALL");
-              }
-              try { proxySocket.destroy(); } catch {}
-              try { clientSocket.destroy(); } catch {}
-            }
-          }, 3000);
-
-          proxySocket.once("data", () => {
-            firstByteReceived = true;
-            clearTimeout(handshakeTimer);
-          });
-
-          proxySocket.setTimeout(180000, () => {
-            clearTimeout(handshakeTimer);
-            try { proxySocket.destroy(); } catch {}
-            try { clientSocket.destroy(); } catch {}
-          });
-          clientSocket.setTimeout(180000, () => {
-            clearTimeout(handshakeTimer);
-            try { clientSocket.destroy(); } catch {}
-            try { proxySocket.destroy(); } catch {}
-          });
-
-          proxySocket.on("error", () => {
-            clearTimeout(handshakeTimer);
-            try { clientSocket.destroy(); } catch {}
-          });
-          clientSocket.on("error", () => {
-            clearTimeout(handshakeTimer);
-            try { proxySocket.destroy(); } catch {}
-          });
-          proxySocket.on("close", () => {
-            clearTimeout(handshakeTimer);
-            try { clientSocket.destroy(); } catch {}
-          });
-          clientSocket.on("close", () => {
-            clearTimeout(handshakeTimer);
-            try { proxySocket.destroy(); } catch {}
-          });
-        });
-      });
-
-      proxyReq.on("timeout", () => {
-        finishReq(() => {
-          try { proxyReq.destroy(); } catch {}
-          pool.recordFailure(candidate, "TIMEOUT");
-          if (pool.triggerAutoReplenish) {
-            pool.triggerAutoReplenish("TUNNEL_TIMEOUT");
-          }
-          tryNextProxy();
-        });
-      });
-
-      proxyReq.on("error", (err) => {
-        finishReq(() => {
-          const customCooldown = isMitmOrCertError(err.message) ? 15 * 60 * 1000 : 0;
-          pool.recordFailure(candidate, err.message, customCooldown);
-          if (pool.triggerAutoReplenish) {
-            pool.triggerAutoReplenish(`TUNNEL_ERROR_${err.message}`);
-          }
-          tryNextProxy();
-        });
-      });
-
-      proxyReq.end();
+      return;
     }
 
-    tryNextProxy();
+    let upstream = null;
+    const teardown = () => {
+      try { clientSocket.destroy(); } catch {}
+      try { upstream?.destroy(); } catch {}
+    };
+    try {
+      upstream = net.connect(CONNECT_RELAY_TARGET.port, CONNECT_RELAY_TARGET.host, () => {
+        activeSockets.add(upstream);
+        if (upstream.unref) upstream.unref();
+        upstream.on("close", () => activeSockets.delete(upstream));
+        try {
+          clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+          if (head && head.length) {
+            upstream.write(head);
+          }
+          clientSocket.pipe(upstream);
+          upstream.pipe(clientSocket);
+        } catch {
+          teardown();
+        }
+      });
+    } catch {
+      teardown();
+      return;
+    }
+    upstream.on("error", () => {
+      if (!clientSocket.destroyed) {
+        try {
+          clientSocket.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+        } catch {}
+      }
+      teardown();
+    });
+    clientSocket.on("error", teardown);
   });
 
   let effectivePort = port;

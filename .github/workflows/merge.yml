@@ -85,7 +85,7 @@ jobs:
           node-version: "20"
           package-manager-cache: false
       - name: install pinned opencode cli
-        run: npm install -g opencode-ai@1.18.30
+        run: npm install -g opencode-ai@1.18.33
       - name: install visual toolchain
         run: |
           npm install -g playwright@1.54.0 pngjs pixelmatch

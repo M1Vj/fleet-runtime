@@ -7,8 +7,11 @@ import path from "node:path";
 import { tmpdir } from "node:os";
 
 import {
+  CONNECT_RELAY_TARGET,
   ProxyPool,
+  isAllowedConnectTarget,
   isPrivateOrReservedHost,
+  parseConnectTarget,
   startIndefiniteDispatcher,
   stopIndefiniteDispatcher,
 } from "../scripts/lib/indefinite-dispatcher.mjs";
@@ -98,7 +101,61 @@ test("ProxyPool tracks direct rate limiting", () => {
   assert.equal(pool2.isDirectRateLimited(), true);
 });
 
-test("Indefinite Dispatcher lifecycle, health endpoint, and CONNECT security guard", async () => {
+function rawConnect(boundPort, target) {
+  return new Promise((resolve) => {
+    const socket = net.connect(boundPort, "127.0.0.1", () => {
+      socket.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target.split("\r")[0].split("\n")[0]}\r\n\r\n`);
+    });
+    socket.once("error", (err) => resolve({ socket, status: "error: " + err.message, head: "" }));
+    socket.once("close", () => resolve({ socket, status: "closed", head: "" }));
+    let buf = "";
+    const onData = (chunk) => {
+      buf += chunk.toString("latin1");
+      const end = buf.indexOf("\r\n\r\n");
+      if (end !== -1) {
+        socket.removeListener("data", onData);
+        const statusLine = buf.slice(0, buf.indexOf("\r\n"));
+        const code = Number((/^HTTP\/1\.\d\s+(\d{3})/.exec(statusLine) || [])[1]);
+        resolve({ socket, status: Number.isInteger(code) && code > 0 ? code : statusLine, head: buf.slice(end + 4) });
+      }
+    };
+    socket.on("data", onData);
+  });
+}
+
+async function rawConnectStatus(boundPort, target) {
+  const { socket, status } = await rawConnect(boundPort, target);
+  try { socket.destroy(); } catch {}
+  return status;
+}
+
+async function rawConnectRelay(boundPort, target, payload) {
+  const { socket, status, head } = await rawConnect(boundPort, target);
+  try {
+    assert.equal(status, 200, `CONNECT ${target} must establish with 200, got ${status}`);
+    const echoed = await new Promise((resolve, reject) => {
+      let buf = head || "";
+      const timer = setTimeout(() => reject(new Error("relay echo timeout")), 5000);
+      socket.on("data", (chunk) => {
+        buf += chunk.toString("utf8");
+        if (buf.length >= payload.length) {
+          clearTimeout(timer);
+          resolve(buf.slice(0, payload.length));
+        }
+      });
+      socket.on("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+      socket.write(payload);
+    });
+    return echoed;
+  } finally {
+    try { socket.destroy(); } catch {}
+  }
+}
+
+test("Indefinite Dispatcher lifecycle, health endpoint, and scoped CONNECT relay", async () => {
   const dispatcher = startIndefiniteDispatcher({
     port: 0, // ephemeral port
     stateRoot: tmpdir(),
@@ -126,23 +183,110 @@ test("Indefinite Dispatcher lifecycle, health endpoint, and CONNECT security gua
     assert.equal(parsed.status, "healthy");
     assert.equal(parsed.service, "fleet-indefinite-dispatcher");
 
-    // Test CONNECT to private/reserved target is blocked with 403 Forbidden
-    const connectRes = await new Promise((resolve, reject) => {
-      const req = http.request({
-        hostname: "127.0.0.1",
-        port: boundPort,
-        method: "CONNECT",
-        path: "169.254.169.254:80",
-      });
-      req.on("response", (resp) => resolve(resp.statusCode));
-      req.on("error", (err) => resolve("error: " + err.message));
-      req.on("close", () => resolve("closed"));
-      req.end();
+    // Scoped CONNECT relay (2026-09-29): only targets normalizing to
+    // opencode.ai:443 are relayed via direct TCP; every other target is
+    // refused with 405 and the connection terminated. Raw sockets are used
+    // throughout: they speak the same authority-form CONNECT bytes as real
+    // HTTPS_PROXY clients, while http.request's CONNECT path surfaces
+    // non-2xx refusals as a bare close on this Node version.
+    const refuseTargets = [
+      "169.254.169.254:80",
+      "evil.com:443",
+      "opencode.ai:80",
+      "user@opencode.ai:443",
+      "93.184.216.34:443",
+    ];
+    for (const target of refuseTargets) {
+      const status = await rawConnectStatus(boundPort, target);
+      assert.strictEqual(status, 405, `tunnel request to ${target} must be refused with 405, got ${status}`);
+    }
+
+    // Non-authority-form targets go over a raw socket (the HTTP client
+    // cannot frame them). None may ever establish (200). Note: a raw CRLF
+    // inside the request line is split by the HTTP parser itself, so the
+    // server only ever sees the first line's target — embedded-CRLF
+    // rejection is covered at the parser level in the matrix test above.
+    const rawRefuseTargets = [
+      "opencode.ai:443/extra",
+      "opencode.ai:443?x=1",
+      "opencode%2eai:443",
+      "[::1]:443",
+    ];
+    for (const target of rawRefuseTargets) {
+      const status = await rawConnectStatus(boundPort, target);
+      assert.notEqual(status, 200, `tunnel to ${JSON.stringify(target)} must never be established`);
+      assert.ok(
+        status === 405 || status === "closed" || String(status).startsWith("error"),
+        `tunnel to ${JSON.stringify(target)} must be refused, got ${status}`,
+      );
+    }
+
+    // Allowlisted target relays with byte flow: point the relay seam at a
+    // loopback echo server, CONNECT (mixed case + bare host forms), then
+    // assert the 200 establishes and payload bytes round-trip.
+    const echoServer = net.createServer((socket) => {
+      socket.on("data", (chunk) => socket.write(chunk));
     });
-    assert.ok(connectRes === "closed" || connectRes === 403 || String(connectRes).includes("error"));
+    await new Promise((resolve) => echoServer.listen(0, "127.0.0.1", resolve));
+    const echoPort = echoServer.address().port;
+    const savedRelayHost = CONNECT_RELAY_TARGET.host;
+    const savedRelayPort = CONNECT_RELAY_TARGET.port;
+    CONNECT_RELAY_TARGET.host = "127.0.0.1";
+    CONNECT_RELAY_TARGET.port = echoPort;
+    try {
+      for (const target of ["opencode.ai:443", "OPENCODE.AI:443", "opencode.ai"]) {
+        const echoed = await rawConnectRelay(boundPort, target, "relay-probe-bytes");
+        assert.equal(echoed, "relay-probe-bytes", `CONNECT ${target} must relay bytes through the tunnel`);
+      }
+    } finally {
+      CONNECT_RELAY_TARGET.host = savedRelayHost;
+      CONNECT_RELAY_TARGET.port = savedRelayPort;
+      await new Promise((resolve) => echoServer.close(resolve));
+    }
   } finally {
     await stopIndefiniteDispatcher();
   }
+});
+
+test("parseConnectTarget allow/refuse matrix (opencode.ai:443 only)", () => {
+  for (const target of ["opencode.ai:443", "OPENCODE.AI:443", "Opencode.AI:443", "opencode.ai", "  opencode.ai:443  "]) {
+    assert.equal(isAllowedConnectTarget(target), true, `${JSON.stringify(target)} must be allowed`);
+  }
+  const parsed = parseConnectTarget("OPENCODE.AI:443");
+  assert.deepEqual(parsed, { host: "opencode.ai", port: 443, allowed: true });
+
+  for (const target of [
+    "169.254.169.254:80",
+    "evil.com:443",
+    "opencode.ai:80",
+    "opencode.ai:444",
+    "models.opencode.ai:443",
+    "user@opencode.ai:443",
+    "user:pass@opencode.ai:443",
+    "93.184.216.34:443",
+    "[::1]:443",
+    "opencode.ai:443/extra",
+    "opencode.ai:443?x=1",
+    "opencode.ai:443#frag",
+    "opencode%2eai:443",
+    "opencode.ai:443\r\nX-Inject: 1",
+    "opencode.ai:443\n",
+    "",
+    "   ",
+    "opencode.ai:",
+    ":443",
+    "opencode.ai:notaport",
+    "opencode.ai:99999",
+    "http://opencode.ai:443",
+    null,
+    undefined,
+    443,
+  ]) {
+    assert.equal(isAllowedConnectTarget(target), false, `${JSON.stringify(target)} must be refused`);
+  }
+  assert.equal(parseConnectTarget("evil.com:443").allowed, false);
+  assert.equal(parseConnectTarget("not authority form"), null);
+  assert.equal(parseConnectTarget("x".repeat(256)), null);
 });
 
 test("Request Sanitizer eliminates invalid_request_error artifacts", () => {

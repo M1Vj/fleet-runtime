@@ -775,7 +775,7 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
       try {
         const dispatcher = startIndefiniteDispatcher({
           stateRoot: poolRoot,
-          port: env.FLEET_DISPATCHER_PORT || 58444,
+          port: env.FLEET_DISPATCHER_PORT || 58446,
         });
         if (dispatcher && dispatcher.port) {
           childEnv.HTTP_PROXY = `http://127.0.0.1:${dispatcher.port}`;

@@ -745,11 +745,11 @@ test("ci-diag and emergency-stop remain available before activation", () => {
   assert.match(stop, /name: record public stop request/);
 });
 
-test("every OpenCode installation is pinned exactly to 1.18.30", () => {
+test("every OpenCode installation is pinned exactly to 1.18.33", () => {
   for (const name of WORKFLOW_FILES) {
     const text = workflowText(name);
     for (const match of text.matchAll(/npm\s+install\s+-g\s+opencode-ai@([^\s'"\\]+)/g)) {
-      assert.equal(match[1], "1.18.30", `${name} must pin opencode-ai to 1.18.30`);
+      assert.equal(match[1], "1.18.33", `${name} must pin opencode-ai to 1.18.33`);
     }
     assert.doesNotMatch(text, /opencode-ai@(?:1\.18\.21|latest|[~^<>=])/i, `${name} contains mutable or stale OpenCode versioning`);
   }

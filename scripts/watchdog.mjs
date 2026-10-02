@@ -7,6 +7,10 @@ import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
 import { verifyCommit, verifyIssueAuthor } from "./lib/verify.mjs";
 import { planWatchdogActions, WATCHDOG_WORKFLOWS, DEFAULT_WATCHDOG_THRESHOLD_MS } from "./lib/watchdog-recipes.mjs";
+import { createAdmissionGate, RUNTIME_REPOSITORY } from "./lib/dispatch-admission.mjs";
+import { selfRunFromEnv } from "./lib/watchdog-admission.mjs";
+import { createSelfRepairDispatcher } from "./lib/watchdog-self-repair.mjs";
+import { append, loadLedger, has } from "./lib/ledger.mjs";
 import {
   isPublicDataClass,
   makeExecutionTerminal,
@@ -27,6 +31,84 @@ const REPO_ROOT = resolveStateRoot(process.env, CODE_ROOT);
 export const QUEUE_STALE_MS = 40 * 60 * 1000;
 export const QUEUE_MAX_ATTEMPTS = 3;
 export const ALERT_DEDUPE_MS = 6 * 3600 * 1000;
+
+function watchdogLedgerPath() {
+  return path.join(REPO_ROOT, "state", "ledger.jsonl");
+}
+
+/**
+ * Bounded occupancy read across `repositories`.
+ *
+ * A repository that cannot be read is reported as unknown rather than assumed
+ * idle, so admission fails closed instead of dispatching into a state it could
+ * not see. Runs are read newest-last and capped per repository by the API page
+ * size, which is the whole observation: the decision, the starvation bound and
+ * every side effect live in lib/dispatch-admission.mjs.
+ */
+export function observeWatchdogRuns(env = process.env, repositories, note = () => {}) {
+  const runs = [];
+  const unknownRepos = [];
+  for (const repo of repositories) {
+    try {
+      const res = gh(["api", `/repos/${repo}/actions/runs?per_page=50`], env);
+      for (const run of Array.isArray(res?.workflow_runs) ? res.workflow_runs : []) {
+        runs.push({
+          repo,
+          id: String(run.id ?? ""),
+          workflowFile: String(run.path ?? "").replace(/^\.github\/workflows\//, ""),
+          status: String(run.status ?? "").toLowerCase(),
+          createdAt: run.created_at ?? null,
+          updatedAt: run.updated_at ?? null,
+        });
+      }
+    } catch (err) {
+      unknownRepos.push(repo);
+      note("dispatch-observe", `${repo} unreadable: ${String(err.message).slice(0, 120)}`);
+    }
+  }
+  return { runs, unknownRepos };
+}
+
+export function createWatchdogAdmissionGate({ env = process.env, audit = null, terminal = null, controlRepository, now = () => Date.now() } = {}) {
+  const ledgerPath = watchdogLedgerPath();
+  const control = controlRepository ?? privateRepository(env, PRIVATE_REPOSITORY_ENV.control);
+  // The control repository is the one whose workflows run on the physical
+  // self-hosted runner, so that is the contended target and the occupancy that
+  // decides. The runtime repository is observed too: its own workflows are
+  // GitHub-hosted, so counting it can only defer conservatively, never dispatch
+  // work the fleet cannot execute.
+  const repositories = [control, RUNTIME_REPOSITORY].filter(Boolean);
+  return createAdmissionGate({
+    observe: () => observeWatchdogRuns(env, repositories, (kind, text) => audit?.note(kind, text)),
+    loadHistory: () => {
+      const records = [];
+      if (!existsSync(ledgerPath)) return records;
+      for (const line of readFileSync(ledgerPath, "utf8").split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const row = JSON.parse(trimmed);
+          if (row && row.admission === true && typeof row.duty === "string") {
+            records.push({ duty: row.duty, cycle: typeof row.cycle === "string" ? row.cycle : "", decision: row.decision === "dispatch" ? "dispatch" : "defer", reasonCode: typeof row.reasonCode === "string" ? row.reasonCode : "", t: row.t });
+          }
+        } catch {
+          continue;
+        }
+      }
+      return records;
+    },
+    loadLedger: () => loadLedger(ledgerPath),
+    hasLedger: has,
+    appendLedger: (key, meta) => append(ledgerPath, key, meta),
+    // The watchdog's own run occupies the runner it is about to read, so it has
+    // to be discounted. A duty is never deferred by the run doing the deferring.
+    selfRun: selfRunFromEnv(env),
+    contendedRepository: control,
+    audit,
+    terminal,
+    clock: now,
+  });
+}
 
 export function refreshQueue(tasks, nowMs = Date.now(), staleMs = QUEUE_STALE_MS, maxAttempts = QUEUE_MAX_ATTEMPTS) {
   let requeued = 0;
@@ -129,6 +211,15 @@ export async function main() {
 
     const controlRepository = privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control);
 
+    // Declared before the gate because the gate publishes deferrals through it,
+    // so a deferral can be recorded before the first dispatch is attempted.
+    const terminal = makeExecutionTerminal(process.env, REPO_ROOT, { lane: "watchdog" });
+
+    // One gate per watchdog cycle: every dispatch below shares a single
+    // bounded occupancy read and a single `now`, and the gate discounts this
+    // cycle's own run so no duty is deferred by the run doing the deferring.
+    const admission = createWatchdogAdmissionGate({ env: process.env, audit, terminal, controlRepository });
+
     // Auto-rearm: if FLEET_PRIVATE_ACTIVATED was false but no KILL_SWITCH file exists, restore it.
     let isActivated = true;
     try {
@@ -142,8 +233,11 @@ export async function main() {
       audit.note("auto-rearm", "FLEET_PRIVATE_ACTIVATED was false without KILL_SWITCH; re-arming fleet");
       try {
         gh(["variable", "set", "FLEET_PRIVATE_ACTIVATED", "--body", "true", "-R", controlRepository], process.env);
-        gh(["workflow", "run", "patrol.yml", "-R", controlRepository], process.env);
-        audit.note("auto-rearm-dispatch", "patrol.yml dispatched after re-arm");
+        const rearm = admission.dispatchGuarded(
+          { duty: "auto-rearm patrol", repo: controlRepository, workflow: "patrol.yml" },
+          () => gh(["workflow", "run", "patrol.yml", "-R", controlRepository], process.env),
+        );
+        audit.note("auto-rearm-dispatch", rearm.dispatch ? "patrol.yml dispatched after re-arm" : `patrol.yml ${rearm.reason} (not dispatched)`);
       } catch (err) {
         audit.incident("auto-rearm-error", err.message.slice(0, 100));
       }
@@ -159,10 +253,21 @@ export async function main() {
     if (recentFailedRuns.length > 0) {
       audit.note("failed-runs", `detected ${recentFailedRuns.length} failed run(s): ${recentFailedRuns.map((r) => r.name).join(", ")}`);
       try {
-        const repairTarget = recentFailedRuns.some((r) => /patrol|merge|watchdog/i.test(r.name)) ? "M1Vj/fleet-runtime" : controlRepository;
-        gh(["workflow", "run", "improve.yml", "-R", controlRepository, "-f", `repo=${repairTarget}`], process.env);
-        audit.note("self-repair-dispatch", `dispatched improve.yml to repair ${repairTarget}`);
-        gh(["workflow", "run", "retro.yml", "-R", controlRepository], process.env);
+        const repair = createSelfRepairDispatcher({
+          stateRoot: REPO_ROOT,
+          admission,
+          audit,
+          controlRepository,
+          runtimeRepository: RUNTIME_REPOSITORY,
+          owner: String(process.env.FLEET_PUBLIC_OWNER ?? "").trim(),
+          dispatchWorkflow: (workflow, target) => gh(["workflow", "run", workflow, "-R", target], process.env),
+        });
+        for (const outcome of repair.respondToFailures(recentFailedRuns)) {
+          audit.note(
+            outcome.dispatched ? "self-repair-dispatch" : "self-repair-refusal",
+            `${outcome.workflow} at ${outcome.target || "unknown"} ${outcome.dispatched ? "dispatched" : `refused: ${outcome.reason}`}`,
+          );
+        }
       } catch (err) {
         audit.incident("self-repair-error", err.message.slice(0, 100));
       }
@@ -180,7 +285,6 @@ export async function main() {
     const staleThresholdMs = Number(process.env.FLEET_STALE_THRESHOLD_MS) || DEFAULT_WATCHDOG_THRESHOLD_MS;
     const plan = planWatchdogActions(heartbeat, Date.now(), staleThresholdMs, { autoEnable });
     audit.note("heartbeat", `decision=${plan.reason} ageMinutes=${plan.ageMinutes}`);
-    const terminal = makeExecutionTerminal(process.env, REPO_ROOT, { lane: "watchdog" });
 
     if (!plan.stale && recentFailedRuns.length === 0 && isActivated) {
       writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Watchdog", "ok-fresh");
@@ -214,8 +318,11 @@ export async function main() {
       // so recovery does not wait indefinitely for GitHub's throttled cron engine.
       for (const wf of ["patrol.yml", "merge.yml"]) {
         try {
-          gh(["workflow", "run", wf, "-R", controlRepository], process.env);
-          audit.note("dispatch-stale", `${controlRepository}/${wf}`);
+          const outcome = admission.dispatchGuarded(
+            { duty: `stale recovery ${wf}`, repo: controlRepository, workflow: wf },
+            () => gh(["workflow", "run", wf, "-R", controlRepository], process.env),
+          );
+          audit.note("dispatch-stale", `${controlRepository}/${wf}${outcome.dispatch ? "" : ` deferred=${outcome.reason}`}`);
         } catch (err) {
           audit.note("dispatch-skip", `${controlRepository}/${wf}: ${String(err.message).slice(0, 80)}`);
         }

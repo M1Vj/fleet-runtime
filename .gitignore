@@ -5,3 +5,6 @@ auth.json
 .DS_Store
 .opencode-attachments/
 state/
+.bak-*/
+.fleet-trace-*/
+.playwright-cli/

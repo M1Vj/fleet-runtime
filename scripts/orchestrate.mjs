@@ -36,8 +36,13 @@ import { gh as defaultGh, scrub } from "./lib/util.mjs";
 import { advisoryModelEnv, askModel as defaultAskModel } from "./lib/model.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
 import { buildFleetPlan } from "./lib/fleet-scheduler.mjs";
+import { createAdmissionGate } from "./lib/dispatch-admission.mjs";
+import { selfRunFromEnv } from "./lib/watchdog-admission.mjs";
+import { append, has, loadLedger } from "./lib/ledger.mjs";
 import {
   isPublicDataClass,
+  PRIVATE_REPOSITORY_ENV,
+  privateRepository,
   publicRepository,
   publicModelEnv,
   publicStateRoot,
@@ -3159,6 +3164,137 @@ export function supportsRepoInput(workflowText) {
   return /\n\s{4}repo\s*:/m.test(block) || /\n\s{6}repo\s*:/m.test(block);
 }
 
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+/** The fleet's shared admission ledger; patrol and watchdog write the same rows. */
+function admissionLedgerPath() {
+  return path.join(REPO_ROOT, "state", "ledger.jsonl");
+}
+
+/**
+ * Prior admission decisions, read back from the shared ledger. The deferral
+ * chain is reconstructed from these, so a chain that reached the starvation
+ * bound is terminated by the dispatch row that followed it.
+ */
+function loadAdmissionRecords(filePath) {
+  if (!existsSync(filePath)) return [];
+  const records = [];
+  for (const line of readFileSync(filePath, "utf8").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const row = JSON.parse(trimmed);
+      if (row && row.admission === true && typeof row.duty === "string") {
+        records.push({
+          duty: row.duty,
+          cycle: typeof row.cycle === "string" ? row.cycle : "",
+          decision: row.decision === "dispatch" ? "dispatch" : "defer",
+          reasonCode: typeof row.reasonCode === "string" ? row.reasonCode : "",
+          t: row.t,
+        });
+      }
+    } catch {
+      continue;
+    }
+  }
+  return records;
+}
+
+/**
+ * Bounded occupancy read. A repository that cannot be read is reported as
+ * unknown rather than assumed idle, so admission fails closed.
+ */
+function observeAdmissionRuns({ env, ghClient, repositories }) {
+  const runs = [];
+  const unknownRepos = [];
+  for (const repo of repositories) {
+    try {
+      const res = ghClient(["api", `/repos/${repo}/actions/runs?per_page=50`], env);
+      for (const run of Array.isArray(res?.workflow_runs) ? res.workflow_runs : []) {
+        runs.push({
+          repo,
+          id: String(run.id ?? ""),
+          workflowFile: String(run.path ?? "").replace(/^\.github\/workflows\//, ""),
+          status: String(run.status ?? "").toLowerCase(),
+          createdAt: run.created_at ?? null,
+          updatedAt: run.updated_at ?? null,
+        });
+      }
+    } catch {
+      unknownRepos.push(repo);
+    }
+  }
+  return { runs, unknownRepos };
+}
+
+/**
+ * Non-repository marker for a contended identity this plane cannot name.
+ *
+ * `repositoryOccupiesRunner()` decides contention by comparing the dispatch
+ * target against the contended repository by value, so a blank contended
+ * identity is not "does not contend" but "cannot answer", and the gate refuses
+ * it. The marker keeps those apart for a plane that cannot name the contended
+ * repository at all: it is not a value any `owner/name` can take, so the
+ * comparison resolves to "this dispatch does not occupy the runner" and the
+ * dispatch is decided on its merits instead of being refused blind.
+ */
+const CONTENTION_IDENTITY_OUT_OF_REACH = "<contended-repository-not-nameable-from-this-plane>";
+
+/**
+ * The contended repository for the one workflow dispatch this scheduler makes.
+ *
+ * The repository whose workflows occupy the single physical self-hosted runner
+ * is the private control repository. The public plane that runs this file
+ * cannot name it -- it is never compiled into this public source and receives
+ * no `FLEET_CONTROL_REPOSITORY` (ADR-001) -- so a blank resolution is the
+ * normal case here, not an edge case. When the environment does name it the gate
+ * gets the real identity and decides against real occupancy; when it cannot,
+ * the gate still decides, against a marker no dispatch target can equal. That
+ * is the truthful answer for this call site rather than a bypass: every job in
+ * `improve.yml` runs on GitHub-hosted `ubuntu-latest`, so a dispatch into this
+ * repository cannot occupy the runner slice D4 exists to protect.
+ */
+function contendedAdmissionRepository(env = process.env) {
+  try {
+    return privateRepository(env, PRIVATE_REPOSITORY_ENV.control);
+  } catch {
+    return CONTENTION_IDENTITY_OUT_OF_REACH;
+  }
+}
+
+/**
+ * Drop-before-dispatch admission (root decision D4) for the one workflow
+ * dispatch this scheduler makes.
+ *
+ * `improve.yml` in this repository runs on GitHub-hosted `ubuntu-latest`, so a
+ * dispatch into the runtime repository does not contend for the single physical
+ * self-hosted runner and the gate returns it ungated. That is the gate's own
+ * rule rather than a flag a caller can pass: the only input is the repository
+ * being dispatched into. The contended identity, the bounded occupancy read and
+ * the shared ledger are supplied exactly as patrol and watchdog supply them, so a
+ * destination that did contend would be deferred here instead of dispatched.
+ * Collapsing an unnameable contended identity to a blank one instead of a
+ * marker no target can equal made that last clause unreachable: every upgrade
+ * dispatch in this plane was refused before dispatch rather than decided.
+ */
+function upgradeAdmissionGate({ env = process.env, ghClient = defaultGh } = {}) {
+  const contended = contendedAdmissionRepository(env);
+  // Occupancy is only ever read from a repository that was actually resolved.
+  const observedRepositories = contended === CONTENTION_IDENTITY_OUT_OF_REACH ? [] : [contended];
+  const ledgerFile = admissionLedgerPath();
+  return createAdmissionGate({
+    observe: () => observeAdmissionRuns({ env, ghClient, repositories: observedRepositories }),
+    loadHistory: () => loadAdmissionRecords(ledgerFile),
+    loadLedger: () => loadLedger(ledgerFile),
+    appendLedger: (key, meta) => append(ledgerFile, key, meta),
+    hasLedger: has,
+    // This run occupies the runner it is about to read, so it has to be
+    // discounted: a duty is never deferred by the run doing the deferring.
+    selfRun: selfRunFromEnv(env),
+    contendedRepository: contended,
+  });
+}
+
 async function executeUpgradeTask(task, { env = process.env, ghClient = defaultGh, workflowPath, workflowName = "improve.yml" } = {}) {
   const observedAt = new Date().toISOString();
   const candidatePath = workflowPath || path.join(process.cwd(), ".github", "workflows", workflowName);
@@ -3176,7 +3312,25 @@ async function executeUpgradeTask(task, { env = process.env, ghClient = defaultG
     return { ...result, artifact };
   }
   try {
-    const dispatchResponse = await ghClient(["workflow", "run", workflowName, "-R", RUNTIME_REPO, "-f", `repo=${task.repo}`], env);
+    const admission = upgradeAdmissionGate({ env, ghClient });
+    const outcome = await admission.dispatchGuarded(
+      { duty: `improve ${task.repo}`, repo: RUNTIME_REPO, workflow: workflowName },
+      () => ghClient(["workflow", "run", workflowName, "-R", RUNTIME_REPO, "-f", `repo=${task.repo}`], env),
+    );
+    if (!outcome.dispatch) {
+      const deferred = {
+        status: "deferred",
+        reason: outcome.reason || "admission-deferred",
+        observedAt,
+        workflow: workflowName,
+        repo: task.repo,
+        dispatchAttempted: false,
+        dispatchConfirmed: false,
+      };
+      const artifact = writeTaskArtifact(task, deferred, env);
+      return { ...deferred, artifact };
+    }
+    const dispatchResponse = outcome.result;
     const runId = dispatchResponse && typeof dispatchResponse === "object"
       ? firstValue(dispatchResponse.runId, dispatchResponse.run_id, dispatchResponse.id)
       : undefined;

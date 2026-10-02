@@ -3,14 +3,14 @@
   "model": "opencode/muse-spark-1.3-contributor-free",
   "small_model": "opencode/muse-spark-1.3-contributor-free",
   "instructions": [
-    "CONCRETE AUTONOMOUS MUTATION: Runner utility lanes (@implementer, @code-simplifier, @refactorer, @test-engineer, @performance-engineer, @security-reviewer, @architect, @designer, @prompt-architect, @humanizer) perform concrete actions inside their dispatched lane—editing code, writing tests, refactoring modules, and verifying changes autonomously rather than executing passive read-only inspections. Each lane completes its own assigned work; scheduling and consequential writes live outside this repo.",
-    "SERIALIZED-RUNNER EXECUTION (no fan-out): The runner serializes its own jobs—run one utility lane at a time. Never fan out parallel subagent lanes and never hedge stragglers with speculative clones on this runner. When a remote Codex/T3 process is active, or memory/disk headroom is low, defer new work instead of starting it. Treat degraded state, runner-busy, low available memory, or any non-running host state as a reason to wait, never to add load.",
+    "CONCRETE AUTONOMOUS MUTATION: Runner utility lanes (@implementer, @code-simplifier, @refactorer, @test-engineer, @performance-engineer, @security-reviewer, @architect, @designer, @prompt-architect, @humanizer) perform concrete actions inside their dispatched lane\u2014editing code, writing tests, refactoring modules, and verifying changes autonomously rather than executing passive read-only inspections. Each lane completes its own assigned work; scheduling and consequential writes live outside this repo.",
+    "SERIALIZED-RUNNER EXECUTION (no fan-out): The runner serializes its own jobs\u2014run one utility lane at a time. Never fan out parallel subagent lanes and never hedge stragglers with speculative clones on this runner. When a remote Codex/T3 process is active, or memory/disk headroom is low, defer new work instead of starting it. Treat degraded state, runner-busy, low available memory, or any non-running host state as a reason to wait, never to add load.",
     "BOUNDED UTILITY-LANE ENDURANCE: Run the dispatched lane to verified completion and do not abort while making forward progress. Keep the lane bounded: no always-on services, no background daemons, no open-ended loops on this memory-constrained runner. On memory pressure, checkpoint state, stop cleanly, and defer the remainder rather than pushing through.",
     "NON-TERMINATION & TASK COMPLETION INVARIANT: Execute implementations, run automated verification tests live, and confirm outcomes completely within this task before finishing. An unfinished task is an invalid exit.",
-    "BATCHED EXECUTION WITHIN RUNNER LIMITS: Group operations into multi-tool batches. Keep turns brief, factual, and action-oriented. Batch reads, greps, edits, and test commands inside one serialized lane while keeping memory footprint small—prefer sequential bounded batches over wide parallel bursts.",
+    "BATCHED EXECUTION WITHIN RUNNER LIMITS: Group operations into multi-tool batches. Keep turns brief, factual, and action-oriented. Batch reads, greps, edits, and test commands inside one serialized lane while keeping memory footprint small\u2014prefer sequential bounded batches over wide parallel bursts.",
     "PERSISTENT CROSS-SESSION MEMORY (ACID SQLite WAL): Memory of past runs, error signatures, and fleet invariants is automatically synchronized in ACID SQLite WAL mode. Past mistakes and verified fixes are injected directly into your context. Adhere to proven fixes and never repeat known errors.",
-    "COUNCIL GATE & 9/10 PASSING BAR (fleet executor, serialized): Every executor lane touching >1 file or any auth/data/deploy path, config/agents/, permissions, skills, or instructions MUST pass review before the lane reports complete: (1) the maker lane output that built it, (2) a critic/adversarial pass, (3) a reviewer-or-domain pass (@security-reviewer for auth/data/deploy, else @test-engineer/@performance-engineer/domain specialist). Passes run serialized, one at a time on this runner — never parallel fan-out, never speculative clones. Gate is unanimous pass on all Critical findings plus overall score >=9/10 per pass, each with live verification evidence (passing checks, command output, file:line cites); a score without live evidence is invalid and dissent is preserved verbatim, never averaged away. Audits, research, and self-test lanes are still reviewed — lane type never waives the gate. Research lanes use 3 sequential independent survey passes plus lane synthesis citing agreements, conflicts, and unknowns. Single-pass completion is valid only for single-file non-auth/data/deploy edits with passing focused checks.",
-    "LOOP-UNTIL-9PLUS, NEVER DOWNGRADE (fleet executor, serialized): If any axis scores below 9/10, or any Critical is open, or any score lacks live evidence, loop indefinitely inside the lane: fix, re-verify live, re-run the review passes one at a time. Never cap iterations, never downgrade the bar to pass, never report complete below 9+/10 on every axis with unanimous Critical pass. 8/10 is NEEDS_REVISION, never complete. Checkpoint lane state between iterations so the loop never loses progress. Circuit-breaker: after 3 failed loops on the same axis, park state and report to the dispatcher with the dissent log and exact unblock; never auto-downgrade the bar, but stop spinning. Scores serve the fleet owner and downstream users — state who benefits, what visible outcome changed, what risk fell, what was left undone and why; theater over substance is NEEDS_REVISION."
+    "COUNCIL GATE & 9/10 PASSING BAR (fleet executor, serialized): Every executor lane touching >1 file or any auth/data/deploy path, config/agents/, permissions, skills, or instructions MUST pass review before the lane reports complete: (1) the maker lane output that built it, (2) a critic/adversarial pass, (3) a reviewer-or-domain pass (@security-reviewer for auth/data/deploy, else @test-engineer/@performance-engineer/domain specialist). Passes run serialized, one at a time on this runner \u2014 never parallel fan-out, never speculative clones. Gate is unanimous pass on all Critical findings plus overall score >=9/10 per pass, each with live verification evidence (passing checks, command output, file:line cites); a score without live evidence is invalid and dissent is preserved verbatim, never averaged away. Audits, research, and self-test lanes are still reviewed \u2014 lane type never waives the gate. Research lanes use 3 sequential independent survey passes plus lane synthesis citing agreements, conflicts, and unknowns. Single-pass completion is valid only for single-file non-auth/data/deploy edits with passing focused checks.",
+    "LOOP-UNTIL-9PLUS, NEVER DOWNGRADE (fleet executor, serialized): If any axis scores below 9/10, or any Critical is open, or any score lacks live evidence, loop indefinitely inside the lane: fix, re-verify live, re-run the review passes one at a time. Never cap iterations, never downgrade the bar to pass, never report complete below 9+/10 on every axis with unanimous Critical pass. 8/10 is NEEDS_REVISION, never complete. Checkpoint lane state between iterations so the loop never loses progress. Circuit-breaker: after 3 failed loops on the same axis, park state and report to the dispatcher with the dissent log and exact unblock; never auto-downgrade the bar, but stop spinning. Scores serve the fleet owner and downstream users \u2014 state who benefits, what visible outcome changed, what risk fell, what was left undone and why; theater over substance is NEEDS_REVISION."
   ],
   "permission": {
     "*": "allow",
@@ -29,7 +29,7 @@
     "implementer": {
       "variant": "xhigh",
       "reasoningEffort": "xhigh",
-      "steps": 35,
+      "steps": 9007199254740991,
       "permission": {
         "*": "allow",
         "edit": "allow",
@@ -41,7 +41,7 @@
     "code-simplifier": {
       "variant": "xhigh",
       "reasoningEffort": "xhigh",
-      "steps": 30,
+      "steps": 9007199254740991,
       "permission": {
         "*": "allow",
         "edit": "allow",
@@ -53,7 +53,7 @@
     "refactorer": {
       "variant": "xhigh",
       "reasoningEffort": "xhigh",
-      "steps": 30,
+      "steps": 9007199254740991,
       "permission": {
         "*": "allow",
         "edit": "allow",
@@ -65,7 +65,7 @@
     "test-engineer": {
       "variant": "xhigh",
       "reasoningEffort": "xhigh",
-      "steps": 30,
+      "steps": 9007199254740991,
       "permission": {
         "*": "allow",
         "edit": "allow",
@@ -77,7 +77,7 @@
     "performance-engineer": {
       "variant": "xhigh",
       "reasoningEffort": "xhigh",
-      "steps": 30,
+      "steps": 9007199254740991,
       "permission": {
         "*": "allow",
         "edit": "allow",
@@ -89,7 +89,7 @@
     "security-reviewer": {
       "variant": "xhigh",
       "reasoningEffort": "xhigh",
-      "steps": 25,
+      "steps": 9007199254740991,
       "permission": {
         "*": "allow",
         "edit": "allow",
@@ -101,7 +101,7 @@
     "architect": {
       "variant": "xhigh",
       "reasoningEffort": "xhigh",
-      "steps": 30,
+      "steps": 9007199254740991,
       "permission": {
         "*": "allow",
         "edit": "allow",
@@ -113,7 +113,7 @@
     "designer": {
       "variant": "xhigh",
       "reasoningEffort": "xhigh",
-      "steps": 30,
+      "steps": 9007199254740991,
       "permission": {
         "*": "allow",
         "edit": "allow",
@@ -125,7 +125,7 @@
     "prompt-architect": {
       "variant": "xhigh",
       "reasoningEffort": "xhigh",
-      "steps": 25,
+      "steps": 9007199254740991,
       "permission": {
         "*": "allow",
         "edit": "allow",
@@ -137,7 +137,7 @@
     "humanizer": {
       "variant": "xhigh",
       "reasoningEffort": "xhigh",
-      "steps": 25,
+      "steps": 9007199254740991,
       "permission": {
         "*": "allow",
         "edit": "allow",
@@ -149,7 +149,7 @@
     "critic": {
       "variant": "xhigh",
       "reasoningEffort": "xhigh",
-      "steps": 25,
+      "steps": 9007199254740991,
       "permission": {
         "*": "deny",
         "read": "allow",
@@ -162,7 +162,7 @@
     "reviewer": {
       "variant": "xhigh",
       "reasoningEffort": "xhigh",
-      "steps": 25,
+      "steps": 9007199254740991,
       "permission": {
         "*": "deny",
         "read": "allow",
@@ -175,7 +175,7 @@
     "clerk": {
       "variant": "xhigh",
       "reasoningEffort": "xhigh",
-      "steps": 20,
+      "steps": 9007199254740991,
       "permission": {
         "*": "deny",
         "read": "allow",
@@ -188,7 +188,7 @@
     "researcher": {
       "variant": "xhigh",
       "reasoningEffort": "xhigh",
-      "steps": 25,
+      "steps": 9007199254740991,
       "permission": {
         "*": "deny",
         "read": "allow",

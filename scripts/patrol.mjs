@@ -10,6 +10,8 @@ import { validateDirectives } from "./lib/directives.mjs";
 import { askModel } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor, verifyCommentAuthor, verifyIssueAuthor } from "./lib/verify.mjs";
 import { shouldCoalesce } from "./lib/watchdog-decide.mjs";
+import { createAdmissionGate } from "./lib/dispatch-admission.mjs";
+import { selfRunFromEnv } from "./lib/watchdog-admission.mjs";
 import {
   isPublicDataClass,
   makeExecutionTerminal,
@@ -93,6 +95,100 @@ function heartbeatPath() {
 
 function sessionsPath() {
   return path.join(STATE_DIR, "sessions.json");
+}
+
+/**
+ * Drop-before-dispatch admission (root decision D4). The decision is the pure
+ * planDispatch() inside lib/dispatch-admission.mjs; everything here is the I/O
+ * that decision needs. The control repository is read because it is the one that
+ * schedules onto the single physical self-hosted runner; the runtime repository
+ * is read too, so a run in flight in either is visible rather than assumed idle.
+ * A repository that cannot be read is reported as unreadable, never idle.
+ *
+ * The control repository is resolved from the environment at call time. Patrol
+ * must never compile a private repository identity into source; the public
+ * runtime ships this same file.
+ */
+export function admissionRepositories(env = process.env) {
+  const repos = [DEEP_WORKFLOW_REPO];
+  try {
+    repos.unshift(privateRepository(env, PRIVATE_REPOSITORY_ENV.control));
+  } catch {
+    // Public data class: the control repository is deliberately unresolvable,
+    // and no dispatch below can target it either.
+  }
+  return Object.freeze(repos.filter((repo, index) => repo && repos.indexOf(repo) === index));
+}
+
+export function observeRunnerRuns(env = process.env, note = () => {}) {
+  const runs = [];
+  const unknownRepos = [];
+  for (const repo of admissionRepositories(env)) {
+    try {
+      const res = gh(["api", `/repos/${repo}/actions/runs?per_page=50`], env);
+      for (const run of Array.isArray(res?.workflow_runs) ? res.workflow_runs : []) {
+        runs.push({
+          repo,
+          id: String(run.id ?? ""),
+          workflowFile: String(run.path ?? "").replace(/^\.github\/workflows\//, ""),
+          status: String(run.status ?? "").toLowerCase(),
+          createdAt: run.created_at ?? null,
+          updatedAt: run.updated_at ?? null,
+        });
+      }
+    } catch (err) {
+      unknownRepos.push(repo);
+      note("dispatch-observe", `${repo} unreadable: ${String(err.message).slice(0, 120)}`);
+    }
+  }
+  return { runs, unknownRepos };
+}
+
+export function loadAdmissionRecords(filePath = ledgerPath()) {
+  const records = [];
+  if (!existsSync(filePath)) return records;
+  for (const line of readFileSync(filePath, "utf8").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const row = JSON.parse(trimmed);
+      if (row && row.admission === true && typeof row.duty === "string") {
+        records.push({
+          duty: row.duty,
+          cycle: typeof row.cycle === "string" ? row.cycle : "",
+          decision: row.decision === "dispatch" ? "dispatch" : "defer",
+          reasonCode: typeof row.reasonCode === "string" ? row.reasonCode : "",
+          t: row.t,
+        });
+      }
+    } catch {
+      continue;
+    }
+  }
+  return records;
+}
+
+/**
+ * One admission gate per patrol cycle: the bounded occupancy read and the
+ * ledger snapshot are shared by every duty this cycle decides.
+ */
+export function createPatrolAdmissionGate({ env = process.env, audit = null, terminal = null, now } = {}) {
+  return createAdmissionGate({
+    observe: () => observeRunnerRuns(env, (kind, text) => audit?.note(kind, text)),
+    loadHistory: () => loadAdmissionRecords(),
+    loadLedger: () => loadPatrolLedger(ledgerPath()),
+    appendLedger: (key, meta) => append(ledgerPath(), key, meta),
+    hasLedger: (seen, key) => seen.has(key),
+    // Patrol's own run occupies the runner it is about to read. Discounting it
+    // is what stops every duty from being deferred by the run doing the
+    // deferring, which would also forge a starvation chain out of a false
+    // `runner_occupied`.
+    selfRun: selfRunFromEnv(env),
+    contendedRepository: admissionRepositories(env)[0] || null,
+    audit,
+    terminal,
+    clock: now === undefined ? () => Date.now() : () => now,
+  });
 }
 
 function loadPatrolSession() {
@@ -793,6 +889,15 @@ export async function main() {
   let identity = null;
   let status = "failed";
   const terminal = makeExecutionTerminal(process.env, REPO_ROOT, { lane: "patrol" });
+  // The control repository identity is private configuration, so it is resolved
+  // from the environment and only when the run is actually a private run. A
+  // public run must reach its own read-only branch below, never a private-target
+  // resolution, which is why this is a lazy getter and not a hoisted constant.
+  const controlRepository = () => privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control);
+  // One admission gate per patrol cycle: every dispatch this cycle shares a
+  // single bounded occupancy read and a single `now`, so two duties decided in
+  // the same cycle can never disagree about what the runner was doing.
+  const admissionGate = createPatrolAdmissionGate({ env: process.env, audit, terminal });
   let trigger = "manual";
   let gwRoot = REPO_ROOT;
   let auditFileRel = "";
@@ -970,10 +1075,20 @@ export async function main() {
     });
     for (const d of scoutDispatches) {
       try {
-        const args = ["workflow", "run", d.workflow, "-R", privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control)];
-        if (d.repo) args.push("-f", `repo=${d.repo}`);
-        if (d.pr) args.push("-f", `pr=${d.pr}`);
-        gh(args, process.env);
+        // D4: a dispatch that finds the runner occupied only adds a pending run
+        // which GitHub then cancels. Defer it before the dispatch instead. The
+        // argument list is built inside the gate so a deferral never resolves the
+        // private destination at all.
+        const admission = admissionGate.dispatchGuarded(
+          { duty: `${d.workflow} for ${d.repo}`, repo: controlRepository(), workflow: d.workflow },
+          () => {
+            const args = ["workflow", "run", d.workflow, "-R", controlRepository()];
+            if (d.repo) args.push("-f", `repo=${d.repo}`);
+            if (d.pr) args.push("-f", `pr=${d.pr}`);
+            return gh(args, process.env);
+          },
+        );
+        if (!admission.dispatch) continue;
         append(ledgerPath(), d.key, { workflow: d.workflow, repo: d.repo, pr: d.pr });
         audit.note("scout-dispatch", `dispatched ${d.workflow} for ${d.repo}${d.pr ? `#${d.pr}` : ""}`);
       } catch (err) {
@@ -999,8 +1114,11 @@ export async function main() {
       statePushVerified = true;
       audit.note("push-verify", `attribution verified sha=${sha.slice(0, 10)}`);
       try {
-        gh(["workflow", "run", "deep.yml", "-R", privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control), "-f", "workers=3"], process.env);
-        audit.note("deep-dispatch", "deep.yml dispatched");
+        const deepAdmission = admissionGate.dispatchGuarded(
+          { duty: "deep synthesis", repo: controlRepository(), workflow: "deep.yml" },
+          () => gh(["workflow", "run", "deep.yml", "-R", privateRepository(process.env, PRIVATE_REPOSITORY_ENV.control), "-f", "workers=3"], process.env),
+        );
+        if (deepAdmission.dispatch) audit.note("deep-dispatch", "deep.yml dispatched");
       } catch (err) {
         audit.note("deep-dispatch", `dispatch skipped: ${err.message.slice(0, 120)}`);
       }
@@ -1014,9 +1132,14 @@ export async function main() {
       patrolsSince += 1;
       if (patrolsSince >= 5) {
         try {
-          gh(["workflow", "run", "selftest.yml", "-R", "M1Vj/fleet-runtime"], process.env);
-          patrolsSince = 0;
-          audit.note("selftest-dispatch", "every-5-patrols cadence");
+          const selftestAdmission = admissionGate.dispatchGuarded(
+            { duty: "selftest", repo: "M1Vj/fleet-runtime", workflow: "selftest.yml" },
+            () => gh(["workflow", "run", "selftest.yml", "-R", "M1Vj/fleet-runtime"], process.env),
+          );
+          if (selftestAdmission.dispatch) {
+            patrolsSince = 0;
+            audit.note("selftest-dispatch", "every-5-patrols cadence");
+          }
         } catch (err) {
           audit.note("selftest-dispatch", `failed: ${err.message.slice(0, 100)}`);
         }

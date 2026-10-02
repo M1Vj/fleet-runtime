@@ -2,10 +2,17 @@ name: ci-diag
 run-name: "opencode CI diagnostic ${{ github.run_id }}"
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-diag-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   diag:

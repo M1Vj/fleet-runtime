@@ -2,6 +2,9 @@ name: fleet-selftest
 run-name: "fleet public selftest ${{ github.run_id }}"
 
 on:
+  push:
+    branches:
+      - main
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
@@ -9,9 +12,11 @@ on:
 permissions:
   contents: read
 
+# Push runs supersede earlier push runs so a burst of commits cannot queue.
+# Scheduled and dispatched runs keep the original non-cancelling behaviour.
 concurrency:
-  group: fleet-selftest-public
-  cancel-in-progress: false
+  group: fleet-selftest-public-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
   FLEET_DATA_CLASS: public

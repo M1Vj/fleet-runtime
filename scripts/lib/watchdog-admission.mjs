@@ -281,6 +281,29 @@ export function deferralChain(history, duty) {
   return Object.freeze({ consecutiveDefers, chainStartMs, records: Object.freeze(records) });
 }
 
+/**
+ * The one way a run list is ever read out of a `gh` body.
+ *
+ * `gh()` resolves to `null` on empty stdout and to the RAW STRING when stdout
+ * is not JSON, both at exit 0 -- so an HTML rate-limit page, a proxy error or a
+ * truncated response all arrive here looking like "observed, zero runs". A
+ * caller that treats that as an empty run list publishes `runner_idle` with
+ * `observationKnown: true` and dispatches onto a runner it never saw, which is
+ * the fail-open this guards.
+ *
+ * Occupancy is claimed only when the body genuinely is a run list: a
+ * non-array JSON object carrying an array `workflow_runs`. An empty array is a
+ * real observation of zero live runs and is accepted; everything else --
+ * `null`, a string, a bare array, an object without the key -- is unreadable
+ * and must become an entry in `unknownRepos` so `summarizeOccupancy` reports a
+ * partial observation and `planDispatch` defers.
+ */
+export function readRunList(res) {
+  if (res === null || typeof res !== "object" || Array.isArray(res)) return null;
+  if (!Array.isArray(res.workflow_runs)) return null;
+  return res.workflow_runs;
+}
+
 /** Bounded view of runner occupancy: live and queued runs across every repo
  *  that shares the one physical runner. `unknownRepos` are repos whose run list
  *  could not be read; any of them makes the observation partial, and a partial

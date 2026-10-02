@@ -11,7 +11,7 @@ import { askModel } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor, verifyCommentAuthor, verifyIssueAuthor } from "./lib/verify.mjs";
 import { shouldCoalesce } from "./lib/watchdog-decide.mjs";
 import { createAdmissionGate } from "./lib/dispatch-admission.mjs";
-import { selfRunFromEnv } from "./lib/watchdog-admission.mjs";
+import { readRunList, selfRunFromEnv } from "./lib/watchdog-admission.mjs";
 import {
   isPublicDataClass,
   makeExecutionTerminal,
@@ -124,21 +124,33 @@ export function observeRunnerRuns(env = process.env, note = () => {}) {
   const runs = [];
   const unknownRepos = [];
   for (const repo of admissionRepositories(env)) {
+    let list = null;
+    let unreadable = null;
     try {
-      const res = gh(["api", `/repos/${repo}/actions/runs?per_page=50`], env);
-      for (const run of Array.isArray(res?.workflow_runs) ? res.workflow_runs : []) {
-        runs.push({
-          repo,
-          id: String(run.id ?? ""),
-          workflowFile: String(run.path ?? "").replace(/^\.github\/workflows\//, ""),
-          status: String(run.status ?? "").toLowerCase(),
-          createdAt: run.created_at ?? null,
-          updatedAt: run.updated_at ?? null,
-        });
-      }
+      list = readRunList(gh(["api", `/repos/${repo}/actions/runs?per_page=50`], env));
     } catch (err) {
+      unreadable = String(err.message).slice(0, 120);
+    }
+    if (!list) {
+      // Covers the throw above and every body that is not a run list: an empty
+      // body, an HTML rate-limit page, or JSON without `workflow_runs` all mean
+      // this repository's occupancy is unknown. Reporting it unknown is what
+      // keeps the cycle from claiming the runner is idle on the strength of a
+      // read that never happened. Noted here, not only on the throw, because a
+      // malformed body is otherwise indistinguishable from a healthy idle read.
       unknownRepos.push(repo);
-      note("dispatch-observe", `${repo} unreadable: ${String(err.message).slice(0, 120)}`);
+      note("dispatch-observe", `${repo} unreadable: ${unreadable || "response was not a run list"}`);
+      continue;
+    }
+    for (const run of list) {
+      runs.push({
+        repo,
+        id: String(run.id ?? ""),
+        workflowFile: String(run.path ?? "").replace(/^\.github\/workflows\//, ""),
+        status: String(run.status ?? "").toLowerCase(),
+        createdAt: run.created_at ?? null,
+        updatedAt: run.updated_at ?? null,
+      });
     }
   }
   return { runs, unknownRepos };

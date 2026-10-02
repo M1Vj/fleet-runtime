@@ -7,6 +7,7 @@ import { AuditBuffer } from "./lib/audit.mjs";
 import { scrub, gh, gitAdd, gitCommit, gitPush, gitHasChanges, gitRevParse, configureIdentity } from "./lib/util.mjs";
 import { verifyCommit, verifyIssueAuthor } from "./lib/verify.mjs";
 import { planWatchdogActions, WATCHDOG_WORKFLOWS, DEFAULT_WATCHDOG_THRESHOLD_MS } from "./lib/watchdog-recipes.mjs";
+import { readRunList } from "./lib/watchdog-admission.mjs";
 import { createAdmissionGate, RUNTIME_REPOSITORY } from "./lib/dispatch-admission.mjs";
 import { selfRunFromEnv } from "./lib/watchdog-admission.mjs";
 import { createSelfRepairDispatcher } from "./lib/watchdog-self-repair.mjs";
@@ -49,21 +50,25 @@ export function observeWatchdogRuns(env = process.env, repositories, note = () =
   const runs = [];
   const unknownRepos = [];
   for (const repo of repositories) {
+    let list = null;
     try {
-      const res = gh(["api", `/repos/${repo}/actions/runs?per_page=50`], env);
-      for (const run of Array.isArray(res?.workflow_runs) ? res.workflow_runs : []) {
-        runs.push({
-          repo,
-          id: String(run.id ?? ""),
-          workflowFile: String(run.path ?? "").replace(/^\.github\/workflows\//, ""),
-          status: String(run.status ?? "").toLowerCase(),
-          createdAt: run.created_at ?? null,
-          updatedAt: run.updated_at ?? null,
-        });
-      }
+      list = readRunList(gh(["api", `/repos/${repo}/actions/runs?per_page=50`], env));
     } catch (err) {
-      unknownRepos.push(repo);
       note("dispatch-observe", `${repo} unreadable: ${String(err.message).slice(0, 120)}`);
+    }
+    if (!list) {
+      unknownRepos.push(repo);
+      continue;
+    }
+    for (const run of list) {
+      runs.push({
+        repo,
+        id: String(run.id ?? ""),
+        workflowFile: String(run.path ?? "").replace(/^\.github\/workflows\//, ""),
+        status: String(run.status ?? "").toLowerCase(),
+        createdAt: run.created_at ?? null,
+        updatedAt: run.updated_at ?? null,
+      });
     }
   }
   return { runs, unknownRepos };

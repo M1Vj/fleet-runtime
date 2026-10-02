@@ -37,7 +37,7 @@ import { advisoryModelEnv, askModel as defaultAskModel } from "./lib/model.mjs";
 import { extractJsonObject } from "./lib/directives.mjs";
 import { buildFleetPlan } from "./lib/fleet-scheduler.mjs";
 import { createAdmissionGate } from "./lib/dispatch-admission.mjs";
-import { selfRunFromEnv } from "./lib/watchdog-admission.mjs";
+import { readRunList, selfRunFromEnv } from "./lib/watchdog-admission.mjs";
 import { append, has, loadLedger } from "./lib/ledger.mjs";
 import {
   isPublicDataClass,
@@ -3208,20 +3208,25 @@ function observeAdmissionRuns({ env, ghClient, repositories }) {
   const runs = [];
   const unknownRepos = [];
   for (const repo of repositories) {
+    let list = null;
     try {
-      const res = ghClient(["api", `/repos/${repo}/actions/runs?per_page=50`], env);
-      for (const run of Array.isArray(res?.workflow_runs) ? res.workflow_runs : []) {
-        runs.push({
-          repo,
-          id: String(run.id ?? ""),
-          workflowFile: String(run.path ?? "").replace(/^\.github\/workflows\//, ""),
-          status: String(run.status ?? "").toLowerCase(),
-          createdAt: run.created_at ?? null,
-          updatedAt: run.updated_at ?? null,
-        });
-      }
+      list = readRunList(ghClient(["api", `/repos/${repo}/actions/runs?per_page=50`], env));
     } catch {
+      // Unreadable: the repository is reported unknown below, never as idle.
+    }
+    if (!list) {
       unknownRepos.push(repo);
+      continue;
+    }
+    for (const run of list) {
+      runs.push({
+        repo,
+        id: String(run.id ?? ""),
+        workflowFile: String(run.path ?? "").replace(/^\.github\/workflows\//, ""),
+        status: String(run.status ?? "").toLowerCase(),
+        createdAt: run.created_at ?? null,
+        updatedAt: run.updated_at ?? null,
+      });
     }
   }
   return { runs, unknownRepos };

@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "opencode/muse-spark-1.3-contributor-free",
+  "model": "opencode/fledge-alpha-free",
   "small_model": "opencode/muse-spark-1.3-contributor-free",
   "instructions": [
     "CONCRETE AUTONOMOUS MUTATION: Runner utility lanes (@implementer, @code-simplifier, @refactorer, @test-engineer, @performance-engineer, @security-reviewer, @architect, @designer, @prompt-architect, @humanizer) perform concrete actions inside their dispatched lane\u2014editing code, writing tests, refactoring modules, and verifying changes autonomously rather than executing passive read-only inspections. Each lane completes its own assigned work; scheduling and consequential writes live outside this repo.",
@@ -27,7 +27,7 @@
   },
   "agent": {
     "implementer": {
-      "variant": "xhigh",
+      "variant": "max",
       "reasoningEffort": "xhigh",
       "steps": 9007199254740991,
       "permission": {
@@ -36,10 +36,11 @@
         "bash": "allow",
         "write": "allow",
         "doom_loop": "allow"
-      }
+      },
+      "model": "opencode/fledge-alpha-free"
     },
     "code-simplifier": {
-      "variant": "xhigh",
+      "variant": "max",
       "reasoningEffort": "xhigh",
       "steps": 9007199254740991,
       "permission": {
@@ -48,10 +49,11 @@
         "bash": "allow",
         "write": "allow",
         "doom_loop": "allow"
-      }
+      },
+      "model": "opencode/fledge-alpha-free"
     },
     "refactorer": {
-      "variant": "xhigh",
+      "variant": "max",
       "reasoningEffort": "xhigh",
       "steps": 9007199254740991,
       "permission": {
@@ -60,10 +62,11 @@
         "bash": "allow",
         "write": "allow",
         "doom_loop": "allow"
-      }
+      },
+      "model": "opencode/fledge-alpha-free"
     },
     "test-engineer": {
-      "variant": "xhigh",
+      "variant": "max",
       "reasoningEffort": "xhigh",
       "steps": 9007199254740991,
       "permission": {
@@ -72,10 +75,11 @@
         "bash": "allow",
         "write": "allow",
         "doom_loop": "allow"
-      }
+      },
+      "model": "opencode/fledge-alpha-free"
     },
     "performance-engineer": {
-      "variant": "xhigh",
+      "variant": "max",
       "reasoningEffort": "xhigh",
       "steps": 9007199254740991,
       "permission": {
@@ -84,10 +88,11 @@
         "bash": "allow",
         "write": "allow",
         "doom_loop": "allow"
-      }
+      },
+      "model": "opencode/fledge-alpha-free"
     },
     "security-reviewer": {
-      "variant": "xhigh",
+      "variant": "max",
       "reasoningEffort": "xhigh",
       "steps": 9007199254740991,
       "permission": {
@@ -96,10 +101,11 @@
         "bash": "allow",
         "write": "allow",
         "doom_loop": "allow"
-      }
+      },
+      "model": "opencode/fledge-alpha-free"
     },
     "architect": {
-      "variant": "xhigh",
+      "variant": "max",
       "reasoningEffort": "xhigh",
       "steps": 9007199254740991,
       "permission": {
@@ -108,10 +114,11 @@
         "bash": "allow",
         "write": "allow",
         "doom_loop": "allow"
-      }
+      },
+      "model": "opencode/fledge-alpha-free"
     },
     "designer": {
-      "variant": "xhigh",
+      "variant": "max",
       "reasoningEffort": "xhigh",
       "steps": 9007199254740991,
       "permission": {
@@ -120,10 +127,11 @@
         "bash": "allow",
         "write": "allow",
         "doom_loop": "allow"
-      }
+      },
+      "model": "opencode/fledge-alpha-free"
     },
     "prompt-architect": {
-      "variant": "xhigh",
+      "variant": "max",
       "reasoningEffort": "xhigh",
       "steps": 9007199254740991,
       "permission": {
@@ -132,10 +140,11 @@
         "bash": "allow",
         "write": "allow",
         "doom_loop": "allow"
-      }
+      },
+      "model": "opencode/fledge-alpha-free"
     },
     "humanizer": {
-      "variant": "xhigh",
+      "variant": "max",
       "reasoningEffort": "xhigh",
       "steps": 9007199254740991,
       "permission": {
@@ -144,10 +153,11 @@
         "bash": "allow",
         "write": "allow",
         "doom_loop": "allow"
-      }
+      },
+      "model": "opencode/fledge-alpha-free"
     },
     "critic": {
-      "variant": "xhigh",
+      "variant": "max",
       "reasoningEffort": "xhigh",
       "steps": 9007199254740991,
       "permission": {
@@ -157,10 +167,11 @@
         "grep": "allow",
         "list": "allow",
         "lsp": "allow"
-      }
+      },
+      "model": "opencode/fledge-alpha-free"
     },
     "reviewer": {
-      "variant": "xhigh",
+      "variant": "max",
       "reasoningEffort": "xhigh",
       "steps": 9007199254740991,
       "permission": {
@@ -170,10 +181,11 @@
         "grep": "allow",
         "list": "allow",
         "lsp": "allow"
-      }
+      },
+      "model": "opencode/fledge-alpha-free"
     },
     "clerk": {
-      "variant": "xhigh",
+      "variant": "max",
       "reasoningEffort": "xhigh",
       "steps": 9007199254740991,
       "permission": {
@@ -183,10 +195,11 @@
         "grep": "allow",
         "list": "allow",
         "lsp": "allow"
-      }
+      },
+      "model": "opencode/fledge-alpha-free"
     },
     "researcher": {
-      "variant": "xhigh",
+      "variant": "max",
       "reasoningEffort": "xhigh",
       "steps": 9007199254740991,
       "permission": {
@@ -198,7 +211,9 @@
         "lsp": "allow",
         "webfetch": "allow",
         "websearch": "allow"
-      }
+      },
+      "model": "opencode/fledge-alpha-free"
     }
-  }
+  },
+  "variant": "max"
 }

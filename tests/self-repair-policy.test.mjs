@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -427,6 +427,242 @@ test("the dispatcher charges budget before the dispatch leaves, so a cancelled r
     const outcomes = later.respondToFailures([run, cancelledEcho]);
     assert.ok(outcomes.some((outcome) => outcome.reason === REPAIR_REFUSALS.BUDGET));
     assert.equal(readSelfRepairReceipts(space.receiptPath).receipts.length, 1);
+  } finally {
+    space.cleanup();
+  }
+});
+
+test("a deferred admission decision leaves the ledger byte-identical and the allowance unspent", () => {
+  const space = workspace();
+  try {
+    const calls = [];
+    const deferring = createSelfRepairDispatcher({
+      receiptPath: space.receiptPath,
+      admission: {
+        observation: () => ({ runs: [], unknownRepos: [] }),
+        dispatchGuarded: (duty) => ({ dispatch: false, reason: "OWNERSHIP_BUSY", duty }),
+      },
+      dispatchWorkflow: (workflow, target) => calls.push(`${workflow}@${target}`),
+      controlRepository: CONTROL,
+      runtimeRepository: RUNTIME,
+      owner: "fixture-owner",
+      clock: () => NOW,
+    });
+
+    const run = failedRun();
+    const readBytes = () => (existsSync(space.receiptPath) ? readFileSync(space.receiptPath, "utf8") : null);
+    const before = readBytes();
+    const outcomes = deferring.respondToFailures([run]);
+    assert.ok(outcomes.length > 0);
+    assert.ok(outcomes.every((outcome) => outcome.dispatched === false));
+    assert.equal(calls.length, 0);
+    // The deferral created no run, so it must create no receipt: the ledger
+    // file is byte-identical (still absent counts) and every refusal carries
+    // the admission gate's truthful reason rather than a budget refusal.
+    assert.equal(readBytes(), before);
+    assert.equal(readSelfRepairReceipts(space.receiptPath).receipts.length, 0);
+    assert.ok(outcomes.every((outcome) => outcome.admissionReason === "OWNERSHIP_BUSY"));
+
+    // The allowance is unspent, so the same failure is still answerable once
+    // admission re-opens.
+    const admittedCalls = [];
+    const admitted = createSelfRepairDispatcher({
+      receiptPath: space.receiptPath,
+      admission: {
+        observation: () => ({ runs: [], unknownRepos: [] }),
+        dispatchGuarded: (duty, dispatch) => {
+          dispatch();
+          return { dispatch: true, reason: "admitted" };
+        },
+      },
+      dispatchWorkflow: (workflow, target) => admittedCalls.push(`${workflow}@${target}`),
+      controlRepository: CONTROL,
+      runtimeRepository: RUNTIME,
+      owner: "fixture-owner",
+      clock: () => NOW + 60_000,
+    });
+    const next = admitted.respondToFailures([run]);
+    assert.equal(next.filter((outcome) => outcome.dispatched).length, 1);
+    assert.equal(admittedCalls.length, 1);
+    assert.equal(readSelfRepairReceipts(space.receiptPath).receipts.length, 1);
+  } finally {
+    space.cleanup();
+  }
+});
+
+test("a real dispatch appends exactly one receipt and refuses the second attempt", () => {
+  const space = workspace();
+  try {
+    const run = failedRun();
+    // Cycle 1: saturation. The gate defers, so no run exists and no receipt may.
+    const deferred = createSelfRepairDispatcher({
+      receiptPath: space.receiptPath,
+      admission: {
+        observation: () => ({ runs: [], unknownRepos: [] }),
+        dispatchGuarded: (duty) => ({ dispatch: false, reason: "OWNERSHIP_BUSY", duty }),
+      },
+      dispatchWorkflow: () => {
+        throw new Error("deferred cycle must never reach the dispatch function");
+      },
+      controlRepository: CONTROL,
+      runtimeRepository: RUNTIME,
+      owner: "fixture-owner",
+      clock: () => NOW,
+    });
+    assert.ok(deferred.respondToFailures([run]).every((outcome) => outcome.dispatched === false));
+    assert.equal(readSelfRepairReceipts(space.receiptPath).receipts.length, 0);
+
+    // Cycle 2: admission re-opens. Exactly one run is created and exactly one
+    // receipt records it.
+    const calls = [];
+    const admitted = createSelfRepairDispatcher({
+      receiptPath: space.receiptPath,
+      admission: {
+        observation: () => ({ runs: [], unknownRepos: [] }),
+        dispatchGuarded: (duty, dispatch) => {
+          dispatch();
+          return { dispatch: true, reason: "admitted" };
+        },
+      },
+      dispatchWorkflow: (workflow, target) => calls.push(`${workflow}@${target}`),
+      controlRepository: CONTROL,
+      runtimeRepository: RUNTIME,
+      owner: "fixture-owner",
+      clock: () => NOW + 60_000,
+    });
+    const second = admitted.respondToFailures([run]);
+    assert.equal(second.filter((outcome) => outcome.dispatched).length, 1);
+    assert.equal(calls.length, 1);
+    const ledger = readSelfRepairReceipts(space.receiptPath);
+    assert.equal(ledger.receipts.length, 1);
+    assert.equal(ledger.receipts[0].signature, failingSignature(run, run.repo));
+
+    // Cycle 3: the same failure is refused on budget, and the ledger is untouched.
+    const later = createSelfRepairDispatcher({
+      receiptPath: space.receiptPath,
+      admission: {
+        observation: () => ({ runs: [], unknownRepos: [] }),
+        dispatchGuarded: (duty, dispatch) => {
+          dispatch();
+          return { dispatch: true, reason: "admitted" };
+        },
+      },
+      dispatchWorkflow: (workflow, target) => calls.push(`${workflow}@${target}`),
+      controlRepository: CONTROL,
+      runtimeRepository: RUNTIME,
+      owner: "fixture-owner",
+      clock: () => NOW + 2 * 60_000,
+    });
+    const third = later.respondToFailures([run]);
+    assert.equal(third.filter((outcome) => outcome.dispatched).length, 0);
+    assert.ok(third.some((outcome) => outcome.reason === REPAIR_REFUSALS.BUDGET));
+    assert.equal(calls.length, 1);
+    assert.equal(readSelfRepairReceipts(space.receiptPath).receipts.length, 1);
+  } finally {
+    space.cleanup();
+  }
+});
+
+test("a run cancelled after its receipt keeps the budget spent without muting forever", () => {
+  const space = workspace();
+  try {
+    const run = failedRun();
+    // Cycle 1: saturation. The gate defers, so nothing is charged.
+    const deferred = createSelfRepairDispatcher({
+      receiptPath: space.receiptPath,
+      admission: {
+        observation: () => ({ runs: [], unknownRepos: [] }),
+        dispatchGuarded: (duty) => ({ dispatch: false, reason: "OWNERSHIP_BUSY", duty }),
+      },
+      dispatchWorkflow: () => {
+        throw new Error("deferred cycle must never reach the dispatch function");
+      },
+      controlRepository: CONTROL,
+      runtimeRepository: RUNTIME,
+      owner: "fixture-owner",
+      clock: () => NOW,
+    });
+    deferred.respondToFailures([run]);
+
+    // Cycle 2: admission re-opens and one repair run is genuinely created.
+    let created = 0;
+    const admitted = createSelfRepairDispatcher({
+      receiptPath: space.receiptPath,
+      admission: {
+        observation: () => ({ runs: [], unknownRepos: [] }),
+        dispatchGuarded: (duty, dispatch) => {
+          dispatch();
+          return { dispatch: true, reason: "admitted" };
+        },
+      },
+      dispatchWorkflow: () => {
+        created += 1;
+      },
+      controlRepository: CONTROL,
+      runtimeRepository: RUNTIME,
+      owner: "fixture-owner",
+      clock: () => NOW + 60_000,
+    });
+    admitted.respondToFailures([run]);
+    assert.equal(created, 1);
+    assert.equal(readSelfRepairReceipts(space.receiptPath).receipts.length, 1);
+
+    // Cycle 3: the dispatched repair run is observed cancelled. The budget stays
+    // spent (no refund) and the cancelled echo is not a fresh trigger.
+    const cancelledEcho = failedRun({
+      repo: RUNTIME,
+      id: "2001",
+      workflowFile: "improve.yml",
+      name: "fleet-improve",
+      conclusion: "cancelled",
+      createdAt: new Date(NOW + 2 * 60_000).toISOString(),
+      updatedAt: new Date(NOW + 3 * 60_000).toISOString(),
+    });
+    const afterCancel = createSelfRepairDispatcher({
+      receiptPath: space.receiptPath,
+      admission: {
+        observation: () => ({ runs: [run, cancelledEcho], unknownRepos: [] }),
+        dispatchGuarded: (duty, dispatch) => {
+          dispatch();
+          return { dispatch: true, reason: "admitted" };
+        },
+      },
+      dispatchWorkflow: () => {
+        created += 1;
+      },
+      controlRepository: CONTROL,
+      runtimeRepository: RUNTIME,
+      owner: "fixture-owner",
+      clock: () => NOW + 4 * 60_000,
+    });
+    const third = afterCancel.respondToFailures([run, cancelledEcho]);
+    assert.ok(third.every((outcome) => outcome.dispatched === false));
+    assert.ok(third.some((outcome) => outcome.reason === REPAIR_REFUSALS.BUDGET));
+    assert.equal(created, 1);
+    assert.equal(readSelfRepairReceipts(space.receiptPath).receipts.length, 1);
+
+    // Cycle 4: past the window the same signature earns a fresh allowance, so
+    // the spent budget was a window, never a permanent mute.
+    const drained = createSelfRepairDispatcher({
+      receiptPath: space.receiptPath,
+      admission: {
+        observation: () => ({ runs: [], unknownRepos: [] }),
+        dispatchGuarded: (duty, dispatch) => {
+          dispatch();
+          return { dispatch: true, reason: "admitted" };
+        },
+      },
+      dispatchWorkflow: () => {
+        created += 1;
+      },
+      controlRepository: CONTROL,
+      runtimeRepository: RUNTIME,
+      owner: "fixture-owner",
+      clock: () => NOW + WINDOW_MS + 5 * 60_000,
+    });
+    const fourth = drained.respondToFailures([run]);
+    assert.equal(fourth.filter((outcome) => outcome.dispatched).length, 1);
+    assert.equal(created, 2);
   } finally {
     space.cleanup();
   }

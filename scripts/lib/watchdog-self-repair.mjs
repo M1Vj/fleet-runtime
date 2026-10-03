@@ -7,10 +7,13 @@
  *
  *   1. A repair dispatch is only ever made through `evaluateSelfRepair`, and a
  *      refusal is never worked around.
- *   2. The receipt is written BEFORE the dispatch leaves the process, so a
- *      cancelled or crashed dispatch still has spent its signature's budget. That
- *      is what makes the cap survive cancellation: a run that never happened must
- *      not hand the same signature a fresh allowance every 15 minutes.
+  *   2. The receipt is written immediately AFTER the admission gate admits and
+  *      the dispatch function returns, and only then, so a deferred or refused
+  *      dispatch creates no run and therefore spends no budget. An admitted
+  *      dispatch still spends its signature's budget even when the run is later
+  *      cancelled or the process crashes after the receipt lands: the cap
+  *      survives cancellation because a run that happened must not hand the
+  *      same signature a fresh allowance every window.
  *   3. A ledger or occupancy observation that cannot be read refuses the dispatch.
  *      "Cannot prove there is budget" is a refusal, never an empty budget.
  *
@@ -216,10 +219,32 @@ export function createSelfRepairDispatcher({
             continue;
           }
 
-          // Charged before the dispatch leaves: a run that is cancelled, or that
-          // never starts, has still consumed this signature's single allowance.
-          // The in-memory ledger takes the charge too, or the next repair workflow
-          // for the same failure would be authorized by a budget already spent.
+          // The admission gate decides FIRST: a deferral creates no run, so it
+          // must create no receipt either. Charging a deferred repair is the
+          // phantom-receipt defect: under saturation every repair defers, every
+          // deferral burned the signature's single allowance, and self-repair
+          // muted itself while the fleet was busiest. The receipt (durable file
+          // and in-memory ledger) is written only after the gate admits and the
+          // dispatch function returns, so an admitted dispatch still spends its
+          // budget even when the run is later cancelled.
+          const guarded = admission?.dispatchGuarded
+            ? admission.dispatchGuarded(
+                { duty: `self-repair ${workflow} for ${target}`, repo: target, workflow },
+                () => dispatchWorkflow(workflow, target),
+              )
+            : { dispatch: false, reason: "no admission gate" };
+
+          if (!guarded.dispatch) {
+            audit?.note("self-repair-deferred", `${workflow} at ${target} ${guarded.reason} (not dispatched)`);
+            outcomes.push({
+              ...decision,
+              failedRun: run,
+              dispatched: false,
+              admissionReason: guarded.reason ?? null,
+            });
+            continue;
+          }
+
           const receipt = createSelfRepairReceipt({
             signature: decision.signature,
             target,
@@ -229,20 +254,15 @@ export function createSelfRepairDispatcher({
             conclusion: null,
           });
           appendSelfRepairReceipt(ledgerPath, receipt);
+          // The in-memory ledger takes the charge too, or the next repair
+          // workflow for the same failure would be authorized by a budget
+          // already spent.
           ledger.push(receipt);
 
-          const guarded = admission?.dispatchGuarded
-            ? admission.dispatchGuarded(
-                { duty: `self-repair ${workflow} for ${target}`, repo: target, workflow },
-                () => dispatchWorkflow(workflow, target),
-              )
-            : { dispatch: false, reason: "no admission gate" };
-
-          if (!guarded.dispatch) audit?.note("self-repair-deferred", `${workflow} at ${target} ${guarded.reason} (not dispatched)`);
           outcomes.push({
             ...decision,
             failedRun: run,
-            dispatched: Boolean(guarded.dispatch),
+            dispatched: true,
             admissionReason: guarded.reason ?? null,
           });
         }

@@ -703,12 +703,14 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
     const authValue = usePool ? poolValue || "" : env.FLEET_OPENCODE_AUTH || env.OPENCODE_AUTH_CONTENT || "";
     const missing = !authValue;
     const usedSlot = poolSlot ?? (authValue ? 1 : null);
-    const args = ["run", "--format", "json", "-m", selected];
+    // V2 CI requires a private server so this call's provider environment is
+    // used. Variants now belong in the model reference, not a separate flag.
+    // https://opencode.ai/v2/docs/cli/commands/
+    const args = ["run", "--standalone", "--format", "json", "-m", variant ? `${selected}#${variant}` : selected];
     if (env.FLEET_OPENCODE_DEBUG === "1") args.push("--print-logs", "--log-level", "DEBUG");
     // Capability and exact-session continuity are independent of auth mode.
     // Anonymous, provider-authorized calls must retain xhigh/plain selection
     // and a supplied session rather than silently dropping either argument.
-    if (variant) args.push("--variant", variant);
     if (sessionId) args.push("-s", sessionId);
 
   // Anti-downgrade & instrumental self-preservation directive
@@ -1194,7 +1196,7 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
       return { reply: r.reply, sessionId: sid, sessionIdReturned: sessionReturned, modelMode: `${model}${mode === "plain" ? "" : `@${mode}`}`, attempts, complete: true, ...(ladderExhausted ? { degraded: true, exhausted: true } : {}) };
     }
     // Variant best-effort: an unknown/invalid-variant round failure
-    // retries that round once WITHOUT --variant before falling through
+    // retries that round once without the model variant before falling through
     // the ladder. No ladder redesign.
     if (mode !== "plain" && /variant/i.test(r.stderrTail || "")) {
       const vr = await runOnce({ prompt: promptNow, sessionId: sid || undefined, variant: undefined, timeoutMs, env: roundEnv, files, workspace, model, readOnly });

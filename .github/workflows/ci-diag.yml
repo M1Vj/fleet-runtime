@@ -33,7 +33,7 @@ jobs:
           node-version: "20"
           package-manager-cache: false
       - name: install opencode
-        run: npm install -g opencode-ai@1.18.33
+        run: npm install -g @opencode/cli@2.0.26
       - name: environment facts
         run: |
           uname -a

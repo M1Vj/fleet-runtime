@@ -178,7 +178,9 @@ test("anonymous provider-authorized calls preserve variant and exact session arg
   });
   assert.equal(r.reply, "hello-test");
   const args = await lastArgs(capture);
-  assert.equal(args[args.indexOf("--variant") + 1], "xhigh");
+  assert.equal(args[args.indexOf("-m") + 1], `${PRIMARY_MODEL}#xhigh`);
+  assert.equal(args.includes("--variant"), false, "V2 rejects the removed variant flag");
+  assert.equal(args.includes("--standalone"), true, "CI provider settings must reach the private server");
   assert.equal(args[args.indexOf("-s") + 1], "sess-anonymous-1");
 });
 

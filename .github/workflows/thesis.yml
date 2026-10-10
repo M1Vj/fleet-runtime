@@ -23,7 +23,7 @@ env:
 
 jobs:
   survey:
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -93,7 +93,7 @@ jobs:
 
   draft:
     needs: survey
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 75
     steps:
@@ -169,7 +169,7 @@ jobs:
 
   refine:
     needs: [survey, draft]
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' && needs.draft.result == 'success' }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' && needs.draft.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 75
     steps:
@@ -245,7 +245,7 @@ jobs:
 
   ship:
     needs: [draft, refine]
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' && always() && needs.draft.result == 'success' }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' && always() && needs.draft.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

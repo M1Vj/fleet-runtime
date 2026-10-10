@@ -23,7 +23,7 @@ env:
 
 jobs:
   inventory:
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -93,7 +93,7 @@ jobs:
 
   synthesize:
     needs: inventory
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 75
     steps:
@@ -169,7 +169,7 @@ jobs:
 
   ship:
     needs: [inventory, synthesize]
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' && needs.synthesize.result == 'success' }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' && needs.synthesize.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 75
     steps:
@@ -245,7 +245,7 @@ jobs:
 
   deliver:
     needs: [synthesize, ship]
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' && always() && needs.synthesize.result == 'success' }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' && always() && needs.synthesize.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

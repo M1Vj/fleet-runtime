@@ -37,7 +37,7 @@ env:
 
 jobs:
   plan:
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -110,7 +110,7 @@ jobs:
 
   execute:
     needs: plan
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
     strategy:
       fail-fast: false
       max-parallel: 15

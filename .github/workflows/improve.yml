@@ -28,7 +28,7 @@ env:
 
 jobs:
   pick:
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -97,7 +97,7 @@ jobs:
 
   research:
     needs: pick
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -173,7 +173,7 @@ jobs:
 
   plan:
     needs: [pick, research]
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     outputs:
@@ -255,7 +255,7 @@ jobs:
 
   implement:
     needs: plan
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' && needs.plan.result == 'success' && needs.plan.outputs.hasanalysis == 'true' }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' && needs.plan.result == 'success' && needs.plan.outputs.hasanalysis == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
@@ -331,7 +331,7 @@ jobs:
 
   review:
     needs: [plan, implement]
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' && always() && needs.plan.result == 'success' && needs.plan.outputs.hasanalysis == 'true' }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' && always() && needs.plan.result == 'success' && needs.plan.outputs.hasanalysis == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -416,7 +416,7 @@ jobs:
 
   finalize:
     needs: [pick, research, plan, implement, review]
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' && always() }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' && always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

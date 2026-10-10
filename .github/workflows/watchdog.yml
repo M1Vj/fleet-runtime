@@ -23,7 +23,7 @@ env:
 
 jobs:
   watchdog:
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 6
     steps:

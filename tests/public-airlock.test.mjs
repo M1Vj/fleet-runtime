@@ -153,7 +153,7 @@ function workflowJobBlocks(text) {
   return blocks;
 }
 
-const PUBLIC_ACTIVATION_GATE = /(?:^|\n)\s{4}if:\s*(?:\$\{\{\s*)?vars\.FLEET_PUBLIC_ACTIVATED\s*==\s*['"]true['"]/;
+const PUBLIC_ACTIVATION_GATE = /(?:^|\n)\s{4}if:\s*(?:\$\{\{\s*)?vars\.FLEET_GITHUB_HOSTED_ALLOWED\s*==\s*['"]true['"]\s*&&\s*vars\.FLEET_PUBLIC_ACTIVATED\s*==\s*['"]true['"]/;
 
 function publicTargetDecision(metadata, allowedOwners = ["M1Vj"]) {
   if (!metadata || typeof metadata !== "object") return { ok: false, reason: "missing-metadata" };
@@ -718,7 +718,7 @@ test("ci-diag remains public-only and does not grow privileged inputs", () => {
   assert.match(text, /permissions:\s*\n\s+contents:\s+read/);
 });
 
-test("every operational public job is activation-gated while ci-diag remains active", () => {
+test("every operational public job retains activation behind hosted-cost opt-in", () => {
   const operationalWorkflows = WORKFLOW_FILES.filter((name) => name !== "ci-diag.yml" && name !== "emergency-stop.yml");
   assert.equal(operationalWorkflows.length, 11, "the public airlock has eleven activation-gated work-progress workflows");
   for (const name of operationalWorkflows) {
@@ -736,7 +736,7 @@ test("every operational public job is activation-gated while ci-diag remains act
   assert.equal(String("false") === "true", false, "an unset/false activation value blocks operations");
 });
 
-test("ci-diag and emergency-stop remain available before activation", () => {
+test("ci-diag and emergency-stop require cost opt-in but not public activation", () => {
   for (const name of ["ci-diag.yml", "emergency-stop.yml"]) {
     for (const job of workflowJobBlocks(workflowText(name))) assert.doesNotMatch(job, /FLEET_PUBLIC_ACTIVATED/);
   }

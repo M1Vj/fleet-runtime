@@ -111,6 +111,8 @@ test("opencode.json defines all 14 agent roles with strict permission bounds in 
   const opencodePath = path.resolve("opencode.json");
   const config = JSON.parse(fs.readFileSync(opencodePath, "utf8"));
   assert.ok(config.agent, "agent configuration exists");
+  assert.equal(config.model, "opencode/muse-spark-1.3-contributor-free#xhigh");
+  assert.equal(config.small_model, config.model);
 
   const expectedRoles = [
     "implementer",
@@ -131,6 +133,8 @@ test("opencode.json defines all 14 agent roles with strict permission bounds in 
 
   for (const role of expectedRoles) {
     assert.ok(config.agent[role], `role ${role} must be defined in opencode.json`);
+    assert.equal(config.agent[role].model, config.model.split("#")[0], `role ${role} uses the exact owner-selected model`);
+    assert.equal(config.agent[role].variant, "xhigh");
     assert.ok(Number.isInteger(config.agent[role].steps), `role ${role} must define integer step budget`);
     assert.ok(config.agent[role].steps >= 20, `role ${role} steps budget must be >= 20`);
   }

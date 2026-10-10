@@ -36,8 +36,11 @@ function signalReadEnv(env) {
 }
 
 function parseSignal(result, variable) {
-  if (Number(result?.status) !== 0) {
-    throw new KillSwitchError(2, "KILL_SWITCH_SIGNAL_UNAVAILABLE");
+  if (result?.status !== 0) {
+    const detail = result?.error?.code === "ETIMEDOUT"
+      ? "timeout"
+      : /HTTP \d{3}/.exec(String(result?.stderr || ""))?.[0] || "read failed";
+    throw new KillSwitchError(2, "KILL_SWITCH_SIGNAL_UNAVAILABLE", detail);
   }
   let payload;
   try {
@@ -138,7 +141,9 @@ export function assertKillSwitchClear(env = process.env, {
       env: signalReadEnv(env),
       encoding: "utf8",
       maxBuffer: 64 * 1024,
-      timeout: 5000,
+      // VM startup and swap pressure can delay an otherwise valid read beyond
+      // five seconds. Keep it bounded and fail closed on every unreadable reply.
+      timeout: 15000,
       killSignal: "SIGTERM",
     });
   } catch {

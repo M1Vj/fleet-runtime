@@ -135,6 +135,7 @@ test("opencode.json defines all 14 agent roles with strict permission bounds in 
     assert.ok(config.agent[role], `role ${role} must be defined in opencode.json`);
     assert.equal(config.agent[role].model, config.model.split("#")[0], `role ${role} uses the exact owner-selected model`);
     assert.equal(config.agent[role].variant, "xhigh");
+    assert.equal(config.agent[role].mode, "all", `role ${role} remains available for direct runs and bounded delegation in V2`);
     assert.ok(Number.isInteger(config.agent[role].steps), `role ${role} must define integer step budget`);
     assert.ok(config.agent[role].steps >= 20, `role ${role} steps budget must be >= 20`);
   }

@@ -850,6 +850,7 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
       const nativeKey = childEnv.OPENCODE_API_KEY;
       if (typeof nativeKey === "string" && nativeKey) safeStderr = safeStderr.split(nativeKey).join("[redacted]");
       const tail = safeStderr.slice(-400);
+      const providerAccessDenied = /OpenCode['’]s free tier can only be used from within OpenCode/i.test(safeStderr);
       const sessionNotFound = /session.*not found/i.test(`${stderr} ${stdout}`);
       // Pool bookkeeping: success clears the slot; auth/quota-class failures
       // cool it down so the next call rotates. Mid-run transport failures
@@ -860,7 +861,7 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
       // classification): stderr-text 429 evidence is rate_limited ONLY — a
       // short model-level cooldown, NEVER a slot-level quota cooldown.
       // Text-only unknown failures likewise cool only the model entry.
-      const failureClass = classifyFailure(tail);
+      const failureClass = providerAccessDenied ? "provider_access_denied" : classifyFailure(tail);
       try {
         recordModelOutcome(selected, {
           ok: !timedOut && (code ?? -1) === 0 && Boolean(reply),
@@ -907,6 +908,7 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
         model: selected,
         slot: usedSlot,
         sessionNotFound,
+        ...(providerAccessDenied ? { blocked: true, providerAccessDenied: true, reason: "provider_access_denied", surfaced: true, complete: false } : {}),
         ...(exhaustedDegraded ? { exhausted: true, degraded: true, total: exhaustedTotal } : {}),
       });
     });
@@ -1061,6 +1063,13 @@ export async function askModel({ prompt, sessionId, timeoutMs = MODEL_TIMEOUTS.s
     allAttempts.push(...(r.attempts || []));
     lastSid = r.sessionId || "";
     lastMode = r.modelMode || lastMode;
+    // Access policy is terminal across models and credentials, not capacity
+    // exhaustion. Preserve the denial rather than attempting another route.
+    if (r.providerAccessDenied) {
+      try { saveModelMetricsSnapshot(stateRoot); } catch {}
+      logModelAudit(stateRoot, { event: "provider_access_blocked", model: chain[ci], attempts: allAttempts.length });
+      return { ...r, sessionId: lastSid, attempts: allAttempts, complete: false };
+    }
     // Preserve a surfaced credential/quota wait across the chain boundary.
     // Once an authenticated route is capacity-limited, never continue to a
     // later anonymous or otherwise unauthorized attempt; callers must receive
@@ -1152,7 +1161,7 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
     }
     const roundEnv = useAuth ? env : stripAuth(env);
     let r = await runOnce({ prompt: promptNow, sessionId: sid || undefined, variant: mode === "plain" ? undefined : mode, timeoutMs, env: roundEnv, files, workspace, model, readOnly });
-    if (sid && (r.sessionNotFound || /session.*not found/i.test(`${r.stderrTail || ""} ${r.rawTail || ""}`))) {
+    if (!r.providerAccessDenied && sid && (r.sessionNotFound || /session.*not found/i.test(`${r.stderrTail || ""} ${r.rawTail || ""}`))) {
       logModelAudit(stateRoot, { event: "session_not_found_cleared", staleSessionId: sid, model, round });
       attempts.push({
         round,
@@ -1191,6 +1200,9 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
     };
     attempts.push(att);
     logModelAudit(stateRoot, { event: "round_attempt", ...att });
+    if (r.providerAccessDenied) {
+      return { ...r, sessionId: r.sessionId || sid || "", attempts, modelMode: "provider-access-blocked", complete: false };
+    }
     if (r.waitingForCapacity || r.waitingForQuota) {
       return { ...r, sessionId: r.sessionId || sid || "", attempts, modelMode: "waiting_for_capacity", complete: false };
     }
@@ -1233,9 +1245,13 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
         hadSession: Boolean(vr.sessionId),
         sessionReturned: vr.sessionIdReturned === true,
         errTail: (vr.stderrTail || "").slice(-160),
+        errHead: (vr.stderrHead || "").slice(0, 400),
         rawTail: (vr.rawTail || "").slice(-300),
         variantRetry: true,
       });
+      if (vr.providerAccessDenied) {
+        return { ...vr, sessionId: vr.sessionId || sid || "", attempts, modelMode: "provider-access-blocked", complete: false };
+      }
       const vrClass = classifyFailure(`${vr.stderrTail || ""} ${vr.rawTail || ""}`);
       // HEAD parity: same authenticated text-only 429 rule on variant retry.
       if (startedAuthenticated && (vrClass === "auth" || vrClass === "quota" || vrClass === "rate_limited")) {
@@ -1275,7 +1291,7 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
 
 export async function askModelResilient(opts) {
   const first = await askModel(opts);
-  if (first.complete) return { ...first, ladders: 1 };
+  if (first.complete || first.providerAccessDenied) return { ...first, ladders: 1 };
   const longForm = Boolean(opts.longForm) || (opts.timeoutMs || 0) >= MODEL_TIMEOUTS.long;
   const cooldownMs = opts.cooldownMs ?? (longForm ? CHAIN_RETRY_COOLDOWN_LONG_MS : CHAIN_RETRY_COOLDOWN_MS);
   await new Promise((r) => setTimeout(r, cooldownMs));

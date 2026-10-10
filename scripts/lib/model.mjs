@@ -844,7 +844,12 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
         reply = tail.slice(-4000);
       }
       const rawTailSrc = stdout.split("\n").filter(Boolean).slice(-8).join("\n").slice(-1200);
-      const tail = scrubTail(stderr).slice(-400);
+      let safeStderr = scrubTail(stderr);
+      // The selected native key may not have a recognizable token prefix.
+      // Redact its exact value before retaining either diagnostic boundary.
+      const nativeKey = childEnv.OPENCODE_API_KEY;
+      if (typeof nativeKey === "string" && nativeKey) safeStderr = safeStderr.split(nativeKey).join("[redacted]");
+      const tail = safeStderr.slice(-400);
       const sessionNotFound = /session.*not found/i.test(`${stderr} ${stdout}`);
       // Pool bookkeeping: success clears the slot; auth/quota-class failures
       // cool it down so the next call rotates. Mid-run transport failures
@@ -895,6 +900,7 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
         exitCode: code ?? -1,
         interrupted: timedOut,
         stderrTail: tail,
+        stderrHead: safeStderr.slice(0, 400),
         rawTail: scrubTail(rawTailSrc).slice(-1200),
         spawnFailed: false,
         authMissing: missing,
@@ -1179,6 +1185,7 @@ async function askOnModel({ model, isPrimary, prompt, sessionId, timeoutMs, env,
       hadSession: Boolean(r.sessionId),
       sessionReturned: r.sessionIdReturned === true,
       errTail: (r.stderrTail || "").slice(-160),
+      errHead: (r.stderrHead || "").slice(0, 400),
       rawTail: (r.rawTail || "").slice(-300),
       sessionNotFound: r.sessionNotFound === true,
     };

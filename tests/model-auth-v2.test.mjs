@@ -44,3 +44,24 @@ console.log(JSON.stringify({ text: correct && !leaked ? "ready" : "credential un
     assert.equal(anonymous.reply, "credential unavailable");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('native crash diagnostics retain the redacted cause before a long stack', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'fleet-v2-error-'));
+  try {
+    const bin = path.join(root, 'opencode');
+    writeFileSync(bin, `#!/usr/bin/env node
+process.stderr.write('ConfigError: rejected schema; credential=' + process.env.OPENCODE_API_KEY + '\\n' + '    at nativeFrame()\\n'.repeat(100));
+process.exitCode = 1;
+`);
+    chmodSync(bin, 0o755);
+    const result = await runOnce({ prompt: 'diagnostic fixture', workspace: root, env: {
+      PATH: `${root}:${process.env.PATH}`, HOME: root, FLEET_STATE_ROOT: root,
+      FLEET_INDEFINITE_DISABLE: '1',
+      FLEET_OPENCODE_AUTH: JSON.stringify({opencode:{type:'api',key:'opaque-fixture-value'}}),
+    }});
+    assert.match(result.stderrHead, /ConfigError: rejected schema/);
+    assert.doesNotMatch(result.stderrHead, /opaque-fixture-value/);
+    assert.ok(result.stderrHead.length <= 400);
+    assert.match(result.stderrTail, /nativeFrame/);
+  } finally { rmSync(root, { recursive:true, force:true }); }
+});

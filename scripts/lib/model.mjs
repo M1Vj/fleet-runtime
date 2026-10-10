@@ -757,6 +757,18 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
     delete childEnv.GDRIVE_CLIENT_SECRET;
     stripSlotKeys(childEnv);
     childEnv.OPENCODE_AUTH_CONTENT = authValue;
+    // V2 reads the Zen API credential from its native environment rather than
+    // the V1 auth-content override. Preserve slot selection and never forward
+    // an ambient API key or credentials for an unrelated provider.
+    // https://github.com/anomalyco/opencode/blob/v2/packages/core/src/plugin/provider/opencode.ts
+    if (selected.startsWith("opencode/")) {
+      try {
+        const credential = JSON.parse(authValue)?.opencode;
+        if (credential?.type === "api" && typeof credential.key === "string" && credential.key.trim()) {
+          childEnv.OPENCODE_API_KEY = credential.key;
+        }
+      } catch {}
+    }
     if (childEnv.OPENCODE_MODELS_URL && (childEnv.OPENCODE_MODELS_URL.startsWith("file:") || childEnv.OPENCODE_MODELS_URL.endsWith(".json"))) {
       delete childEnv.OPENCODE_MODELS_URL;
     }

@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
+import {mkdtempSync, writeFileSync, chmodSync, rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';
 
 import {
   CENTRAL_KILL_SWITCH_VARIABLE,
@@ -18,6 +20,37 @@ const centralEnv = (extra = {}) => ({
   FLEET_KILL_SWITCH_VARIABLE: CENTRAL_KILL_SWITCH_VARIABLE,
   FLEET_GH_TOKEN: "token-redacted",
   ...extra,
+});
+
+test('slow clear and engaged central signals retain their actual disposition', () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'fleet-slow-kill-signal-'));
+  try {
+    const gh = path.join(root, 'gh');
+    const env = centralEnv({PATH:`${root}:${process.env.PATH}`,HOME:root});
+    for (const value of ['clear','engaged']) {
+      writeFileSync(gh, `#!/usr/bin/env node\nsetTimeout(()=>console.log(JSON.stringify({name:'FLEET_KILL_SWITCH',value:${JSON.stringify(value)}})),6000);\n`);
+      chmodSync(gh, 0o755);
+      if (value === 'clear') assert.equal(assertKillSwitchClear(env), true);
+      else assert.throws(()=>assertKillSwitchClear(env), e=>e.reason==='KILL_SWITCH_ENGAGED');
+    }
+  } finally { rmSync(root,{recursive:true,force:true}); }
+});
+
+test('kill signal reads keep a fixed bounded deadline and fail closed on timeout', () => {
+  let observedTimeout;
+  assert.throws(()=>assertKillSwitchClear(centralEnv(), {
+    run: (_bin,_args,options) => {
+      observedTimeout = options.timeout;
+      return {status:null,stdout:''};
+    },
+  }), e=>e.reason==='KILL_SWITCH_SIGNAL_UNAVAILABLE');
+  assert.equal(observedTimeout,15000);
+});
+
+test('an interrupted central read cannot authorize from partial stdout', () => {
+  assert.throws(()=>assertKillSwitchClear(centralEnv(), {
+    run:fakeGh({status:null,stdout:JSON.stringify({name:CENTRAL_KILL_SWITCH_VARIABLE,value:'clear'})}),
+  }),e=>e.reason==='KILL_SWITCH_SIGNAL_UNAVAILABLE');
 });
 
 test("central kill-switch signal blocks a mutation when the repository variable is present", () => {

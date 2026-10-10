@@ -48,6 +48,10 @@ function task(repo, kind, status = "pending") {
 
 test("patrol fails closed when model work or directive validation is incomplete", () => {
   assert.throws(
+    () => requirePatrolModelResult({ complete: false, providerAccessDenied: true }),
+    (error) => error?.code === 6 && error?.reason === "PROVIDER_ACCESS_DENIED",
+  );
+  assert.throws(
     () => requirePatrolModelResult({ complete: false, reply: "", modelMode: "waiting_for_capacity" }),
     (error) => error?.code === 6 && error?.reason === "MODEL_UNAVAILABLE",
   );

@@ -58,6 +58,12 @@ export function patrolFailureReason(error, env = process.env) {
 }
 
 export function requirePatrolModelResult(modelResult) {
+  if (modelResult?.providerAccessDenied) {
+    throw Object.assign(new Error("provider access denied; supported route required"), {
+      code: 6,
+      reason: "PROVIDER_ACCESS_DENIED",
+    });
+  }
   if (!modelResult?.complete || !modelResult?.reply) {
     throw Object.assign(new Error("MODEL_UNAVAILABLE after resume attempts"), {
       code: 6,

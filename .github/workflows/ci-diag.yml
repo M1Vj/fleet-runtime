@@ -16,6 +16,7 @@ concurrency:
 
 jobs:
   diag:
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:

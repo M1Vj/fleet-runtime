@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   plan:
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -106,7 +106,7 @@ jobs:
 
   analyze:
     needs: plan
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
@@ -199,7 +199,7 @@ jobs:
 
   commit:
     needs: [plan, analyze]
-    if: ${{ vars.FLEET_PUBLIC_ACTIVATED == 'true' && always() }}
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' && vars.FLEET_PUBLIC_ACTIVATED == 'true' && always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 8
     env:

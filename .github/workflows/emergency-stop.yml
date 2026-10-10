@@ -15,6 +15,7 @@ permissions:
 
 jobs:
   stop:
+    if: ${{ vars.FLEET_GITHUB_HOSTED_ALLOWED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 6
     env:

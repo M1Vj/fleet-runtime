@@ -67,6 +67,12 @@ const MAX_DIFF_CHARS = 48_000;
 const MAX_METADATA_CHARS = 16_000;
 const MAX_ANALYSIS_CHARS = 12_000;
 const MAX_STATE_FILE_BYTES = 1_024 * 1_024;
+// The shared admission ledger (`ledger.jsonl`) is a lifetime audit journal:
+// patrol, watchdog and orchestrate append to it forever and no compaction is
+// authorized, so it can outgrow the snapshot budget. Ledger reads carry a
+// larger, still-finite budget instead; a runaway journal keeps failing closed
+// beyond it and every other state file keeps the tighter snapshot bound.
+const MAX_LEDGER_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_HISTORY_ROWS = 10_000;
 const MAX_REVIEW_REPLY_CHARS = 96_000;
 const MAX_REVIEW_FINDINGS = 25;
@@ -705,7 +711,7 @@ function unlinkDurable(filePath, expectedMetadata) {
   return true;
 }
 
-function readBoundedFile(filePath) {
+function readBoundedFile(filePath, maximumBytes = MAX_STATE_FILE_BYTES) {
   // These files include lifetime receipts.  A prefix or tail is not a valid
   // snapshot because either can hide the current state of an older work key.
   // Reject oversize input before reading it instead of silently truncating it.
@@ -713,18 +719,18 @@ function readBoundedFile(filePath) {
     requireNoFollow();
     const metadata = lstatSync(filePath);
     if (metadata.isSymbolicLink() || !metadata.isFile()) throw stateReadError("unreadable", filePath);
-    if (metadata.size > MAX_STATE_FILE_BYTES) throw stateReadError("oversize", filePath);
+    if (metadata.size > maximumBytes) throw stateReadError("oversize", filePath);
     const fd = openSync(filePath, SAFE_READ_FLAGS);
     let data;
     try {
       const stats = fstatSync(fd);
       if (!stats.isFile()) throw stateReadError("unreadable", filePath);
-      if (stats.size > MAX_STATE_FILE_BYTES) throw stateReadError("oversize", filePath);
+      if (stats.size > maximumBytes) throw stateReadError("oversize", filePath);
       data = readFileSync(fd);
     } finally {
       try { closeSync(fd); } catch {}
     }
-    if (data.length > MAX_STATE_FILE_BYTES) throw stateReadError("oversize", filePath);
+    if (data.length > maximumBytes) throw stateReadError("oversize", filePath);
     const text = data.toString("utf8");
     if (Buffer.byteLength(text, "utf8") !== data.length) throw stateReadError("invalid", filePath);
     return text;
@@ -745,9 +751,21 @@ function parseStateJson(raw, filePath) {
   }
 }
 
+/**
+ * Read budget for one state file.  `ledger.jsonl` is the shared admission
+ * ledger -- a lifetime audit journal appended to forever by patrol, watchdog
+ * and orchestrate with no authorized compaction -- so it replays under a
+ * larger, still-finite budget. Every
+ * other file, including every other durable journal, keeps the original
+ * snapshot budget and its existing fail-closed ceiling.
+ */
+function stateJournalBudget(filePath) {
+  return path.basename(filePath) === "ledger.jsonl" ? MAX_LEDGER_FILE_BYTES : MAX_STATE_FILE_BYTES;
+}
+
 function parseStateFile(filePath) {
   if (filePath.endsWith(".jsonl")) {
-    return parseJsonlBounded(filePath).slice(-MAX_HISTORY_ROWS);
+    return parseJsonlBounded(filePath, Number.POSITIVE_INFINITY, stateJournalBudget(filePath)).slice(-MAX_HISTORY_ROWS);
   }
   return historyRows(parseStateJson(readBoundedFile(filePath), filePath));
 }
@@ -774,11 +792,13 @@ export function orchestrationStatePaths(stateRoot) {
   return paths ? { ...paths } : null;
 }
 
-function parseJsonlBounded(filePath, maximumRows = Number.POSITIVE_INFINITY) {
+function parseJsonlBounded(filePath, maximumRows = Number.POSITIVE_INFINITY, maximumBytes = MAX_STATE_FILE_BYTES) {
   // Parse every complete row before applying any presentation bound.  Durable
   // journals use the default unbounded row count so latestRecords can retain
-  // receipts that have not changed in many scheduling cycles.
-  const raw = readBoundedFile(filePath);
+  // receipts that have not changed in many scheduling cycles.  The byte budget
+  // is passed through to readBoundedFile so a lifetime ledger journal can
+  // outgrow the snapshot budget while oversize input still fails closed.
+  const raw = readBoundedFile(filePath, maximumBytes);
   if (raw === null) return [];
   if (!raw.trim()) throw stateReadError("empty", filePath);
   const rows = [];

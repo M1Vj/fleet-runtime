@@ -6,6 +6,7 @@ import path from "node:path";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import * as orchestrate from "../scripts/orchestrate.mjs";
 import { buildFleetPlan } from "../scripts/lib/fleet-scheduler.mjs";
+import { loadLedger } from "../scripts/lib/ledger.mjs";
 
 const {
   validateTrigger,
@@ -15,6 +16,7 @@ const {
   stableWorkKey,
   stableEffectKey,
   loadOrchestrationState,
+  loadSchedulingState,
   applyEffectReceipt,
   canTransition,
   transitionWorkState,
@@ -803,6 +805,135 @@ test("rejects a symlinked lifetime journal instead of reading or appending throu
       "lifetime state must not follow a symlink",
     );
     assert.equal(readFileSync(external, "utf8"), `${JSON.stringify({ workKey: "external-work", state: "completed" })}\n`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The shared admission ledger is a lifetime audit journal that patrol, watchdog
+// and orchestrate all append to forever; no compaction is authorized.  The
+// 2026-10-17 control run failed with ORCHESTRATE_FAILED because a valid
+// ledger.jsonl (1,267,547 bytes) outgrew the 1 MiB snapshot budget, so ledger
+// journals carry a larger still-finite budget while every other guard holds.
+test("replays a valid admission ledger larger than the state snapshot budget", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-ledger-grow-"));
+  const stateDir = path.join(root, "state");
+  mkdirSync(stateDir, { recursive: true });
+  const ledgerPath = path.join(stateDir, "ledger.jsonl");
+  const ledgerRow = (index, overrides = {}) => JSON.stringify({
+    k: `row-${String(index).padStart(5, "0")}-${"a".repeat(56)}`,
+    t: "2026-09-01T00:00:00.000Z",
+    admission: true,
+    duty: `scheduled-scan-${index}`,
+    cycle: "scan",
+    decision: "defer",
+    reasonCode: "runner-occupied",
+    ...overrides,
+  });
+  const lines = [ledgerRow(0, { decision: "dispatch", duty: "first-scan" })];
+  let bytes = Buffer.byteLength(lines[0]) + 1;
+  let filler = 1;
+  while (bytes <= 1024 * 1024) {
+    const line = ledgerRow(filler++);
+    lines.push(line);
+    bytes += Buffer.byteLength(line) + 1;
+  }
+  const latestLine = ledgerRow(filler, { decision: "dispatch", duty: "latest-scan" });
+  lines.push(latestLine);
+  const journal = `${lines.join("\n")}\n`;
+  writeFileSync(ledgerPath, journal);
+  try {
+    assert.ok(Buffer.byteLength(journal) > 1024 * 1024, "fixture must exceed the old 1 MiB snapshot budget");
+    assert.ok(Buffer.byteLength(journal) <= 16 * 1024 * 1024, "fixture must stay inside the journal budget");
+    const state = loadSchedulingState(root);
+    assert.equal(state.history.length, lines.length, "every ledger row must replay, not just a prefix or tail");
+    assert.deepEqual(state.history[0], JSON.parse(lines[0]), "the oldest receipt must survive the replay");
+    assert.deepEqual(state.history.at(-1), JSON.parse(latestLine), "the newest receipt must survive the replay");
+    const seen = loadLedger(ledgerPath);
+    assert.equal(seen.size, lines.length, "all lifetime keys stay visible to admission dedupe");
+    assert.ok(seen.has(JSON.parse(lines[0]).k) && seen.has(JSON.parse(latestLine).k));
+    assert.equal(readFileSync(ledgerPath, "utf8"), journal, "a replay must never rewrite or truncate the ledger");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("still rejects a ledger journal beyond its own finite budget instead of truncating", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-ledger-overflow-"));
+  const stateDir = path.join(root, "state");
+  mkdirSync(stateDir, { recursive: true });
+  const ledgerPath = path.join(stateDir, "ledger.jsonl");
+  const line = `${JSON.stringify({
+    k: "a".repeat(64),
+    t: "2026-09-01T00:00:00.000Z",
+    admission: true,
+    duty: "x".repeat(1024),
+  })}\n`;
+  const journal = line.repeat(Math.floor((16 * 1024 * 1024) / Buffer.byteLength(line)) + 1);
+  writeFileSync(ledgerPath, journal);
+  try {
+    assert.ok(Buffer.byteLength(journal) > 16 * 1024 * 1024, "fixture must exceed the journal budget");
+    assert.throws(
+      () => loadSchedulingState(root),
+      /state journal exceeds size limit: ledger\.jsonl/,
+      "the larger ledger budget must still fail closed beyond a finite ceiling",
+    );
+    assert.equal(readFileSync(ledgerPath, "utf8"), journal, "oversize input must be rejected, never truncated");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("still rejects an invalid ledger row under the larger ledger budget", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-ledger-invalid-"));
+  const stateDir = path.join(root, "state");
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(path.join(stateDir, "ledger.jsonl"), [
+    JSON.stringify({ k: "a".repeat(64), t: "2026-09-01T00:00:00.000Z", admission: true, duty: "scan" }),
+    "not-json",
+    "",
+  ].join("\n") + "\n");
+  try {
+    assert.throws(
+      () => loadSchedulingState(root),
+      /state journal record invalid: ledger\.jsonl:2/,
+      "strict parsing must hold at any ledger size",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("still refuses a symlinked ledger instead of reading through it", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-ledger-symlink-"));
+  const stateDir = path.join(root, "state");
+  const external = path.join(root, "external-ledger.jsonl");
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(external, `${JSON.stringify({ k: "external-key", t: "2026-09-01T00:00:00.000Z" })}\n`);
+  symlinkSync(external, path.join(stateDir, "ledger.jsonl"));
+  try {
+    assert.throws(
+      () => loadSchedulingState(root),
+      /state file unreadable|symlink|regular file/i,
+      "the ledger must not be read or appended through a symlink",
+    );
+    assert.equal(readFileSync(external, "utf8"), `${JSON.stringify({ k: "external-key", t: "2026-09-01T00:00:00.000Z" })}\n`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("keeps the original finite budget for state snapshot files", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "fleet-orch-snapshot-budget-"));
+  const stateDir = path.join(root, "state");
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(path.join(stateDir, "orchestrate-desired.json"), JSON.stringify({ desired: "x".repeat(1024 * 1024) }));
+  try {
+    assert.throws(
+      () => loadOrchestrationState(root),
+      /state (?:journal|file) (?:exceeds|too large|oversize)/i,
+      "only journals may outgrow the snapshot budget; snapshots stay bounded",
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

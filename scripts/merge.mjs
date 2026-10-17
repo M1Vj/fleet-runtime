@@ -12,6 +12,7 @@ import { verifyCommit } from "./lib/verify.mjs";
 import { findSuperseded, isStale } from "./lib/pr-hygiene.mjs";
 import { verifyPullAuthor, verifyCommentAuthor } from "./lib/verify.mjs";
 import { recordHumanReview, reconcileHumanReviewQueue, tagPrNeedsHumanReview } from "./lib/human-review.mjs";
+import { createMergeWorkflowTelemetry } from "./lib/workflow-telemetry.mjs";
 import {
   isPublicDataClass,
   publicRepository,
@@ -837,6 +838,10 @@ export async function discoverFleetPRs(limit = process.env.FLEET_MERGE_SCAN_CAP 
 }
 
 async function main() {
+  // Scan children keep raw stdout/stderr captured. Only the new allowlisted
+  // terminal notice uses FD 3, which the parent connects to its stdout.
+  const telemetry = createMergeWorkflowTelemetry(process.env.FLEET_TELEMETRY_FD);
+  telemetry.phase("preflight");
   const runId = `merge-${Date.now()}`;
   const audit = new AuditBuffer(scrub(process.env));
   const executionTerminal = makeExecutionTerminal(process.env, STATE_ROOT, { lane: "merge" });
@@ -859,6 +864,7 @@ async function main() {
       }, { kind: "merge", status: "blocked", repository, runId });
       writeExecutionAudit(audit, process.env, REPO_ROOT, runId, `Merge gate ${repository}`, "blocked");
       console.log("MERGE_TERMINAL_STATE=BLOCKED");
+      telemetry.terminal("BLOCKED", "public-read-only");
       return 4;
     }
   if (process.env.FLEET_GH_TOKEN) {
@@ -887,6 +893,8 @@ async function main() {
     }
     mkdirSync(AUDIT_DIR, { recursive: true });
     let scanExitCode = 0;
+    let childNotices = 0;
+    telemetry.phase("children");
     for (const item of queue) {
       try {
         const { spawnSync } = await import("node:child_process");
@@ -895,10 +903,14 @@ async function main() {
         const res = spawnSync("node", [scriptPath], {
           encoding: "utf8",
           timeout: 3600000,
+          stdio: ["ignore", "pipe", "pipe", 1],
           env: {
             ...process.env,
             FLEET_TARGET_REPO: item.repo,
             FLEET_PR_NUMBER: String(item.number),
+            // Parent emits seven notices at most; reserve three child slots
+            // within GitHub's ten-notice-per-step limit, even for a larger scan.
+            FLEET_TELEMETRY_FD: childNotices++ < 3 ? "3" : "off",
           },
         });
         audit.note("child", `${item.repo}#${item.number} exit=${res.status}`);
@@ -913,6 +925,7 @@ async function main() {
         scanExitCode = 1;
       }
     }
+    telemetry.end(scanExitCode === 0 ? "none" : "child-failed");
     try {
       const reconciledCount = await reconcileHumanReviewQueue(STATE_ROOT, process.env);
       audit.note("human-review-reconcile", `reconciled ${reconciledCount} human review items`);
@@ -924,6 +937,7 @@ async function main() {
     writeExecutionAudit(audit, process.env, REPO_ROOT, runId, "Merge gate scan", scanExitCode === 0 ? "ok" : "failed-child");
     const scanTerminalState = scanExitCode === 0 ? "SCAN-DONE" : "SCAN-FAILED";
     executionTerminal(scanTerminalState, { runId, scanExitCode });
+    telemetry.phase("persistence");
     const persistence = await commitPushVerify(STATE_ROOT, ["state", "audit"], `[fleet] merge-gate scan ${runId}`, identity, audit, process.env);
     const resultCode = Math.max(scanExitCode, mergePersistenceExitCode(persistence));
     if (mergePersistenceExitCode(persistence) !== 0) {
@@ -936,6 +950,11 @@ async function main() {
       }, process.env);
     }
     console.log(`MERGE_TERMINAL_STATE=${resultCode === 0 ? "SCAN-DONE" : "SCAN-FAILED"}`);
+    telemetry.terminal(
+      resultCode === 0 ? "SCAN-DONE" : "SCAN-FAILED",
+      mergePersistenceExitCode(persistence) !== 0 ? "push-failed" : scanExitCode !== 0 ? "child-failed" : "none",
+      mergePersistenceExitCode(persistence) === 0 && scanExitCode !== 0 ? "children" : "persistence",
+    );
     return resultCode;
   }
 
@@ -982,6 +1001,7 @@ async function main() {
   riskCommentBits.push(...cls.reasons);
 
   let visualEvidence = "not-applicable";
+  telemetry.phase("checks");
   let visualOk = true;
   let visualData = null;
   if (cls.uiTouched) {
@@ -1045,6 +1065,7 @@ async function main() {
   ].filter(Boolean).join("\n\n");
 
   // 2. Multi-Agent Adversarial Panel
+  telemetry.phase("judges");
   const correctness = await judge({ repo: TARGET_REPO, prNumber: PR_NUMBER, title: pr.title, body: pr.body, files, extraEvidence: combinedEvidence, lens: "correctness-and-security", audit });
   const standards = await judge({ repo: TARGET_REPO, prNumber: PR_NUMBER, title: pr.title, body: pr.body, files, extraEvidence: combinedEvidence, lens: "industry-standards-and-maintainability", audit });
   
@@ -1237,6 +1258,7 @@ async function main() {
   // If approved and not routed to human review: Proceed with Autonomous Merge!
   // Pre-merge gates on the exact evaluated SHA: kill-switch, SHA stability
   // (PR must not have moved under us while judges ran), then CI green.
+  telemetry.phase("merge");
   if (killSwitchEngaged()) {
     audit.incident("kill-switch", "merge refused: KILL_SWITCH engaged after judges approved");
     await terminal("BLOCKED", { why: "kill-switch-engaged" });
@@ -1323,6 +1345,7 @@ async function main() {
   await terminal("SUCCESS", { mergeCommit: mergedMeta.merge_commit_sha, scores: [correctness.score, standards.score] });
   return finish(audit, runId, "SUCCESS");
   } catch (err) {
+    telemetry.fail(err);
     const msg = String((err && err.message) || err).slice(0, 200);
     audit.incident("fatal", `unexpected merge-gate failure: ${msg}`);
     try {
@@ -1333,6 +1356,8 @@ async function main() {
   }
 
   async function finish(a, rid, stateName) {
+    const outcomePhase = telemetry.currentPhase();
+    telemetry.phase("persistence");
     if (stateName !== "MERGED" && stateName !== "NO-OP") {
       writeQueueOutputs(process.env.GITHUB_OUTPUT, true);
     }
@@ -1349,6 +1374,11 @@ async function main() {
         pr: PR_NUMBER,
       }, process.env);
     }
+    telemetry.terminal(
+      stateName,
+      mergePersistenceExitCode(persistence) !== 0 ? "push-failed" : undefined,
+      mergePersistenceExitCode(persistence) !== 0 ? "persistence" : outcomePhase,
+    );
     return Math.max(mergeExitCode(stateName), mergePersistenceExitCode(persistence));
   }
 }

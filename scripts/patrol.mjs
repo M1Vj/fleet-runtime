@@ -11,6 +11,7 @@ import { askModel } from "./lib/model.mjs";
 import { verifyCommit, verifyPullAuthor, verifyCommentAuthor, verifyIssueAuthor } from "./lib/verify.mjs";
 import { shouldCoalesce } from "./lib/watchdog-decide.mjs";
 import { createAdmissionGate } from "./lib/dispatch-admission.mjs";
+import { createWorkflowTelemetry } from "./lib/workflow-telemetry.mjs";
 import { readRunList, selfRunFromEnv } from "./lib/watchdog-admission.mjs";
 import {
   isPublicDataClass,
@@ -901,6 +902,8 @@ export async function executeDirectives(env, identity, directives, targets, audi
 }
 
 export async function main() {
+  const telemetry = createWorkflowTelemetry("patrol");
+  telemetry.phase("preflight");
   const runId = `patrol-${Date.now()}`;
   const redact = scrub(process.env);
   const audit = new AuditBuffer(redact);
@@ -940,6 +943,7 @@ export async function main() {
       const digest = buildDigest(signals, new Map());
       let modelStatus = "skipped-empty-digest";
       let directives = [];
+      telemetry.phase("model");
       if (digest !== "[]") {
         const modelResult = await askModel({
           prompt: buildPrompt(digest),
@@ -954,6 +958,7 @@ export async function main() {
         if (!validation.ok) audit.note("validator", "public directive output rejected");
         directives = requirePatrolDirectiveValidation(validation);
       }
+      telemetry.phase("execution");
       const result = await executeDirectives(process.env, identity, directives, { tier1: [repo], excluded: [] }, audit);
       if (patrolExecutorExitCode(result.results) !== 0) {
         throw Object.assign(new Error("PATROL_DIRECTIVE_EXECUTION_FAILED"), {
@@ -964,6 +969,7 @@ export async function main() {
       writePublicArtifact(process.env, { mode: "patrol", status: "ok", repository: repo, count: signals.length, results: result.results, checks: { model: modelStatus, digestBytes: digest.length } }, { kind: "patrol", status: "ok", repository: repo, runId });
       writePatrolAudit("ok-public-read-only");
       console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "public-read-only", directives: directives.length, mutations: 0 })}`);
+      telemetry.terminal("SUCCESS");
       return 0;
     }
     const { gatewayDown } = await import("./lib/gateway-health.mjs");
@@ -973,6 +979,7 @@ export async function main() {
       audit.incident("gateway", "circuit open at patrol start; failing closed code=6");
       terminal("EXHAUSTED", { runId, why: "gateway-circuit-open", code: 6 });
       console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "model-unavailable", code: 6 })}`);
+      telemetry.terminal("EXHAUSTED", "gateway-circuit-open");
       return 6;
     }
 
@@ -984,6 +991,7 @@ export async function main() {
     if (coalesce.coalesce) {
       terminal("NO-OP", { runId, coalesced: true, gapMinutes: coalesce.gapMinutes });
       console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "coalesced", gapMinutes: coalesce.gapMinutes })}`);
+      telemetry.terminal("NO-OP");
       return 0;
     }
 
@@ -997,6 +1005,7 @@ export async function main() {
 
     let directives = [];
     let modelMode = "skipped-empty-digest";
+    telemetry.phase("model");
     if (digest !== "[]") {
       const modelResult = await askModel({
         prompt: buildPrompt(digest),
@@ -1048,6 +1057,7 @@ export async function main() {
       }
     }
 
+    telemetry.phase("execution");
     const { mutations, results } = await executeDirectives(process.env, identity, directives, targets, audit);
     audit.note("executor", `mutations=${mutations}`);
 
@@ -1119,6 +1129,7 @@ export async function main() {
     // Write once before persistence so the audit itself is included in the
     // single state commit/push. A final write below captures post-push notes
     // without attempting a second unsafe push.
+    telemetry.phase("persistence");
     writePatrolAudit(status);
 
     if (gitHasChanges(REPO_ROOT, ["state", "audit"])) {
@@ -1169,8 +1180,10 @@ export async function main() {
     }
     writePatrolAudit(status);
     console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status, modelMode, directives: directives.length, mutations, auditFile: auditFileRel })}`);
+    telemetry.terminal("SUCCESS");
     return 0;
   } catch (err) {
+    telemetry.fail(err);
     const code = err.code && Number.isInteger(err.code) ? err.code : 1;
     const publicMode = (() => {
       try {
@@ -1193,6 +1206,7 @@ export async function main() {
           terminal("EXHAUSTED", { runId, why: "gateway-circuit-open", code: 6, trigger });
           writePatrolAudit(failureStatus);
           console.log(`FLEET_RUN_RESULT=${JSON.stringify({ runId, status: "model-unavailable", code: 6 })}`);
+          telemetry.terminal("EXHAUSTED");
           return 6;
         }
       } catch {}
@@ -1224,6 +1238,7 @@ export async function main() {
     // Preserve fatal incidents and any push outcome in the final local audit;
     // never replay the push merely to persist this note.
     writePatrolAudit(failureStatus);
+    telemetry.terminal("FAILED");
     return code;
   }
 }

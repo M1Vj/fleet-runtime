@@ -138,7 +138,12 @@ export function handleToolCall(name, args = {}, env = process.env) {
       const current = getRepoMemory(cwd, env);
 
       if (category === "fleet") {
-        storeFleetKnowledge(key || "general", value, "general", env);
+        if (!storeFleetKnowledge(key || "general", value, "general", env)) {
+          return {
+            content: [{ type: "text", text: "Fleet memory was not stored: node:sqlite storage is unavailable." }],
+            isError: true,
+          };
+        }
       } else if (category === "test_command") {
         const tests = Array.from(new Set([...(current.testCommands || []), value]));
         storeRepoMemory(cwd, { testCommands: tests }, {}, env);

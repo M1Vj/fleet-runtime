@@ -83,6 +83,40 @@ capacity is unavailable.
 - Action references are immutable commit pins. Keep the pins current through a
   reviewed dependency update.
 
+## Memory capability
+
+`scripts/lib/persistent-memory.mjs` uses SQLite only when the runtime provides
+`node:sqlite` with `DatabaseSync`. File-backed databases request WAL mode;
+`:memory:` databases are process-local and do not establish WAL or durability.
+SQLite availability does not change the public architecture: lane state stays
+below the runner temporary directory and is ephemeral. Durable private state
+still belongs to the separate controller.
+
+When `node:sqlite` is unavailable (including Node 20), optional memory does not
+stop the lane, but capability is reduced:
+
+- `getDb()` returns `null` and creates no SQLite database.
+- Mistake records live in process-local Maps, lost on `closeDb()` or exit.
+- `getFleetMemory()` returns empty cross-repository knowledge.
+- `storeFleetKnowledge()` returns `false` without storing; the MCP
+  `memory_store` tool with category `fleet` returns `isError: true` instead of
+  claiming success.
+- Repository SQL reads/writes are bypassed. `MEMORY.md` is still read when
+  present and a write is attempted only for an existing file or explicit
+  `syncFile: true`; that separate path is not SQLite persistence.
+
+The selftest workflow currently selects Node 20. A compatibility pass there is
+not evidence of SQLite, WAL, or persistence. Run the focused capability suite
+under both a SQLite-enabled runtime and one without the native module:
+
+```bash
+node --test tests/persistent-memory.test.mjs
+```
+
+The suite labels and skips inapplicable capability cases. Its temporary-file
+close/reopen checks are not crash-recovery, cross-runner, or deployed-runtime
+verification; check the actual runtime and state configuration separately.
+
 ## Local checks
 
 Run the focused public airlock suite from this repository:

@@ -276,10 +276,11 @@ export function getFleetMemory(env = process.env) {
 
 export function storeFleetKnowledge(key, value, category = "general", env = process.env) {
   const db = getDb(env);
+  // Fleet knowledge has no in-process fallback: do not acknowledge a no-op.
+  if (!db) return false;
+
   const now = new Date().toISOString();
   const valStr = typeof value === "object" ? JSON.stringify(value) : String(value);
-
-  if (!db) return true;
 
   const stmt = db.prepare(`
     INSERT INTO fleet_memory (category, key, value, updated_at)

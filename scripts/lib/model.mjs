@@ -517,7 +517,8 @@ function deepFind(obj, key, out = []) {
     return out;
   }
   for (const [k, v] of Object.entries(obj)) {
-    if (k === key && typeof v === "string" && v.length > 0) out.push(v);
+    const isStatusNumber = (key === "statusCode" || key === "status") && typeof v === "number";
+    if (k === key && ((typeof v === "string" && v.length > 0) || isStatusNumber)) out.push(v);
     deepFind(v, key, out);
   }
   return out;
@@ -816,11 +817,11 @@ export function runOnce({ prompt, sessionId, variant, timeoutMs = MODEL_TIMEOUTS
       clearTimeout(timer);
       let reply = "";
       let sid = "";
+      const events = [];
       try {
         // Non-streaming `--format json` parse: synthesize reply text from
         // event payloads. (Muse streaming omits finish_reason, so completion
         // is derived from exit code + non-empty reply, never from a stop field.)
-        const events = [];
         for (const line of stdout.split("\n")) {
           const trimmed = line.trim();
           if (!trimmed.startsWith("{")) continue;

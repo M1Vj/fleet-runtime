@@ -47,7 +47,12 @@ scheduling, credentials, durable state, and consequential writes live outside th
 
 ## 5. Memory (SQLite, ephemeral)
 
-- Lane memory is SQLite WAL via `node:sqlite` (`DatabaseSync`).
+- Lane memory uses SQLite when `node:sqlite` (`DatabaseSync`) is available;
+  file-backed databases request WAL. Node 20 lacks that native module.
+- Without SQLite, mistakes are process-local, fleet knowledge reads are empty,
+  and fleet knowledge writes return `false` (MCP reports an error). Separate
+  `MEMORY.md` behavior does not provide SQLite persistence. See the
+  [memory capability boundary](README.md#memory-capability).
 - Recall conventions and past pitfalls before acting; store only
   durable, public-safe findings (decisions, pitfalls, fixes).
 - Keep state under the lane temp root; never persist private text,

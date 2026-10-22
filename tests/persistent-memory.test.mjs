@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -21,7 +21,102 @@ import {
 } from "../scripts/lib/persistent-memory.mjs";
 import { handleToolCall } from "../scripts/lib/memory-mcp-server.mjs";
 
-test("persistent memory: SQLite in-memory initialization and mistake recording", () => {
+let sqliteAvailable = false;
+try {
+  const { DatabaseSync } = await import("node:sqlite");
+  sqliteAvailable = typeof DatabaseSync === "function";
+} catch (error) {
+  if (error.code !== "ERR_UNKNOWN_BUILTIN_MODULE") throw error;
+}
+const requiresSqlite = { skip: sqliteAvailable ? false : "node:sqlite DatabaseSync unavailable" };
+const requiresFallback = { skip: sqliteAvailable ? "native SQLite available" : false };
+beforeEach(() => closeDb());
+afterEach(() => closeDb());
+
+function temporaryRepo(t) {
+  const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-memory-capability-"));
+  t.after(() => {
+    closeDb();
+    fs.rmSync(repoPath, { recursive: true, force: true });
+  });
+  return repoPath;
+}
+
+test("persistent memory: SQLite fleet knowledge updates survive file close/reopen", requiresSqlite, (t) => {
+  const repoPath = temporaryRepo(t);
+  const env = { FLEET_MEMORY_DB: path.join(repoPath, "state", "memory.db") };
+  const db = getDb(env);
+  assert.equal(db.prepare("PRAGMA journal_mode").get().journal_mode, "wal");
+  assert.equal(storeFleetKnowledge("command", "first", "general", env), true);
+  assert.equal(storeFleetKnowledge("command", { verified: true, commands: ["node --test"] }, "general", env), true);
+  assert.equal(storeFleetKnowledge("command", "separate category", "other", env), true);
+  closeDb();
+
+  const memory = getFleetMemory(env);
+  assert.deepEqual(memory.crossRepoKnowledge.general.command.value, { verified: true, commands: ["node --test"] });
+  assert.equal(memory.crossRepoKnowledge.other.command.value, "separate category");
+  assert.equal(getDb(env).prepare("SELECT count(*) AS n FROM fleet_memory").get().n, 2);
+});
+
+test("memory MCP server: SQLite fleet store success corresponds to a stored value", requiresSqlite, (t) => {
+  const repoPath = temporaryRepo(t);
+  const env = { FLEET_MEMORY_DB: ":memory:" };
+  const result = handleToolCall("memory_store", { category: "fleet", key: "test", value: "public finding", repoPath }, env);
+  assert.notEqual(result.isError, true);
+  assert.match(result.content[0].text, /Memory stored successfully/);
+  assert.equal(getFleetMemory(env).crossRepoKnowledge.general.test.value, "public finding");
+  assert.equal(fs.existsSync(path.join(repoPath, "MEMORY.md")), false);
+});
+
+test("persistent memory: unavailable SQLite fleet writes return false without creating files", requiresFallback, (t) => {
+  const repoPath = temporaryRepo(t);
+  const env = { FLEET_MEMORY_DB: path.join(repoPath, "state", "memory.db") };
+  assert.equal(getDb(env), null);
+  assert.equal(storeFleetKnowledge("test", "public finding", "general", env), false);
+  // A rejected write must not serialize its value or invoke user-controlled hooks.
+  assert.equal(storeFleetKnowledge("test", { toJSON() { throw new Error("must not serialize"); } }, "general", env), false);
+  assert.deepEqual(getFleetMemory(env), { version: 2, crossRepoKnowledge: {} });
+  assert.deepEqual(fs.readdirSync(repoPath), []);
+  closeDb();
+  assert.deepEqual(getFleetMemory(env).crossRepoKnowledge, {});
+});
+
+test("memory MCP server: unavailable SQLite fleet writes return a fixed error without echoing input", requiresFallback, (t) => {
+  const repoPath = temporaryRepo(t);
+  const env = { FLEET_MEMORY_DB: path.join(repoPath, "state", "memory.db") };
+  const result = handleToolCall("memory_store", {
+    category: "fleet", key: "untrusted-key", value: "untrusted-value\n::error::untrusted", repoPath,
+  }, env);
+  assert.deepEqual(result, {
+    content: [{ type: "text", text: "Fleet memory was not stored: node:sqlite storage is unavailable." }],
+    isError: true,
+  });
+  assert.deepEqual(fs.readdirSync(repoPath), []);
+});
+
+test("persistent memory: unavailable SQLite mistakes are process-local and cleared on close", requiresFallback, () => {
+  const env = { FLEET_MEMORY_DB: ":memory:" };
+  assert.equal(recordMistake({ errorSignature: "fixture", mistakeDescription: "fixture failure", correctFix: "fixture fix" }, env), true);
+  assert.equal(listMistakes({}, env).length, 1);
+  closeDb();
+  assert.deepEqual(listMistakes({}, env), []);
+});
+
+test("persistent memory: unavailable SQLite repository memory only survives through separate MEMORY.md sync", requiresFallback, (t) => {
+  const repoPath = temporaryRepo(t);
+  const env = { FLEET_MEMORY_DB: path.join(repoPath, "state", "memory.db") };
+  storeRepoMemory(repoPath, { conventions: ["not retained without a file"] }, {}, env);
+  assert.deepEqual(getRepoMemory(repoPath, env).conventions, []);
+  storeRepoMemory(repoPath, { conventions: ["explicit file sync"] }, { syncFile: true }, env);
+  closeDb();
+  assert.deepEqual(getRepoMemory(repoPath, env).conventions, ["explicit file sync"]);
+  storeRepoMemory(repoPath, { conventions: ["existing file sync"] }, {}, env);
+  closeDb();
+  assert.deepEqual(getRepoMemory(repoPath, env).conventions, ["explicit file sync", "existing file sync"]);
+  assert.deepEqual(fs.readdirSync(repoPath), ["MEMORY.md"]);
+});
+
+test("persistent memory: SQLite in-memory initialization and mistake recording", requiresSqlite, () => {
   closeDb();
   const testEnv = { FLEET_MEMORY_DB: ":memory:" };
   const db = getDb(testEnv);
@@ -90,7 +185,7 @@ test("persistent memory: repo memory storage and bidirectional MEMORY.md sync", 
   try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
 });
 
-test("persistent memory: system prompt block generation", () => {
+test("persistent memory: SQLite-backed system prompt block generation", requiresSqlite, () => {
   closeDb();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-mem-prompt-test-"));
   const testEnv = { FLEET_MEMORY_DB: ":memory:" };
